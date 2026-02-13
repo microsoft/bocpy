@@ -1,0 +1,12 @@
+#============================== Baseline config ==============================
+[flake8]
+inline-quotes = double
+import-order-style = google
+docstring-convention = google
+max-line-length = 120
+
+extend-ignore = E203, N812, N817
+
+#============================ Repo-specific config ===========================
+per-file-ignores =
+    tests/*:D103

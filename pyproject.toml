@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "boc"
+version = "0.1.0"
+authors = [
+    {name = "Pyrona Team", email="pyrona@microsoft.com"}
+]
+description = "boc is a Python extension that adds Behavior-oriented concurrency built on top of cross-interpreter data."
+readme = "README.md"
+keywords = ["behavior-oriented", "concurrency", "subinterpreters"]
+license = "MIT"
+classifiers = [
+    "ProgrammingLanguage :: Python :: 3"
+]
+
+[project.urls]
+homepage = "https://microsoft.github.io/bocpy/"
+source = "https://github.com/microsoft/bocpy"
+documentation = "https://microsoft.github.io/bocpy/docs"
+issues = "https://github.com/microsoft/bocpy/issues"
+
+[project.optional-dependencies]
+test = ["pytest-md", "pytest-emoji", "pytest-cov", "pytest"]
+linting = ["flake8", "flake8-bugbear", "flake8-builtins", "flake8-docstrings", "flake8-import-order", "flake8-quotes", "pep8-naming"]
+docs = ["sphinx", "sphinx-autodoc-typehints", "enum-tools[sphinx]"]
