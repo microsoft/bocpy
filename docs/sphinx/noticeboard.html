@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+
+<html lang="en" data-content_root="./">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Noticeboard &#8212; bocpy 0.9.0 documentation</title>
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=5ecbeea2" />
+    <link rel="stylesheet" type="text/css" href="_static/basic.css?v=b08954a9" />
+    <link rel="stylesheet" type="text/css" href="_static/alabaster.css?v=27fed22d" />
+    <script src="_static/documentation_options.js?v=39bb1c6d"></script>
+    <script src="_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <link rel="icon" href="_static/favicon.ico"/>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Messaging" href="messaging.html" />
+    <link rel="prev" title="Pinned Cowns" href="pinned_cowns.html" />
+   
+  <link rel="stylesheet" href="_static/custom.css" type="text/css" />
+  
+
+  
+  
+
+  </head><body>
+  
+
+    <div class="document">
+      <div class="documentwrapper">
+        <div class="bodywrapper">
+          
+
+          <div class="body" role="main">
+            
+  <section id="noticeboard">
+<span id="id1"></span><h1>Noticeboard<a class="headerlink" href="#noticeboard" title="Link to this heading">¶</a></h1>
+<p>The <strong>noticeboard</strong> is a global key-value store (up to 64 entries) designed for
+cross-behavior data sharing that does not warrant a dedicated <a class="reference internal" href="api.html#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a>.
+It is eventually consistent: writes are fire-and-forget, and readers see a
+snapshot that may lag behind the latest committed state.</p>
+<section id="when-to-use-the-noticeboard">
+<h2>When to Use the Noticeboard<a class="headerlink" href="#when-to-use-the-noticeboard" title="Link to this heading">¶</a></h2>
+<p>Use the noticeboard when:</p>
+<ul class="simple">
+<li><p>Multiple behaviors need to observe shared configuration or summary data
+without taking exclusive ownership.</p></li>
+<li><p>You want to broadcast a value (<em>e.g.,</em> “stop” flag, running totals, discovered
+results) that many independent behaviors can poll.</p></li>
+<li><p>The data does not need strict read-your-writes ordering between behaviors.</p></li>
+</ul>
+<p>If you need strict sequencing or exclusive access, use a <a class="reference internal" href="api.html#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a> instead.</p>
+</section>
+<section id="consistency-model">
+<h2>Consistency Model<a class="headerlink" href="#consistency-model" title="Link to this heading">¶</a></h2>
+<p>All mutations (<code class="docutils literal notranslate"><span class="pre">notice_write</span></code>, <code class="docutils literal notranslate"><span class="pre">notice_update</span></code>, <code class="docutils literal notranslate"><span class="pre">notice_delete</span></code>) are
+serialized through a dedicated <strong>noticeboard thread</strong>. The calling behavior (or
+thread) hands off the mutation and returns immediately — this is the
+“fire-and-forget” property.</p>
+<p>Readers call <a class="reference internal" href="api.html#bocpy.noticeboard" title="bocpy.noticeboard"><code class="xref py py-func docutils literal notranslate"><span class="pre">noticeboard()</span></code></a> or <a class="reference internal" href="api.html#bocpy.notice_read" title="bocpy.notice_read"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_read()</span></code></a> to take a <strong>snapshot</strong>
+that is cached for the lifetime of the behavior. The snapshot is consistent
+(all entries come from the same committed version), but may not reflect writes
+that were posted after the snapshot was taken — or even writes posted <em>before</em>
+it, if the noticeboard thread has not yet committed them.</p>
+<div class="admonition important">
+<p class="admonition-title">Important</p>
+<p>The noticeboard is <strong>not</strong> a synchronization channel. Do not rely on a
+subsequent behavior seeing a prior behavior’s write just because the two
+are chained through a cown. If you need read-your-writes ordering, model
+the shared state as a <a class="reference internal" href="api.html#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a> instead.</p>
+</div>
+</section>
+<section id="worked-example-early-termination">
+<h2>Worked Example: Early Termination<a class="headerlink" href="#worked-example-early-termination" title="Link to this heading">¶</a></h2>
+<p>The
+<a class="reference external" href="https://github.com/microsoft/bocpy/tree/main/examples/prime_factor.py">prime_factor example</a>
+uses the noticeboard to coordinate early termination across parallel worker
+behaviors. A simplified version of the pattern:</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p><code class="docutils literal notranslate"><span class="pre">expensive_computation</span></code>, <code class="docutils literal notranslate"><span class="pre">is_final_answer</span></code> and <code class="docutils literal notranslate"><span class="pre">get_work</span></code> below are
+placeholders for application logic; substitute your own when adapting
+the example.</p>
+</div>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">functools</span><span class="w"> </span><span class="kn">import</span> <span class="n">partial</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">bocpy</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">Cown</span><span class="p">,</span> <span class="n">notice_read</span><span class="p">,</span> <span class="n">notice_update</span><span class="p">,</span> <span class="n">notice_write</span><span class="p">,</span>
+                   <span class="n">wait</span><span class="p">,</span> <span class="n">when</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">append_result</span><span class="p">(</span><span class="n">existing</span><span class="p">,</span> <span class="n">new_item</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Append new_item to the shared partials list (used with notice_update).&quot;&quot;&quot;</span>
+    <span class="k">return</span> <span class="n">existing</span> <span class="o">+</span> <span class="p">[</span><span class="n">new_item</span><span class="p">]</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">WorkerState</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">worker_id</span><span class="p">,</span> <span class="n">items</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">worker_id</span> <span class="o">=</span> <span class="n">worker_id</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">items</span> <span class="o">=</span> <span class="n">items</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">process_batch</span><span class="p">(</span><span class="n">state</span><span class="p">:</span> <span class="n">Cown</span><span class="p">[</span><span class="n">WorkerState</span><span class="p">]):</span>
+    <span class="nd">@when</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_</span><span class="p">(</span><span class="n">state</span><span class="p">):</span>
+        <span class="c1"># Check if another worker already signalled completion.</span>
+        <span class="k">if</span> <span class="n">notice_read</span><span class="p">(</span><span class="s2">&quot;done&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">):</span>
+            <span class="k">return</span>
+
+        <span class="n">item</span> <span class="o">=</span> <span class="n">state</span><span class="o">.</span><span class="n">value</span><span class="o">.</span><span class="n">items</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+        <span class="n">result</span> <span class="o">=</span> <span class="n">expensive_computation</span><span class="p">(</span><span class="n">item</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">is_final_answer</span><span class="p">(</span><span class="n">result</span><span class="p">):</span>
+            <span class="c1"># Signal all other workers to stop and publish the answer</span>
+            <span class="c1"># to the noticeboard. wait(noticeboard=True) will lift the</span>
+            <span class="c1"># final state back across runtime shutdown for us.</span>
+            <span class="n">notice_write</span><span class="p">(</span><span class="s2">&quot;done&quot;</span><span class="p">,</span> <span class="kc">True</span><span class="p">)</span>
+            <span class="n">notice_write</span><span class="p">(</span><span class="s2">&quot;answer&quot;</span><span class="p">,</span> <span class="n">result</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="c1"># Record the partial result for diagnostics, then continue.</span>
+            <span class="n">notice_update</span><span class="p">(</span><span class="s2">&quot;partials&quot;</span><span class="p">,</span> <span class="n">partial</span><span class="p">(</span><span class="n">append_result</span><span class="p">,</span> <span class="n">new_item</span><span class="o">=</span><span class="n">result</span><span class="p">),</span>
+                          <span class="n">default</span><span class="o">=</span><span class="p">[])</span>
+            <span class="k">if</span> <span class="n">state</span><span class="o">.</span><span class="n">value</span><span class="o">.</span><span class="n">items</span><span class="p">:</span>
+                <span class="n">process_batch</span><span class="p">(</span><span class="n">state</span><span class="p">)</span>
+
+
+<span class="c1"># Launch parallel workers.</span>
+<span class="n">workers</span> <span class="o">=</span> <span class="p">[</span><span class="n">Cown</span><span class="p">(</span><span class="n">WorkerState</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="n">get_work</span><span class="p">(</span><span class="n">i</span><span class="p">)))</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">4</span><span class="p">)]</span>
+<span class="k">for</span> <span class="n">w</span> <span class="ow">in</span> <span class="n">workers</span><span class="p">:</span>
+    <span class="n">process_batch</span><span class="p">(</span><span class="n">w</span><span class="p">)</span>
+
+<span class="c1"># Drain the runtime and lift the final noticeboard state back. See</span>
+<span class="c1"># &quot;Reading the Final State at Shutdown&quot; below for the API contract.</span>
+<span class="n">final</span> <span class="o">=</span> <span class="n">wait</span><span class="p">(</span><span class="n">noticeboard</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;final answer:&quot;</span><span class="p">,</span> <span class="n">final</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;answer&quot;</span><span class="p">))</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;partials:    &quot;</span><span class="p">,</span> <span class="n">final</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;partials&quot;</span><span class="p">,</span> <span class="p">[]))</span>
+</pre></div>
+</div>
+<p><strong>Key points:</strong></p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">notice_write(&quot;done&quot;,</span> <span class="pre">True)</span></code> is non-blocking — the worker doesn’t wait
+for the write to commit.</p></li>
+<li><p>Other workers poll <code class="docutils literal notranslate"><span class="pre">notice_read(&quot;done&quot;,</span> <span class="pre">False)</span></code> at the start of each
+batch. They will <em>eventually</em> see the flag and stop.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">notice_update(&quot;partials&quot;,</span> <span class="pre">append_result,</span> <span class="pre">...)</span></code> shows the read-modify-
+write pattern: <code class="docutils literal notranslate"><span class="pre">append_result</span></code> is run atomically against the current
+list, so concurrent appends from different workers don’t lose entries.</p></li>
+<li><p>The final answer is lifted back through <a class="reference internal" href="api.html#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a> with
+<code class="docutils literal notranslate"><span class="pre">noticeboard=True</span></code> — <a class="reference internal" href="api.html#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a> snapshots the noticeboard between
+joining the noticeboard thread and clearing the C-side entries, so the
+caller gets a plain <code class="docutils literal notranslate"><span class="pre">dict</span></code> of the last committed state.</p></li>
+<li><p>The pattern is cooperative: there is no hard cancellation. Workers stop
+at the next polling point.</p></li>
+</ul>
+</section>
+<section id="reading-the-final-state-at-shutdown">
+<h2>Reading the Final State at Shutdown<a class="headerlink" href="#reading-the-final-state-at-shutdown" title="Link to this heading">¶</a></h2>
+<p>The noticeboard is torn down at the end of <a class="reference internal" href="api.html#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a>: the dedicated
+mutator thread is joined and the C-side entries are freed before control
+returns to the main thread. To carry data back across that boundary, pass
+<code class="docutils literal notranslate"><span class="pre">noticeboard=True</span></code>:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">bocpy</span><span class="w"> </span><span class="kn">import</span> <span class="n">wait</span>
+
+<span class="n">snap</span> <span class="o">=</span> <span class="n">wait</span><span class="p">(</span><span class="n">noticeboard</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>        <span class="c1"># plain dict[str, Any]</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">snap</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;answer&quot;</span><span class="p">))</span>
+</pre></div>
+</div>
+<p>The snapshot is taken on the main thread between joining the noticeboard
+thread and clearing the entries, so every mutation enqueued by a behavior
+that completed before <a class="reference internal" href="api.html#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a> returns is visible.</p>
+<p>The combined form returns a <a class="reference internal" href="api.html#bocpy.WaitResult" title="bocpy.WaitResult"><code class="xref py py-class docutils literal notranslate"><span class="pre">WaitResult</span></code></a> <code class="docutils literal notranslate"><span class="pre">NamedTuple</span></code> carrying
+the scheduler-stats snapshot alongside the noticeboard:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">result</span> <span class="o">=</span> <span class="n">wait</span><span class="p">(</span><span class="n">stats</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">noticeboard</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">noticeboard</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;answer&quot;</span><span class="p">))</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">stats</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="s2">&quot;popped_local&quot;</span><span class="p">])</span>
+</pre></div>
+</div>
+<p>Edge cases:</p>
+<ul class="simple">
+<li><p>If the runtime was never started (or already torn down), the
+noticeboard snapshot is the empty dict <code class="docutils literal notranslate"><span class="pre">{}</span></code> rather than <code class="docutils literal notranslate"><span class="pre">None</span></code>.</p></li>
+<li><p>If a key your code expects might not have been written before
+quiescence, use <code class="docutils literal notranslate"><span class="pre">snap.get(key)</span></code> (or check <code class="docutils literal notranslate"><span class="pre">key</span> <span class="pre">in</span> <span class="pre">snap</span></code>) rather
+than indexing — <a class="reference internal" href="api.html#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a> quiesces as soon as every behavior
+completes, with no guarantee any particular write happened.</p></li>
+<li><p>The returned dict is a plain mutable <code class="docutils literal notranslate"><span class="pre">dict</span></code>; mutating it locally
+does not affect the (now-freed) noticeboard.</p></li>
+</ul>
+</section>
+<section id="reading-the-state-between-rounds">
+<h2>Reading the State Between Rounds<a class="headerlink" href="#reading-the-state-between-rounds" title="Link to this heading">¶</a></h2>
+<p>When you want a noticeboard snapshot at a synchronization point
+<em>without</em> tearing the runtime down — e.g. a parallel search that
+inspects its best-so-far state between rounds and then keeps
+working — use <a class="reference internal" href="api.html#bocpy.quiesce" title="bocpy.quiesce"><code class="xref py py-func docutils literal notranslate"><span class="pre">quiesce()</span></code></a> with <code class="docutils literal notranslate"><span class="pre">noticeboard=True</span></code>:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">bocpy</span><span class="w"> </span><span class="kn">import</span> <span class="n">quiesce</span>
+
+<span class="n">snap</span> <span class="o">=</span> <span class="n">quiesce</span><span class="p">(</span><span class="n">noticeboard</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>  <span class="c1"># plain dict[str, Any]</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;best so far:&quot;</span><span class="p">,</span> <span class="n">snap</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;best&quot;</span><span class="p">))</span>
+<span class="c1"># ... next batch of @when calls runs immediately ...</span>
+</pre></div>
+</div>
+<p><a class="reference internal" href="api.html#bocpy.quiesce" title="bocpy.quiesce"><code class="xref py py-func docutils literal notranslate"><span class="pre">quiesce()</span></code></a> blocks until every in-flight behavior completes,
+captures the snapshot the same way <a class="reference internal" href="api.html#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a> does (by cycling
+the dedicated mutator thread, which guarantees every prior
+<code class="docutils literal notranslate"><span class="pre">notice_write</span></code> / <code class="docutils literal notranslate"><span class="pre">notice_update</span></code> / <code class="docutils literal notranslate"><span class="pre">notice_delete</span></code> has been
+committed before the read), and then leaves the workers and the
+noticeboard thread running. The combined <code class="docutils literal notranslate"><span class="pre">stats=True,</span>
+<span class="pre">noticeboard=True</span></code> form returns a <a class="reference internal" href="api.html#bocpy.WaitResult" title="bocpy.WaitResult"><code class="xref py py-class docutils literal notranslate"><span class="pre">WaitResult</span></code></a> just like
+<a class="reference internal" href="api.html#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a>.</p>
+</section>
+<section id="reading-the-noticeboard">
+<h2>Reading the Noticeboard<a class="headerlink" href="#reading-the-noticeboard" title="Link to this heading">¶</a></h2>
+<p>The noticeboard is a <strong>behavior-scope read surface</strong>. Inside a behavior,
+call <a class="reference internal" href="api.html#bocpy.noticeboard" title="bocpy.noticeboard"><code class="xref py py-func docutils literal notranslate"><span class="pre">noticeboard()</span></code></a> to get a read-only mapping of all entries, or
+<a class="reference internal" href="api.html#bocpy.notice_read" title="bocpy.notice_read"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_read()</span></code></a> for a single key:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">bocpy</span><span class="w"> </span><span class="kn">import</span> <span class="n">noticeboard</span><span class="p">,</span> <span class="n">notice_read</span><span class="p">,</span> <span class="n">when</span><span class="p">,</span> <span class="n">Cown</span>
+
+<span class="n">c</span> <span class="o">=</span> <span class="n">Cown</span><span class="p">(</span><span class="kc">None</span><span class="p">)</span>
+
+<span class="nd">@when</span><span class="p">(</span><span class="n">c</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_</span><span class="p">(</span><span class="n">c</span><span class="p">):</span>
+    <span class="c1"># Full snapshot</span>
+    <span class="n">snap</span> <span class="o">=</span> <span class="n">noticeboard</span><span class="p">()</span>
+    <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">snap</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2"> = </span><span class="si">{</span><span class="n">value</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="c1"># Single key with a default</span>
+    <span class="n">threshold</span> <span class="o">=</span> <span class="n">notice_read</span><span class="p">(</span><span class="s2">&quot;threshold&quot;</span><span class="p">,</span> <span class="mf">0.5</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>The snapshot is taken once per behavior and cached – multiple calls to
+<a class="reference internal" href="api.html#bocpy.noticeboard" title="bocpy.noticeboard"><code class="xref py py-func docutils literal notranslate"><span class="pre">noticeboard()</span></code></a> or <a class="reference internal" href="api.html#bocpy.notice_read" title="bocpy.notice_read"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_read()</span></code></a> within the same behavior return
+data from the same point in time.</p>
+<p>Cowns embedded in a noticeboard entry remain valid for the lifetime of
+the entry; they survive as long as the entry has not been overwritten or
+deleted, regardless of how many readers have observed the entry.</p>
+<div class="admonition warning">
+<p class="admonition-title">Warning</p>
+<p>Calling <a class="reference internal" href="api.html#bocpy.noticeboard" title="bocpy.noticeboard"><code class="xref py py-func docutils literal notranslate"><span class="pre">noticeboard()</span></code></a> or <a class="reference internal" href="api.html#bocpy.notice_read" title="bocpy.notice_read"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_read()</span></code></a> from the main
+thread <em>outside</em> a behavior is <strong>undefined behavior</strong>. The only
+supported ways to read the noticeboard from the main thread are
+<a class="reference internal" href="api.html#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a> with <code class="docutils literal notranslate"><span class="pre">noticeboard=True</span></code> (see “Reading the Final
+State at Shutdown” above) and <a class="reference internal" href="api.html#bocpy.quiesce" title="bocpy.quiesce"><code class="xref py py-func docutils literal notranslate"><span class="pre">quiesce()</span></code></a> with
+<code class="docutils literal notranslate"><span class="pre">noticeboard=True</span></code> (see “Reading the State Between Rounds”
+above). Seeding the noticeboard with <a class="reference internal" href="api.html#bocpy.notice_write" title="bocpy.notice_write"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_write()</span></code></a> from
+the main thread <em>before</em> scheduling behaviors is fine and is
+the recommended pattern for installing read-mostly configuration.</p>
+</div>
+</section>
+<section id="writing-and-updating">
+<h2>Writing and Updating<a class="headerlink" href="#writing-and-updating" title="Link to this heading">¶</a></h2>
+<p><a class="reference internal" href="api.html#bocpy.notice_write" title="bocpy.notice_write"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_write()</span></code></a> sets a key unconditionally:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">bocpy</span><span class="w"> </span><span class="kn">import</span> <span class="n">notice_write</span>
+
+<span class="n">notice_write</span><span class="p">(</span><span class="s2">&quot;config.max_retries&quot;</span><span class="p">,</span> <span class="mi">3</span><span class="p">)</span>
+<span class="n">notice_write</span><span class="p">(</span><span class="s2">&quot;status&quot;</span><span class="p">,</span> <span class="s2">&quot;running&quot;</span><span class="p">)</span>
+</pre></div>
+</div>
+<p><a class="reference internal" href="api.html#bocpy.notice_update" title="bocpy.notice_update"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_update()</span></code></a> performs an atomic read-modify-write. The function
+<code class="docutils literal notranslate"><span class="pre">fn</span></code> receives the current value (or <code class="docutils literal notranslate"><span class="pre">default</span></code> if the key is absent) and
+returns the new value:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">functools</span><span class="w"> </span><span class="kn">import</span> <span class="n">partial</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">operator</span><span class="w"> </span><span class="kn">import</span> <span class="n">add</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">bocpy</span><span class="w"> </span><span class="kn">import</span> <span class="n">notice_update</span>
+
+<span class="c1"># Increment a counter</span>
+<span class="n">notice_update</span><span class="p">(</span><span class="s2">&quot;counter&quot;</span><span class="p">,</span> <span class="n">partial</span><span class="p">(</span><span class="n">add</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span> <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+
+<span class="c1"># Append to a list</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">append_item</span><span class="p">(</span><span class="n">lst</span><span class="p">,</span> <span class="n">item</span><span class="p">):</span>
+    <span class="k">return</span> <span class="n">lst</span> <span class="o">+</span> <span class="p">[</span><span class="n">item</span><span class="p">]</span>
+
+<span class="n">notice_update</span><span class="p">(</span><span class="s2">&quot;results&quot;</span><span class="p">,</span> <span class="n">partial</span><span class="p">(</span><span class="n">append_item</span><span class="p">,</span> <span class="n">item</span><span class="o">=</span><span class="s2">&quot;found!&quot;</span><span class="p">),</span> <span class="n">default</span><span class="o">=</span><span class="p">[])</span>
+</pre></div>
+</div>
+<div class="admonition warning">
+<p class="admonition-title">Warning</p>
+<p><code class="docutils literal notranslate"><span class="pre">fn</span></code> must be <strong>picklable</strong> — lambdas and closures are not.
+Use <code class="docutils literal notranslate"><span class="pre">functools.partial</span></code> with module-level functions, or <code class="docutils literal notranslate"><span class="pre">operator</span></code>
+functions.</p>
+</div>
+<p>If <code class="docutils literal notranslate"><span class="pre">fn</span></code> returns <a class="reference internal" href="api.html#bocpy.REMOVED" title="bocpy.REMOVED"><code class="xref py py-data docutils literal notranslate"><span class="pre">REMOVED</span></code></a>, the entry is deleted:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">bocpy</span><span class="w"> </span><span class="kn">import</span> <span class="n">notice_update</span><span class="p">,</span> <span class="n">REMOVED</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">clear_if_empty</span><span class="p">(</span><span class="n">value</span><span class="p">):</span>
+    <span class="k">return</span> <span class="n">REMOVED</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">value</span> <span class="k">else</span> <span class="n">value</span>
+
+<span class="n">notice_update</span><span class="p">(</span><span class="s2">&quot;buffer&quot;</span><span class="p">,</span> <span class="n">clear_if_empty</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="p">[])</span>
+</pre></div>
+</div>
+</section>
+<section id="deleting-entries">
+<h2>Deleting Entries<a class="headerlink" href="#deleting-entries" title="Link to this heading">¶</a></h2>
+<p><a class="reference internal" href="api.html#bocpy.notice_delete" title="bocpy.notice_delete"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_delete()</span></code></a> removes a single key (no-op if absent):</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">bocpy</span><span class="w"> </span><span class="kn">import</span> <span class="n">notice_delete</span>
+
+<span class="n">notice_delete</span><span class="p">(</span><span class="s2">&quot;temporary_flag&quot;</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+<section id="notice-sync-testing-only">
+<h2><code class="docutils literal notranslate"><span class="pre">notice_sync</span></code> (Testing Only)<a class="headerlink" href="#notice-sync-testing-only" title="Link to this heading">¶</a></h2>
+<p><a class="reference internal" href="api.html#bocpy.notice_sync" title="bocpy.notice_sync"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_sync()</span></code></a> blocks until every mutation the calling thread has
+posted so far has been committed by the noticeboard thread. It exists to
+make the noticeboard’s eventual consistency tractable for <strong>tests</strong> — a
+test can write a value, call <code class="docutils literal notranslate"><span class="pre">notice_sync()</span></code>, and then assert that a
+subsequently scheduled behavior observes the write — not as a primitive
+for application code.</p>
+<div class="admonition warning">
+<p class="admonition-title">Warning</p>
+<p>Outside of tests, reaching for <code class="docutils literal notranslate"><span class="pre">notice_sync</span></code> is almost always an
+anti-pattern. The guarantee it provides is much weaker than it looks:</p>
+<ul class="simple">
+<li><p>It only orders the <strong>calling thread’s prior writes</strong> against the
+<strong>next per-behavior snapshot</strong> taken on any thread. Snapshots are
+captured once per behavior, so a behavior already executing when
+<code class="docutils literal notranslate"><span class="pre">notice_sync</span></code> returns will keep seeing its existing snapshot.</p></li>
+<li><p>It does <strong>not</strong> refresh the calling behavior’s own snapshot — you
+cannot <code class="docutils literal notranslate"><span class="pre">notice_sync</span></code> and then <code class="docutils literal notranslate"><span class="pre">notice_read</span></code> to see your write.</p></li>
+<li><p>It establishes no happens-before relationship between unrelated
+behaviors and is not a substitute for cown-mediated ordering.</p></li>
+</ul>
+<p>If application code needs read-your-writes ordering, model the shared
+state as a <a class="reference internal" href="api.html#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a>. If you find yourself wanting
+<code class="docutils literal notranslate"><span class="pre">notice_sync</span></code> outside a test, that is a strong signal the noticeboard
+is the wrong primitive for the problem.</p>
+</div>
+</section>
+<section id="api-reference">
+<h2>API Reference<a class="headerlink" href="#api-reference" title="Link to this heading">¶</a></h2>
+<dl class="py function">
+<dt class="sig sig-object py">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">notice_write</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">value</span></span></em><span class="sig-paren">)</span></dt>
+<dd><p>Write a value to the noticeboard.</p>
+<p>The write is fire-and-forget: the value is serialized immediately and
+handed to a dedicated noticeboard thread, which applies it under
+mutex. <code class="docutils literal notranslate"><span class="pre">notice_write</span></code> returns as soon as the message is enqueued.</p>
+<p><strong>No ordering guarantee.</strong> A subsequent behavior — even one that
+chains directly off the writer through a shared cown — is <em>not</em>
+guaranteed to observe this write. The noticeboard mutator runs on
+its own thread and may not have processed the message by the time
+the next behavior reads. Treat the noticeboard as eventually
+consistent shared state, never as a synchronization channel between
+behaviors. Use cowns or <code class="docutils literal notranslate"><span class="pre">send</span></code>/<code class="docutils literal notranslate"><span class="pre">receive</span></code> for that.</p>
+<p>The noticeboard supports up to 64 distinct keys.  Writes beyond the
+limit are not applied; the noticeboard thread catches the resulting
+error and logs a warning.  No exception propagates to the caller.</p>
+<p>Values may embed <a class="reference internal" href="api.html#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a> references; the noticeboard keeps
+each embedded cown alive for as long as the entry remains in the
+noticeboard.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>key</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">str</span></code></a></span>) – The noticeboard key (max 63 UTF-8 bytes).</p></li>
+<li><p><strong>value</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Any</span></code></a></span>) – The value to store.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/constants.html#None" title="(in Python v3.14)"><code class="xref py py-obj docutils literal notranslate"><span class="pre">None</span></code></a></span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">notice_update</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fn</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">default</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span></dt>
+<dd><p>Atomically update a noticeboard entry.</p>
+<p>Reads the current value for <em>key</em> (or <em>default</em> if absent), applies
+<em>fn</em> to it, and writes the result back.  The read-modify-write is
+atomic because the single-threaded noticeboard mutator performs all
+three steps without interleaving.</p>
+<p>Like <a class="reference internal" href="api.html#bocpy.notice_write" title="bocpy.notice_write"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_write()</span></code></a>, the call is fire-and-forget and carries
+<strong>no ordering guarantee</strong> with respect to other behaviors. The
+update is processed on the noticeboard thread; subsequent behaviors
+may or may not observe the result.</p>
+<p>Both <em>fn</em> and <em>default</em> must be picklable — they are serialized and
+sent to the noticeboard thread via the message queue.  Lambdas and
+closures are <strong>not</strong> picklable; use <code class="docutils literal notranslate"><span class="pre">functools.partial</span></code> with a
+module-level function or an <code class="docutils literal notranslate"><span class="pre">operator</span></code> function instead:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">operator</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">functools</span><span class="w"> </span><span class="kn">import</span> <span class="n">partial</span>
+<span class="n">notice_update</span><span class="p">(</span><span class="s2">&quot;total&quot;</span><span class="p">,</span> <span class="n">partial</span><span class="p">(</span><span class="n">operator</span><span class="o">.</span><span class="n">add</span><span class="p">,</span> <span class="mi">5</span><span class="p">),</span> <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+<span class="n">notice_update</span><span class="p">(</span><span class="s2">&quot;best&quot;</span><span class="p">,</span> <span class="n">partial</span><span class="p">(</span><span class="nb">max</span><span class="p">,</span> <span class="mi">42</span><span class="p">),</span> <span class="n">default</span><span class="o">=</span><span class="nb">float</span><span class="p">(</span><span class="s2">&quot;-inf&quot;</span><span class="p">))</span>
+</pre></div>
+</div>
+<p>If <em>fn</em> raises, the key retains its previous value and a warning is
+logged by the noticeboard thread.</p>
+<p><strong>Important:</strong> <em>fn</em> runs synchronously on the single-threaded
+noticeboard mutator.  It must be fast, pure (no side effects), and
+must not call any bocpy API (<code class="docutils literal notranslate"><span class="pre">notice_write</span></code>, <code class="docutils literal notranslate"><span class="pre">send</span></code>, <code class="docutils literal notranslate"><span class="pre">when</span></code>,
+etc.). A blocking or expensive <em>fn</em> will stall every other
+noticeboard mutation.</p>
+<p>If <em>fn</em> returns the <code class="docutils literal notranslate"><span class="pre">REMOVED</span></code> sentinel, the entry is deleted from
+the noticeboard instead of being updated.</p>
+<p>The value returned by <em>fn</em> may embed <a class="reference internal" href="api.html#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a> references; the
+noticeboard retains them until the entry is overwritten or deleted,
+identical to <a class="reference internal" href="api.html#bocpy.notice_write" title="bocpy.notice_write"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_write()</span></code></a>.</p>
+<div class="admonition warning">
+<p class="admonition-title">Warning</p>
+<p><em>fn</em> and <em>default</em> are pickled and sent to the noticeboard thread
+for execution. <strong>Anyone with permission to call this function can
+therefore cause arbitrary Python code to run on the noticeboard
+thread</strong>, which holds the privileged noticeboard-mutator role.
+In the current threat model bocpy treats all code running in the
+runtime (primary and sub-interpreters) as equally trusted, so
+this is no worse than any other cross-interpreter message. If you
+need to run untrusted behavior code, restrict what can reach
+<code class="docutils literal notranslate"><span class="pre">boc_noticeboard</span></code> and audit callers of <a class="reference internal" href="api.html#bocpy.notice_update" title="bocpy.notice_update"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_update()</span></code></a>.</p>
+</div>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>key</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">str</span></code></a></span>) – The noticeboard key (max 63 UTF-8 bytes).</p></li>
+<li><p><strong>fn</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Callable" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Callable</span></code></a>[[<a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Any</span></code></a>], <a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Any</span></code></a>]</span>) – A picklable callable taking the current value, returning the new.</p></li>
+<li><p><strong>default</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Any</span></code></a></span>) – Value used when <em>key</em> does not yet exist.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/constants.html#None" title="(in Python v3.14)"><code class="xref py py-obj docutils literal notranslate"><span class="pre">None</span></code></a></span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">notice_delete</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span></em><span class="sig-paren">)</span></dt>
+<dd><p>Delete a single noticeboard entry.</p>
+<p>The deletion is fire-and-forget: the request is sent to the
+noticeboard thread, which removes the entry under mutex.  If the
+key does not exist, the operation is a no-op. Like
+<a class="reference internal" href="api.html#bocpy.notice_write" title="bocpy.notice_write"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_write()</span></code></a>, this carries <strong>no ordering guarantee</strong> with
+respect to other behaviors.</p>
+<p>Alternatively, use <code class="docutils literal notranslate"><span class="pre">notice_update</span></code> with a function that returns
+<code class="docutils literal notranslate"><span class="pre">REMOVED</span></code> to conditionally delete an entry based on its current
+value.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>key</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">str</span></code></a></span>) – The noticeboard key to delete (max 63 UTF-8 bytes).</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/constants.html#None" title="(in Python v3.14)"><code class="xref py py-obj docutils literal notranslate"><span class="pre">None</span></code></a></span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">noticeboard</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span></dt>
+<dd><p>Return a cached snapshot of the noticeboard.</p>
+<p>The noticeboard is a behavior-scope read surface. The supported
+use is from inside a <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code> body: the first call captures all
+entries under mutex and caches them, and every subsequent call
+in the same behavior returns the same cached view.</p>
+<p>The returned mapping is read-only.</p>
+<p>The only supported way to read the noticeboard from the main
+thread is to ask <a class="reference internal" href="api.html#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a> for it via <code class="docutils literal notranslate"><span class="pre">wait(noticeboard=True)</span></code>
+(or <code class="docutils literal notranslate"><span class="pre">wait(stats=True,</span> <span class="pre">noticeboard=True)</span></code>); that snapshot is taken
+on the main thread between joining the noticeboard mutator thread
+and clearing the C-side entries.</p>
+<p>Calling <a class="reference internal" href="api.html#bocpy.noticeboard" title="bocpy.noticeboard"><code class="xref py py-func docutils literal notranslate"><span class="pre">noticeboard()</span></code></a> or <a class="reference internal" href="api.html#bocpy.notice_read" title="bocpy.notice_read"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_read()</span></code></a> from any other
+main-thread context (outside a behavior, outside
+<code class="docutils literal notranslate"><span class="pre">wait(noticeboard=True)</span></code>) is <strong>undefined behavior</strong>: the cached
+proxy is never re-anchored on a behavior boundary, so subsequent
+calls may observe either a stale snapshot or partially-applied
+writes.</p>
+<p>Seeding the noticeboard with <a class="reference internal" href="api.html#bocpy.notice_write" title="bocpy.notice_write"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_write()</span></code></a> from the main
+thread <em>before</em> scheduling behaviors is fine and is the
+recommended pattern for installing read-mostly configuration.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>A read-only mapping of keys to their stored values.</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Mapping" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Mapping</span></code></a>[<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">str</span></code></a>, <a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Any</span></code></a>]</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">notice_read</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">default</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span></dt>
+<dd><p>Read a single key from the noticeboard.</p>
+<p>Convenience wrapper over <a class="reference internal" href="api.html#bocpy.noticeboard" title="bocpy.noticeboard"><code class="xref py py-func docutils literal notranslate"><span class="pre">noticeboard()</span></code></a> that takes a snapshot
+and returns one value. The same supported-usage contract applies:
+call from inside a <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code> behavior, or read the final state on
+main via <code class="docutils literal notranslate"><span class="pre">wait(noticeboard=True)</span></code>. Calling <a class="reference internal" href="api.html#bocpy.notice_read" title="bocpy.notice_read"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_read()</span></code></a>
+from any other main-thread context is <strong>undefined behavior</strong>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>key</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">str</span></code></a></span>) – The noticeboard key to read.</p></li>
+<li><p><strong>default</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Any</span></code></a></span>) – Value returned when key is absent.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>The stored value, or <em>default</em> if the key does not exist.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Any</span></code></a></span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">notice_sync</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">timeout</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">30.0</span></span></em><span class="sig-paren">)</span></dt>
+<dd><p>Block until the caller’s prior noticeboard mutations are committed.</p>
+<p>Because <a class="reference internal" href="api.html#bocpy.notice_write" title="bocpy.notice_write"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_write()</span></code></a>, <a class="reference internal" href="api.html#bocpy.notice_update" title="bocpy.notice_update"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_update()</span></code></a>, and
+<a class="reference internal" href="api.html#bocpy.notice_delete" title="bocpy.notice_delete"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_delete()</span></code></a> are fire-and-forget, a behavior that wants
+read-your-writes ordering against a <em>subsequent</em> behavior must call
+<code class="docutils literal notranslate"><span class="pre">notice_sync()</span></code> after its writes. The call posts a sentinel onto
+the <code class="docutils literal notranslate"><span class="pre">boc_noticeboard</span></code> tag (which is FIFO per producer) and blocks
+until the noticeboard thread has drained that sentinel. By the time
+this returns, every write/update/delete posted from the calling
+thread before the sentinel has been applied to the noticeboard.</p>
+<p>The barrier carries <strong>no ordering guarantee</strong> with respect to
+writes posted from other threads or behaviors interleaved with the
+caller’s; it only flushes the caller’s own queued mutations.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>timeout</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Optional" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Optional</span></code></a>[<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">float</span></code></a>]</span>) – Maximum seconds to wait. <code class="docutils literal notranslate"><span class="pre">None</span></code> waits forever.
+Defaults to 30 seconds.</p>
+</dd>
+<dt class="field-even">Raises<span class="colon">:</span></dt>
+<dd class="field-even"><ul class="simple">
+<li><p><a class="reference external" href="https://docs.python.org/3/library/exceptions.html#TimeoutError" title="(in Python v3.14)"><strong>TimeoutError</strong></a> – If the noticeboard thread does not drain the
+caller’s sentinel within <em>timeout</em> seconds.</p></li>
+<li><p><a class="reference external" href="https://docs.python.org/3/library/exceptions.html#RuntimeError" title="(in Python v3.14)"><strong>RuntimeError</strong></a> – If the runtime is not started.</p></li>
+</ul>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/constants.html#None" title="(in Python v3.14)"><code class="xref py py-obj docutils literal notranslate"><span class="pre">None</span></code></a></span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py data">
+<dt class="sig sig-object py">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">REMOVED</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">REMOVED</span></span></dt>
+<dd><p>Sentinel returned by notice_update fn to delete the entry.</p>
+</dd></dl>
+
+</section>
+</section>
+
+
+          </div>
+          
+        </div>
+      </div>
+      <div class="sphinxsidebar" role="navigation" aria-label="Main">
+        <div class="sphinxsidebarwrapper">
+            <p class="logo"><a href="index.html">
+              <img class="logo" src="_static/logo-200.svg" alt="Logo of bocpy"/>
+            </a></p>
+<h1 class="logo"><a href="index.html">bocpy</a></h1>
+
+
+
+
+
+
+
+
+
+<search id="searchbox" style="display: none" role="search">
+    <div class="searchformwrapper">
+    <form class="search" action="search.html" method="get">
+      <input type="text" name="q" aria-labelledby="searchlabel" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Search"/>
+      <input type="submit" value="Go" />
+    </form>
+    </div>
+</search>
+<script>document.getElementById('searchbox').style.display = "block"</script><h3>Navigation</h3>
+<p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="api.html">API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="pinned_cowns.html">Pinned Cowns</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Noticeboard</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#when-to-use-the-noticeboard">When to Use the Noticeboard</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#consistency-model">Consistency Model</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#worked-example-early-termination">Worked Example: Early Termination</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#reading-the-final-state-at-shutdown">Reading the Final State at Shutdown</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#reading-the-state-between-rounds">Reading the State Between Rounds</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#reading-the-noticeboard">Reading the Noticeboard</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#writing-and-updating">Writing and Updating</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#deleting-entries">Deleting Entries</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#notice-sync-testing-only"><code class="docutils literal notranslate"><span class="pre">notice_sync</span></code> (Testing Only)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#api-reference">API Reference</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="messaging.html">Messaging</a></li>
+<li class="toctree-l1"><a class="reference internal" href="c_abi.html">C ABI</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sbom.html">Software Bill of Materials (SBOM)</a></li>
+</ul>
+
+<div class="relations">
+<h3>Related Topics</h3>
+<ul>
+  <li><a href="index.html">Documentation overview</a><ul>
+      <li>Previous: <a href="pinned_cowns.html" title="previous chapter">Pinned Cowns</a></li>
+      <li>Next: <a href="messaging.html" title="next chapter">Messaging</a></li>
+  </ul></li>
+</ul>
+</div>
+
+
+
+
+
+
+
+
+        </div>
+      </div>
+      <div class="clearer"></div>
+    </div>
+    <div class="footer">
+      &#169;2026, Microsoft.
+      
+      |
+      Powered by <a href="https://www.sphinx-doc.org/">Sphinx 9.1.0</a>
+      &amp; <a href="https://alabaster.readthedocs.io">Alabaster 1.0.0</a>
+      
+      |
+      <a href="_sources/noticeboard.rst.txt"
+          rel="nofollow">Page source</a>
+    </div>
+
+    
+
+    
+  </body>
+</html>

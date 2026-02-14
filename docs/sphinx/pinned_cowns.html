@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+
+<html lang="en" data-content_root="./">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Pinned Cowns &#8212; bocpy 0.9.0 documentation</title>
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=5ecbeea2" />
+    <link rel="stylesheet" type="text/css" href="_static/basic.css?v=b08954a9" />
+    <link rel="stylesheet" type="text/css" href="_static/alabaster.css?v=27fed22d" />
+    <script src="_static/documentation_options.js?v=39bb1c6d"></script>
+    <script src="_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <link rel="icon" href="_static/favicon.ico"/>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Noticeboard" href="noticeboard.html" />
+    <link rel="prev" title="API" href="api.html" />
+   
+  <link rel="stylesheet" href="_static/custom.css" type="text/css" />
+  
+
+  
+  
+
+  </head><body>
+  
+
+    <div class="document">
+      <div class="documentwrapper">
+        <div class="bodywrapper">
+          
+
+          <div class="body" role="main">
+            
+  <section id="pinned-cowns">
+<span id="id1"></span><h1>Pinned Cowns<a class="headerlink" href="#pinned-cowns" title="Link to this heading">¶</a></h1>
+<p>A <a class="reference internal" href="api.html#bocpy.PinnedCown" title="bocpy.PinnedCown"><code class="xref py py-class docutils literal notranslate"><span class="pre">PinnedCown</span></code></a> is a <a class="reference internal" href="api.html#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a> whose value never leaves the
+<strong>main interpreter</strong>. Behaviors whose request set contains <em>any</em>
+pinned cown run on the main thread, drained by <a class="reference internal" href="api.html#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> (called
+from your event loop) or implicitly by <a class="reference internal" href="api.html#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a>. Use a pinned
+cown when the underlying value cannot survive an XIData round-trip:
+pyglet shapes, Tk widgets, open file handles, ctypes pointers, GPU
+contexts, asyncio loops.</p>
+<section id="when-to-use-a-pinned-cown">
+<h2>When to Use a Pinned Cown<a class="headerlink" href="#when-to-use-a-pinned-cown" title="Link to this heading">¶</a></h2>
+<p>Reach for <a class="reference internal" href="api.html#bocpy.PinnedCown" title="bocpy.PinnedCown"><code class="xref py py-class docutils literal notranslate"><span class="pre">PinnedCown</span></code></a> when the value:</p>
+<ul class="simple">
+<li><p>has a <code class="docutils literal notranslate"><span class="pre">__reduce__</span></code> that raises or silently reconstructs a
+broken object on the other side of the worker boundary,</p></li>
+<li><p>is a handle into a library loaded only by <code class="docutils literal notranslate"><span class="pre">__main__</span></code>
+(pyglet GL state, a Tk root, an open SQLite connection, a CUDA
+context),</p></li>
+<li><p>must observe identity across acquires (<code class="docutils literal notranslate"><span class="pre">id(value)</span></code> stable
+between behaviors).</p></li>
+</ul>
+<p>A regular <a class="reference internal" href="api.html#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a> stores its value as cross-interpreter data
+and the same Python object is never observed twice in a worker. A
+<a class="reference internal" href="api.html#bocpy.PinnedCown" title="bocpy.PinnedCown"><code class="xref py py-class docutils literal notranslate"><span class="pre">PinnedCown</span></code></a> holds its value as a plain <code class="docutils literal notranslate"><span class="pre">PyObject</span></code>
+reference in the main interpreter; every acquire sees the same
+object.</p>
+</section>
+<section id="pump-contract">
+<h2>Pump Contract<a class="headerlink" href="#pump-contract" title="Link to this heading">¶</a></h2>
+<p><a class="reference internal" href="api.html#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> drains the main-thread queue of pinned-aware
+behaviors. Each behavior runs to completion before the next starts.
+The pump is non-preemptive: <code class="docutils literal notranslate"><span class="pre">deadline_ms</span></code> gates <em>starting</em> the
+next behavior, not interrupting one already running.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">bocpy</span><span class="w"> </span><span class="kn">import</span> <span class="n">pump</span>
+
+<span class="n">result</span> <span class="o">=</span> <span class="n">pump</span><span class="p">()</span>                       <span class="c1"># drain to empty</span>
+<span class="n">result</span> <span class="o">=</span> <span class="n">pump</span><span class="p">(</span><span class="n">deadline_ms</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>          <span class="c1"># wall-clock budget</span>
+<span class="n">result</span> <span class="o">=</span> <span class="n">pump</span><span class="p">(</span><span class="n">max_behaviors</span><span class="o">=</span><span class="mi">8</span><span class="p">)</span>        <span class="c1"># hard count</span>
+<span class="n">result</span> <span class="o">=</span> <span class="n">pump</span><span class="p">(</span><span class="n">raise_on_error</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>    <span class="c1"># re-raise first body exception</span>
+</pre></div>
+</div>
+<p>The result is a <a class="reference internal" href="api.html#bocpy.PumpResult" title="bocpy.PumpResult"><code class="xref py py-class docutils literal notranslate"><span class="pre">PumpResult</span></code></a> <code class="docutils literal notranslate"><span class="pre">NamedTuple</span></code>:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">executed</span></code> — pinned behaviors whose lifecycle (acquire attempt
+→ optional body → release) ran to completion.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">deadline_reached</span></code> — <code class="docutils literal notranslate"><span class="pre">True</span></code> iff the loop exited because
+<code class="docutils literal notranslate"><span class="pre">deadline_ms</span></code> tripped before the queue drained.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">raised</span></code> — pinned behaviors whose body raised an
+<code class="docutils literal notranslate"><span class="pre">Exception</span></code> captured to the result cown’s <code class="docutils literal notranslate"><span class="pre">.exception</span></code>.</p></li>
+</ul>
+<p>Script-mode programs need not call <a class="reference internal" href="api.html#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> explicitly —
+<a class="reference internal" href="api.html#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a> pumps internally when any <a class="reference internal" href="api.html#bocpy.PinnedCown" title="bocpy.PinnedCown"><code class="xref py py-class docutils literal notranslate"><span class="pre">PinnedCown</span></code></a> exists
+in the process.</p>
+</section>
+<section id="the-coarse-grained-dispatch-pattern">
+<span id="pinned-coarse-grained"></span><h2>The Coarse-Grained Dispatch Pattern<a class="headerlink" href="#the-coarse-grained-dispatch-pattern" title="Link to this heading">¶</a></h2>
+<p>The pinned arm is <strong>single-consumer</strong>: only the main thread drains
+the pump queue. If you schedule a pinned behavior per item, those
+behaviors serialise on the main thread and you lose worker
+parallelism.</p>
+<p>Schedule pinned behaviors <strong>coarsely</strong> — one per logical frame or
+batch, not per item:</p>
+<ol class="arabic simple">
+<li><p>Wrap per-item state in regular <a class="reference internal" href="api.html#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a>s.</p></li>
+<li><p>Schedule worker <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code>s that compute per-item physics and
+<strong>return</strong> a result <a class="reference internal" href="api.html#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a>.</p></li>
+<li><p>Schedule <strong>one</strong> pinned <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code> per frame that captures all
+the result cowns together with the main-thread handle, and
+performs the batched write-back.</p></li>
+</ol>
+<p>The
+<a class="reference external" href="https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/boids.py">boids example</a>
+follows this pattern: worker behaviors compute per-cell flock
+physics in parallel; one pinned behavior per frame writes the
+results back into the global pyglet-visible position and velocity
+matrices. Dispatch through the pump queue is ~1 per frame, not N.</p>
+</section>
+<section id="integrating-with-an-event-loop">
+<h2>Integrating with an Event Loop<a class="headerlink" href="#integrating-with-an-event-loop" title="Link to this heading">¶</a></h2>
+<section id="pyglet">
+<h3>Pyglet<a class="headerlink" href="#pyglet" title="Link to this heading">¶</a></h3>
+<p>Call <a class="reference internal" href="api.html#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> at the top of each scheduled tick so the prior
+frame’s write-back drains before new work is scheduled:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">pyglet</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">bocpy</span><span class="w"> </span><span class="kn">import</span> <span class="n">PinnedCown</span><span class="p">,</span> <span class="n">pump</span><span class="p">,</span> <span class="n">start</span><span class="p">,</span> <span class="n">when</span>
+
+<span class="n">start</span><span class="p">()</span>
+<span class="n">canvas</span> <span class="o">=</span> <span class="n">PinnedCown</span><span class="p">(</span><span class="n">MyCanvas</span><span class="p">())</span>   <span class="c1"># holds a pyglet handle</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">update</span><span class="p">(</span><span class="n">dt</span><span class="p">):</span>
+    <span class="n">pump</span><span class="p">()</span>                         <span class="c1"># drain prior frame&#39;s write-back</span>
+    <span class="c1"># ... schedule worker behaviors that return result cowns ...</span>
+    <span class="n">results</span> <span class="o">=</span> <span class="p">[</span><span class="n">worker_compute</span><span class="p">(</span><span class="n">i</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">num_items</span><span class="p">)]</span>
+
+    <span class="nd">@when</span><span class="p">(</span><span class="o">*</span><span class="n">results</span><span class="p">,</span> <span class="n">canvas</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_writeback</span><span class="p">(</span><span class="o">*</span><span class="n">args</span><span class="p">):</span>
+        <span class="o">*</span><span class="n">cells</span><span class="p">,</span> <span class="n">canvas</span> <span class="o">=</span> <span class="n">args</span>
+        <span class="k">for</span> <span class="n">cell</span> <span class="ow">in</span> <span class="n">cells</span><span class="p">:</span>
+            <span class="n">canvas</span><span class="o">.</span><span class="n">value</span><span class="o">.</span><span class="n">draw</span><span class="p">(</span><span class="n">cell</span><span class="o">.</span><span class="n">value</span><span class="p">)</span>
+
+<span class="n">pyglet</span><span class="o">.</span><span class="n">clock</span><span class="o">.</span><span class="n">schedule_interval</span><span class="p">(</span><span class="n">update</span><span class="p">,</span> <span class="mi">1</span> <span class="o">/</span> <span class="mi">60</span><span class="p">)</span>
+<span class="n">pyglet</span><span class="o">.</span><span class="n">app</span><span class="o">.</span><span class="n">run</span><span class="p">()</span>
+</pre></div>
+</div>
+</section>
+<section id="tk-asyncio">
+<h3>Tk / asyncio<a class="headerlink" href="#tk-asyncio" title="Link to this heading">¶</a></h3>
+<p>Drive <a class="reference internal" href="api.html#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> from a periodic callback (<code class="docutils literal notranslate"><span class="pre">root.after(ms,</span>
+<span class="pre">...)</span></code> for Tk, <code class="docutils literal notranslate"><span class="pre">loop.call_later(...)</span></code> or an <code class="docutils literal notranslate"><span class="pre">asyncio</span></code>-friendly
+periodic task for asyncio). The same coarse-grained pattern
+applies: keep dispatch rate at one pinned behavior per logical
+batch.</p>
+</section>
+</section>
+<section id="starvation-and-the-watchdog">
+<h2>Starvation and the Watchdog<a class="headerlink" href="#starvation-and-the-watchdog" title="Link to this heading">¶</a></h2>
+<p><strong>The watchdog is disabled until you call</strong> <a class="reference internal" href="api.html#bocpy.set_pump_watchdog" title="bocpy.set_pump_watchdog"><code class="xref py py-func docutils literal notranslate"><span class="pre">set_pump_watchdog()</span></code></a>.
+No call means no warnings — the runtime stays silent regardless of
+how long the pinned queue has been non-empty.</p>
+<p>Once enabled, if pinned work piles up because the host event loop
+is wedged or not calling <a class="reference internal" href="api.html#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> often enough, the watchdog
+logs a warning carrying the queue’s age and depth. The threshold
+gates on <strong>queue-non-empty time</strong>: a program that runs only
+unpinned work indefinitely never trips it.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">bocpy</span><span class="w"> </span><span class="kn">import</span> <span class="n">set_pump_watchdog</span>
+
+<span class="n">set_pump_watchdog</span><span class="p">(</span><span class="n">warn_ms</span><span class="o">=</span><span class="mi">1000</span><span class="p">)</span>   <span class="c1"># enable warn-at-1s (matches the kwarg default)</span>
+<span class="n">set_pump_watchdog</span><span class="p">(</span><span class="n">warn_ms</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>   <span class="c1"># disable</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p><strong>No call ⇒ no watchdog.</strong> The runtime ships with the warn
+threshold unset; you opt in by calling
+<a class="reference internal" href="api.html#bocpy.set_pump_watchdog" title="bocpy.set_pump_watchdog"><code class="xref py py-func docutils literal notranslate"><span class="pre">set_pump_watchdog()</span></code></a> at least once.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">warn_ms</span></code> (default <code class="docutils literal notranslate"><span class="pre">1000</span></code> when the kwarg is omitted) logs a
+warning carrying the queue’s non-empty duration (ms) and current
+depth. Pass <code class="docutils literal notranslate"><span class="pre">None</span></code> to turn the warning off.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">on_starve</span></code> lets the host replace the default <code class="docutils literal notranslate"><span class="pre">logging</span></code>
+sink. Use it to escalate (<code class="docutils literal notranslate"><span class="pre">on_starve=lambda</span> <span class="pre">s,</span> <span class="pre">m:</span> <span class="pre">pytest.fail(m)</span></code>
+in tests, a counter / alert hook in production).</p></li>
+</ul>
+<p>The watchdog deliberately never raises on its own: the pinned queue
+is bounded by the live <a class="reference internal" href="api.html#bocpy.PinnedCown" title="bocpy.PinnedCown"><code class="xref py py-class docutils literal notranslate"><span class="pre">PinnedCown</span></code></a> count by construction,
+so there is no back-pressure threat the library can defend against
+without lying about it. Fail-fast policy belongs in the host’s
+<code class="docutils literal notranslate"><span class="pre">on_starve</span></code> callback, where the calling code can record the right
+context and pick the right exception class.</p>
+<p>Hosts that need to tune <a class="reference internal" href="api.html#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a>’s internal pump cadence call
+<a class="reference internal" href="api.html#bocpy.set_wait_pump_poll" title="bocpy.set_wait_pump_poll"><code class="xref py py-func docutils literal notranslate"><span class="pre">set_wait_pump_poll()</span></code></a>. The default cadence is <strong>50 ms</strong>, which
+is the upper bound on how long the auto-pump loop will park between
+checks when no broadcast wakes it.</p>
+</section>
+<section id="main-thread-direct-reads">
+<h2>Main-thread Direct Reads<a class="headerlink" href="#main-thread-direct-reads" title="Link to this heading">¶</a></h2>
+<p>The pinned-cown contract refuses worker-side reads of the underlying
+value (the owner CAS rejects them). The symmetric question — “may
+the main thread read the value directly, outside a pinned <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code>
+body?” — has a narrower answer:</p>
+<ul class="simple">
+<li><p>Reading the underlying object from the <strong>main thread</strong> is safe
+<strong>iff</strong> no pinned <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code> is currently executing against that
+cown. Pinned bodies run synchronously inside <a class="reference internal" href="api.html#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a>; once
+<code class="docutils literal notranslate"><span class="pre">pump()</span></code> (or <a class="reference internal" href="api.html#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a>’s auto-pump) returns, no body holds
+the cown, and an immediate main-thread read sees a consistent
+value.</p></li>
+<li><p>Reading from the main thread <strong>while</strong> <code class="docutils literal notranslate"><span class="pre">pump()</span></code> is dispatching
+a body that targets the same cown is <strong>undefined</strong>. Do not
+alternate between “I’m pumping” and “I’m reading directly”
+inside the same callback.</p></li>
+<li><p>The safe pattern is: stash any main-thread alias for read-only
+rendering / event-loop integration, but treat the pinned <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code>
+body as the only writer.</p></li>
+</ul>
+<p>In the boids example, the <code class="docutils literal notranslate"><span class="pre">Simulation</span></code> object aliases the same
+<code class="docutils literal notranslate"><span class="pre">Matrix</span></code> under <code class="docutils literal notranslate"><span class="pre">self.positions</span></code> (for pyglet rendering) and
+<code class="docutils literal notranslate"><span class="pre">self.positions_cown</span> <span class="pre">=</span> <span class="pre">PinnedCown(positions)</span></code> (for the per-frame
+write-back). The render path runs on the main thread between
+<code class="docutils literal notranslate"><span class="pre">pump()</span></code> calls; the write-back runs inside <code class="docutils literal notranslate"><span class="pre">pump()</span></code>. They never
+overlap.</p>
+</section>
+<section id="thread-affinity-and-free-threaded-builds">
+<h2>Thread Affinity and Free-Threaded Builds<a class="headerlink" href="#thread-affinity-and-free-threaded-builds" title="Link to this heading">¶</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="api.html#bocpy.PinnedCown" title="bocpy.PinnedCown"><code class="xref py py-class docutils literal notranslate"><span class="pre">PinnedCown</span></code></a> may only be <strong>constructed</strong> from the main
+interpreter; a worker that calls <code class="docutils literal notranslate"><span class="pre">PinnedCown(x)</span></code> raises
+<a class="reference external" href="https://docs.python.org/3/library/exceptions.html#RuntimeError" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">RuntimeError</span></code></a>.</p></li>
+<li><p><a class="reference internal" href="api.html#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> must run on the main interpreter. On classic
+CPython, any thread within the main interpreter may pump (the
+per-interpreter GIL serialises).</p></li>
+<li><p>On free-threaded builds (<code class="docutils literal notranslate"><span class="pre">Py_GIL_DISABLED</span></code>) only <strong>one thread
+at a time</strong> may pump, enforced by a CAS on pump entry that
+raises <a class="reference external" href="https://docs.python.org/3/library/exceptions.html#RuntimeError" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">RuntimeError</span></code></a> if a second thread tries to enter
+concurrently. The CAS is cleared on every exit path, including
+<code class="docutils literal notranslate"><span class="pre">BaseException</span></code> propagation from a pinned body.</p></li>
+<li><p><a class="reference internal" href="api.html#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> is <strong>not reentrant</strong>. Calling <a class="reference internal" href="api.html#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> from
+inside a pinned-behavior body raises <a class="reference external" href="https://docs.python.org/3/library/exceptions.html#RuntimeError" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">RuntimeError</span></code></a>.</p></li>
+</ul>
+</section>
+<section id="handle-vs-value">
+<h2>Handle vs. Value<a class="headerlink" href="#handle-vs-value" title="Link to this heading">¶</a></h2>
+<p>A <a class="reference internal" href="api.html#bocpy.PinnedCown" title="bocpy.PinnedCown"><code class="xref py py-class docutils literal notranslate"><span class="pre">PinnedCown</span></code></a> <em>handle</em> (the Python wrapper and its C
+capsule) is a normal cross-interpreter shareable. It travels via
+the same XIData mechanism as a regular <a class="reference internal" href="api.html#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a> and may be:</p>
+<ul class="simple">
+<li><p>shipped as a captured variable to a worker behavior,</p></li>
+<li><p>embedded in any value graph stored in a regular <a class="reference internal" href="api.html#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a>
+(<code class="docutils literal notranslate"><span class="pre">Cown(PinnedCown(x))</span></code> is supported),</p></li>
+<li><p>placed in a noticeboard entry via <a class="reference internal" href="api.html#bocpy.notice_write" title="bocpy.notice_write"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_write()</span></code></a> or
+<a class="reference internal" href="api.html#bocpy.notice_update" title="bocpy.notice_update"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_update()</span></code></a>.</p></li>
+</ul>
+<p>What never crosses interpreter boundaries is the <em>value</em>. A worker
+that ends up holding a pinned-cown handle can do exactly one
+useful thing with it: schedule pinned <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code>s against it,
+which the runtime auto-routes to the main pump queue. Any attempt
+to acquire the value from a worker is rejected by the C-level
+owner CAS.</p>
+</section>
+<section id="mixed-request-sets">
+<h2>Mixed Request Sets<a class="headerlink" href="#mixed-request-sets" title="Link to this heading">¶</a></h2>
+<p>A behavior may freely combine pinned and unpinned cowns; the 2PL
+acquisition order is unchanged. As soon as the request set contains
+any pinned cown, the body runs on the main thread. Unpinned cowns
+in the set still travel through XIData into the main interpreter
+for the body’s duration.</p>
+</section>
+<section id="exception-model">
+<h2>Exception Model<a class="headerlink" href="#exception-model" title="Link to this heading">¶</a></h2>
+<p>Body exceptions follow the same rules as worker behaviors:
+captured on the result <a class="reference internal" href="api.html#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a> and surfaced through
+<code class="docutils literal notranslate"><span class="pre">cown.exception</span></code>. The default <a class="reference internal" href="api.html#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> does <strong>not</strong> re-raise;
+pass <code class="docutils literal notranslate"><span class="pre">raise_on_error=True</span></code> to opt into fail-fast propagation.
+<code class="docutils literal notranslate"><span class="pre">BaseException</span></code> (<code class="docutils literal notranslate"><span class="pre">KeyboardInterrupt</span></code>, <code class="docutils literal notranslate"><span class="pre">SystemExit</span></code>,
+<code class="docutils literal notranslate"><span class="pre">GeneratorExit</span></code>) propagates from <a class="reference internal" href="api.html#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> immediately after
+the offending behavior’s per-iteration cleanup completes; any
+behaviors still queued remain in the pinned queue and resume on
+the next <a class="reference internal" href="api.html#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> (or <a class="reference internal" href="api.html#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a>-driven auto-pump) call.</p>
+</section>
+<section id="free-threaded-trajectory">
+<h2>Free-Threaded Trajectory<a class="headerlink" href="#free-threaded-trajectory" title="Link to this heading">¶</a></h2>
+<p>On free-threaded CPython (the <code class="docutils literal notranslate"><span class="pre">3.13t</span></code> and <code class="docutils literal notranslate"><span class="pre">3.15t</span></code> builds),
+<a class="reference internal" href="api.html#bocpy.PinnedCown" title="bocpy.PinnedCown"><code class="xref py py-class docutils literal notranslate"><span class="pre">PinnedCown</span></code></a> works identically to classic CPython — the
+sub-interpreter boundary still exists for FT workers, and
+free-threaded support is “experimental” across all of bocpy.
+<a class="reference internal" href="api.html#bocpy.PinnedCown" title="bocpy.PinnedCown"><code class="xref py py-class docutils literal notranslate"><span class="pre">PinnedCown</span></code></a> inherits that label. The single-pumper CAS
+prevents silent data races from concurrent pumpers, raising
+<a class="reference external" href="https://docs.python.org/3/library/exceptions.html#RuntimeError" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">RuntimeError</span></code></a> instead.</p>
+<p>Long term, bocpy will fork into a classic-CPython build (using
+sub-interpreters — where <a class="reference internal" href="api.html#bocpy.PinnedCown" title="bocpy.PinnedCown"><code class="xref py py-class docutils literal notranslate"><span class="pre">PinnedCown</span></code></a> is meaningful) and a
+free-threaded build (running workers as plain main-interpreter
+threads — where every cown is effectively pinned and
+<a class="reference internal" href="api.html#bocpy.PinnedCown" title="bocpy.PinnedCown"><code class="xref py py-class docutils literal notranslate"><span class="pre">PinnedCown</span></code></a> becomes a no-op). In that future, the
+single-pumper CAS is removed. Out of scope for v1.</p>
+</section>
+<section id="api-reference">
+<h2>API Reference<a class="headerlink" href="#api-reference" title="Link to this heading">¶</a></h2>
+<p>See <a class="reference internal" href="api.html#api"><span class="std std-ref">API</span></a> for the autodoc-generated reference for
+<a class="reference internal" href="api.html#bocpy.PinnedCown" title="bocpy.PinnedCown"><code class="xref py py-class docutils literal notranslate"><span class="pre">PinnedCown</span></code></a>, <a class="reference internal" href="api.html#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a>, <a class="reference internal" href="api.html#bocpy.PumpResult" title="bocpy.PumpResult"><code class="xref py py-class docutils literal notranslate"><span class="pre">PumpResult</span></code></a>,
+<a class="reference internal" href="api.html#bocpy.set_pump_watchdog" title="bocpy.set_pump_watchdog"><code class="xref py py-func docutils literal notranslate"><span class="pre">set_pump_watchdog()</span></code></a>, and <a class="reference internal" href="api.html#bocpy.set_wait_pump_poll" title="bocpy.set_wait_pump_poll"><code class="xref py py-func docutils literal notranslate"><span class="pre">set_wait_pump_poll()</span></code></a>.</p>
+</section>
+</section>
+
+
+          </div>
+          
+        </div>
+      </div>
+      <div class="sphinxsidebar" role="navigation" aria-label="Main">
+        <div class="sphinxsidebarwrapper">
+            <p class="logo"><a href="index.html">
+              <img class="logo" src="_static/logo-200.svg" alt="Logo of bocpy"/>
+            </a></p>
+<h1 class="logo"><a href="index.html">bocpy</a></h1>
+
+
+
+
+
+
+
+
+
+<search id="searchbox" style="display: none" role="search">
+    <div class="searchformwrapper">
+    <form class="search" action="search.html" method="get">
+      <input type="text" name="q" aria-labelledby="searchlabel" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Search"/>
+      <input type="submit" value="Go" />
+    </form>
+    </div>
+</search>
+<script>document.getElementById('searchbox').style.display = "block"</script><h3>Navigation</h3>
+<p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="api.html">API</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Pinned Cowns</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#when-to-use-a-pinned-cown">When to Use a Pinned Cown</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#pump-contract">Pump Contract</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#the-coarse-grained-dispatch-pattern">The Coarse-Grained Dispatch Pattern</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#integrating-with-an-event-loop">Integrating with an Event Loop</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#starvation-and-the-watchdog">Starvation and the Watchdog</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#main-thread-direct-reads">Main-thread Direct Reads</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#thread-affinity-and-free-threaded-builds">Thread Affinity and Free-Threaded Builds</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#handle-vs-value">Handle vs. Value</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#mixed-request-sets">Mixed Request Sets</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#exception-model">Exception Model</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#free-threaded-trajectory">Free-Threaded Trajectory</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#api-reference">API Reference</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="noticeboard.html">Noticeboard</a></li>
+<li class="toctree-l1"><a class="reference internal" href="messaging.html">Messaging</a></li>
+<li class="toctree-l1"><a class="reference internal" href="c_abi.html">C ABI</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sbom.html">Software Bill of Materials (SBOM)</a></li>
+</ul>
+
+<div class="relations">
+<h3>Related Topics</h3>
+<ul>
+  <li><a href="index.html">Documentation overview</a><ul>
+      <li>Previous: <a href="api.html" title="previous chapter">API</a></li>
+      <li>Next: <a href="noticeboard.html" title="next chapter">Noticeboard</a></li>
+  </ul></li>
+</ul>
+</div>
+
+
+
+
+
+
+
+
+        </div>
+      </div>
+      <div class="clearer"></div>
+    </div>
+    <div class="footer">
+      &#169;2026, Microsoft.
+      
+      |
+      Powered by <a href="https://www.sphinx-doc.org/">Sphinx 9.1.0</a>
+      &amp; <a href="https://alabaster.readthedocs.io">Alabaster 1.0.0</a>
+      
+      |
+      <a href="_sources/pinned_cowns.rst.txt"
+          rel="nofollow">Page source</a>
+    </div>
+
+    
+
+    
+  </body>
+</html>

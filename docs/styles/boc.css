@@ -1,0 +1,18 @@
+.animate-img>img {
+    transition: transform 0.2s ease-in-out
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .animate-img>img {
+        transition: none
+    }
+}
+
+.animate-img:hover>img {
+    transform: scale(1.1)
+}
+
+.rc-footer a {
+    color: var(--bs-body-color);
+    text-decoration: none;
+}

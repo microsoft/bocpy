@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+
+<html lang="en" data-content_root="./">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>C ABI &#8212; bocpy 0.9.0 documentation</title>
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=5ecbeea2" />
+    <link rel="stylesheet" type="text/css" href="_static/basic.css?v=b08954a9" />
+    <link rel="stylesheet" type="text/css" href="_static/alabaster.css?v=27fed22d" />
+    <script src="_static/documentation_options.js?v=39bb1c6d"></script>
+    <script src="_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <link rel="icon" href="_static/favicon.ico"/>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Software Bill of Materials (SBOM)" href="sbom.html" />
+    <link rel="prev" title="Messaging" href="messaging.html" />
+   
+  <link rel="stylesheet" href="_static/custom.css" type="text/css" />
+  
+
+  
+  
+
+  </head><body>
+  
+
+    <div class="document">
+      <div class="documentwrapper">
+        <div class="bodywrapper">
+          
+
+          <div class="body" role="main">
+            
+  <section id="c-abi">
+<span id="id1"></span><h1>C ABI<a class="headerlink" href="#c-abi" title="Link to this heading">¶</a></h1>
+<p>This page documents the public C ABI shipped with bocpy. Use it when
+writing a downstream C extension that needs to participate in
+behavior-oriented concurrency at the C level — typically by registering
+a custom Python type as cross-interpreter shareable so <a class="reference internal" href="api.html#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a>
+can hand instances of it across worker interpreters.</p>
+<section id="when-do-i-need-this">
+<h2>When do I need this?<a class="headerlink" href="#when-do-i-need-this" title="Link to this heading">¶</a></h2>
+<p>You do <strong>not</strong> need this header to use a custom Python type with
+<a class="reference internal" href="api.html#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a>. Any type that has been registered as cross-interpreter
+shareable through CPython’s <code class="docutils literal notranslate"><span class="pre">_PyXIData_*</span></code> / <code class="docutils literal notranslate"><span class="pre">_PyCrossInterpreterData_*</span></code>
+machinery — by whatever means — is automatically handled by bocpy’s
+scheduler and message queue. Registration is what makes a type usable
+across worker sub-interpreters; bocpy does not impose any additional
+requirement on top of that.</p>
+<p>The public C ABI is provided as a <strong>convenience</strong> for extension
+authors who want to do that registration from C. It exists for two
+reasons:</p>
+<ul class="simple">
+<li><p><strong>Cross-platform atomics.</strong> <code class="docutils literal notranslate"><span class="pre">&lt;bocpy/bocpy.h&gt;</span></code> exposes a small
+sequentially-consistent atomics surface
+(<code class="docutils literal notranslate"><span class="pre">atomic_load</span></code> / <code class="docutils literal notranslate"><span class="pre">atomic_store</span></code> / <code class="docutils literal notranslate"><span class="pre">atomic_fetch_add</span></code> /
+<code class="docutils literal notranslate"><span class="pre">atomic_compare_exchange_strong</span></code> over <code class="docutils literal notranslate"><span class="pre">atomic_int_least64_t</span></code>,
+plus a <code class="docutils literal notranslate"><span class="pre">thread_local</span></code> macro) that compiles on MSVC as well as
+every toolchain that ships <code class="docutils literal notranslate"><span class="pre">&lt;stdatomic.h&gt;</span></code>. On non-MSVC builds
+the umbrella simply pulls in <code class="docutils literal notranslate"><span class="pre">&lt;stdatomic.h&gt;</span></code>; on MSVC it provides
+the missing prototypes so the same source compiles unchanged.</p></li>
+<li><p><strong>Portability across Python versions.</strong> The <code class="docutils literal notranslate"><span class="pre">_PyXIData_*</span></code> API has
+changed shape several times between CPython 3.12, 3.13, 3.14, and
+3.15 (free-threaded builds included), and differs again on the
+legacy <code class="docutils literal notranslate"><span class="pre">BOC_NO_MULTIGIL</span></code> path. <code class="docutils literal notranslate"><span class="pre">&lt;bocpy/bocpy.h&gt;</span></code> and
+<code class="docutils literal notranslate"><span class="pre">&lt;bocpy/xidata.h&gt;</span></code> paper over those differences with a single
+set of macros, so one source file builds unchanged across every
+supported Python version that bocpy itself supports.</p></li>
+</ul>
+<p>If neither of those concerns applies to your extension, you can ignore
+the C ABI entirely and rely on whatever cross-interpreter registration
+your type already has.</p>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>The bocpy public C ABI is <strong>C only</strong>. Including <code class="docutils literal notranslate"><span class="pre">bocpy.h</span></code> from a
+C++ translation unit is not supported in this release. C++ consumers
+must wrap the bocpy ABI in a thin C translation unit and call into
+that from C++.</p>
+</div>
+</section>
+<section id="quickstart">
+<h2>Quickstart<a class="headerlink" href="#quickstart" title="Link to this heading">¶</a></h2>
+<p>In your downstream <code class="docutils literal notranslate"><span class="pre">setup.py</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">bocpy</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">setuptools</span><span class="w"> </span><span class="kn">import</span> <span class="n">setup</span><span class="p">,</span> <span class="n">Extension</span>
+
+<span class="n">setup</span><span class="p">(</span>
+    <span class="n">ext_modules</span><span class="o">=</span><span class="p">[</span>
+        <span class="n">Extension</span><span class="p">(</span>
+            <span class="s2">&quot;myext&quot;</span><span class="p">,</span>
+            <span class="n">sources</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;myext.c&quot;</span><span class="p">]</span> <span class="o">+</span> <span class="n">bocpy</span><span class="o">.</span><span class="n">get_sources</span><span class="p">(),</span>
+            <span class="n">include_dirs</span><span class="o">=</span><span class="p">[</span><span class="n">bocpy</span><span class="o">.</span><span class="n">get_include</span><span class="p">()],</span>
+        <span class="p">)</span>
+    <span class="p">],</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<p>In your C source:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;bocpy/bocpy.h&gt;</span>
+
+<span class="cm">/* &lt;bocpy/bocpy.h&gt; includes &lt;Python.h&gt; internally and is</span>
+<span class="cm"> * order-insensitive with respect to &lt;Python.h&gt; itself (which is</span>
+<span class="cm"> * idempotent). It must still appear *before* any system header</span>
+<span class="cm"> * (&lt;stdio.h&gt;, &lt;string.h&gt;, ...) in the same translation unit, the</span>
+<span class="cm"> * same way &lt;Python.h&gt; must — CPython forbids system headers</span>
+<span class="cm"> * before Python.h. */</span>
+</pre></div>
+</div>
+</section>
+<section id="abi-versioning">
+<h2>ABI versioning<a class="headerlink" href="#abi-versioning" title="Link to this heading">¶</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">bocpy.h</span></code> defines a single integer macro <code class="docutils literal notranslate"><span class="pre">BOCPY_ABI</span></code>. Compare it
+with <code class="docutils literal notranslate"><span class="pre">&gt;=</span></code> if you want to gate code on a minimum bocpy ABI revision.
+The value is bumped on any incompatible change to <code class="docutils literal notranslate"><span class="pre">bocpy.h</span></code> or
+<code class="docutils literal notranslate"><span class="pre">xidata.h</span></code>. Wheels are CPython-version-tagged (currently <code class="docutils literal notranslate"><span class="pre">cp310</span></code>,
+<code class="docutils literal notranslate"><span class="pre">cp311</span></code>, <code class="docutils literal notranslate"><span class="pre">cp312</span></code>, <code class="docutils literal notranslate"><span class="pre">cp313</span></code>, <code class="docutils literal notranslate"><span class="pre">cp314</span></code>), so a runtime ABI mismatch
+between bocpy and its host CPython cannot occur: each wheel embeds
+the <code class="docutils literal notranslate"><span class="pre">xidata.h</span></code> ladder arm appropriate for its target CPython.</p>
+</section>
+<section id="atomic-surface">
+<h2>Atomic surface<a class="headerlink" href="#atomic-surface" title="Link to this heading">¶</a></h2>
+<p>The atomic surface is a minimal, sequentially-consistent shim over
+<code class="docutils literal notranslate"><span class="pre">int_least64_t</span></code>. On non-MSVC compilers it is just <code class="docutils literal notranslate"><span class="pre">&lt;stdatomic.h&gt;</span></code>;
+on MSVC the four functions below have out-of-line bodies in
+<code class="docutils literal notranslate"><span class="pre">bocpy_msvc.c</span></code>, which downstream extensions pick up automatically
+via <a class="reference internal" href="api.html#bocpy.get_sources" title="bocpy.get_sources"><code class="xref py py-func docutils literal notranslate"><span class="pre">bocpy.get_sources()</span></code></a>.</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 35.0%" />
+<col style="width: 65.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Symbol</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atomic_int_least64_t</span></code></p></td>
+<td><p>Type alias for a 64-bit atomic integer.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atomic_load(ptr)</span></code></p></td>
+<td><p>Sequentially-consistent load of <code class="docutils literal notranslate"><span class="pre">*ptr</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atomic_store(ptr,</span> <span class="pre">value)</span></code></p></td>
+<td><p>Sequentially-consistent store of <code class="docutils literal notranslate"><span class="pre">value</span></code> into <code class="docutils literal notranslate"><span class="pre">*ptr</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atomic_fetch_add(ptr,</span> <span class="pre">value)</span></code></p></td>
+<td><p>Sequentially-consistent <code class="docutils literal notranslate"><span class="pre">*ptr</span> <span class="pre">+=</span> <span class="pre">value</span></code> returning the old value.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atomic_compare_exchange_strong(ptr,</span> <span class="pre">expected,</span> <span class="pre">desired)</span></code></p></td>
+<td><p>Sequentially-consistent CAS. Returns <code class="docutils literal notranslate"><span class="pre">true</span></code> on success;
+on failure writes the observed value through <code class="docutils literal notranslate"><span class="pre">expected</span></code>.</p></td>
+</tr>
+</tbody>
+</table>
+<p>All operations are sequentially consistent on every supported MSVC
+target (x86, x64, ARM64). The MSVC shim implements <code class="docutils literal notranslate"><span class="pre">atomic_load</span></code>
+via <code class="docutils literal notranslate"><span class="pre">InterlockedOr64(ptr,</span> <span class="pre">0)</span></code> and <code class="docutils literal notranslate"><span class="pre">atomic_store</span></code> via
+<code class="docutils literal notranslate"><span class="pre">InterlockedExchange64</span></code> on x64/ARM64 (full barriers); on x86 both
+go through <code class="docutils literal notranslate"><span class="pre">InterlockedCompareExchange64</span></code>. The RMW ops are
+<code class="docutils literal notranslate"><span class="pre">InterlockedExchangeAdd64</span></code> / <code class="docutils literal notranslate"><span class="pre">InterlockedCompareExchange64</span></code> on
+x64/ARM64 and CAS-loops on x86 — all already full barriers. The shim
+deliberately does not expose <code class="docutils literal notranslate"><span class="pre">_explicit</span></code> variants or weaker memory
+orders.</p>
+</section>
+<section id="ownership-helpers">
+<h2>Ownership helpers<a class="headerlink" href="#ownership-helpers" title="Link to this heading">¶</a></h2>
+<p>The XIData callbacks shown in the worked example below flip a single
+<code class="docutils literal notranslate"><span class="pre">atomic_int_least64_t</span></code> owner field as the resource crosses
+interpreter boundaries. <code class="docutils literal notranslate"><span class="pre">bocpy.h</span></code> exposes two helpers for that
+pattern so downstream code does not have to redefine them:</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 35.0%" />
+<col style="width: 65.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Symbol</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">BOCPY_NO_OWNER</span></code></p></td>
+<td><p>Sentinel value (<code class="docutils literal notranslate"><span class="pre">-2</span></code>) meaning “no interpreter currently owns
+this resource”. Use it as the initial value of an owner field
+and as the CAS target during the producer-side
+<code class="docutils literal notranslate"><span class="pre">XIDATA_GETDATA_FUNC</span></code> callback. Negative so it never collides
+with a real <code class="docutils literal notranslate"><span class="pre">PyInterpreterState_GetID()</span></code> return value.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">bocpy_interpid()</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">static</span> <span class="pre">inline</span> <span class="pre">int_least64_t</span></code>: returns the running
+interpreter’s ID, pre-typed for the
+<code class="docutils literal notranslate"><span class="pre">atomic_compare_exchange_strong</span></code> parameter list. Must be
+called with the GIL held (or while attached to an interpreter
+on free-threaded builds) — same contract as the underlying
+<code class="docutils literal notranslate"><span class="pre">PyInterpreterState_GetID(PyInterpreterState_Get())</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">bocpy_main_interpid()</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">static</span> <span class="pre">inline</span> <span class="pre">int_least64_t</span></code>: returns the <em>main</em>
+interpreter’s ID, pre-typed to match <code class="docutils literal notranslate"><span class="pre">bocpy_interpid()</span></code> for
+owner-field equality checks. Wraps
+<code class="docutils literal notranslate"><span class="pre">PyInterpreterState_GetID(PyInterpreterState_Main())</span></code>, which
+returns the process’s main interpreter regardless of which
+interpreter the caller is currently attached to, so this
+helper is safe to call from a worker sub-interpreter for
+diagnostic / assert use (under the GIL or equivalent
+attachment, same as <code class="docutils literal notranslate"><span class="pre">bocpy_interpid()</span></code>). Used by bocpy’s
+own main-pinned-cown call sites to assert that the running
+interpreter is the permanent owner of a pinned cown’s value.</p></td>
+</tr>
+</tbody>
+</table>
+<p>The two are designed to be used together: producer-side, CAS the
+owner from <code class="docutils literal notranslate"><span class="pre">bocpy_interpid()</span></code> to <code class="docutils literal notranslate"><span class="pre">BOCPY_NO_OWNER</span></code> before calling
+<code class="docutils literal notranslate"><span class="pre">XIDATA_INIT</span></code>; consumer-side, CAS it back from <code class="docutils literal notranslate"><span class="pre">BOCPY_NO_OWNER</span></code> to
+<code class="docutils literal notranslate"><span class="pre">bocpy_interpid()</span></code> inside the <code class="docutils literal notranslate"><span class="pre">new_object</span></code> callback. See the
+worked example below.</p>
+</section>
+<section id="proto-region-semantics">
+<h2>Proto-Region semantics<a class="headerlink" href="#proto-region-semantics" title="Link to this heading">¶</a></h2>
+<p>The ownership pattern shown in the worked example is a deliberately
+narrow approximation of the <strong>Region</strong> discipline from Pyrona’s
+<em>Lungfish</em> model (Stoldt et al., <a class="reference external" href="https://www.microsoft.com/en-us/research/publication/dynamic-region-ownership-for-concurrency-safety/">Dynamic Region Ownership for
+Concurrency Safety</a>,
+PLDI 2025). Lungfish is a dynamic ownership model for Python in which mutable state is grouped into
+<em>regions</em>: at any point in time at most one thread has access to a
+region, transferring a region into a <cite>cown</cite> makes it sharable
+between threads, and acquiring the cown moves the region into the
+acquiring thread for the duration of the behavior. The bocpy public
+ABI does not implement Lungfish — there is no region graph, no
+freeze, no merge, no borrow tracking — but the <code class="docutils literal notranslate"><span class="pre">BOCPY_NO_OWNER</span></code> /
+<code class="docutils literal notranslate"><span class="pre">bocpy_interpid()</span></code> pair gives downstream C extensions enough
+machinery to model the <em>single most important</em> invariant a region
+provides: <strong>a mutable C resource is owned by exactly one interpreter
+at a time, and any other interpreter that still holds a wrapper
+around it cannot read or write its contents.</strong></p>
+<section id="what-proto-region-buys-you">
+<h3>What proto-Region buys you<a class="headerlink" href="#what-proto-region-buys-you" title="Link to this heading">¶</a></h3>
+<p>Wrapping a C struct in a refcounted Python type and registering it
+through <code class="docutils literal notranslate"><span class="pre">XIDATA_REGISTERCLASS</span></code> already moves the <em>pointer</em> between
+sub-interpreters efficiently — no copy, no pickle. But pointers alone
+are unsafe: nothing stops a worker from racing the previous owner on
+the same impl after the handoff, exactly the unrestricted-shared-
+mutable-state hazard regions are designed to eliminate (see Pyrona §1
+and Fig. 1: <code class="docutils literal notranslate"><span class="pre">share(x,</span> <span class="pre">T2)</span></code> between threads is unsafe). The owner
+field, flipped atomically as the impl crosses the XIData boundary,
+turns that hazard into a deterministic <code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code> rather than a
+data race.</p>
+</section>
+<section id="the-contract">
+<h3>The contract<a class="headerlink" href="#the-contract" title="Link to this heading">¶</a></h3>
+<p>A custom C resource opting into proto-Region semantics commits to all
+of the following:</p>
+<ol class="arabic simple">
+<li><p><strong>Single owner field.</strong> The resource carries one
+<code class="docutils literal notranslate"><span class="pre">atomic_int_least64_t</span> <span class="pre">owner</span></code> field, initialised to
+<code class="docutils literal notranslate"><span class="pre">bocpy_interpid()</span></code> of the constructing interpreter. <code class="docutils literal notranslate"><span class="pre">Matrix</span></code>’s
+<code class="docutils literal notranslate"><span class="pre">matrix_impl</span></code> and the consumer template’s <code class="docutils literal notranslate"><span class="pre">counter_impl</span></code> are
+the canonical examples.</p></li>
+<li><p><strong>CAS in the producer callback.</strong> <code class="docutils literal notranslate"><span class="pre">XIDATA_GETDATA_FUNC</span></code> CASes
+the owner from <code class="docutils literal notranslate"><span class="pre">bocpy_interpid()</span></code> to <code class="docutils literal notranslate"><span class="pre">BOCPY_NO_OWNER</span></code> before
+calling <code class="docutils literal notranslate"><span class="pre">XIDATA_INIT</span></code>. A failed CAS surfaces as a
+<code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code> and aborts the handoff: the resource is not
+transferred.</p></li>
+<li><p><strong>CAS in the consumer callback.</strong> The <code class="docutils literal notranslate"><span class="pre">new_object</span></code> callback
+CASes the owner from <code class="docutils literal notranslate"><span class="pre">BOCPY_NO_OWNER</span></code> to <code class="docutils literal notranslate"><span class="pre">bocpy_interpid()</span></code>
+before constructing the new wrapper. If wrapper allocation fails
+after the CAS succeeds, the callback must store the owner back to
+<code class="docutils literal notranslate"><span class="pre">BOCPY_NO_OWNER</span></code> so a future retry of the handoff can succeed.</p></li>
+<li><p><strong>Ownership check on data accessors.</strong> Any method or getter that
+reads or writes the resource’s payload must verify
+<code class="docutils literal notranslate"><span class="pre">bocpy_interpid()</span> <span class="pre">==</span> <span class="pre">atomic_load(&amp;impl-&gt;owner)</span></code> and raise
+<code class="docutils literal notranslate"><span class="pre">RuntimeError</span></code> otherwise. <code class="docutils literal notranslate"><span class="pre">Matrix</span></code>’s
+<code class="docutils literal notranslate"><span class="pre">impl_check_acquired</span></code> and the consumer template’s
+<code class="docutils literal notranslate"><span class="pre">counter_impl_check_acquired</span></code> are the canonical helpers.
+Identity-only accessors (e.g. <code class="docutils literal notranslate"><span class="pre">Counter.address</span></code>,
+<code class="docutils literal notranslate"><span class="pre">Counter.refcount</span></code>) are allowed to skip the check — the same way
+you may print the address of a Lungfish bridge object without
+acquiring its region.</p></li>
+<li><p><strong>No raw send of the cown’s value.</strong> Inside a <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code>,
+<code class="docutils literal notranslate"><span class="pre">send(&quot;tag&quot;,</span> <span class="pre">c.value)</span></code> is <em>not</em> the right primitive for shipping
+a proto-Region resource to another behavior: it would atomically
+move the impl out of the cown mid-behavior and leave the worker
+unable to release the cown afterwards. Send a copy
+(<code class="docutils literal notranslate"><span class="pre">c.value.copy()</span></code>, like <code class="docutils literal notranslate"><span class="pre">examples/boids.py</span></code>) or send primitive
+summary data (<code class="docutils literal notranslate"><span class="pre">c.value.address</span></code>, <code class="docutils literal notranslate"><span class="pre">c.value.count</span></code>). The cown
+itself is the right primitive for handing the resource to a
+different behavior — schedule a downstream <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code> on the same
+cown.</p></li>
+</ol>
+</section>
+<section id="what-proto-region-does-not-give-you">
+<h3>What proto-Region does <strong>not</strong> give you<a class="headerlink" href="#what-proto-region-does-not-give-you" title="Link to this heading">¶</a></h3>
+<p>The bocpy ABI does <strong>not</strong> implement these parts of Lungfish, and a
+downstream extension that wants them must build them on top:</p>
+<ul class="simple">
+<li><p><strong>Transitive closure.</strong> Lungfish regions enforce isolation across a
+whole object graph; proto-Region tracks ownership of a single
+<code class="docutils literal notranslate"><span class="pre">impl</span></code> pointer. If your resource holds further heap-allocated
+state, you are responsible for keeping that state private (no
+outgoing references) or applying the same owner-CAS pattern to
+each piece. <code class="docutils literal notranslate"><span class="pre">Matrix</span></code> does this implicitly: <code class="docutils literal notranslate"><span class="pre">matrix_impl</span></code>
+encapsulates <code class="docutils literal notranslate"><span class="pre">data</span></code> and <code class="docutils literal notranslate"><span class="pre">row_ptrs</span></code>, both private to the impl.</p></li>
+<li><p><strong>Freezing and immutability.</strong> There is no equivalent of
+<code class="docutils literal notranslate"><span class="pre">freeze(b)</span></code>. Resources are either owned-and-mutable or in flight.</p></li>
+<li><p><strong>Merge / region trees.</strong> There is no nesting; one resource = one
+owner field.</p></li>
+<li><p><strong>Borrowed references from a “local region”.</strong> The bocpy worker
+loop is the closest equivalent — a worker behavior is the period
+during which the impl is owned by that interpreter — but there is
+no first-class borrow type, and a borrowed-style reference held
+past the end of a behavior is undefined behavior.</p></li>
+</ul>
+<p>In short: proto-Region is the <strong>smallest</strong> thing that turns a
+shareable C struct into a Region-like resource, and it slots into
+the existing <code class="docutils literal notranslate"><span class="pre">XIDATA_REGISTERCLASS</span></code> lifecycle without any
+additional machinery beyond the two ABI symbols
+<code class="docutils literal notranslate"><span class="pre">BOCPY_NO_OWNER</span></code> and <code class="docutils literal notranslate"><span class="pre">bocpy_interpid()</span></code>.</p>
+</section>
+</section>
+<section id="xidata-ladder">
+<h2>XIData ladder<a class="headerlink" href="#xidata-ladder" title="Link to this heading">¶</a></h2>
+<p>The cross-interpreter data (“XIData”) API is a thin macro ladder over
+CPython’s internal cross-interpreter data primitives, smoothing over
+the rename from <code class="docutils literal notranslate"><span class="pre">_PyCrossInterpreterData</span></code> (3.12, 3.13) to
+<code class="docutils literal notranslate"><span class="pre">_PyXIData</span></code> (3.14+). All macros and the typedef below are exposed
+by <code class="docutils literal notranslate"><span class="pre">bocpy.h</span></code> via its <code class="docutils literal notranslate"><span class="pre">#include</span> <span class="pre">&quot;xidata.h&quot;</span></code>.</p>
+<table class="docutils align-default">
+<colgroup>
+<col style="width: 35.0%" />
+<col style="width: 65.0%" />
+</colgroup>
+<thead>
+<tr class="row-odd"><th class="head"><p>Symbol</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">XIDATA_T</span></code></p></td>
+<td><p>Opaque struct holding a serialised cross-interpreter handoff.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">XIDATA_NEW()</span></code></p></td>
+<td><p>Allocate and zero a fresh <code class="docutils literal notranslate"><span class="pre">XIDATA_T</span> <span class="pre">*</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">XIDATA_INIT(xidata,</span> <span class="pre">interp,</span> <span class="pre">data,</span> <span class="pre">obj,</span> <span class="pre">new_object)</span></code></p></td>
+<td><p>Initialise an allocated <code class="docutils literal notranslate"><span class="pre">XIDATA_T</span></code>. See safety contract.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">XIDATA_GETXIDATA(value,</span> <span class="pre">xidata)</span></code></p></td>
+<td><p>Ask CPython to populate <code class="docutils literal notranslate"><span class="pre">xidata</span></code> from the producer-side
+Python object <code class="docutils literal notranslate"><span class="pre">value</span></code>.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">XIDATA_NEWOBJECT</span></code></p></td>
+<td><p>Field type used for the consumer-side reconstruction callback.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">XIDATA_FREE(xidata)</span></code></p></td>
+<td><p>Release any resources owned by <code class="docutils literal notranslate"><span class="pre">xidata</span></code> and free the buffer.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">XIDATA_SET_FREE(xidata,</span> <span class="pre">fn)</span></code></p></td>
+<td><p>Install a custom free callback into <code class="docutils literal notranslate"><span class="pre">xidata</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">XIDATA_REGISTERCLASS(type,</span> <span class="pre">cb)</span></code></p></td>
+<td><p>Register a Python <code class="docutils literal notranslate"><span class="pre">type</span></code> as cross-interpreter shareable with
+producer-side callback <code class="docutils literal notranslate"><span class="pre">cb</span></code>. See safety contract.</p></td>
+</tr>
+</tbody>
+</table>
+<p>The lifecycle is <strong>register once, then per-handoff init/get/free</strong>:
+register each shareable type at module init; on the producer side,
+allocate an <code class="docutils literal notranslate"><span class="pre">XIDATA_T</span></code>, populate it with <code class="docutils literal notranslate"><span class="pre">XIDATA_GETXIDATA</span></code> (which
+internally calls the registered callback that will end up calling
+<code class="docutils literal notranslate"><span class="pre">XIDATA_INIT</span></code>), hand the buffer to the consumer interpreter; on the
+consumer side, call the <code class="docutils literal notranslate"><span class="pre">new_object</span></code> callback recorded during init
+to reconstruct the Python object, then <code class="docutils literal notranslate"><span class="pre">XIDATA_FREE</span></code> to release.</p>
+</section>
+<section id="safety-contract">
+<h2>Safety contract<a class="headerlink" href="#safety-contract" title="Link to this heading">¶</a></h2>
+<p>These contracts are mirrored from the canonical doc-comments in
+<code class="docutils literal notranslate"><span class="pre">xidata.h</span></code>; the C header is the single source of truth.</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">XIDATA_INIT(xidata,</span> <span class="pre">interp,</span> <span class="pre">…)</span></code> — <code class="docutils literal notranslate"><span class="pre">interp</span></code> must be the
+interpreter that currently owns <code class="docutils literal notranslate"><span class="pre">data</span></code>. Passing the wrong
+<code class="docutils literal notranslate"><span class="pre">interp</span></code> produces a use-after-free across the worker handoff.
+The <code class="docutils literal notranslate"><span class="pre">xidata</span></code> buffer must be freshly allocated (or zeroed) and
+must not have been initialised before; double-init is undefined.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">XIDATA_REGISTERCLASS(type,</span> <span class="pre">cb)</span></code> — must be called once per
+<code class="docutils literal notranslate"><span class="pre">(type,</span> <span class="pre">cb)</span></code> pair <strong>per interpreter</strong>, from inside that
+interpreter’s module-exec slot (or equivalent module-init code that
+runs on every import in every interpreter). The standard idiom is
+to call it from a <code class="docutils literal notranslate"><span class="pre">Py_mod_exec</span></code> slot — see <code class="docutils literal notranslate"><span class="pre">_core.c</span></code> /
+<code class="docutils literal notranslate"><span class="pre">_math.c</span></code> for the canonical pattern, mirrored by the consumer
+template under <code class="docutils literal notranslate"><span class="pre">templates/c_abi_consumer/</span></code>. Registering the same type
+twice with different callbacks in the same interpreter is
+undefined.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">BOC_NO_MULTIGIL</span></code> — internal marker. Defined only on CPython
+&lt;3.12, where the host interpreter has no per-interpreter GIL and
+the bocpy runtime falls back to a single-interpreter mode. The
+<code class="docutils literal notranslate"><span class="pre">XIDATA_*</span></code> ladder still exposes the same macros on these
+versions; downstream consumers do not need to special-case this
+macro themselves. (The <code class="docutils literal notranslate"><span class="pre">XIDATA_GETDATA_FUNC</span></code> macro — see below —
+hides the only consumer-visible signature change for you.)</p></li>
+</ul>
+</section>
+<section id="worked-example-bocpy-matrix">
+<h2>Worked example: <code class="docutils literal notranslate"><span class="pre">bocpy.Matrix</span></code><a class="headerlink" href="#worked-example-bocpy-matrix" title="Link to this heading">¶</a></h2>
+<p>The bocpy-shipped <a class="reference internal" href="api.html#bocpy.Matrix" title="bocpy.Matrix"><code class="xref py py-class docutils literal notranslate"><span class="pre">Matrix</span></code></a> type uses every entry in the table
+above. The annotated extracts below come from <code class="docutils literal notranslate"><span class="pre">src/bocpy/_math.c</span></code>.</p>
+<p><strong>1. Module init: register the type from the exec slot.</strong> This runs
+once per interpreter, on every import — main interpreter and every
+worker sub-interpreter that imports the module. Use multi-phase
+initialisation (<code class="docutils literal notranslate"><span class="pre">Py_mod_exec</span></code>) and declare
+<code class="docutils literal notranslate"><span class="pre">Py_MOD_PER_INTERPRETER_GIL_SUPPORTED</span></code> so the bocpy runtime can
+load the module inside worker sub-interpreters:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="cm">/* _math_module_exec */</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">XIDATA_REGISTERCLASS</span><span class="p">(</span><span class="n">state</span><span class="o">-&gt;</span><span class="n">matrix_type</span><span class="p">,</span><span class="w"> </span><span class="n">_matrix_shared</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">Py_FatalError</span><span class="p">(</span>
+<span class="w">        </span><span class="s">&quot;could not register MatrixObject for cross-interpreter sharing&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">-1</span><span class="p">;</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>A single-phase <code class="docutils literal notranslate"><span class="pre">PyModule_Create</span></code> module that registers from
+<code class="docutils literal notranslate"><span class="pre">PyInit</span></code> will load fine in the main interpreter but cannot satisfy
+<code class="docutils literal notranslate"><span class="pre">Py_MOD_PER_INTERPRETER_GIL_SUPPORTED</span></code>; if a transpiled <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code>
+body imports it, the worker sub-interpreter import will not run the
+registration and the consumer callback will see no type registered
+in its registry. See <code class="docutils literal notranslate"><span class="pre">templates/c_abi_consumer/src/_bocpy_probe.c</span></code> for
+the full multi-phase template.</p>
+<p><strong>2. Producer side: prepare the underlying C matrix for handoff.</strong>
+<code class="docutils literal notranslate"><span class="pre">_matrix_shared</span></code> is the <code class="docutils literal notranslate"><span class="pre">cb</span></code> registered above; CPython invokes it
+when <code class="docutils literal notranslate"><span class="pre">XIDATA_GETXIDATA</span></code> is called against a <code class="docutils literal notranslate"><span class="pre">MatrixObject</span></code> from
+the producer interpreter. Declare the callback with
+<code class="docutils literal notranslate"><span class="pre">XIDATA_GETDATA_FUNC</span></code> so the body has the same
+<code class="docutils literal notranslate"><span class="pre">(tstate,</span> <span class="pre">obj,</span> <span class="pre">xidata)</span></code> parameter list on every supported CPython —
+the macro emits a small trampoline on Python &lt;3.12 (where the runtime
+calls the callback with <code class="docutils literal notranslate"><span class="pre">(obj,</span> <span class="pre">xidata)</span></code> only) so the body never has
+to special-case <code class="docutils literal notranslate"><span class="pre">BOC_NO_MULTIGIL</span></code>:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="n">XIDATA_GETDATA_FUNC</span><span class="p">(</span><span class="n">_matrix_shared</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">MatrixObject</span><span class="w"> </span><span class="o">*</span><span class="n">matrix</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">MatrixObject</span><span class="w"> </span><span class="o">*</span><span class="p">)</span><span class="n">obj</span><span class="p">;</span>
+<span class="w">    </span><span class="n">matrix_impl</span><span class="w"> </span><span class="o">*</span><span class="n">impl</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">matrix</span><span class="o">-&gt;</span><span class="n">impl</span><span class="p">;</span>
+
+<span class="w">    </span><span class="cm">/* Atomically transfer ownership: this interpreter -&gt; BOCPY_NO_OWNER. */</span>
+<span class="w">    </span><span class="kt">int_least64_t</span><span class="w"> </span><span class="n">expected</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">bocpy_interpid</span><span class="p">();</span>
+<span class="w">    </span><span class="kt">int_least64_t</span><span class="w"> </span><span class="n">desired</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">BOCPY_NO_OWNER</span><span class="p">;</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">atomic_compare_exchange_strong</span><span class="p">(</span><span class="o">&amp;</span><span class="n">impl</span><span class="o">-&gt;</span><span class="n">owner</span><span class="p">,</span>
+<span class="w">                                        </span><span class="o">&amp;</span><span class="n">expected</span><span class="p">,</span><span class="w"> </span><span class="n">desired</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">PyErr_Format</span><span class="p">(</span><span class="n">PyExc_RuntimeError</span><span class="p">,</span><span class="w"> </span><span class="cm">/* … */</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">-1</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="n">XIDATA_INIT</span><span class="p">(</span><span class="n">xidata</span><span class="p">,</span><span class="w"> </span><span class="n">tstate</span><span class="o">-&gt;</span><span class="n">interp</span><span class="p">,</span><span class="w"> </span><span class="n">impl</span><span class="p">,</span><span class="w"> </span><span class="n">obj</span><span class="p">,</span><span class="w"> </span><span class="n">_new_matrix_object</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>Note the use of <code class="docutils literal notranslate"><span class="pre">atomic_compare_exchange_strong</span></code> from the atomic
+surface to flip the matrix’s owner field, and <code class="docutils literal notranslate"><span class="pre">XIDATA_INIT</span></code> to wire
+<code class="docutils literal notranslate"><span class="pre">xidata</span></code> to the C-level <code class="docutils literal notranslate"><span class="pre">impl</span></code>, the original Python <code class="docutils literal notranslate"><span class="pre">obj</span></code>, and
+the consumer-side reconstruction callback <code class="docutils literal notranslate"><span class="pre">_new_matrix_object</span></code>.</p>
+<p><strong>3. Consumer side: reconstruct a Python wrapper for the C matrix.</strong>
+<code class="docutils literal notranslate"><span class="pre">_new_matrix_object</span></code> is the <code class="docutils literal notranslate"><span class="pre">new_object</span></code> callback recorded by
+<code class="docutils literal notranslate"><span class="pre">XIDATA_INIT</span></code>; CPython invokes it on the consumer interpreter:</p>
+<div class="highlight-c notranslate"><div class="highlight"><pre><span></span><span class="k">static</span><span class="w"> </span><span class="n">PyObject</span><span class="w"> </span><span class="o">*</span><span class="nf">_new_matrix_object</span><span class="p">(</span><span class="n">XIDATA_T</span><span class="w"> </span><span class="o">*</span><span class="n">xidata</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">matrix_impl</span><span class="w"> </span><span class="o">*</span><span class="n">impl</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">matrix_impl</span><span class="w"> </span><span class="o">*</span><span class="p">)</span><span class="n">xidata</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">;</span>
+
+<span class="w">    </span><span class="cm">/* Atomically take ownership: BOCPY_NO_OWNER -&gt; this interpreter. */</span>
+<span class="w">    </span><span class="kt">int_least64_t</span><span class="w"> </span><span class="n">expected</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">BOCPY_NO_OWNER</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">int_least64_t</span><span class="w"> </span><span class="n">desired</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">bocpy_interpid</span><span class="p">();</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">atomic_compare_exchange_strong</span><span class="p">(</span><span class="o">&amp;</span><span class="n">impl</span><span class="o">-&gt;</span><span class="n">owner</span><span class="p">,</span>
+<span class="w">                                        </span><span class="o">&amp;</span><span class="n">expected</span><span class="p">,</span><span class="w"> </span><span class="n">desired</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">PyErr_Format</span><span class="p">(</span><span class="n">PyExc_RuntimeError</span><span class="p">,</span><span class="w"> </span><span class="cm">/* … */</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="nb">NULL</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="n">PyTypeObject</span><span class="w"> </span><span class="o">*</span><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LOCAL_STATE</span><span class="o">-&gt;</span><span class="n">matrix_type</span><span class="p">;</span>
+<span class="w">    </span><span class="n">MatrixObject</span><span class="w"> </span><span class="o">*</span><span class="n">matrix</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">MatrixObject</span><span class="w"> </span><span class="o">*</span><span class="p">)</span><span class="n">type</span><span class="o">-&gt;</span><span class="n">tp_alloc</span><span class="p">(</span><span class="n">type</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="cm">/* … wrap and return … */</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+</section>
+<section id="consumer-modules-and-worker-sub-interpreters">
+<h2>Consumer modules and worker sub-interpreters<a class="headerlink" href="#consumer-modules-and-worker-sub-interpreters" title="Link to this heading">¶</a></h2>
+<p>Workers always run in sub-interpreters, on every supported CPython.
+What varies across versions is whether each sub-interpreter owns its
+own GIL (3.12+) or shares the legacy global GIL (3.10/3.11, marked
+internally by <code class="docutils literal notranslate"><span class="pre">BOC_NO_MULTIGIL</span></code>). The execution model —
+per-interpreter module state, multi-phase init, the per-interpreter
+<code class="docutils literal notranslate"><span class="pre">XIDATA_REGISTERCLASS</span></code> registry — is identical across versions.</p>
+<p>Because every <code class="docutils literal notranslate"><span class="pre">XIDATA_REGISTERCLASS</span></code> ladder lives in a per-interpreter
+exec slot (see step 1 above), a consumer extension’s <code class="docutils literal notranslate"><span class="pre">Matrix</span></code>-like
+type is only registered in interpreters that actually imported the
+extension. Any consumer module whose XIData wrappers will travel into
+a <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code> body must be <strong>imported at module scope</strong> in the file the
+worker exec’d from.</p>
+<p>The transpiler propagates module-scope <code class="docutils literal notranslate"><span class="pre">import</span></code> statements into the
+exported per-worker module, but it does <strong>not</strong> see runtime imports
+(<code class="docutils literal notranslate"><span class="pre">importlib.import_module(...)</span></code>, <code class="docutils literal notranslate"><span class="pre">pytest.importorskip(...)</span></code>,
+<code class="docutils literal notranslate"><span class="pre">__import__(...)</span></code> from inside a function, …). A worker that imports
+the transpiled body without the consumer extension will load the
+shared object via the OS loader but skip the per-interpreter exec
+slot, leaving its <code class="docutils literal notranslate"><span class="pre">LOCAL_STATE</span></code> (or equivalent module-state cache)
+NULL. The consumer callback will then segfault on the first reconstruction.</p>
+<p>Practical rule for downstream authors:</p>
+<ul class="simple">
+<li><p>Use a top-level <code class="docutils literal notranslate"><span class="pre">import</span> <span class="pre">_your_extension</span></code> in any test or example
+file that schedules <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code> bodies which observe your extension’s
+types. <code class="docutils literal notranslate"><span class="pre">pytest.importorskip</span></code> is not transpiler-visible.</p></li>
+<li><p>Mirror the per-interpreter state pattern (heap-allocated type from
+<code class="docutils literal notranslate"><span class="pre">PyType_FromModuleAndSpec</span></code>, per-module state, <code class="docutils literal notranslate"><span class="pre">thread_local</span></code>
+cache primed in the exec slot) shown in
+<code class="docutils literal notranslate"><span class="pre">templates/c_abi_consumer/src/_bocpy_probe.c</span></code>.</p></li>
+</ul>
+</section>
+<section id="what-is-not-public">
+<h2>What is NOT public<a class="headerlink" href="#what-is-not-public" title="Link to this heading">¶</a></h2>
+<p>The wheel ships only <code class="docutils literal notranslate"><span class="pre">bocpy.h</span></code>, <code class="docutils literal notranslate"><span class="pre">xidata.h</span></code>, and <code class="docutils literal notranslate"><span class="pre">bocpy_msvc.c</span></code>
+under the package directory. The following internal headers and
+surfaces are <strong>not</strong> part of the public C ABI; do not depend on them:</p>
+<ul class="simple">
+<li><p>Internal headers: <code class="docutils literal notranslate"><span class="pre">boc_compat.h</span></code>, <code class="docutils literal notranslate"><span class="pre">boc_cown.h</span></code>, <code class="docutils literal notranslate"><span class="pre">boc_sched.h</span></code>, <code class="docutils literal notranslate"><span class="pre">boc_tags.h</span></code>,
+<code class="docutils literal notranslate"><span class="pre">boc_terminator.h</span></code>, <code class="docutils literal notranslate"><span class="pre">boc_noticeboard.h</span></code>. As a general rule,
+every <code class="docutils literal notranslate"><span class="pre">boc_*</span></code> file in the package directory is private — only
+<code class="docutils literal notranslate"><span class="pre">bocpy.h</span></code>, <code class="docutils literal notranslate"><span class="pre">xidata.h</span></code>, and <code class="docutils literal notranslate"><span class="pre">bocpy_msvc.c</span></code> are public.</p></li>
+<li><p>Ordered atomics (<code class="docutils literal notranslate"><span class="pre">boc_atomic_*_explicit</span></code> and the typed
+<code class="docutils literal notranslate"><span class="pre">boc_atomic_*_u64</span></code> / <code class="docutils literal notranslate"><span class="pre">_intptr</span></code> API).</p></li>
+<li><p>BOC mutex / condition-variable types (<code class="docutils literal notranslate"><span class="pre">BOCMutex</span></code>, <code class="docutils literal notranslate"><span class="pre">BOCCond</span></code>)
+and the <code class="docutils literal notranslate"><span class="pre">boc_mtx_*</span></code> / <code class="docutils literal notranslate"><span class="pre">boc_cnd_*</span></code> helpers.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">boc_yield</span></code>, <code class="docutils literal notranslate"><span class="pre">boc_now_s</span></code>, <code class="docutils literal notranslate"><span class="pre">boc_now_ns</span></code>, <code class="docutils literal notranslate"><span class="pre">boc_sleep_ns</span></code>, the
+physical-CPU helpers, and any other <code class="docutils literal notranslate"><span class="pre">boc_</span></code>-prefixed function not
+exposed via <code class="docutils literal notranslate"><span class="pre">bocpy.h</span></code>.</p></li>
+</ul>
+<p>C++ consumer support is also a non-goal for this release.</p>
+</section>
+<section id="cpython-version-skew">
+<h2>CPython version skew<a class="headerlink" href="#cpython-version-skew" title="Link to this heading">¶</a></h2>
+<p>bocpy wheels are tagged cp310 / cp311 / cp312 / cp313 / cp314.
+Downstream extensions ship the same per-CPython matrix and thereby
+pick up the matching <code class="docutils literal notranslate"><span class="pre">bocpy.h</span></code> view of the cross-interpreter data
+ladder. <code class="docutils literal notranslate"><span class="pre">BOCPY_ABI</span></code> is bumped on any incompatible change to
+<code class="docutils literal notranslate"><span class="pre">bocpy.h</span></code> or <code class="docutils literal notranslate"><span class="pre">xidata.h</span></code>.</p>
+</section>
+</section>
+
+
+          </div>
+          
+        </div>
+      </div>
+      <div class="sphinxsidebar" role="navigation" aria-label="Main">
+        <div class="sphinxsidebarwrapper">
+            <p class="logo"><a href="index.html">
+              <img class="logo" src="_static/logo-200.svg" alt="Logo of bocpy"/>
+            </a></p>
+<h1 class="logo"><a href="index.html">bocpy</a></h1>
+
+
+
+
+
+
+
+
+
+<search id="searchbox" style="display: none" role="search">
+    <div class="searchformwrapper">
+    <form class="search" action="search.html" method="get">
+      <input type="text" name="q" aria-labelledby="searchlabel" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Search"/>
+      <input type="submit" value="Go" />
+    </form>
+    </div>
+</search>
+<script>document.getElementById('searchbox').style.display = "block"</script><h3>Navigation</h3>
+<p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="api.html">API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="pinned_cowns.html">Pinned Cowns</a></li>
+<li class="toctree-l1"><a class="reference internal" href="noticeboard.html">Noticeboard</a></li>
+<li class="toctree-l1"><a class="reference internal" href="messaging.html">Messaging</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">C ABI</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#when-do-i-need-this">When do I need this?</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#quickstart">Quickstart</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#abi-versioning">ABI versioning</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#atomic-surface">Atomic surface</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#ownership-helpers">Ownership helpers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#proto-region-semantics">Proto-Region semantics</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#xidata-ladder">XIData ladder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#safety-contract">Safety contract</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#worked-example-bocpy-matrix">Worked example: <code class="docutils literal notranslate"><span class="pre">bocpy.Matrix</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="#consumer-modules-and-worker-sub-interpreters">Consumer modules and worker sub-interpreters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#what-is-not-public">What is NOT public</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#cpython-version-skew">CPython version skew</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="sbom.html">Software Bill of Materials (SBOM)</a></li>
+</ul>
+
+<div class="relations">
+<h3>Related Topics</h3>
+<ul>
+  <li><a href="index.html">Documentation overview</a><ul>
+      <li>Previous: <a href="messaging.html" title="previous chapter">Messaging</a></li>
+      <li>Next: <a href="sbom.html" title="next chapter">Software Bill of Materials (SBOM)</a></li>
+  </ul></li>
+</ul>
+</div>
+
+
+
+
+
+
+
+
+        </div>
+      </div>
+      <div class="clearer"></div>
+    </div>
+    <div class="footer">
+      &#169;2026, Microsoft.
+      
+      |
+      Powered by <a href="https://www.sphinx-doc.org/">Sphinx 9.1.0</a>
+      &amp; <a href="https://alabaster.readthedocs.io">Alabaster 1.0.0</a>
+      
+      |
+      <a href="_sources/c_abi.rst.txt"
+          rel="nofollow">Page source</a>
+    </div>
+
+    
+
+    
+  </body>
+</html>

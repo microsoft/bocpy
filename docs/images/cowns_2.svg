@@ -1,0 +1,35 @@
+<svg width="1280" height="720" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+    overflow="hidden">
+    <g>
+        <path
+            d="M550 135.5C550 85.5182 590.294 45 640 45 689.706 45 730 85.5182 730 135.5 730 185.482 689.706 226 640 226 590.294 226 550 185.482 550 135.5Z"
+            stroke="#622C0F" stroke-width="2" stroke-miterlimit="8" fill="#E97132" fill-rule="evenodd" /><text
+            fill="#FFFFFF" font-family="sans-serif" font-weight="400" font-size="32"
+            transform="translate(602.573 107)">cown</text>
+        <path
+            d="M172 359.168C172 328.147 197.147 303 228.168 303L496.832 303C527.853 303 553 328.147 553 359.168L553 583.832C553 614.853 527.853 640 496.832 640L228.168 640C197.147 640 172 614.853 172 583.832Z"
+            stroke="#E97132" stroke-width="6" stroke-miterlimit="8" fill-opacity="0" fill-rule="evenodd" /><text
+            font-family="sans-serif" font-weight="400" font-size="42.6667"
+            transform="translate(247.41 607)">Interpreter A</text>
+        <path
+            d="M727 359.168C727 328.147 752.147 303 783.168 303L1051.83 303C1082.85 303 1108 328.147 1108 359.168L1108 583.832C1108 614.853 1082.85 640 1051.83 640L783.168 640C752.147 640 727 614.853 727 583.832Z"
+            stroke="#196B24" stroke-width="6" stroke-miterlimit="8" fill-opacity="0" fill-rule="evenodd" /><text
+            font-family="sans-serif" font-weight="400" font-size="42.6667"
+            transform="translate(802.59 607)">Interpreter B</text>
+        <path
+            d="M312 397C312 369.386 334.386 347 362 347 389.614 347 412 369.386 412 397 412 424.614 389.614 447 362 447 334.386 447 312 424.614 312 397Z"
+            stroke="#042433" stroke-width="2" stroke-miterlimit="8" fill="#156082" fill-rule="evenodd" />
+        <path
+            d="M868 397C868 369.386 890.386 347 918 347 945.614 347 968 369.386 968 397 968 424.614 945.614 447 918 447 890.386 447 868 424.614 868 397Z"
+            stroke="#042433" stroke-width="2" stroke-miterlimit="8" fill="#156082" fill-rule="evenodd" />
+        <path
+            d="M2.69087-2.9596 166.569 146.038 161.187 151.957-2.69087 2.9596ZM174.373 131.509 178.676 162.452 147.464 161.105Z"
+            fill="#156082" transform="matrix(1 0 0 -1 398 361.452)" />
+        <path
+            d="M879.985 364.412 716.107 215.414 721.489 209.495 885.367 358.492ZM708.303 229.943 704 199 735.212 200.347Z"
+            fill="#156082" />
+        <path d="M337 535 362.5 491 388 535Z" stroke="#410C3B" stroke-width="2" stroke-miterlimit="8" fill="#A02B93"
+            fill-rule="evenodd" /><text fill="#EE0000" font-family="sans-serif"
+            font-weight="700" font-size="42.6667" transform="translate(843.267 688)">acquire</text>
+    </g>
+</svg>

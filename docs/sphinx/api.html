@@ -1,0 +1,1351 @@
+<!DOCTYPE html>
+
+<html lang="en" data-content_root="./">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>API &#8212; bocpy 0.9.0 documentation</title>
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=5ecbeea2" />
+    <link rel="stylesheet" type="text/css" href="_static/basic.css?v=b08954a9" />
+    <link rel="stylesheet" type="text/css" href="_static/alabaster.css?v=27fed22d" />
+    <script src="_static/documentation_options.js?v=39bb1c6d"></script>
+    <script src="_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <link rel="icon" href="_static/favicon.ico"/>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Pinned Cowns" href="pinned_cowns.html" />
+    <link rel="prev" title="bocpy documentation" href="index.html" />
+   
+  <link rel="stylesheet" href="_static/custom.css" type="text/css" />
+  
+
+  
+  
+
+  </head><body>
+  
+
+    <div class="document">
+      <div class="documentwrapper">
+        <div class="bodywrapper">
+          
+
+          <div class="body" role="main">
+            
+  <section id="api">
+<span id="id1"></span><h1>API<a class="headerlink" href="#api" title="Link to this heading">¶</a></h1>
+<p id="module-bocpy">This part of the documentation covers all the interfaces of <cite>bocpy</cite>.</p>
+<dl class="py data">
+<dt class="sig sig-object py" id="bocpy.__version__">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">__version__</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'0.9.0'</span></span><a class="headerlink" href="#bocpy.__version__" title="Link to this definition">¶</a></dt>
+<dd><p>str(object=’’) -&gt; str
+str(bytes_or_buffer[, encoding[, errors]]) -&gt; str</p>
+<p>Create a new string object from the given object. If encoding or
+errors is specified, then the object must expose a data buffer
+that will be decoded using the given encoding and error handler.
+Otherwise, returns the result of object.__str__() (if defined)
+or repr(object).
+encoding defaults to sys.getdefaultencoding().
+errors defaults to ‘strict’.</p>
+</dd></dl>
+
+<section id="behaviors">
+<h2>Behaviors<a class="headerlink" href="#behaviors" title="Link to this heading">¶</a></h2>
+<dl class="py class">
+<dt class="sig sig-object py" id="bocpy.Cown">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">Cown</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">value</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Cown" title="Link to this definition">¶</a></dt>
+<dd><p>Lightweight wrapper around the underlying cown capsule.</p>
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Cown.acquire">
+<span class="sig-name descname"><span class="pre">acquire</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Cown.acquire" title="Link to this definition">¶</a></dt>
+<dd><p>Acquires the cown (required for reading and writing).</p>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="bocpy.Cown.acquired">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">acquired</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><span class="pre">bool</span></a></span><a class="headerlink" href="#bocpy.Cown.acquired" title="Link to this definition">¶</a></dt>
+<dd><p>Whether the cown is currently acquired.</p>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="bocpy.Cown.exception">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">exception</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><span class="pre">bool</span></a></span><a class="headerlink" href="#bocpy.Cown.exception" title="Link to this definition">¶</a></dt>
+<dd><p>Whether the held value is the result of an unhandled exception.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Cown.release">
+<span class="sig-name descname"><span class="pre">release</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Cown.release" title="Link to this definition">¶</a></dt>
+<dd><p>Releases the cown.</p>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="bocpy.Cown.value">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">value</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">T</span></span><a class="headerlink" href="#bocpy.Cown.value" title="Link to this definition">¶</a></dt>
+<dd><p>Return the current stored value.</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.when">
+<span class="sig-prename descclassname"><span class="pre">&#64;</span></span><span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">when</span></span><a class="headerlink" href="#bocpy.when" title="Link to this definition">¶</a></dt>
+<dd><p>Decorator to schedule a function as a behavior using given cowns.</p>
+<p>This decorator takes a list of zero or more cown objects, which will be passed in the order
+in which they were provided to the decorated function. The function itself is extracted and
+run as a behavior once all the cowns are available (i.e., not acquired by other behaviors).
+Behaviors are scheduled such that deadlock will not occur.</p>
+<p>The function itself will be replaced by a Cown which will hold the
+result of executing the behavior. This Cown can be used for further
+coordination.</p>
+<p>The transpiler recognises module-level aliases for the decorator,
+so <code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">bocpy</span> <span class="pre">import</span> <span class="pre">when</span> <span class="pre">as</span> <span class="pre">boc_when</span></code> and <code class="docutils literal notranslate"><span class="pre">&#64;boc_when(...)</span></code>,
+as well as <code class="docutils literal notranslate"><span class="pre">import</span> <span class="pre">bocpy</span> <span class="pre">[as</span> <span class="pre">alias]</span></code> followed by
+<code class="docutils literal notranslate"><span class="pre">&#64;bocpy.when(...)</span></code> / <code class="docutils literal notranslate"><span class="pre">&#64;alias.when(...)</span></code>, are all supported.
+Aliases declared inside a function body are not tracked.</p>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.wait">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">wait</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">timeout</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">stats</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">noticeboard</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.wait" title="Link to this definition">¶</a></dt>
+<dd><p>Block until all behaviors complete, with optional timeout.</p>
+<p>When <code class="docutils literal notranslate"><span class="pre">stats=True</span></code>, captures the per-worker
+<code class="docutils literal notranslate"><span class="pre">_core.scheduler_stats</span></code> snapshot. When
+<code class="docutils literal notranslate"><span class="pre">noticeboard=True</span></code>, captures the noticeboard contents as a
+plain <code class="docutils literal notranslate"><span class="pre">dict</span></code> at the quiescence point (NOT after teardown — the
+two are equivalent in single-caller programs but the quiescence
+snapshot is the documented one). See the stub in
+<code class="docutils literal notranslate"><span class="pre">__init__.pyi</span></code> for the full contract.</p>
+<p>Return value:</p>
+<ul class="simple">
+<li><p>neither flag: <code class="docutils literal notranslate"><span class="pre">None</span></code>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">stats=True</span></code> only: <code class="docutils literal notranslate"><span class="pre">list[dict]</span></code> (or <code class="docutils literal notranslate"><span class="pre">[]</span></code>).</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">noticeboard=True</span></code> only: <code class="docutils literal notranslate"><span class="pre">dict[str,</span> <span class="pre">Any]</span></code> (or <code class="docutils literal notranslate"><span class="pre">{}</span></code>).</p></li>
+<li><p>both flags: <a class="reference internal" href="#bocpy.WaitResult" title="bocpy.WaitResult"><code class="xref py py-class docutils literal notranslate"><span class="pre">WaitResult</span></code></a>.</p></li>
+</ul>
+<p>Internally a thin wrapper around <a class="reference internal" href="#bocpy.quiesce" title="bocpy.quiesce"><code class="xref py py-func docutils literal notranslate"><span class="pre">quiesce()</span></code></a> +
+<code class="docutils literal notranslate"><span class="pre">Behaviors.stop</span></code>; quiescence timeout warns rather than
+raising.</p>
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="bocpy.WaitResult">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">WaitResult</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">stats</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#list" title="(in Python v3.14)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#dict" title="(in Python v3.14)"><span class="pre">dict</span></a><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">noticeboard</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#dict" title="(in Python v3.14)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><span class="pre">Any</span></a><span class="p"><span class="pre">]</span></span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.WaitResult" title="Link to this definition">¶</a></dt>
+<dd><p>Bundle of optional artifacts returned by <a class="reference internal" href="#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a>.</p>
+<p>Only produced when both <code class="docutils literal notranslate"><span class="pre">stats=True</span></code> and <code class="docutils literal notranslate"><span class="pre">noticeboard=True</span></code>
+are passed (e.g. <code class="docutils literal notranslate"><span class="pre">wait(stats=True,</span> <span class="pre">noticeboard=True)</span></code>).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Variables<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>stats</strong> – Per-worker scheduler-stats snapshot.</p></li>
+<li><p><strong>noticeboard</strong> – Final noticeboard contents as a plain <code class="docutils literal notranslate"><span class="pre">dict</span></code>.</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.WaitResult.noticeboard">
+<span class="sig-name descname"><span class="pre">noticeboard</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#dict" title="(in Python v3.14)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><span class="pre">Any</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#bocpy.WaitResult.noticeboard" title="Link to this definition">¶</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.WaitResult.stats">
+<span class="sig-name descname"><span class="pre">stats</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#list" title="(in Python v3.14)"><span class="pre">list</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#dict" title="(in Python v3.14)"><span class="pre">dict</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#bocpy.WaitResult.stats" title="Link to this definition">¶</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.quiesce">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">quiesce</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">timeout</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">stats</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">noticeboard</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.quiesce" title="Link to this definition">¶</a></dt>
+<dd><p>Block until in-flight behaviors complete without tearing down the runtime.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>timeout</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Optional" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Optional</span></code></a>[<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">float</span></code></a>]</span>) – Upper bound (seconds). <code class="docutils literal notranslate"><span class="pre">None</span></code> waits forever.</p></li>
+<li><p><strong>stats</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">bool</span></code></a></span>) – If True, capture per-worker scheduler stats.</p></li>
+<li><p><strong>noticeboard</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">bool</span></code></a></span>) – If True, capture a noticeboard snapshot via a thread cycle.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Raises<span class="colon">:</span></dt>
+<dd class="field-even"><ul class="simple">
+<li><p><a class="reference external" href="https://docs.python.org/3/library/exceptions.html#TimeoutError" title="(in Python v3.14)"><strong>TimeoutError</strong></a> – If quiescence is not reached within <code class="docutils literal notranslate"><span class="pre">timeout</span></code>.</p></li>
+<li><p><a class="reference external" href="https://docs.python.org/3/library/exceptions.html#RuntimeError" title="(in Python v3.14)"><strong>RuntimeError</strong></a> – If called from a non-primary interpreter while pinned cowns are live.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.start">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">start</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">worker_count</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">module</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.start" title="Link to this definition">¶</a></dt>
+<dd><p>Start the behavior runtime: worker pool plus noticeboard thread.</p>
+<p>Idempotent: bare <code class="docutils literal notranslate"><span class="pre">start()</span></code> on a running runtime is a silent no-op; mismatched <code class="docutils literal notranslate"><span class="pre">worker_count</span></code>/<code class="docutils literal notranslate"><span class="pre">module</span></code> raise.</p>
+<p>The runtime distributes scheduling (2PL link/release) across
+caller and worker threads; there is no central scheduler thread.</p>
+<p>The runtime distributes scheduling (2PL link/release) across
+caller and worker threads; there is no central scheduler thread.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>worker_count</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Optional" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Optional</span></code></a>[<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">int</span></code></a>]</span>) – The number of worker interpreters to start.  If
+None, defaults to the number of available cores minus one.</p></li>
+<li><p><strong>module</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Optional" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Optional</span></code></a>[<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#tuple" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">tuple</span></code></a>[<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">str</span></code></a>, <a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">str</span></code></a>]]</span>) – A tuple of the target module name and file path to export
+for worker import.  If None, the caller’s module will be used.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Raises<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3/library/exceptions.html#RuntimeError" title="(in Python v3.14)"><strong>RuntimeError</strong></a> – If called from a non-primary interpreter,
+or if the runtime is already up under a different
+<code class="docutils literal notranslate"><span class="pre">worker_count</span></code> / <code class="docutils literal notranslate"><span class="pre">module</span></code> than the one supplied.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<section id="cown-groups">
+<h3>Cown Groups<a class="headerlink" href="#cown-groups" title="Link to this heading">¶</a></h3>
+<p>In addition to passing individual cowns to <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code>, you can pass a
+<strong>list of cowns</strong> to acquire an entire group atomically. The list is
+delivered to the behavior parameter as a <code class="docutils literal notranslate"><span class="pre">list[Cown]</span></code>:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">bocpy</span><span class="w"> </span><span class="kn">import</span> <span class="n">Cown</span><span class="p">,</span> <span class="n">when</span><span class="p">,</span> <span class="n">wait</span>
+
+<span class="n">items</span> <span class="o">=</span> <span class="p">[</span><span class="n">Cown</span><span class="p">(</span><span class="n">i</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">5</span><span class="p">)]</span>
+
+<span class="nd">@when</span><span class="p">(</span><span class="n">items</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_</span><span class="p">(</span><span class="n">items</span><span class="p">):</span>
+    <span class="c1"># `items` is a list[Cown] — all five acquired together</span>
+    <span class="n">total</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">value</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">items</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Sum:&quot;</span><span class="p">,</span> <span class="n">total</span><span class="p">)</span>
+
+<span class="n">wait</span><span class="p">()</span>
+</pre></div>
+</div>
+<p>You can mix individual cowns and groups freely:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">summary</span> <span class="o">=</span> <span class="n">Cown</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="n">items</span> <span class="o">=</span> <span class="p">[</span><span class="n">Cown</span><span class="p">(</span><span class="n">i</span><span class="p">)</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">5</span><span class="p">)]</span>
+
+<span class="nd">@when</span><span class="p">(</span><span class="n">summary</span><span class="p">,</span> <span class="n">items</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">_</span><span class="p">(</span><span class="n">summary</span><span class="p">,</span> <span class="n">items</span><span class="p">):</span>
+    <span class="n">summary</span><span class="o">.</span><span class="n">value</span> <span class="o">=</span> <span class="nb">sum</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">value</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">items</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Each argument to <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code> becomes one parameter of the decorated function:
+a single <a class="reference internal" href="#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a> is passed directly, while a list is delivered as a
+<code class="docutils literal notranslate"><span class="pre">list[Cown]</span></code>.</p>
+</section>
+<section id="runtime-lifecycle">
+<h3>Runtime Lifecycle<a class="headerlink" href="#runtime-lifecycle" title="Link to this heading">¶</a></h3>
+<p>The bocpy runtime follows a simple lifecycle:</p>
+<ol class="arabic simple">
+<li><p><strong>Start</strong> — the first <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code> call (or an explicit <a class="reference internal" href="#bocpy.start" title="bocpy.start"><code class="xref py py-func docutils literal notranslate"><span class="pre">start()</span></code></a>) spawns
+the worker sub-interpreters and the noticeboard thread.</p></li>
+<li><p><strong>Schedule</strong> — <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code> / <a class="reference internal" href="#bocpy.whencall" title="bocpy.whencall"><code class="xref py py-func docutils literal notranslate"><span class="pre">whencall()</span></code></a> schedules behaviors against
+cowns. Scheduling and release run on the caller and worker threads; there
+is no central scheduler thread.</p></li>
+<li><p><strong>Wait</strong> — <a class="reference internal" href="#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a> blocks until all scheduled behaviors complete, then
+tears down the runtime (joins workers, closes the noticeboard).
+For a non-tearing-down checkpoint (e.g. parallel-search inspection
+between rounds), use <a class="reference internal" href="#bocpy.quiesce" title="bocpy.quiesce"><code class="xref py py-func docutils literal notranslate"><span class="pre">quiesce()</span></code></a> instead — it blocks until
+the runtime is quiescent, returns optional <code class="docutils literal notranslate"><span class="pre">stats</span></code> /
+<code class="docutils literal notranslate"><span class="pre">noticeboard</span></code> snapshots, and leaves workers and the noticeboard
+thread running so further <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code> calls work immediately.</p></li>
+<li><p><strong>Re-start</strong> — after <code class="docutils literal notranslate"><span class="pre">wait()</span></code> returns, the next <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code> call spins up
+a fresh runtime. The noticeboard is cleared and worker statistics are
+reset; existing <a class="reference internal" href="#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a> objects survive and can be scheduled
+against the new runtime.</p></li>
+</ol>
+<dl class="py data">
+<dt class="sig sig-object py" id="bocpy.WORKER_COUNT">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">WORKER_COUNT</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">3</span></span><a class="headerlink" href="#bocpy.WORKER_COUNT" title="Link to this definition">¶</a></dt>
+<dd><p>int([x]) -&gt; integer
+int(x, base=10) -&gt; integer</p>
+<p>Convert a number or string to an integer, or return 0 if no arguments
+are given.  If x is a number, return x.__int__().  For floating point
+numbers, this truncates towards zero.</p>
+<p>If x is not a number or if base is given, then x must be a string,
+bytes, or bytearray instance representing an integer literal in the
+given base.  The literal can be preceded by ‘+’ or ‘-’ and be surrounded
+by whitespace.  The base defaults to 10.  Valid bases are 0 and 2-36.
+Base 0 means to interpret the base from the string as an integer literal.
+&gt;&gt;&gt; int(‘0b100’, base=0)
+4</p>
+</dd></dl>
+
+</section>
+<section id="advanced">
+<h3>Advanced<a class="headerlink" href="#advanced" title="Link to this heading">¶</a></h3>
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.whencall">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">whencall</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">thunk</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">captures</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.whencall" title="Link to this definition">¶</a></dt>
+<dd><p>Invoke a behavior by name with cown args and captured values.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type"><a class="reference internal" href="#bocpy.Cown" title="bocpy.behaviors.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a></span></p>
+</dd>
+</dl>
+</dd></dl>
+
+</section>
+</section>
+<section id="pinned-cowns">
+<h2>Pinned Cowns<a class="headerlink" href="#pinned-cowns" title="Link to this heading">¶</a></h2>
+<p>See <a class="reference internal" href="pinned_cowns.html#pinned-cowns"><span class="std std-ref">Pinned Cowns</span></a> for the conceptual overview, the
+coarse-grained dispatch pattern, event-loop integration recipes,
+and the free-threaded support trajectory.</p>
+<dl class="py class">
+<dt class="sig sig-object py" id="bocpy.PinnedCown">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">PinnedCown</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">value</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.PinnedCown" title="Link to this definition">¶</a></dt>
+<dd><p>A cown whose value never leaves the main interpreter.</p>
+<p>Behaviors whose request set contains <em>any</em> PinnedCown run on the
+main interpreter, scheduled onto a pump queue that the runtime
+drains under <a class="reference internal" href="#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a> and that hosts may drive explicitly via
+<a class="reference internal" href="#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">bocpy.pump()</span></code></a>.</p>
+<p>A regular <a class="reference internal" href="#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a> stores its value as cross-interpreter
+data: every time a worker acquires the cown the value is
+unpickled into the worker’s interpreter, mutated, and re-pickled
+on release. That round-trip is the reason a cown can be acquired
+by any worker – but it also means the value must be picklable
+and that <strong>the same Python object is never observed twice</strong> in
+a worker.</p>
+<p>Many useful values cannot survive that round-trip: pyglet shapes,
+Tk widgets, open file handles, ctypes pointers into a library
+loaded by <code class="docutils literal notranslate"><span class="pre">__main__</span></code>, an asyncio event loop, a GPU context.
+Their <code class="docutils literal notranslate"><span class="pre">__reduce__</span></code> either raises or silently reconstructs a
+broken object on the other side.</p>
+<p>A <a class="reference internal" href="#bocpy.PinnedCown" title="bocpy.PinnedCown"><code class="xref py py-class docutils literal notranslate"><span class="pre">PinnedCown</span></code></a> holds its value as a plain
+<a class="reference external" href="https://docs.python.org/3/c-api/structures.html#c.PyObject" title="(in Python v3.14)"><code class="xref c c-type docutils literal notranslate"><span class="pre">PyObject</span></code></a> reference in the main interpreter. The value
+never goes through <code class="docutils literal notranslate"><span class="pre">XIData</span></code>; the same Python object is
+observed on every acquire. The trade-off: every behavior whose
+request set contains a pinned cown runs <strong>on the main thread</strong>,
+drained by <a class="reference internal" href="#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> (called from your event loop) or
+implicitly by <a class="reference internal" href="#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a>.</p>
+<dl>
+<dt>Pattern: coarse-grained pinned dispatch</dt><dd><p>The pinned arm is single-consumer (the main thread). If you
+schedule a pinned behavior per item, those behaviors
+serialise on the main thread and you lose worker
+parallelism. Schedule pinned behaviors coarsely – one per
+logical frame or batch, not per item. Do per-item
+computation on workers against per-item <a class="reference internal" href="#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a>
+slices, then dispatch <strong>one</strong> pinned <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code> per frame
+that captures all of them together with the main-thread
+canvas / handle and performs the batched write-back.</p>
+</dd>
+<dt>Thread affinity</dt><dd><p>Pinned cowns may only be constructed from the <strong>main
+interpreter</strong>. Constructing one from a worker raises
+<a class="reference external" href="https://docs.python.org/3/library/exceptions.html#RuntimeError" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">RuntimeError</span></code></a>; the value would have no home
+interpreter to live in. <a class="reference internal" href="#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> likewise requires the
+main interpreter – any thread within it on classic CPython;
+on free-threaded builds (<code class="docutils literal notranslate"><span class="pre">Py_GIL_DISABLED</span></code>) a single
+thread at a time, enforced by a CAS on pump entry that
+raises <a class="reference external" href="https://docs.python.org/3/library/exceptions.html#RuntimeError" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">RuntimeError</span></code></a> if a second thread tries to
+pump concurrently. The CAS is cleared on <strong>every</strong> exit
+path, including <code class="docutils literal notranslate"><span class="pre">BaseException</span></code> propagation from a
+pinned body.</p>
+</dd>
+<dt>Mixed request sets</dt><dd><p>A behavior may freely combine pinned and unpinned cowns;
+the 2PL acquisition order is unchanged. As soon as the
+request set contains any pinned cown, the body runs on the
+main thread. Unpinned cowns in the set still travel through
+XIData into the main interpreter for the body’s duration.</p>
+</dd>
+<dt>Exception model</dt><dd><p>Body exceptions follow the same rules as worker behaviors:
+captured on the result <a class="reference internal" href="#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a> and surfaced through
+<code class="docutils literal notranslate"><span class="pre">cown.exception</span></code>. The default <a class="reference internal" href="#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> does <strong>not</strong>
+re-raise; pass <code class="docutils literal notranslate"><span class="pre">raise_on_error=True</span></code> to opt into
+fail-fast propagation.</p>
+</dd>
+<dt>Nested pumping</dt><dd><p>Calling <a class="reference internal" href="#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> from inside a pinned-behavior body
+raises <a class="reference external" href="https://docs.python.org/3/library/exceptions.html#RuntimeError" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">RuntimeError</span></code></a> (v1).</p>
+</dd>
+<dt>Handle vs. value</dt><dd><p>A <a class="reference internal" href="#bocpy.PinnedCown" title="bocpy.PinnedCown"><code class="xref py py-class docutils literal notranslate"><span class="pre">PinnedCown</span></code></a> <em>handle</em> (the Python wrapper object
+and its C capsule) is a normal cross-interpreter shareable.
+It travels via the same XIData mechanism as a regular
+<a class="reference internal" href="#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a> and may be:</p>
+<ul class="simple">
+<li><p>shipped as a captured variable to a worker behavior,</p></li>
+<li><p>embedded in any value graph stored in a regular
+<a class="reference internal" href="#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a> (<code class="docutils literal notranslate"><span class="pre">Cown(PinnedCown(x))</span></code> is supported),</p></li>
+<li><p>placed in a noticeboard entry via <a class="reference internal" href="#bocpy.notice_write" title="bocpy.notice_write"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_write()</span></code></a>
+or <a class="reference internal" href="#bocpy.notice_update" title="bocpy.notice_update"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_update()</span></code></a>.</p></li>
+</ul>
+<p>What never crosses interpreter boundaries is the <em>value</em>
+<code class="docutils literal notranslate"><span class="pre">x</span></code>. A worker that ends up holding a pinned-cown handle
+can do exactly one useful thing with it: schedule pinned
+behaviors against it (which the runtime auto-routes to
+the main pump queue). Any attempt to acquire the value
+from a worker is rejected by the C-level owner CAS – the
+value’s owner is permanently the main interpreter.</p>
+</dd>
+<dt>Restrictions</dt><dd><ul class="simple">
+<li><p>Constructible only on the main interpreter (see
+<em>Thread affinity</em> above).</p></li>
+<li><p>The pinning interpreter is the main interpreter, by
+design. There is one pinned queue per process and one
+consumer of that queue (the main pumper); pinned cowns do
+not split across interpreters.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.pump">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">pump</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">deadline_ms</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">max_behaviors</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">raise_on_error</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.pump" title="Link to this definition">¶</a></dt>
+<dd><p>Run pinned behaviors that are ready, then return.</p>
+<p>Drains the main-thread queue of behaviors whose request sets
+contain at least one <a class="reference internal" href="#bocpy.PinnedCown" title="bocpy.PinnedCown"><code class="xref py py-class docutils literal notranslate"><span class="pre">PinnedCown</span></code></a>. Each behavior runs to
+completion before the next starts. The pump is non-preemptive:
+<code class="docutils literal notranslate"><span class="pre">deadline_ms</span></code> gates <em>starting</em> the next behavior, not
+interrupting one already running.</p>
+<p>Call <a class="reference internal" href="#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> from your event loop’s idle / on-tick hook.
+Script-mode programs need not call it explicitly – <a class="reference internal" href="#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a>
+pumps internally when any <a class="reference internal" href="#bocpy.PinnedCown" title="bocpy.PinnedCown"><code class="xref py py-class docutils literal notranslate"><span class="pre">PinnedCown</span></code></a> exists in the
+process.</p>
+<dl>
+<dt>Bounding</dt><dd><ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">deadline_ms</span></code>: wall-clock budget. <code class="docutils literal notranslate"><span class="pre">None</span></code> drains to
+empty; otherwise a positive <a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">int</span></code></a>.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">max_behaviors</span></code>: hard count. <code class="docutils literal notranslate"><span class="pre">None</span></code> drains to empty;
+otherwise a positive <a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">int</span></code></a>.</p></li>
+</ul>
+<p><code class="docutils literal notranslate"><span class="pre">0</span></code> is rejected for both bounds (use <code class="docutils literal notranslate"><span class="pre">if</span> <span class="pre">budget:</span></code> at
+the call site instead of relying on the pump to no-op).</p>
+</dd>
+<dt>Exception model</dt><dd><p>By default body exceptions land on the result cown; pump
+continues. With <code class="docutils literal notranslate"><span class="pre">raise_on_error=True</span></code>, the first body
+exception re-raises on the pump thread after the queue
+finishes draining. <a class="reference external" href="https://docs.python.org/3/library/exceptions.html#BaseException" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">BaseException</span></code></a>
+(<code class="docutils literal notranslate"><span class="pre">KeyboardInterrupt</span></code>, <code class="docutils literal notranslate"><span class="pre">SystemExit</span></code>, <code class="docutils literal notranslate"><span class="pre">GeneratorExit</span></code>)
+propagates immediately after the offending behavior’s
+per-iteration cleanup completes; any behaviors still queued
+are left in place for the next <a class="reference internal" href="#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> call.</p>
+</dd>
+<dt>Thread affinity</dt><dd><p><a class="reference internal" href="#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> must run on the <strong>main interpreter</strong>. Calling
+from a worker interpreter raises <a class="reference external" href="https://docs.python.org/3/library/exceptions.html#RuntimeError" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">RuntimeError</span></code></a>
+immediately. On free-threaded builds (<code class="docutils literal notranslate"><span class="pre">Py_GIL_DISABLED</span></code>)
+only one thread may pump at a time: a concurrent call from
+a different thread raises <a class="reference external" href="https://docs.python.org/3/library/exceptions.html#RuntimeError" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">RuntimeError</span></code></a>. Calling
+<a class="reference internal" href="#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> when no <a class="reference internal" href="#bocpy.PinnedCown" title="bocpy.PinnedCown"><code class="xref py py-class docutils literal notranslate"><span class="pre">PinnedCown</span></code></a> exists is a no-op
+returning <code class="docutils literal notranslate"><span class="pre">PumpResult(0,</span> <span class="pre">False,</span> <span class="pre">0)</span></code>.</p>
+</dd>
+<dt>Reentrance</dt><dd><p>Not reentrant. Calling from inside a pinned-behavior body
+raises <a class="reference external" href="https://docs.python.org/3/library/exceptions.html#RuntimeError" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">RuntimeError</span></code></a> (v1).</p>
+</dd>
+</dl>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>deadline_ms</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Optional" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Optional</span></code></a>[<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">int</span></code></a>]</span>) – Wall-clock budget in milliseconds.
+<code class="docutils literal notranslate"><span class="pre">None</span></code> for unbounded; otherwise a positive <a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">int</span></code></a>.
+Must not be <a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">bool</span></code></a>.</p></li>
+<li><p><strong>max_behaviors</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Optional" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Optional</span></code></a>[<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">int</span></code></a>]</span>) – Maximum behaviors to start this call.
+<code class="docutils literal notranslate"><span class="pre">None</span></code> for unbounded; otherwise a positive <a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">int</span></code></a>.
+Must not be <a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">bool</span></code></a>.</p></li>
+<li><p><strong>raise_on_error</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">bool</span></code></a></span>) – Re-raise the first body exception after
+drain.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#bocpy.PumpResult" title="bocpy.PumpResult"><code class="xref py py-class docutils literal notranslate"><span class="pre">PumpResult</span></code></a> (<code class="docutils literal notranslate"><span class="pre">executed</span></code>,
+<code class="docutils literal notranslate"><span class="pre">deadline_reached</span></code>, <code class="docutils literal notranslate"><span class="pre">raised</span></code>). On
+<a class="reference external" href="https://docs.python.org/3/library/exceptions.html#BaseException" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">BaseException</span></code></a> propagation, <a class="reference internal" href="#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> raises and
+no <a class="reference internal" href="#bocpy.PumpResult" title="bocpy.PumpResult"><code class="xref py py-class docutils literal notranslate"><span class="pre">PumpResult</span></code></a> is returned.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type"><a class="reference internal" href="#bocpy.PumpResult" title="bocpy.behaviors.PumpResult"><code class="xref py py-class docutils literal notranslate"><span class="pre">PumpResult</span></code></a></span></p>
+</dd>
+<dt class="field-even">Raises<span class="colon">:</span></dt>
+<dd class="field-even"><ul class="simple">
+<li><p><a class="reference external" href="https://docs.python.org/3/library/exceptions.html#TypeError" title="(in Python v3.14)"><strong>TypeError</strong></a> – if <code class="docutils literal notranslate"><span class="pre">deadline_ms</span></code> or <code class="docutils literal notranslate"><span class="pre">max_behaviors</span></code> is
+not <code class="docutils literal notranslate"><span class="pre">None</span></code>, a positive <a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">int</span></code></a>, or is <a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">bool</span></code></a>.</p></li>
+<li><p><a class="reference external" href="https://docs.python.org/3/library/exceptions.html#RuntimeError" title="(in Python v3.14)"><strong>RuntimeError</strong></a> – wrong interpreter, concurrent pump on
+free-threaded, nested pump, no live runtime
+(<a class="reference internal" href="#bocpy.start" title="bocpy.start"><code class="xref py py-func docutils literal notranslate"><span class="pre">start()</span></code></a> has not been called), or watchdog raise
+threshold tripped.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py class">
+<dt class="sig sig-object py" id="bocpy.PumpResult">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">PumpResult</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">executed</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><span class="pre">int</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">deadline_reached</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><span class="pre">bool</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">raised</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><span class="pre">int</span></a></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.PumpResult" title="Link to this definition">¶</a></dt>
+<dd><p>Result of a <a class="reference internal" href="#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> call.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Variables<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>executed</strong> – Pinned behaviors whose lifecycle ran to
+completion this call. Counts the iteration even if the body
+raised or the acquire failed (the MCS chain still drained).</p></li>
+<li><p><strong>deadline_reached</strong> – <code class="docutils literal notranslate"><span class="pre">True</span></code> iff the loop exited because
+<code class="docutils literal notranslate"><span class="pre">deadline_ms</span></code> tripped before the queue drained and before
+<code class="docutils literal notranslate"><span class="pre">max_behaviors</span></code> capped. <code class="docutils literal notranslate"><span class="pre">False</span></code> on drain, on
+<code class="docutils literal notranslate"><span class="pre">max_behaviors</span></code> cap, or when <code class="docutils literal notranslate"><span class="pre">deadline_ms</span></code> is <code class="docutils literal notranslate"><span class="pre">None</span></code>.</p></li>
+<li><p><strong>raised</strong> – Pinned behaviors whose body raised an
+<a class="reference external" href="https://docs.python.org/3/library/exceptions.html#Exception" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Exception</span></code></a> captured to the result cown’s
+<code class="docutils literal notranslate"><span class="pre">.exception</span></code>. Cleanup-path failures (acquire, release,
+noticeboard cache-clear) do <strong>not</strong> count: they are logged
+via <code class="docutils literal notranslate"><span class="pre">PyErr_WriteUnraisable</span></code> and the iteration is still
+counted in <code class="docutils literal notranslate"><span class="pre">executed</span></code>. On <a class="reference external" href="https://docs.python.org/3/library/exceptions.html#BaseException" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">BaseException</span></code></a>
+propagation, <a class="reference internal" href="#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> raises and no
+<a class="reference internal" href="#bocpy.PumpResult" title="bocpy.PumpResult"><code class="xref py py-class docutils literal notranslate"><span class="pre">PumpResult</span></code></a> is returned.</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.PumpResult.deadline_reached">
+<span class="sig-name descname"><span class="pre">deadline_reached</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/functions.html#bool" title="(in Python v3.14)"><span class="pre">bool</span></a></span><a class="headerlink" href="#bocpy.PumpResult.deadline_reached" title="Link to this definition">¶</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.PumpResult.executed">
+<span class="sig-name descname"><span class="pre">executed</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><span class="pre">int</span></a></span><a class="headerlink" href="#bocpy.PumpResult.executed" title="Link to this definition">¶</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.PumpResult.raised">
+<span class="sig-name descname"><span class="pre">raised</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><span class="pre">int</span></a></span><a class="headerlink" href="#bocpy.PumpResult.raised" title="Link to this definition">¶</a></dt>
+<dd><p>Alias for field number 2</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.set_pump_watchdog">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">set_pump_watchdog</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">warn_ms</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1000</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">on_starve</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.set_pump_watchdog" title="Link to this definition">¶</a></dt>
+<dd><p>Configure the pinned-queue starvation watchdog.</p>
+<p><strong>The watchdog is disabled until this function is called.</strong> No
+call means no warnings, regardless of how long the pinned queue
+has been non-empty. <code class="docutils literal notranslate"><span class="pre">warn_ms=1000</span></code> is the kwarg default that
+applies <em>if and when</em> you opt in, not the runtime default.</p>
+<p>Warn-side sampling fires from <a class="reference internal" href="#bocpy.pump" title="bocpy.pump"><code class="xref py py-func docutils literal notranslate"><span class="pre">pump()</span></code></a> on entry (so
+<a class="reference internal" href="#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a>’s auto-pump loop counts). The threshold gates on
+<strong>queue-non-empty time</strong>: a program that runs only unpinned work
+indefinitely never trips it.</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">warn_ms</span></code> (kwarg default 1000): logs a warning carrying the
+queue’s non-empty duration (ms) and current depth. Pass
+<code class="docutils literal notranslate"><span class="pre">None</span></code> to disable. Must be a positive int when set.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">on_starve</span></code>: optional callable <code class="docutils literal notranslate"><span class="pre">(severity,</span> <span class="pre">message)</span></code> to
+replace the default logger. Use this to escalate (for
+example <code class="docutils literal notranslate"><span class="pre">on_starve=lambda</span> <span class="pre">s,</span> <span class="pre">m:</span> <span class="pre">pytest.fail(m)</span></code> in tests, or
+a counter / alert hook in production).</p></li>
+</ul>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>warn_ms</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Optional" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Optional</span></code></a>[<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">int</span></code></a>]</span>) – Warn-after threshold in milliseconds, or
+<code class="docutils literal notranslate"><span class="pre">None</span></code> to disable warnings.</p></li>
+<li><p><strong>on_starve</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Optional" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Optional</span></code></a>[<a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Callable" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Callable</span></code></a>[[<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">int</span></code></a>, <a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">str</span></code></a>], <a class="reference external" href="https://docs.python.org/3/library/constants.html#None" title="(in Python v3.14)"><code class="xref py py-obj docutils literal notranslate"><span class="pre">None</span></code></a>]]</span>) – Optional <code class="docutils literal notranslate"><span class="pre">(severity,</span> <span class="pre">message)</span></code> callback that
+replaces the default logger sink.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Raises<span class="colon">:</span></dt>
+<dd class="field-even"><ul class="simple">
+<li><p><a class="reference external" href="https://docs.python.org/3/library/exceptions.html#TypeError" title="(in Python v3.14)"><strong>TypeError</strong></a> – if <code class="docutils literal notranslate"><span class="pre">warn_ms</span></code> is not <code class="docutils literal notranslate"><span class="pre">None</span></code> or a positive
+<a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">int</span></code></a>, or <code class="docutils literal notranslate"><span class="pre">on_starve</span></code> is not callable.</p></li>
+<li><p><a class="reference external" href="https://docs.python.org/3/library/exceptions.html#OverflowError" title="(in Python v3.14)"><strong>OverflowError</strong></a> – if <code class="docutils literal notranslate"><span class="pre">warn_ms</span></code> exceeds the maximum
+representable nanosecond value.</p></li>
+</ul>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/constants.html#None" title="(in Python v3.14)"><code class="xref py py-obj docutils literal notranslate"><span class="pre">None</span></code></a></span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.set_wait_pump_poll">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">set_wait_pump_poll</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">ms</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">50</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.set_wait_pump_poll" title="Link to this definition">¶</a></dt>
+<dd><p>Set the poll cadence for <a class="reference internal" href="#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a>’s auto-pump loop.</p>
+<p>Default cadence is <strong>50 ms</strong> — the upper bound on how long the
+auto-pump loop will park between checks when no broadcast wakes
+it. The setting is process-global and may be changed at any
+time; the active <a class="reference internal" href="#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a> loop picks up the new value on
+its next iteration.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>ms</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/functions.html#int" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">int</span></code></a></span>) – Poll cadence in milliseconds. Must be positive.</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/constants.html#None" title="(in Python v3.14)"><code class="xref py py-obj docutils literal notranslate"><span class="pre">None</span></code></a></span></p>
+</dd>
+</dl>
+</dd></dl>
+
+</section>
+<section id="noticeboard">
+<h2>Noticeboard<a class="headerlink" href="#noticeboard" title="Link to this heading">¶</a></h2>
+<p>See the <a class="reference internal" href="noticeboard.html#noticeboard"><span class="std std-ref">Noticeboard</span></a> guide for a conceptual overview, consistency model,
+and worked examples.</p>
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.notice_write">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">notice_write</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">value</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.notice_write" title="Link to this definition">¶</a></dt>
+<dd><p>Write a value to the noticeboard.</p>
+<p>The write is fire-and-forget: the value is serialized immediately and
+handed to a dedicated noticeboard thread, which applies it under
+mutex. <code class="docutils literal notranslate"><span class="pre">notice_write</span></code> returns as soon as the message is enqueued.</p>
+<p><strong>No ordering guarantee.</strong> A subsequent behavior — even one that
+chains directly off the writer through a shared cown — is <em>not</em>
+guaranteed to observe this write. The noticeboard mutator runs on
+its own thread and may not have processed the message by the time
+the next behavior reads. Treat the noticeboard as eventually
+consistent shared state, never as a synchronization channel between
+behaviors. Use cowns or <code class="docutils literal notranslate"><span class="pre">send</span></code>/<code class="docutils literal notranslate"><span class="pre">receive</span></code> for that.</p>
+<p>The noticeboard supports up to 64 distinct keys.  Writes beyond the
+limit are not applied; the noticeboard thread catches the resulting
+error and logs a warning.  No exception propagates to the caller.</p>
+<p>Values may embed <a class="reference internal" href="#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a> references; the noticeboard keeps
+each embedded cown alive for as long as the entry remains in the
+noticeboard.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>key</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">str</span></code></a></span>) – The noticeboard key (max 63 UTF-8 bytes).</p></li>
+<li><p><strong>value</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Any</span></code></a></span>) – The value to store.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/constants.html#None" title="(in Python v3.14)"><code class="xref py py-obj docutils literal notranslate"><span class="pre">None</span></code></a></span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.notice_update">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">notice_update</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fn</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">default</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.notice_update" title="Link to this definition">¶</a></dt>
+<dd><p>Atomically update a noticeboard entry.</p>
+<p>Reads the current value for <em>key</em> (or <em>default</em> if absent), applies
+<em>fn</em> to it, and writes the result back.  The read-modify-write is
+atomic because the single-threaded noticeboard mutator performs all
+three steps without interleaving.</p>
+<p>Like <a class="reference internal" href="#bocpy.notice_write" title="bocpy.notice_write"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_write()</span></code></a>, the call is fire-and-forget and carries
+<strong>no ordering guarantee</strong> with respect to other behaviors. The
+update is processed on the noticeboard thread; subsequent behaviors
+may or may not observe the result.</p>
+<p>Both <em>fn</em> and <em>default</em> must be picklable — they are serialized and
+sent to the noticeboard thread via the message queue.  Lambdas and
+closures are <strong>not</strong> picklable; use <code class="docutils literal notranslate"><span class="pre">functools.partial</span></code> with a
+module-level function or an <code class="docutils literal notranslate"><span class="pre">operator</span></code> function instead:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">operator</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">functools</span><span class="w"> </span><span class="kn">import</span> <span class="n">partial</span>
+<span class="n">notice_update</span><span class="p">(</span><span class="s2">&quot;total&quot;</span><span class="p">,</span> <span class="n">partial</span><span class="p">(</span><span class="n">operator</span><span class="o">.</span><span class="n">add</span><span class="p">,</span> <span class="mi">5</span><span class="p">),</span> <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+<span class="n">notice_update</span><span class="p">(</span><span class="s2">&quot;best&quot;</span><span class="p">,</span> <span class="n">partial</span><span class="p">(</span><span class="nb">max</span><span class="p">,</span> <span class="mi">42</span><span class="p">),</span> <span class="n">default</span><span class="o">=</span><span class="nb">float</span><span class="p">(</span><span class="s2">&quot;-inf&quot;</span><span class="p">))</span>
+</pre></div>
+</div>
+<p>If <em>fn</em> raises, the key retains its previous value and a warning is
+logged by the noticeboard thread.</p>
+<p><strong>Important:</strong> <em>fn</em> runs synchronously on the single-threaded
+noticeboard mutator.  It must be fast, pure (no side effects), and
+must not call any bocpy API (<code class="docutils literal notranslate"><span class="pre">notice_write</span></code>, <code class="docutils literal notranslate"><span class="pre">send</span></code>, <code class="docutils literal notranslate"><span class="pre">when</span></code>,
+etc.). A blocking or expensive <em>fn</em> will stall every other
+noticeboard mutation.</p>
+<p>If <em>fn</em> returns the <code class="docutils literal notranslate"><span class="pre">REMOVED</span></code> sentinel, the entry is deleted from
+the noticeboard instead of being updated.</p>
+<p>The value returned by <em>fn</em> may embed <a class="reference internal" href="#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a> references; the
+noticeboard retains them until the entry is overwritten or deleted,
+identical to <a class="reference internal" href="#bocpy.notice_write" title="bocpy.notice_write"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_write()</span></code></a>.</p>
+<div class="admonition warning">
+<p class="admonition-title">Warning</p>
+<p><em>fn</em> and <em>default</em> are pickled and sent to the noticeboard thread
+for execution. <strong>Anyone with permission to call this function can
+therefore cause arbitrary Python code to run on the noticeboard
+thread</strong>, which holds the privileged noticeboard-mutator role.
+In the current threat model bocpy treats all code running in the
+runtime (primary and sub-interpreters) as equally trusted, so
+this is no worse than any other cross-interpreter message. If you
+need to run untrusted behavior code, restrict what can reach
+<code class="docutils literal notranslate"><span class="pre">boc_noticeboard</span></code> and audit callers of <a class="reference internal" href="#bocpy.notice_update" title="bocpy.notice_update"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_update()</span></code></a>.</p>
+</div>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>key</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">str</span></code></a></span>) – The noticeboard key (max 63 UTF-8 bytes).</p></li>
+<li><p><strong>fn</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Callable" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Callable</span></code></a>[[<a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Any</span></code></a>], <a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Any</span></code></a>]</span>) – A picklable callable taking the current value, returning the new.</p></li>
+<li><p><strong>default</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Any</span></code></a></span>) – Value used when <em>key</em> does not yet exist.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/constants.html#None" title="(in Python v3.14)"><code class="xref py py-obj docutils literal notranslate"><span class="pre">None</span></code></a></span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.notice_delete">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">notice_delete</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.notice_delete" title="Link to this definition">¶</a></dt>
+<dd><p>Delete a single noticeboard entry.</p>
+<p>The deletion is fire-and-forget: the request is sent to the
+noticeboard thread, which removes the entry under mutex.  If the
+key does not exist, the operation is a no-op. Like
+<a class="reference internal" href="#bocpy.notice_write" title="bocpy.notice_write"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_write()</span></code></a>, this carries <strong>no ordering guarantee</strong> with
+respect to other behaviors.</p>
+<p>Alternatively, use <code class="docutils literal notranslate"><span class="pre">notice_update</span></code> with a function that returns
+<code class="docutils literal notranslate"><span class="pre">REMOVED</span></code> to conditionally delete an entry based on its current
+value.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>key</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">str</span></code></a></span>) – The noticeboard key to delete (max 63 UTF-8 bytes).</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/constants.html#None" title="(in Python v3.14)"><code class="xref py py-obj docutils literal notranslate"><span class="pre">None</span></code></a></span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.noticeboard">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">noticeboard</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.noticeboard" title="Link to this definition">¶</a></dt>
+<dd><p>Return a cached snapshot of the noticeboard.</p>
+<p>The noticeboard is a behavior-scope read surface. The supported
+use is from inside a <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code> body: the first call captures all
+entries under mutex and caches them, and every subsequent call
+in the same behavior returns the same cached view.</p>
+<p>The returned mapping is read-only.</p>
+<p>The only supported way to read the noticeboard from the main
+thread is to ask <a class="reference internal" href="#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a> for it via <code class="docutils literal notranslate"><span class="pre">wait(noticeboard=True)</span></code>
+(or <code class="docutils literal notranslate"><span class="pre">wait(stats=True,</span> <span class="pre">noticeboard=True)</span></code>); that snapshot is taken
+on the main thread between joining the noticeboard mutator thread
+and clearing the C-side entries.</p>
+<p>Calling <a class="reference internal" href="#bocpy.noticeboard" title="bocpy.noticeboard"><code class="xref py py-func docutils literal notranslate"><span class="pre">noticeboard()</span></code></a> or <a class="reference internal" href="#bocpy.notice_read" title="bocpy.notice_read"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_read()</span></code></a> from any other
+main-thread context (outside a behavior, outside
+<code class="docutils literal notranslate"><span class="pre">wait(noticeboard=True)</span></code>) is <strong>undefined behavior</strong>: the cached
+proxy is never re-anchored on a behavior boundary, so subsequent
+calls may observe either a stale snapshot or partially-applied
+writes.</p>
+<p>Seeding the noticeboard with <a class="reference internal" href="#bocpy.notice_write" title="bocpy.notice_write"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_write()</span></code></a> from the main
+thread <em>before</em> scheduling behaviors is fine and is the
+recommended pattern for installing read-mostly configuration.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>A read-only mapping of keys to their stored values.</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Mapping" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">Mapping</span></code></a>[<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">str</span></code></a>, <a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Any</span></code></a>]</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.notice_read">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">notice_read</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">key</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">default</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.notice_read" title="Link to this definition">¶</a></dt>
+<dd><p>Read a single key from the noticeboard.</p>
+<p>Convenience wrapper over <a class="reference internal" href="#bocpy.noticeboard" title="bocpy.noticeboard"><code class="xref py py-func docutils literal notranslate"><span class="pre">noticeboard()</span></code></a> that takes a snapshot
+and returns one value. The same supported-usage contract applies:
+call from inside a <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code> behavior, or read the final state on
+main via <code class="docutils literal notranslate"><span class="pre">wait(noticeboard=True)</span></code>. Calling <a class="reference internal" href="#bocpy.notice_read" title="bocpy.notice_read"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_read()</span></code></a>
+from any other main-thread context is <strong>undefined behavior</strong>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>key</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">str</span></code></a></span>) – The noticeboard key to read.</p></li>
+<li><p><strong>default</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Any</span></code></a></span>) – Value returned when key is absent.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>The stored value, or <em>default</em> if the key does not exist.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Any" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Any</span></code></a></span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.notice_sync">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">notice_sync</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">timeout</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">30.0</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.notice_sync" title="Link to this definition">¶</a></dt>
+<dd><p>Block until the caller’s prior noticeboard mutations are committed.</p>
+<p>Because <a class="reference internal" href="#bocpy.notice_write" title="bocpy.notice_write"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_write()</span></code></a>, <a class="reference internal" href="#bocpy.notice_update" title="bocpy.notice_update"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_update()</span></code></a>, and
+<a class="reference internal" href="#bocpy.notice_delete" title="bocpy.notice_delete"><code class="xref py py-func docutils literal notranslate"><span class="pre">notice_delete()</span></code></a> are fire-and-forget, a behavior that wants
+read-your-writes ordering against a <em>subsequent</em> behavior must call
+<code class="docutils literal notranslate"><span class="pre">notice_sync()</span></code> after its writes. The call posts a sentinel onto
+the <code class="docutils literal notranslate"><span class="pre">boc_noticeboard</span></code> tag (which is FIFO per producer) and blocks
+until the noticeboard thread has drained that sentinel. By the time
+this returns, every write/update/delete posted from the calling
+thread before the sentinel has been applied to the noticeboard.</p>
+<p>The barrier carries <strong>no ordering guarantee</strong> with respect to
+writes posted from other threads or behaviors interleaved with the
+caller’s; it only flushes the caller’s own queued mutations.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>timeout</strong> (<span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/typing.html#typing.Optional" title="(in Python v3.14)"><code class="xref py py-data docutils literal notranslate"><span class="pre">Optional</span></code></a>[<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">float</span></code></a>]</span>) – Maximum seconds to wait. <code class="docutils literal notranslate"><span class="pre">None</span></code> waits forever.
+Defaults to 30 seconds.</p>
+</dd>
+<dt class="field-even">Raises<span class="colon">:</span></dt>
+<dd class="field-even"><ul class="simple">
+<li><p><a class="reference external" href="https://docs.python.org/3/library/exceptions.html#TimeoutError" title="(in Python v3.14)"><strong>TimeoutError</strong></a> – If the noticeboard thread does not drain the
+caller’s sentinel within <em>timeout</em> seconds.</p></li>
+<li><p><a class="reference external" href="https://docs.python.org/3/library/exceptions.html#RuntimeError" title="(in Python v3.14)"><strong>RuntimeError</strong></a> – If the runtime is not started.</p></li>
+</ul>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/constants.html#None" title="(in Python v3.14)"><code class="xref py py-obj docutils literal notranslate"><span class="pre">None</span></code></a></span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py data">
+<dt class="sig sig-object py" id="bocpy.REMOVED">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">REMOVED</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">REMOVED</span></span><a class="headerlink" href="#bocpy.REMOVED" title="Link to this definition">¶</a></dt>
+<dd><p>Sentinel returned by notice_update fn to delete the entry.</p>
+</dd></dl>
+
+</section>
+<section id="math">
+<h2>Math<a class="headerlink" href="#math" title="Link to this heading">¶</a></h2>
+<dl class="py class">
+<dt class="sig sig-object py" id="bocpy.Matrix">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">Matrix</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rows</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">columns</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">values</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix" title="Link to this definition">¶</a></dt>
+<dd><p>A dense 2-D matrix of double-precision floats.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.Matrix.T">
+<span class="sig-name descname"><span class="pre">T</span></span><a class="headerlink" href="#bocpy.Matrix.T" title="Link to this definition">¶</a></dt>
+<dd><p>Return a new matrix that is the transpose of this one.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.__init__">
+<span class="sig-name descname"><span class="pre">__init__</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">args</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.__init__" title="Link to this definition">¶</a></dt>
+<dd><p>Create a new <em>rows</em> x <em>columns</em> matrix.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>rows</strong> – Number of rows (must be ≥ 1).</p></li>
+<li><p><strong>columns</strong> – Number of columns (must be ≥ 1).</p></li>
+<li><p><strong>values</strong> – Initial values.  May be <code class="docutils literal notranslate"><span class="pre">None</span></code> (zero-filled), a scalar
+(broadcast to every element), or a flat sequence of <em>rows</em> x <em>columns</em>
+numbers in row-major order.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.abs">
+<span class="sig-name descname"><span class="pre">abs</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">in_place</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.abs" title="Link to this definition">¶</a></dt>
+<dd><p>Element-wise absolute value.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type">Matrix</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.Matrix.acquired">
+<span class="sig-name descname"><span class="pre">acquired</span></span><a class="headerlink" href="#bocpy.Matrix.acquired" title="Link to this definition">¶</a></dt>
+<dd><p>Whether the matrix is currently acquired.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.allclose">
+<span class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">allclose</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">lhs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rhs</span></span></em>, <em class="sig-param"><span class="positional-only-separator o"><abbr title="Positional-only parameter separator (PEP 570)"><span class="pre">/</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">rtol</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e-05</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">atol</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1e-08</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">equal_nan</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.allclose" title="Link to this definition">¶</a></dt>
+<dd><p>Check element-wise equality within tolerance.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.angle">
+<span class="sig-name descname"><span class="pre">angle</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">axis</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.angle" title="Link to this definition">¶</a></dt>
+<dd><p>Polar angle (<code class="docutils literal notranslate"><span class="pre">atan2(y,</span> <span class="pre">x)</span></code>) of every 2D vector. Returns a float for a single 2D vector, an <code class="docutils literal notranslate"><span class="pre">Mx1</span></code> column matrix for an <code class="docutils literal notranslate"><span class="pre">Nx2</span></code> row batch, or a <code class="docutils literal notranslate"><span class="pre">1xN</span></code> row matrix for a <code class="docutils literal notranslate"><span class="pre">2xN</span></code> column batch. On the ambiguous <code class="docutils literal notranslate"><span class="pre">2x2</span></code> shape the default is per-row; pass <code class="docutils literal notranslate"><span class="pre">axis=0</span></code> to force per-column.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type"><code class="xref py py-data docutils literal notranslate"><span class="pre">Union</span></code>[<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">float</span></code></a>, Matrix]</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.ceil">
+<span class="sig-name descname"><span class="pre">ceil</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">in_place</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.ceil" title="Link to this definition">¶</a></dt>
+<dd><p>Element-wise ceiling.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type">Matrix</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.clip">
+<span class="sig-name descname"><span class="pre">clip</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">min_or_maxval</span></span></em>, <em class="sig-param"><span class="positional-only-separator o"><abbr title="Positional-only parameter separator (PEP 570)"><span class="pre">/</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">maxval</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.clip" title="Link to this definition">¶</a></dt>
+<dd><p>Clip elements to a range.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type">Matrix</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.Matrix.columns">
+<span class="sig-name descname"><span class="pre">columns</span></span><a class="headerlink" href="#bocpy.Matrix.columns" title="Link to this definition">¶</a></dt>
+<dd><p>The number of columns in the matrix.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.concat">
+<span class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">concat</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">values</span></span></em>, <em class="sig-param"><span class="positional-only-separator o"><abbr title="Positional-only parameter separator (PEP 570)"><span class="pre">/</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">axis</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.concat" title="Link to this definition">¶</a></dt>
+<dd><p>Concatenate matrices along an axis.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type">Matrix</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.copy">
+<span class="sig-name descname"><span class="pre">copy</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.copy" title="Link to this definition">¶</a></dt>
+<dd><p>Return a deep copy.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type">Matrix</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.cross">
+<span class="sig-name descname"><span class="pre">cross</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">other</span></span></em>, <em class="sig-param"><span class="positional-only-separator o"><abbr title="Positional-only parameter separator (PEP 570)"><span class="pre">/</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">axis</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.cross" title="Link to this definition">¶</a></dt>
+<dd><p>2D (scalar z-component) or 3D cross product against another vector or batch. 1x2 / 2x1 inputs return a float; 1x3 / 3x1 return a Matrix preserving self’s orientation. Nx2 / 2xN row/column batches return per-vector scalars (Mx1 / 1xN); Nx3 / 3xN return same-shape batches. Batch operands accept either a same-shape other or a single 2D/3D vector (1xK / Kx1) broadcast against every per-vector slot — <code class="docutils literal notranslate"><span class="pre">self</span></code> must be the batch (cross is anticommutative). <code class="docutils literal notranslate"><span class="pre">axis</span></code> disambiguates the 2x2 / 3x3 squares (default rows, <code class="docutils literal notranslate"><span class="pre">axis=0</span></code> for columns).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type"><code class="xref py py-data docutils literal notranslate"><span class="pre">Union</span></code>[<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">float</span></code></a>, Matrix]</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.floor">
+<span class="sig-name descname"><span class="pre">floor</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">in_place</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.floor" title="Link to this definition">¶</a></dt>
+<dd><p>Element-wise floor.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type">Matrix</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.Matrix.length">
+<span class="sig-name descname"><span class="pre">length</span></span><a class="headerlink" href="#bocpy.Matrix.length" title="Link to this definition">¶</a></dt>
+<dd><p>Frobenius (L2) magnitude of the matrix as a read-only property.</p>
+<p>Equivalent to <a class="reference internal" href="#bocpy.Matrix.magnitude" title="bocpy.Matrix.magnitude"><code class="xref py py-meth docutils literal notranslate"><span class="pre">magnitude()</span></code></a> called with no axis argument:
+<code class="docutils literal notranslate"><span class="pre">sqrt(sum(x**2</span> <span class="pre">for</span> <span class="pre">x</span> <span class="pre">in</span> <span class="pre">m))</span></code> over all elements. Exposed as a
+<code class="docutils literal notranslate"><span class="pre">&#64;property</span></code> so that vector-like code reads naturally
+(<code class="docutils literal notranslate"><span class="pre">direction.length</span></code>, <code class="docutils literal notranslate"><span class="pre">velocity.length</span></code>) without the extra
+parentheses of a method call.</p>
+<p>Note: this is <strong>not</strong> the element count. For <code class="docutils literal notranslate"><span class="pre">rows</span> <span class="pre">*</span> <span class="pre">columns</span></code>
+use <a class="reference internal" href="#bocpy.Matrix.size" title="bocpy.Matrix.size"><code class="xref py py-attr docutils literal notranslate"><span class="pre">size</span></code></a> (or <a class="reference external" href="https://docs.python.org/3/library/functions.html#len" title="(in Python v3.14)"><code class="xref py py-func docutils literal notranslate"><span class="pre">len()</span></code></a>, which returns <a class="reference internal" href="#bocpy.Matrix.rows" title="bocpy.Matrix.rows"><code class="xref py py-attr docutils literal notranslate"><span class="pre">rows</span></code></a>).</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.magnitude">
+<span class="sig-name descname"><span class="pre">magnitude</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">axis</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.magnitude" title="Link to this definition">¶</a></dt>
+<dd><p>Euclidean magnitude.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type"><code class="xref py py-data docutils literal notranslate"><span class="pre">Union</span></code>[<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">float</span></code></a>, Matrix]</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.magnitude_squared">
+<span class="sig-name descname"><span class="pre">magnitude_squared</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">axis</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.magnitude_squared" title="Link to this definition">¶</a></dt>
+<dd><p>Sum of squared elements (Euclidean magnitude without the sqrt).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type"><code class="xref py py-data docutils literal notranslate"><span class="pre">Union</span></code>[<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">float</span></code></a>, Matrix]</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.max">
+<span class="sig-name descname"><span class="pre">max</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">axis</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.max" title="Link to this definition">¶</a></dt>
+<dd><p>Maximum of elements.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type"><code class="xref py py-data docutils literal notranslate"><span class="pre">Union</span></code>[<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">float</span></code></a>, Matrix]</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.mean">
+<span class="sig-name descname"><span class="pre">mean</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">axis</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.mean" title="Link to this definition">¶</a></dt>
+<dd><p>Mean of elements.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type"><code class="xref py py-data docutils literal notranslate"><span class="pre">Union</span></code>[<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">float</span></code></a>, Matrix]</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.min">
+<span class="sig-name descname"><span class="pre">min</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">axis</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.min" title="Link to this definition">¶</a></dt>
+<dd><p>Minimum of elements.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type"><code class="xref py py-data docutils literal notranslate"><span class="pre">Union</span></code>[<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">float</span></code></a>, Matrix]</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.negate">
+<span class="sig-name descname"><span class="pre">negate</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">in_place</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.negate" title="Link to this definition">¶</a></dt>
+<dd><p>Element-wise negation.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type">Matrix</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.normal">
+<span class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">normal</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">mean</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stddev</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1.0</span></span></em>, <em class="sig-param"><span class="positional-only-separator o"><abbr title="Positional-only parameter separator (PEP 570)"><span class="pre">/</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.normal" title="Link to this definition">¶</a></dt>
+<dd><p>Sample from a normal distribution.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type"><code class="xref py py-data docutils literal notranslate"><span class="pre">Union</span></code>[<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">float</span></code></a>, Matrix]</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.normalize">
+<span class="sig-name descname"><span class="pre">normalize</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">axis</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">in_place</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.normalize" title="Link to this definition">¶</a></dt>
+<dd><p>Divide elements by their magnitude. <code class="docutils literal notranslate"><span class="pre">axis=None</span></code> divides by the matrix’s total magnitude; <code class="docutils literal notranslate"><span class="pre">axis=0</span></code> divides each column by its own magnitude; <code class="docutils literal notranslate"><span class="pre">axis=1</span></code> divides each row by its own magnitude. Rows or columns whose magnitude is zero are left as the all-zero vector. Sub-normal magnitudes may overflow during division; threshold with magnitude_squared() if safety matters. When <code class="docutils literal notranslate"><span class="pre">in_place=True</span></code>, mutates <code class="docutils literal notranslate"><span class="pre">self</span></code> and returns it.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type">Matrix</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.ones">
+<span class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">ones</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">size</span></span></em>, <em class="sig-param"><span class="positional-only-separator o"><abbr title="Positional-only parameter separator (PEP 570)"><span class="pre">/</span></abbr></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.ones" title="Link to this definition">¶</a></dt>
+<dd><p>Create a matrix of ones.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.perpendicular">
+<span class="sig-name descname"><span class="pre">perpendicular</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">axis</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">in_place</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.perpendicular" title="Link to this definition">¶</a></dt>
+<dd><p>Rotate every 2D vector 90 degrees counter-clockwise: <code class="docutils literal notranslate"><span class="pre">(x,</span> <span class="pre">y)</span> <span class="pre">-&gt;</span> <span class="pre">(-y,</span> <span class="pre">x)</span></code>. Accepts a single 2D vector (<code class="docutils literal notranslate"><span class="pre">1x2</span></code> or <code class="docutils literal notranslate"><span class="pre">2x1</span></code>), a row batch (<code class="docutils literal notranslate"><span class="pre">Nx2</span></code>), or a column batch (<code class="docutils literal notranslate"><span class="pre">2xN</span></code>). On the ambiguous <code class="docutils literal notranslate"><span class="pre">2x2</span></code> shape the default is per-row; pass <code class="docutils literal notranslate"><span class="pre">axis=0</span></code> to force per-column. When <code class="docutils literal notranslate"><span class="pre">in_place=True</span></code>, mutates <code class="docutils literal notranslate"><span class="pre">self</span></code> and returns it.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type">Matrix</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.round">
+<span class="sig-name descname"><span class="pre">round</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">in_place</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.round" title="Link to this definition">¶</a></dt>
+<dd><p>Element-wise rounding (banker’s; IEEE round-half-to-even).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type">Matrix</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.Matrix.rows">
+<span class="sig-name descname"><span class="pre">rows</span></span><a class="headerlink" href="#bocpy.Matrix.rows" title="Link to this definition">¶</a></dt>
+<dd><p>The number of rows in the matrix.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.select">
+<span class="sig-name descname"><span class="pre">select</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">indices</span></span></em>, <em class="sig-param"><span class="positional-only-separator o"><abbr title="Positional-only parameter separator (PEP 570)"><span class="pre">/</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">axis</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.select" title="Link to this definition">¶</a></dt>
+<dd><p>Select rows or columns by index.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.Matrix.shape">
+<span class="sig-name descname"><span class="pre">shape</span></span><a class="headerlink" href="#bocpy.Matrix.shape" title="Link to this definition">¶</a></dt>
+<dd><p>The <code class="docutils literal notranslate"><span class="pre">(rows,</span> <span class="pre">columns)</span></code> shape of the matrix.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.Matrix.size">
+<span class="sig-name descname"><span class="pre">size</span></span><a class="headerlink" href="#bocpy.Matrix.size" title="Link to this definition">¶</a></dt>
+<dd><p>The total element count of the matrix (<code class="docutils literal notranslate"><span class="pre">rows</span> <span class="pre">*</span> <span class="pre">columns</span></code>).</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.sum">
+<span class="sig-name descname"><span class="pre">sum</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">axis</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.sum" title="Link to this definition">¶</a></dt>
+<dd><p>Sum of elements.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type"><code class="xref py py-data docutils literal notranslate"><span class="pre">Union</span></code>[<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">float</span></code></a>, Matrix]</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.transpose">
+<span class="sig-name descname"><span class="pre">transpose</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">in_place</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.transpose" title="Link to this definition">¶</a></dt>
+<dd><p>Return a transposed copy, or transpose <code class="docutils literal notranslate"><span class="pre">self</span></code> in place when <code class="docutils literal notranslate"><span class="pre">in_place=True</span></code> (in which case <code class="docutils literal notranslate"><span class="pre">self</span></code> is returned).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type">Matrix</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.uniform">
+<span class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">uniform</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">minval</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0.0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">maxval</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">1.0</span></span></em>, <em class="sig-param"><span class="positional-only-separator o"><abbr title="Positional-only parameter separator (PEP 570)"><span class="pre">/</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">size</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.uniform" title="Link to this definition">¶</a></dt>
+<dd><p>Sample from a uniform distribution.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type"><code class="xref py py-data docutils literal notranslate"><span class="pre">Union</span></code>[<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">float</span></code></a>, Matrix]</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.vecdot">
+<span class="sig-name descname"><span class="pre">vecdot</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">other</span></span></em>, <em class="sig-param"><span class="positional-only-separator o"><abbr title="Positional-only parameter separator (PEP 570)"><span class="pre">/</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">axis</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.vecdot" title="Link to this definition">¶</a></dt>
+<dd><p>Axis-aware inner product: sum of element-wise products. Equivalent to numpy.linalg.vecdot for 1-D inputs with axis=None; <strong>not</strong> equivalent to numpy.dot.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type"><code class="xref py py-data docutils literal notranslate"><span class="pre">Union</span></code>[<a class="reference external" href="https://docs.python.org/3/library/functions.html#float" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">float</span></code></a>, Matrix]</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.vector">
+<span class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">vector</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">values</span></span></em>, <em class="sig-param"><span class="positional-only-separator o"><abbr title="Positional-only parameter separator (PEP 570)"><span class="pre">/</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">as_column</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.vector" title="Link to this definition">¶</a></dt>
+<dd><p>Create a vector from a sequence.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><span class="sphinx_autodoc_typehints-type">Matrix</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.Matrix.w">
+<span class="sig-name descname"><span class="pre">w</span></span><a class="headerlink" href="#bocpy.Matrix.w" title="Link to this definition">¶</a></dt>
+<dd><p>Set the fourth vector component.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.Matrix.x">
+<span class="sig-name descname"><span class="pre">x</span></span><a class="headerlink" href="#bocpy.Matrix.x" title="Link to this definition">¶</a></dt>
+<dd><p>Set the first vector component.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.Matrix.y">
+<span class="sig-name descname"><span class="pre">y</span></span><a class="headerlink" href="#bocpy.Matrix.y" title="Link to this definition">¶</a></dt>
+<dd><p>Set the second vector component.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.Matrix.z">
+<span class="sig-name descname"><span class="pre">z</span></span><a class="headerlink" href="#bocpy.Matrix.z" title="Link to this definition">¶</a></dt>
+<dd><p>Set the third vector component.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.zeros">
+<span class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">zeros</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">size</span></span></em>, <em class="sig-param"><span class="positional-only-separator o"><abbr title="Positional-only parameter separator (PEP 570)"><span class="pre">/</span></abbr></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.zeros" title="Link to this definition">¶</a></dt>
+<dd><p>Create a zero-filled matrix.</p>
+</dd></dl>
+
+</dd></dl>
+
+</section>
+<section id="messaging">
+<h2>Messaging<a class="headerlink" href="#messaging" title="Link to this heading">¶</a></h2>
+<p>See the <a class="reference internal" href="messaging.html#messaging"><span class="std std-ref">Messaging</span></a> guide for a conceptual overview, the selective-receive
+pattern, timeouts, and a worked calculator example.</p>
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.send">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">send</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tag</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">contents</span></span></em>, <em class="sig-param"><span class="positional-only-separator o"><abbr title="Positional-only parameter separator (PEP 570)"><span class="pre">/</span></abbr></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.send" title="Link to this definition">¶</a></dt>
+<dd><p>Sends a message.</p>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.receive">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">receive</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tags</span></span></em>, <em class="sig-param"><span class="positional-only-separator o"><abbr title="Positional-only parameter separator (PEP 570)"><span class="pre">/</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">timeout</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">-1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">after</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.receive" title="Link to this definition">¶</a></dt>
+<dd><p>Receives a message.</p>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.set_tags">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">set_tags</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tags</span></span></em>, <em class="sig-param"><span class="positional-only-separator o"><abbr title="Positional-only parameter separator (PEP 570)"><span class="pre">/</span></abbr></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.set_tags" title="Link to this definition">¶</a></dt>
+<dd><p>Assigns tags to message queues.</p>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.drain">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">drain</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tags</span></span></em>, <em class="sig-param"><span class="positional-only-separator o"><abbr title="Positional-only parameter separator (PEP 570)"><span class="pre">/</span></abbr></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.drain" title="Link to this definition">¶</a></dt>
+<dd><p>Drains all messages for the given tags.</p>
+</dd></dl>
+
+<dl class="py data">
+<dt class="sig sig-object py" id="bocpy.TIMEOUT">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">TIMEOUT</span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'__timeout__'</span></span><a class="headerlink" href="#bocpy.TIMEOUT" title="Link to this definition">¶</a></dt>
+<dd><p>str(object=’’) -&gt; str
+str(bytes_or_buffer[, encoding[, errors]]) -&gt; str</p>
+<p>Create a new string object from the given object. If encoding or
+errors is specified, then the object must expose a data buffer
+that will be decoded using the given encoding and error handler.
+Otherwise, returns the result of object.__str__() (if defined)
+or repr(object).
+encoding defaults to sys.getdefaultencoding().
+errors defaults to ‘strict’.</p>
+</dd></dl>
+
+</section>
+<section id="c-abi">
+<h2>C ABI<a class="headerlink" href="#c-abi" title="Link to this heading">¶</a></h2>
+<p>See <a class="reference internal" href="c_abi.html#c-abi"><span class="std std-ref">C ABI</span></a> for the full usage contract for downstream C extensions
+that want to interoperate with bocpy at the C level.</p>
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.get_include">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">get_include</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.get_include" title="Link to this definition">¶</a></dt>
+<dd><p>Return the absolute path to the bocpy public C header root.</p>
+<p>Use the returned path as an additional <code class="docutils literal notranslate"><span class="pre">include_dirs</span></code> entry on a
+downstream <a class="reference external" href="https://setuptools.pypa.io/en/latest/userguide/ext_modules.html#setuptools.Extension" title="(in setuptools v82.0.1)"><code class="xref py py-class docutils literal notranslate"><span class="pre">setuptools.Extension</span></code></a> so its translation units
+can <code class="docutils literal notranslate"><span class="pre">#include</span> <span class="pre">&lt;bocpy/bocpy.h&gt;</span></code>. The directory contains a single
+<code class="docutils literal notranslate"><span class="pre">bocpy/</span></code> subdirectory holding the public ABI surface; bocpy’s
+private headers are not exposed.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Absolute filesystem path to the include root (the parent
+of the <code class="docutils literal notranslate"><span class="pre">bocpy/</span></code> subdirectory containing <code class="docutils literal notranslate"><span class="pre">bocpy.h</span></code> and
+<code class="docutils literal notranslate"><span class="pre">xidata.h</span></code>).</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">str</span></code></a></span></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.get_sources">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">get_sources</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.get_sources" title="Link to this definition">¶</a></dt>
+<dd><p>Return platform-specific extra C sources for downstream extensions.</p>
+<p>On Windows the returned list contains the absolute path to
+<code class="docutils literal notranslate"><span class="pre">bocpy_msvc.c</span></code>, which provides MSVC out-of-line bodies for the
+atomic ops declared in <code class="docutils literal notranslate"><span class="pre">&lt;bocpy/bocpy.h&gt;</span></code>. On non-Windows
+platforms the list is empty (<code class="docutils literal notranslate"><span class="pre">&lt;stdatomic.h&gt;</span></code> provides
+everything).</p>
+<dl class="field-list simple">
+<dt class="field-odd">Returns<span class="colon">:</span></dt>
+<dd class="field-odd"><p>A list of absolute paths to add to a downstream
+<a class="reference external" href="https://setuptools.pypa.io/en/latest/userguide/ext_modules.html#setuptools.Extension" title="(in setuptools v82.0.1)"><code class="xref py py-class docutils literal notranslate"><span class="pre">setuptools.Extension</span></code></a>’s <code class="docutils literal notranslate"><span class="pre">sources=</span></code> list.</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><span class="sphinx_autodoc_typehints-type"><a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#list" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">list</span></code></a>[<a class="reference external" href="https://docs.python.org/3/library/stdtypes.html#str" title="(in Python v3.14)"><code class="xref py py-class docutils literal notranslate"><span class="pre">str</span></code></a>]</span></p>
+</dd>
+</dl>
+</dd></dl>
+
+</section>
+</section>
+
+
+          </div>
+          
+        </div>
+      </div>
+      <div class="sphinxsidebar" role="navigation" aria-label="Main">
+        <div class="sphinxsidebarwrapper">
+            <p class="logo"><a href="index.html">
+              <img class="logo" src="_static/logo-200.svg" alt="Logo of bocpy"/>
+            </a></p>
+<h1 class="logo"><a href="index.html">bocpy</a></h1>
+
+
+
+
+
+
+
+
+
+<search id="searchbox" style="display: none" role="search">
+    <div class="searchformwrapper">
+    <form class="search" action="search.html" method="get">
+      <input type="text" name="q" aria-labelledby="searchlabel" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Search"/>
+      <input type="submit" value="Go" />
+    </form>
+    </div>
+</search>
+<script>document.getElementById('searchbox').style.display = "block"</script><h3>Navigation</h3>
+<p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="current reference internal" href="#">API</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#bocpy.__version__"><code class="docutils literal notranslate"><span class="pre">__version__</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="#behaviors">Behaviors</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#pinned-cowns">Pinned Cowns</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#noticeboard">Noticeboard</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#math">Math</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#messaging">Messaging</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#c-abi">C ABI</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="pinned_cowns.html">Pinned Cowns</a></li>
+<li class="toctree-l1"><a class="reference internal" href="noticeboard.html">Noticeboard</a></li>
+<li class="toctree-l1"><a class="reference internal" href="messaging.html">Messaging</a></li>
+<li class="toctree-l1"><a class="reference internal" href="c_abi.html">C ABI</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sbom.html">Software Bill of Materials (SBOM)</a></li>
+</ul>
+
+<div class="relations">
+<h3>Related Topics</h3>
+<ul>
+  <li><a href="index.html">Documentation overview</a><ul>
+      <li>Previous: <a href="index.html" title="previous chapter">bocpy documentation</a></li>
+      <li>Next: <a href="pinned_cowns.html" title="next chapter">Pinned Cowns</a></li>
+  </ul></li>
+</ul>
+</div>
+
+
+
+
+
+
+
+
+        </div>
+      </div>
+      <div class="clearer"></div>
+    </div>
+    <div class="footer">
+      &#169;2026, Microsoft.
+      
+      |
+      Powered by <a href="https://www.sphinx-doc.org/">Sphinx 9.1.0</a>
+      &amp; <a href="https://alabaster.readthedocs.io">Alabaster 1.0.0</a>
+      
+      |
+      <a href="_sources/api.rst.txt"
+          rel="nofollow">Page source</a>
+    </div>
+
+    
+
+    
+  </body>
+</html>

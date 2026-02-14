@@ -2070,7 +2070,7 @@ def wait(timeout: Optional[float] = None, *,
     """Block until all behaviors complete, with optional timeout.
 
     When ``stats=True``, captures the per-worker
-    :func:`_core.scheduler_stats` snapshot. When
+    ``_core.scheduler_stats`` snapshot. When
     ``noticeboard=True``, captures the noticeboard contents as a
     plain ``dict`` at the quiescence point (NOT after teardown — the
     two are equivalent in single-caller programs but the quiescence
@@ -2085,7 +2085,7 @@ def wait(timeout: Optional[float] = None, *,
     - both flags: :class:`WaitResult`.
 
     Internally a thin wrapper around :func:`quiesce` +
-    :meth:`Behaviors.stop`; quiescence timeout warns rather than
+    ``Behaviors.stop``; quiescence timeout warns rather than
     raising.
     """
     global BEHAVIORS

@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+
+<html lang="en" data-content_root="./">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>bocpy documentation &#8212; bocpy 0.9.0 documentation</title>
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=5ecbeea2" />
+    <link rel="stylesheet" type="text/css" href="_static/basic.css?v=b08954a9" />
+    <link rel="stylesheet" type="text/css" href="_static/alabaster.css?v=27fed22d" />
+    <script src="_static/documentation_options.js?v=39bb1c6d"></script>
+    <script src="_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <link rel="icon" href="_static/favicon.ico"/>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="API" href="api.html" />
+   
+  <link rel="stylesheet" href="_static/custom.css" type="text/css" />
+  
+
+  
+  
+
+  </head><body>
+  
+
+    <div class="document">
+      <div class="documentwrapper">
+        <div class="bodywrapper">
+          
+
+          <div class="body" role="main">
+            
+  <section id="bocpy-documentation">
+<h1>bocpy documentation<a class="headerlink" href="#bocpy-documentation" title="Link to this heading">¶</a></h1>
+<p><a class="reference external" href="https://github.com/microsoft/bocpy">bocpy</a> is a Python library implementing
+<strong>Behavior-Oriented Concurrency (BOC)</strong>.  Programmers wrap shared data in
+<strong>cowns</strong> (concurrently-owned objects) and schedule <strong>behaviors</strong> with the
+<code class="docutils literal notranslate"><span class="pre">&#64;when</span></code> decorator; the runtime runs each behavior once all of its required
+cowns are available, with deadlock freedom guaranteed by construction.  On
+Python 3.12 and newer, behaviors execute in parallel across worker
+sub-interpreters that each have their own GIL.</p>
+<p>For a hands-on introduction, see the
+<a class="reference external" href="https://microsoft.github.io/bocpy/">BOC tutorial</a>, the
+<a class="reference external" href="https://github.com/microsoft/bocpy#readme">project README</a>, and the
+<a class="reference external" href="https://github.com/microsoft/bocpy/tree/main/src/bocpy/examples">runnable examples</a>.
+The <a class="reference internal" href="api.html#api"><span class="std std-ref">API</span></a> page below documents every public symbol.</p>
+<section id="a-taste-of-boc">
+<h2>A taste of BOC<a class="headerlink" href="#a-taste-of-boc" title="Link to this heading">¶</a></h2>
+<p>The snippet below — a trimmed version of
+<a class="reference external" href="https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/bank.py">bocpy-bank</a>
+— shows the core concepts: data wrapped in <a class="reference internal" href="api.html#bocpy.Cown" title="bocpy.Cown"><code class="xref py py-class docutils literal notranslate"><span class="pre">Cown</span></code></a>s, a behavior
+scheduled with <a class="reference internal" href="api.html#bocpy.when" title="bocpy.when"><code class="xref py py-func docutils literal notranslate"><span class="pre">when()</span></code></a> that takes exclusive access to two cowns at once,
+and <a class="reference internal" href="api.html#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a> blocking the main thread until all behaviors have completed.
+The runtime acquires <code class="docutils literal notranslate"><span class="pre">src</span></code> and <code class="docutils literal notranslate"><span class="pre">dst</span></code> in a deadlock-free order, so
+<code class="docutils literal notranslate"><span class="pre">transfer</span></code> can safely mutate both accounts.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">bocpy</span><span class="w"> </span><span class="kn">import</span> <span class="n">Cown</span><span class="p">,</span> <span class="n">wait</span><span class="p">,</span> <span class="n">when</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">Account</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">balance</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">name</span> <span class="o">=</span> <span class="n">name</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">balance</span> <span class="o">=</span> <span class="n">balance</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">transfer</span><span class="p">(</span><span class="n">src</span><span class="p">:</span> <span class="n">Cown</span><span class="p">[</span><span class="n">Account</span><span class="p">],</span> <span class="n">dst</span><span class="p">:</span> <span class="n">Cown</span><span class="p">[</span><span class="n">Account</span><span class="p">],</span> <span class="n">amount</span><span class="p">:</span> <span class="nb">float</span><span class="p">):</span>
+    <span class="c1"># `@when` schedules `_` to run once both cowns are available.</span>
+    <span class="c1"># Inside, src.value and dst.value can be mutated safely —</span>
+    <span class="c1"># no other behavior can touch either account at the same time.</span>
+    <span class="nd">@when</span><span class="p">(</span><span class="n">src</span><span class="p">,</span> <span class="n">dst</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_</span><span class="p">(</span><span class="n">src</span><span class="p">,</span> <span class="n">dst</span><span class="p">):</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  transfer: </span><span class="si">{</span><span class="n">src</span><span class="o">.</span><span class="n">value</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2"> -&gt; </span><span class="si">{</span><span class="n">dst</span><span class="o">.</span><span class="n">value</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2"> (</span><span class="si">{</span><span class="n">amount</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">src</span><span class="o">.</span><span class="n">value</span><span class="o">.</span><span class="n">balance</span> <span class="o">&gt;=</span> <span class="n">amount</span><span class="p">:</span>
+            <span class="n">src</span><span class="o">.</span><span class="n">value</span><span class="o">.</span><span class="n">balance</span> <span class="o">-=</span> <span class="n">amount</span>
+            <span class="n">dst</span><span class="o">.</span><span class="n">value</span><span class="o">.</span><span class="n">balance</span> <span class="o">+=</span> <span class="n">amount</span>
+
+    <span class="nd">@when</span><span class="p">(</span><span class="n">dst</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_</span><span class="p">(</span><span class="n">dst</span><span class="p">):</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  </span><span class="si">{</span><span class="n">dst</span><span class="o">.</span><span class="n">value</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2"> now has </span><span class="si">{</span><span class="n">dst</span><span class="o">.</span><span class="n">value</span><span class="o">.</span><span class="n">balance</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+
+<span class="n">alice</span> <span class="o">=</span> <span class="n">Cown</span><span class="p">(</span><span class="n">Account</span><span class="p">(</span><span class="s2">&quot;Alice&quot;</span><span class="p">,</span> <span class="mi">100</span><span class="p">))</span>
+<span class="n">bob</span> <span class="o">=</span> <span class="n">Cown</span><span class="p">(</span><span class="n">Account</span><span class="p">(</span><span class="s2">&quot;Bob&quot;</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span>
+
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;scheduling first transfer&quot;</span><span class="p">)</span>
+<span class="n">transfer</span><span class="p">(</span><span class="n">alice</span><span class="p">,</span> <span class="n">bob</span><span class="p">,</span> <span class="mi">40</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;scheduling second transfer&quot;</span><span class="p">)</span>
+<span class="n">transfer</span><span class="p">(</span><span class="n">bob</span><span class="p">,</span> <span class="n">alice</span><span class="p">,</span> <span class="mi">10</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;main thread reaches wait()&quot;</span><span class="p">)</span>
+
+<span class="n">wait</span><span class="p">()</span>  <span class="c1"># block until every scheduled behavior has finished</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;all behaviors complete&quot;</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>Running it prints something like:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>python<span class="w"> </span>bank.py
+<span class="go">scheduling first transfer</span>
+<span class="go">scheduling second transfer</span>
+<span class="go">main thread reaches wait()</span>
+<span class="go">  transfer: Alice -&gt; Bob (40)</span>
+<span class="go">  Bob now has 40</span>
+<span class="go">  transfer: Bob -&gt; Alice (10)</span>
+<span class="go">  Alice now has 70</span>
+<span class="go">all behaviors complete</span>
+</pre></div>
+</div>
+<p>Note how the <code class="docutils literal notranslate"><span class="pre">scheduling</span> <span class="pre">…</span></code> lines all print <em>before</em> any behavior body
+runs: <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code> returns immediately, and the runtime only fires each
+behavior once its cowns are free.  The two transfers serialise on the
+<code class="docutils literal notranslate"><span class="pre">Alice</span></code>/<code class="docutils literal notranslate"><span class="pre">Bob</span></code> cowns, so their effects are interleaved in a deadlock-free,
+data-race-free order chosen by the runtime.</p>
+<p>For a non-tearing-down synchronization point — e.g. a parallel search that
+needs to inspect a best-so-far cown between rounds before continuing — use
+<a class="reference internal" href="api.html#bocpy.quiesce" title="bocpy.quiesce"><code class="xref py py-func docutils literal notranslate"><span class="pre">quiesce()</span></code></a> instead of <a class="reference internal" href="api.html#bocpy.wait" title="bocpy.wait"><code class="xref py py-func docutils literal notranslate"><span class="pre">wait()</span></code></a>. It blocks until the runtime is
+quiescent, optionally returns a stats or noticeboard snapshot, and leaves
+the worker pool and the noticeboard thread running so the next <code class="docutils literal notranslate"><span class="pre">&#64;when</span></code>
+call dispatches immediately.</p>
+<p>For cross-behavior shared state see <a class="reference internal" href="noticeboard.html#noticeboard"><span class="std std-ref">Noticeboard</span></a>. For lower-level
+Erlang-style <code class="docutils literal notranslate"><span class="pre">send</span></code> / <code class="docutils literal notranslate"><span class="pre">receive</span></code> channels see <a class="reference internal" href="messaging.html#messaging"><span class="std std-ref">Messaging</span></a>.</p>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api.html">API</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api.html#bocpy.__version__"><code class="docutils literal notranslate"><span class="pre">__version__</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="api.html#behaviors">Behaviors</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api.html#pinned-cowns">Pinned Cowns</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api.html#noticeboard">Noticeboard</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api.html#math">Math</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api.html#messaging">Messaging</a></li>
+<li class="toctree-l2"><a class="reference internal" href="api.html#c-abi">C ABI</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="pinned_cowns.html">Pinned Cowns</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="pinned_cowns.html#when-to-use-a-pinned-cown">When to Use a Pinned Cown</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pinned_cowns.html#pump-contract">Pump Contract</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pinned_cowns.html#the-coarse-grained-dispatch-pattern">The Coarse-Grained Dispatch Pattern</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pinned_cowns.html#integrating-with-an-event-loop">Integrating with an Event Loop</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pinned_cowns.html#starvation-and-the-watchdog">Starvation and the Watchdog</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pinned_cowns.html#main-thread-direct-reads">Main-thread Direct Reads</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pinned_cowns.html#thread-affinity-and-free-threaded-builds">Thread Affinity and Free-Threaded Builds</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pinned_cowns.html#handle-vs-value">Handle vs. Value</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pinned_cowns.html#mixed-request-sets">Mixed Request Sets</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pinned_cowns.html#exception-model">Exception Model</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pinned_cowns.html#free-threaded-trajectory">Free-Threaded Trajectory</a></li>
+<li class="toctree-l2"><a class="reference internal" href="pinned_cowns.html#api-reference">API Reference</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="noticeboard.html">Noticeboard</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="noticeboard.html#when-to-use-the-noticeboard">When to Use the Noticeboard</a></li>
+<li class="toctree-l2"><a class="reference internal" href="noticeboard.html#consistency-model">Consistency Model</a></li>
+<li class="toctree-l2"><a class="reference internal" href="noticeboard.html#worked-example-early-termination">Worked Example: Early Termination</a></li>
+<li class="toctree-l2"><a class="reference internal" href="noticeboard.html#reading-the-final-state-at-shutdown">Reading the Final State at Shutdown</a></li>
+<li class="toctree-l2"><a class="reference internal" href="noticeboard.html#reading-the-state-between-rounds">Reading the State Between Rounds</a></li>
+<li class="toctree-l2"><a class="reference internal" href="noticeboard.html#reading-the-noticeboard">Reading the Noticeboard</a></li>
+<li class="toctree-l2"><a class="reference internal" href="noticeboard.html#writing-and-updating">Writing and Updating</a></li>
+<li class="toctree-l2"><a class="reference internal" href="noticeboard.html#deleting-entries">Deleting Entries</a></li>
+<li class="toctree-l2"><a class="reference internal" href="noticeboard.html#notice-sync-testing-only"><code class="docutils literal notranslate"><span class="pre">notice_sync</span></code> (Testing Only)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="noticeboard.html#api-reference">API Reference</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="messaging.html">Messaging</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="messaging.html#concepts">Concepts</a></li>
+<li class="toctree-l2"><a class="reference internal" href="messaging.html#worked-example-calculator-service">Worked Example: Calculator Service</a></li>
+<li class="toctree-l2"><a class="reference internal" href="messaging.html#sending-custom-types-across-sub-interpreters">Sending Custom Types Across Sub-interpreters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="messaging.html#api-reference">API Reference</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="c_abi.html">C ABI</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="c_abi.html#when-do-i-need-this">When do I need this?</a></li>
+<li class="toctree-l2"><a class="reference internal" href="c_abi.html#quickstart">Quickstart</a></li>
+<li class="toctree-l2"><a class="reference internal" href="c_abi.html#abi-versioning">ABI versioning</a></li>
+<li class="toctree-l2"><a class="reference internal" href="c_abi.html#atomic-surface">Atomic surface</a></li>
+<li class="toctree-l2"><a class="reference internal" href="c_abi.html#ownership-helpers">Ownership helpers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="c_abi.html#proto-region-semantics">Proto-Region semantics</a></li>
+<li class="toctree-l2"><a class="reference internal" href="c_abi.html#xidata-ladder">XIData ladder</a></li>
+<li class="toctree-l2"><a class="reference internal" href="c_abi.html#safety-contract">Safety contract</a></li>
+<li class="toctree-l2"><a class="reference internal" href="c_abi.html#worked-example-bocpy-matrix">Worked example: <code class="docutils literal notranslate"><span class="pre">bocpy.Matrix</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="c_abi.html#consumer-modules-and-worker-sub-interpreters">Consumer modules and worker sub-interpreters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="c_abi.html#what-is-not-public">What is NOT public</a></li>
+<li class="toctree-l2"><a class="reference internal" href="c_abi.html#cpython-version-skew">CPython version skew</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="sbom.html">Software Bill of Materials (SBOM)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="sbom.html#at-a-glance">At a glance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sbom.html#what-the-sbom-contains">What the SBOM contains</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sbom.html#extracting-the-sbom-from-a-wheel">Extracting the SBOM from a wheel</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sbom.html#verifying-the-sbom-yourself">Verifying the SBOM yourself</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sbom.html#regenerating-an-sbom-by-hand">Regenerating an SBOM by hand</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sbom.html#wheel-integrity-validation">Wheel integrity validation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="sbom.html#see-also">See also</a></li>
+</ul>
+</li>
+</ul>
+</div>
+</section>
+</section>
+<section id="indices-and-tables">
+<h1>Indices and Tables<a class="headerlink" href="#indices-and-tables" title="Link to this heading">¶</a></h1>
+<ul class="simple">
+<li><p><a class="reference internal" href="genindex.html"><span class="std std-ref">Index</span></a></p></li>
+<li><p><a class="reference internal" href="py-modindex.html"><span class="std std-ref">Module Index</span></a></p></li>
+<li><p><a class="reference internal" href="search.html"><span class="std std-ref">Search Page</span></a></p></li>
+</ul>
+</section>
+
+
+          </div>
+          
+        </div>
+      </div>
+      <div class="sphinxsidebar" role="navigation" aria-label="Main">
+        <div class="sphinxsidebarwrapper">
+            <p class="logo"><a href="#">
+              <img class="logo" src="_static/logo-200.svg" alt="Logo of bocpy"/>
+            </a></p>
+<h1 class="logo"><a href="#">bocpy</a></h1>
+
+
+
+
+
+
+
+
+
+<search id="searchbox" style="display: none" role="search">
+    <div class="searchformwrapper">
+    <form class="search" action="search.html" method="get">
+      <input type="text" name="q" aria-labelledby="searchlabel" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Search"/>
+      <input type="submit" value="Go" />
+    </form>
+    </div>
+</search>
+<script>document.getElementById('searchbox').style.display = "block"</script><h3>Navigation</h3>
+<p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="api.html">API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="pinned_cowns.html">Pinned Cowns</a></li>
+<li class="toctree-l1"><a class="reference internal" href="noticeboard.html">Noticeboard</a></li>
+<li class="toctree-l1"><a class="reference internal" href="messaging.html">Messaging</a></li>
+<li class="toctree-l1"><a class="reference internal" href="c_abi.html">C ABI</a></li>
+<li class="toctree-l1"><a class="reference internal" href="sbom.html">Software Bill of Materials (SBOM)</a></li>
+</ul>
+
+<div class="relations">
+<h3>Related Topics</h3>
+<ul>
+  <li><a href="#">Documentation overview</a><ul>
+      <li>Next: <a href="api.html" title="next chapter">API</a></li>
+  </ul></li>
+</ul>
+</div>
+
+
+
+
+
+
+
+
+        </div>
+      </div>
+      <div class="clearer"></div>
+    </div>
+    <div class="footer">
+      &#169;2026, Microsoft.
+      
+      |
+      Powered by <a href="https://www.sphinx-doc.org/">Sphinx 9.1.0</a>
+      &amp; <a href="https://alabaster.readthedocs.io">Alabaster 1.0.0</a>
+      
+      |
+      <a href="_sources/index.rst.txt"
+          rel="nofollow">Page source</a>
+    </div>
+
+    
+
+    
+  </body>
+</html>
