@@ -1,0 +1,702 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <!-- Required meta tags -->
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>boc: Behavior-Oriented Concurrency for Python</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet"
+        integrity="sha384-9ndCyUaIbzAi2FUVXJi0CjmCapSmO7SnpJef0486qhLnuZ2cdeRhO02iuK6FUUVM" crossorigin="anonymous">
+    <link rel="stylesheet" href="scripts/highlight/styles/default.min.css">
+    <link rel="stylesheet" href="styles/boc.css">
+    <link rel="shortcut icon" href="favicon.png" type="image/png">
+    <link rel="icon" href="favicon.ico" type="image/ico">
+    <meta property="og:title" content="boc: Behavior-Oriented Concurrency for Python" />
+    <meta property="og:image" content="https://microsoft.github.io/bocpy/images/logo-1200.png" />
+    <meta property="og:url" content="https://microsoft.github.io/boc/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:description" content="The bocpy module provides behavior-oriented concurrency for Python." />
+    <meta property="og:locale" content="en_GB" />
+</head>
+
+<body>
+    <main>
+        <div class="container py-4">
+            <header class="pb-3 mb-4 border-bottom">
+                <img class="mb-2" src="images/logo-32.svg" width="24" height="24">
+                <span class="fs-4">boc</span>
+            </header>
+            <div class="mx-auto col-md-8">
+                <div class="container-fluid py-5 text-center">
+                    <img src="images/logo.svg" width="512" height="256" alt="boc python" class="img-fluid">
+                    <h1 class="lh-1 fw-semibold">Behavior-Oriented Concurrency in Python</h1>
+                    <p class="fs-4">Lock-less, Deadlock-free, Ownership-based</p>
+                    <p class="text-body-secondary mb-0">
+                        Currently <strong>v0.2.0</strong><span class="px-1">·</span><a
+                            href="https://github.com/microsoft/bocpy/releases">All releases</a>
+                    </p>
+                </div>
+            </div>
+            <div class="mx-auto col-md-8">
+                <div class="container-fluid py-5">
+                    <h1 class="lh-2 fw-semibold text-center">Getting Started</h1>
+                    <div>
+                        <pre><code class="language bash">pip install bocpy</code></pre>
+                    </div>
+
+                    <h1 class="lh-2 fw-semibold text-center">What is BOC?</h1>
+                    <p class="lead text-center">Behavior-oriented concurrency (<em>BOC</em>) is a new paradigm for
+                        parallel and concurrent programming which is particularly well-suited to Python</b></p>
+
+                    <p>In a BOC program, data is
+                        shared such that each behavior has unique temporal ownership of the data, removing
+                        the need for locks to coordinate access. For Python programmers, this brings a lot
+                        of benefits. Behaviors are implemented as decorated functions, and from the programmer's
+                        perspective, those functions work like normal. Importantly, the programmer's task
+                        shifts from solving concurrent data access problems to organizing data flow through
+                        functions. The resulting programs are easier to understand, easier to support, easier
+                        to extend, and unlock multi-core performance due to the ability to schedule behaviors
+                        to run efficiently across multiple processes.</p>
+
+                    <p>BOC has been implemented in several languages, including as a foundational aspect
+                        of the research language Verona, and now has been implemented in Python.</p>
+
+                    <p class="d-flex justify-content-start lead fw-normal">
+                        <a href="sphinx/index.html" class="icon-link icon-link-hover fw-semibold">
+                            Dive into the API
+                            <img class="bi" src="images/arrow-right.svg">
+                        </a>
+                    </p>
+                </div>
+            </div>
+            <nav class="navbar bg-body-tertiary sticky-top d-md-none">
+                <div class="container-fluid">
+                    <a class="navbar-brand" href="#tutorial">
+                        <img src="images/logo-32.svg" alt="" width="32" height="32"
+                        class="d-inline-block align-text-top">
+                        Tutorial
+                    </a>
+                    <button class="navbar-toggler" type="button" data-bs-toggle="collapse"
+                        data-bs-target="#navbarSupportedContent" aria-controls="navbarSupportedContent"
+                        aria-expanded="false" aria-label="Toggle navigation">
+                        <span class="navbar-toggler-icon"></span>
+                    </button>
+                    <div class="collapse navbar-collapse" id="navbarSupportedContent">
+                        <ul class="navbar-nav">
+                            <li class="nav-item"><a class="nav-link" href="#cooking-an-omelette">Let's Get Cooking!</a>
+                            </li>
+                            <li class="nav-item"><a class="nav-link" href="#cowns">Cowns</a></li>
+                            <li class="nav-item"><a class="nav-link" href="#behaviors">Behaviors</a></li>
+                            <li class="nav-item"><a class="nav-link" href="#cooking-with-boc">Cooking with BOC</a></li>
+                            <li class="nav-item"><a class="nav-link" href="#send-receive">Lock-Free Messaging</a></li>
+                            <li class="nav-item"><a class="nav-link" href="#matrix">Matrix</a></li>
+                        </ul>
+                    </div>
+            </nav>
+            <div class="row">
+                <div class="col-2">
+                    <nav id="tutorial-navbar" class="navbar sticky-top border-end d-none d-md-block">
+                        <a class="navbar-brand" href="#tutorial">
+                            <img src="images/logo-32.svg" alt="Logo" width="32" height="32"
+                            class="d-inline-block align-text-top">
+                            Tutorial
+                        </a>
+                        <ul class="nav nav-pills flex-column mt-2">
+                            <li class="nav-item"><a class="nav-link" href="#cooking-an-omelette">Let's Get Cooking!</a>
+                            </li>
+                            <li class="nav-item"><a class="nav-link" href="#cowns">Cowns</a></li>
+                            <li class="nav-item"><a class="nav-link" href="#behaviors">Behaviors</a></li>
+                            <li class="nav-item"><a class="nav-link" href="#cooking-with-boc">Cooking with BOC</a></li>
+                            <li class="nav-item"><a class="nav-link" href="#send-receive">Lock-Free Messaging</a></li>
+                            <li class="nav-item"><a class="nav-link" href="#matrix">Matrix</a></li>
+                        </ul>
+                    </nav>
+                </div>
+                <div id="tutorial" class="col-md-8" data-bs-spy="scroll" data-bs-target="#tutorial-navbar"
+                    data-bs-root-margin="0px 0px -40%">
+                    <section id="cooking-an-omelette" class="mb-5">
+                        <h1 class="lhd-2 fw-semibold text-center">Let's Get Cooking!</h1>
+                        <p>In this example, we are going to look at a program which simulates cooking an omelette:</p>
+                        <div>
+                            <pre><code class="language python"># first declare our resources
+
+onion = Ingredient("onion")
+pepper = Ingredient("pepper")
+eggs = Ingredient("egg", 3)
+cheese = Ingredient("cheese")
+knife = Utensil("knife")
+whisk = Utensil("whisk")
+grater = Utensil("grater")
+pan = Cookware("pan")
+
+# ...our recipe
+
+omelette = Recipe("omelette", {
+    "onion": "diced",
+    "pepper": "chopped",
+    "egg": "beaten",
+    "cheese": "grated"
+})
+
+# ...then our steps
+
+knife.dice(onion)
+knife.chop(pepper)
+whisk.beat(eggs)
+grater.grate(cheese)
+pan.cook(omelette, (onion, pepper,
+                    eggs, cheese))</code></pre>
+                        </div>
+                        <p>With only one cook, there is no problem. However, if we introduce a second cook into the
+                            kitchen,
+                            then we start having potential problems. In programming terms, if we make this
+                            single-threaded
+                            program concurrent, then the resources become shared, and we have to handle contention.
+                            After
+                            all, both cooks cannot use the knife at the same time! We also have to handle ordering of
+                            operations, to ensure the ingredients have been prepped before they are used. Let's
+                            reframe this program using this table below:</p>
+                        <div class="table-responsive-sm">
+                            <table class="table table-bordered">
+                                <thead>
+                                    <th></th>
+                                    <th class="text-center">Onion</th>
+                                    <th class="text-center">Pepper</th>
+                                    <th class="text-center">Eggs</th>
+                                    <th class="text-center">Cheese</th>
+                                    <th class="text-center">Knife</th>
+                                    <th class="text-center">Whisk</th>
+                                    <th class="text-center">Grater</th>
+                                    <th class="text-center">Pan</th>
+                                </thead>
+                                <tr>
+                                    <td>Dice Onion</td>
+                                    <td class="table-success"></td>
+                                    <td></td>
+                                    <td></td>
+                                    <td></td>
+                                    <td class="table-success"></td>
+                                    <td></td>
+                                    <td></td>
+                                    <td></td>
+                                </tr>
+                                <tr>
+                                    <td>Chop Pepper</td>
+                                    <td></td>
+                                    <td class="table-danger"></td>
+                                    <td></td>
+                                    <td></td>
+                                    <td class="table-danger"></td>
+                                    <td></td>
+                                    <td></td>
+                                    <td></td>
+                                </tr>
+                                <tr>
+                                    <td>Beat Eggs</td>
+                                    <td></td>
+                                    <td></td>
+                                    <td class="table-info"></td>
+                                    <td></td>
+                                    <td></td>
+                                    <td class="table-info"></td>
+                                    <td></td>
+                                    <td></td>
+                                </tr>
+                                <tr>
+                                    <td>Grate cheese</td>
+                                    <td></td>
+                                    <td></td>
+                                    <td></td>
+                                    <td class="table-warning"></td>
+                                    <td></td>
+                                    <td></td>
+                                    <td class="table-warning"></td>
+                                    <td></td>
+                                </tr>
+                                <tr>
+                                    <td>Cook Omelette</td>
+                                    <td class="table-primary"></td>
+                                    <td class="table-primary"></td>
+                                    <td class="table-primary"></td>
+                                    <td class="table-primary"></td>
+                                    <td></td>
+                                    <td></td>
+                                    <td></td>
+                                    <td class="table-primary"></td>
+                                </tr>
+                            </table>
+                        </div>
+
+                        <p>Ideally, we want our cooks to work in parallel, so as to reduce time to breakfast,
+                            something
+                            like
+                            this:</p>
+
+                        <table class="table text-center fw-bold table-bordered">
+                            <tr>
+                                <td class="table-dark">Cook 1</td>
+                                <td class="table-success">Dice Onion</td>
+                                <td class="table-warning"> Grate Cheese</td>
+                                <td></td>
+                            </tr>
+                            <tr>
+                                <td class="table-dark">Cook 2</td>
+                                <td class="table-info">Beat Eggs</td>
+                                <td class="table-danger">Chop Pepper</td>
+                                <td class="table-primary">Cook Omelette</td>
+                            </tr>
+                        </table>
+
+                        <p>If we were to code this using traditional threads and locks, we may write it like this:</p>
+
+                        <div>
+                            <pre><code class="language python">def cook1():
+    with onion.lock:
+        with knife.lock:
+            knife.dice(onion)
+
+    with cheese.lock:
+        with grater.lock:
+            grater.grate(cheese)
+
+
+def wait_until_ready(ingredient: Ingredient,
+                     state: str):
+    with ingredient.lock:
+        if ingredient.state == state:
+            return
+
+    with ingredient.condition:
+        while ingredient.state != state:
+            ingredient.condition.wait()
+
+def cook2():
+    with eggs.lock:
+        with whisk.lock:
+            whisk.beat(eggs)
+
+    with pepper.lock:
+        with knife.lock:
+            knife.chop(pepper)
+
+    wait_until_ready(onion, "diced")
+    wait_until_ready(cheese, "grated")
+
+    with onion.lock:
+        with pepper.lock:
+            with eggs.lock:
+                with cheese.lock:
+                    with pan.lock:
+                        pan.cook(omelette,
+                                 (onion,
+                                  pepper,
+                                  eggs,
+                                  cheese))</code></pre>
+                        </div>
+
+                        <p>There is a lot going on all of a sudden! First and foremost we see the need to explicitly
+                            split
+                            up
+                            tasks between worker threads. There are ways to do this automatically of course
+                            (e.g., producer/consumer queues) but for the sake of simplification we have
+                            divvied up the work optimally between the two cooks. Secondly, we have the need to acquire
+                            and
+                            release locks. This is fairly straightforward for cook 1, but because cook 2 has to cook the
+                            omelette they have the additional task of waiting until the other ingredients have been
+                            prepared
+                            by cook 1. This requires an additional <code>Condition</code> variable on each ingredient to
+                            allow
+                            cook 1 to be notified of changes to the ingredient's state. This example is presented in
+                            full
+                            working
+                            form <a href="https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/cooking_threads.py">on Github</a>.
+                            It all works, but we believe there is a simpler and more intuitive way to code this program
+                            <em class="text-primary">cowns</em> and <em class="text-primary">behaviors</em>
+                        </p>
+                    </section>
+                    <section id="cowns" class="mb-5">
+                        <h1 class="lhd-2 fw-semibold text-center">cowns</h1>
+                        <p>A concurrent-owned variable (<em>cown</em>) ensures that only one thread of execution can
+                            access
+                            its contents at a time. In particular, this is enforced at the level of Python's GIL,
+                            meaning a
+                            cown can only be accessed by one interpreter at a time. However, the reference to a cown can
+                            be
+                            shared between multiple processes. Under the hood, cowns use
+                            <a href="https://docs.python.org/3/library/concurrent.interpreters.html">Python's
+                                cross-interpreter
+                                data API</a> to allow data to safely move across interpreter boundaries. Take the
+                            scenario
+                            below, for example, in which you have a cown that is referenced by two different
+                            interpreters.
+                        </p>
+                        <div class="text-center">
+                            <img src="images/cowns_0.svg" width="512" height="288" class="img-fluid"
+                                alt="diagram showing two interpreters with pointers to a shared cown." />
+                        </div>
+
+                        <p>At this stage, the cown contains the data in cross-interpreter data, or <em>XIData</em>,
+                            form.
+                        </p>.
+
+                        <div class="text-center">
+                            <img src="images/cowns_1.svg" width="512" height="288" class="img-fluid"
+                                alt="diagram showing two interpreters with pointers to a shared cown." />
+                        </div>
+
+                        <p>When Interpreter A calls <b><code>acquire</code></b>, the cown changes ownership and its
+                            contents
+                            are used to create a new object which can be manipulated normally.</p>
+
+                        <div class="text-center">
+                            <img src="images/cowns_2.svg" width="512" height="288" class="img-fluid"
+                                alt="diagram showing two interpreters with pointers to a shared cown." />
+                        </div>
+
+                        <p>If Interpreter B attempts to acquire the cown while it is owned by Interpreter A, this will
+                            result
+                            in an exception being thrown. Only one interpreter is allowed temporal ownership of the
+                            cown.
+                        </p>
+
+                        <div class="text-center">
+                            <img src="images/cowns_3.svg" width="512" height="288" class="img-fluid"
+                                alt="diagram showing two interpreters with pointers to a shared cown." />
+                        </div>
+
+                        <p> Interpreter A changes the data in the cown and then releases it.</p>
+
+                        <div class="text-center">
+                            <img src="images/cowns_4.svg" width="512" height="288" class="img-fluid"
+                                alt="diagram showing two interpreters with pointers to a shared cown." />
+                        </div>
+
+                        <p> Now that Interpreter A has released it, the cown is ready to be acquired again.</p>
+                    </section>
+                    <section id="behaviors" class="mb-5">
+                        <h1 class="lhd-2 fw-semibold text-center">Behaviors</h1>
+                        <p>A behavior is a block of code which requires zero or more cowns to be acquired before it can
+                            be
+                            run. In Python using the <code>boc</code> library, you define this using the
+                            <code>@when</code>
+                            decorator:
+                        </p>
+                        <div>
+                            <pre><code class="language python">@when(onion, knife)
+def dice_onion(onion: Cown, knife: Cown):
+    knife.value.dice(onion.value)</code></pre>
+                        </div>
+                        <p>Note a couple of things here. First, we have the decorator, which lists the cowns that the
+                            upon which the behavior depends. Next, we have a normal function declaration, which has
+                            the same number of arguments as were passed to the decorator. Finally, note how we need to
+                            access the value inside the cown using the <code>value</code> attribute. Once declared, the
+                            behavior is automatically scheduled to be run on the next available worker once its cowns
+                            are available. Behaviors have some other interesting properties. One thing you can do is
+                            have
+                            a behavior which spawns another behavior:</p>
+                        <div>
+                            <pre><code class="language python">@when(onion, knife)
+def dice_onion(onion: Cown, knife: Cown):
+    knife.value.dice(onion.value)
+    @when()
+    def _():
+        print("The onion is diced")</code></pre>
+                        </div>
+                        <p>Here we have a behavior which spawns another behavior to report on the status of the onion
+                            in a way that doesn't block the execution of the main behavior. Since this report does not
+                            need to read or modify the state of the cowns, it can be scheduled without any dependencies
+                            and will run once there is a free worker, but after the currently acquired cowns have been
+                            released. What if a behavior throws an exception?
+                        </p>
+                        <div>
+                            <pre><code class="language python">@when(onion, knife)
+def grate_onion(onion: Cown, knife: Cown):
+    knife.value.grate(onion.value)
+
+@when(grate_onion)
+def _(result):
+    if isinstance(result.value, Exception):
+        print("Exception while grating onion:",
+              result.value)
+        result.value = None</code></pre>
+                        </div>
+                        <p>
+                            Here we show how we can schedule work over the result of a behavior. Here we use it to
+                            handle
+                            an exception, but we could also use it to get the result of a calculation and use it to
+                            schedule additional work (in combination with the results of other calculations). We will
+                            see
+                            this mechanism in use as we look at the cooking example rewritten to use cowns and
+                            behaviors.
+                    </section>
+
+                    <section id="cooking-with-boc" class="mb-5">
+                        <h1 class="lhd-2 fw-semibold text-center">Cooking with BOC</h1>
+                        <p>Now that we've explained the concepts behind cowns and behaviors, let's see how we put them
+                            together
+                            to rewrite the cooking example:
+                        </p>
+                        <div>
+                            <pre><code class="language python"># set up our resources, this time as cowns
+
+onion = Cown(Ingredient("onion"))
+pepper = Cown(Ingredient("pepper"))
+eggs = Cown(Ingredient("egg", 3))
+cheese = Cown(Ingredient("cheese"))
+knife = Cown(Utensil("knife"))
+whisk = Cown(Utensil("whisk"))
+grater = Cown(Utensil("grater"))
+pan = Cown(Cookware("pan"))
+
+# ...our recipe is immutable, thus
+# no need for coordination
+
+omelette = Recipe("omelette", {
+    "onion": "diced",
+    "pepper": "chopped",
+    "egg": "beaten",
+    "cheese": "grated"
+})
+
+# ...declare each step as a behavior
+
+@when(knife, onion)
+def dice_onion(knife, onion):
+    knife.value.dice(onion.value)
+
+@when(knife, pepper)
+def chop_pepper(knife, pepper):
+    knife.value.chop(pepper.value)
+
+@when(whisk, eggs)
+def beat_eggs(whisk, eggs):
+    whisk.value.beat(eggs.value)
+
+@when(grater, cheese)
+def grate_cheese(grater, cheese):
+    grater.value.grate(cheese.value)
+
+@when(onion, pepper, eggs, cheese, pan)
+def cook_omelette(onion, pepper,
+                  eggs, cheese, pan):
+    pan.value.cook(omelette, (onion.value,
+                              pepper.value,
+                              eggs.value,
+                              cheese.value))
+
+# ...then wait for all behaviors to complete
+wait()</code></pre>
+                        </div>
+                        <p>First, we can see that the program becomes much simpler to express: no locks.
+                            Instead, each resource is wrapped in a cown. Note that the recipe does not
+                            need to be wrapped in a Cown. As it is immutable, it can be safely used and
+                            does not require coordination. The second change is that every
+                            action we need to take that depends on resources explicitly declares which
+                            resources it needs (using the <code>@when</code> decorator). Furthermore,
+                            the ordering of the behaviors as they are declared determines the scheduling
+                            of the behaviors. In a situation like this, it means that all the ingredient
+                            behaviors will execute before <code>cook_omelette</code>. The result is a
+                            clean program that is easy to read and reason about. You can view the full
+                            example
+                            <a href="https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/cooking_boc.py">on Github.</a>
+                            In fact, you can view many more examples of what you can do with BOC,
+                            in the examples section of our
+                            <a href="https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples">Github repository</a>
+                        </p>
+                    </section>
+
+                    <section id="send-receive" class="mb-5">
+                        <h1 class="lhd-2 fw-semibold text-center">Lock-free Messaging</h1>
+                        <p>One of the enabling technologies for BOC is Erlang-style <code>send</code> and
+                            selective <code>receive</code>. These functions are implemented under the hood
+                            using a fast, non-blocking concurrent queue implementation in C. We
+                            expose them to end users for general use as they provide a convenient
+                            means of communication across threads and subinterpreters.
+                            The <code>send</code> function is always non-blocking, and involves <em>tag</em>,
+                            which acts like a mailbox where messages will be sent, and <em>contents</em>,
+                            which can be any object that can safely be sent between interpreters using
+                            the cross-interpreter API (with a <code>pickle</code> fallback). Here is an
+                            example of a send message:
+                        <p>
+                        <div>
+                            <pre><code class="language python">send("calculator", ("+", 5))</code></pre>
+                        </div>
+                        <p>
+                            Each of these messages can be received by a <code>receive</code> command.
+                            What may be different if you have not encountered <em>selective</em>
+                            <code>receive</code> before is that the receive command can specify which
+                            tags it is willing to receive, for example:
+                        </p>
+                        <div>
+                            <pre><code class="language python">match receive("calculator"):
+    case [_, ("+", x)]:
+        num_operations += 1
+        value += x
+
+    case [_, ("-", x)]:
+        num_operations += 1
+        value -= x
+
+    case [_, ("*", x)]:
+        num_operations += 1
+        value *= x
+
+    case [_, ("/", x)]:
+        num_operations += 1
+        value /= x</code></pre>
+                        </div>
+                        <p>The <code>match</code> statement provides a particular well-suited way
+                            to handle the results of a call to <code>receive</code>, as you can see here.
+                            In addition to a simple blocking call, <code>receive</code> also accepts a
+                            timeout, in which case a message will be returned with a special tag, for
+                            example:
+                        </p>
+                        <div>
+                            <pre><code class="language python">def after():
+    return "calculator", ("print", True)
+
+while running:
+    match receive("calculator", timeout, after):
+
+        # other cases...
+
+        case [_, ("print", timeout)]:
+            if timeout:
+                print("Timed out")
+
+            print("Total operations:", num_operations)
+            print("Final value:", value)
+            running = False</code></pre>
+                        </div>
+                        <p>The <code>after</code> callback gives you the ability to specify what the return
+                            value of <code>receive</code> should be when it times out.</p>
+                        <p>If you want to learn more about how <code>send</code> and <code>receive</code>
+                            can be used, please take a look at the
+                            <a href="https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/calculator.py">calculator example</a>.
+                        </p>
+                    </section>
+
+                    <section id="matrix" class="mb-5">
+                        <h1 class="lhd-2 fw-semibold text-center">Matrix</h1>
+                        <p>The <code>boc</code> library includes a built-in <code>Matrix</code> class:
+                            a dense 2-D matrix of double-precision floats backed entirely by C.
+                            Because the underlying data lives outside the Python heap, a
+                            <code>Matrix</code> can be placed inside a <code>Cown</code> and safely shared
+                            between interpreters with zero-copy overhead.
+                        </p>
+
+                        <h3>Creating matrices</h3>
+                        <div>
+                            <pre><code class="language python">from boc import Matrix
+
+# 2 x 3 zero-filled
+a = Matrix(2, 3)
+
+# from a flat list (row-major order)
+b = Matrix(2, 3, [1, 2, 3, 4, 5, 6])
+
+# convenience constructors
+zeros = Matrix.zeros((3, 3))
+ones  = Matrix.ones((2, 4))
+rnd   = Matrix.uniform(0, 1, (3, 3))
+vec   = Matrix.vector([1, 2, 3])</code></pre>
+                        </div>
+
+                        <h3>Arithmetic</h3>
+                        <p><code>Matrix</code> supports the familiar element-wise operators
+                            (<code>+</code>, <code>-</code>, <code>*</code>, <code>/</code>)
+                            as well as matrix multiplication with <code>@</code>:</p>
+                        <div>
+                            <pre><code class="language python">c = a + b          # element-wise add
+d = a * 2          # scalar broadcast
+e = a @ b.T        # matrix multiply
+                   # (b transposed)
+a += ones          # in-place add</code></pre>
+                        </div>
+
+                        <h3>Indexing and slicing</h3>
+                        <p>You can index with integers, slices, or <code>(row, col)</code> tuples:</p>
+                        <div>
+                            <pre><code class="language python">row   = b[0]       # first row as a 1 x 3 Matrix
+elem  = b[1, 2]    # element at row 1, column 2
+b[0]  = [7, 8, 9]  # replace an entire row</code></pre>
+                        </div>
+
+                        <h3>Reductions and transforms</h3>
+                        <div>
+                            <pre><code class="language python">total = b.sum()            # scalar sum of all elements
+col_means = b.mean(axis=0) # column-wise means
+t = b.T                    # transpose (property)
+clamped = b.clip(0, 1)     # clamp every element to [0, 1]</code></pre>
+                        </div>
+
+                        <h3>Using Matrix with cowns</h3>
+                        <p>Because a <code>Matrix</code> is cross-interpreter-safe, it works
+                            naturally with <code>Cown</code> and <code>@when</code>:</p>
+                        <div>
+                            <pre><code class="language python">from boc import Cown, when, wait
+
+positions  = Cown(Matrix.uniform(0, 100, (50, 2)))
+velocities = Cown(Matrix.normal(0, 1, (50, 2)))
+
+@when(positions, velocities)
+def step(pos, vel):
+    pos.value += vel.value
+
+wait()</code></pre>
+                        </div>
+                        <p>This pattern is used extensively in the
+                            <a href="https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/boids.py">boids
+                                flocking simulation</a>, where hundreds of agents update their
+                            positions and velocities concurrently across multiple interpreters.
+                        </p>
+                        <p class="d-flex justify-content-start lead fw-normal">
+                            <a href="sphinx/api.html#bocpy.Matrix" class="icon-link icon-link-hover fw-semibold">
+                                Full Matrix API reference
+                                <img class="bi" src="images/arrow-right.svg">
+                            </a>
+                        </p>
+                    </section>
+                </div>
+            </div>
+
+            <footer class="rc-footer py-4 py-md-5 mt-5 bg-body-tertiary">
+                <div class="container">
+                    <div class="row">
+                        <div class="col-md-6 mb-3">
+                            <a class="d-inline-flex align-items-center mb-2 text-body-emphasis text-decoration-none"
+                                href="/" aria-label="boc">
+                                <img src="images/logo-32.svg" class="d-block me-2" width="32" height="32" alt="boc">
+                                <span class="fs-5">boc</span>
+                            </a>
+                            <ul class="list-unstyled small">
+                                <li class="mb-2">Designed and built by the boc team.</li>
+                                <li class="mb-2">&copy; Microsoft 2026.</li>
+                                <li class="mb-2">Code licensed MIT, docs CC BY 3.0</li>
+                                <li class="mb-2">Currently v0.2.0</li>
+                            </ul>
+                        </div>
+                        <div class="col-md-6 mb-3">
+                            <h5>Links</h5>
+                            <ul class="list-unstyled">
+                                <li class="mb2"><a href="sphinx/index.html">Python API</a></li>
+                                <li class="mb2"><a href="https://github.com/microsoft/bocpy">Github</a></li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </footer>
+
+            <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet"
+                integrity="sha384-T3c6CoIi6uLrA9TneNEoa7RxnatzjcDSCmG1MXxSR1GAsXEV/Dwwykc2MPK8M2HN"
+                crossorigin="anonymous">
+            <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"
+                integrity="sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL"
+                crossorigin="anonymous"></script>
+            <script src="scripts/highlight/highlight.min.js"></script>
+            <script>hljs.highlightAll();</script>
+    </main>
+</body>
+
+</html>
