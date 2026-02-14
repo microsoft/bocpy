@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+
+<html lang="en" data-content_root="./">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>API &#8212; bocpy 0.2.2 documentation</title>
+    <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=5ecbeea2" />
+    <link rel="stylesheet" type="text/css" href="_static/basic.css?v=b08954a9" />
+    <link rel="stylesheet" type="text/css" href="_static/alabaster.css?v=27fed22d" />
+    <script src="_static/documentation_options.js?v=000c92bf"></script>
+    <script src="_static/doctools.js?v=9bcbadda"></script>
+    <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
+    <link rel="icon" href="_static/favicon.ico"/>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="prev" title="bocpy documentation" href="index.html" />
+   
+  <link rel="stylesheet" href="_static/custom.css" type="text/css" />
+  
+
+  
+  
+
+  </head><body>
+  
+
+    <div class="document">
+      <div class="documentwrapper">
+        <div class="bodywrapper">
+          
+
+          <div class="body" role="main">
+            
+  <section id="api">
+<span id="id1"></span><h1>API<a class="headerlink" href="#api" title="Link to this heading">¶</a></h1>
+<p id="module-bocpy">This part of the documentation covers all the interfaces of <cite>bocpy</cite>.</p>
+<section id="behaviors">
+<h2>Behaviors<a class="headerlink" href="#behaviors" title="Link to this heading">¶</a></h2>
+<dl class="py class">
+<dt class="sig sig-object py" id="bocpy.Cown">
+<em class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">Cown</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">value</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Cown" title="Link to this definition">¶</a></dt>
+<dd><p>Lightweight wrapper around the underlying cown capsule.</p>
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Cown.acquire">
+<span class="sig-name descname"><span class="pre">acquire</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Cown.acquire" title="Link to this definition">¶</a></dt>
+<dd><p>Acquires the cown (required for reading and writing).</p>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="bocpy.Cown.acquired">
+<em class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">acquired</span></span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">bool</span></span></span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">bool</span></em><a class="headerlink" href="#bocpy.Cown.acquired" title="Link to this definition">¶</a></dt>
+<dd><p>Whether the cown is currently acquired.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Cown.release">
+<span class="sig-name descname"><span class="pre">release</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Cown.release" title="Link to this definition">¶</a></dt>
+<dd><p>Releases the cown.</p>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="bocpy.Cown.value">
+<em class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">value</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">value</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">T</span></span></em><span class="sig-paren">)</span><em class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">T</span></em><a class="headerlink" href="#bocpy.Cown.value" title="Link to this definition">¶</a></dt>
+<dd><p>Return the current stored value.</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.wait">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">wait</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">timeout</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.wait" title="Link to this definition">¶</a></dt>
+<dd><p>Block until all behaviors complete, with optional timeout.</p>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.when">
+<span class="sig-prename descclassname"><span class="pre">&#64;</span></span><span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">when</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">cowns</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.when" title="Link to this definition">¶</a></dt>
+<dd><p>Decorator to schedule a function as a behavior using given cowns.</p>
+<p>This decorator takes a list of zero or more cown objects, which will be passed in the order
+in which they were provided to the decorated function. The function itself is extracted and
+run as a behavior once all the cowns are available (i.e., not acquired by other behaviors).
+Behaviors are scheduled such that deadlock will not occur.</p>
+<p>The function itself will be replaced by a Cown which will hold the
+result of executing the behavior. This Cown can be used for further
+coordination.</p>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.start">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">start</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">worker_count</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">export_dir</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">module</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.start" title="Link to this definition">¶</a></dt>
+<dd><p>Start the behavior scheduler and worker pool.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>worker_count</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – The number of worker interpreters to start.  If
+None, defaults to the number of available cores minus one.</p></li>
+<li><p><strong>export_dir</strong> (<em>Optional</em><em>[</em><em>str</em><em>]</em>) – The directory to which the target module will be
+exported for worker import.  If None, a temporary directory will
+be created and removed on shutdown.</p></li>
+<li><p><strong>module</strong> (<em>Optional</em><em>[</em><em>tuple</em><em>[</em><em>str</em><em>, </em><em>str</em><em>]</em><em>]</em>) – A tuple of the target module name and file path to export
+for worker import.  If None, the caller’s module will be used.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+</section>
+<section id="math">
+<h2>Math<a class="headerlink" href="#math" title="Link to this heading">¶</a></h2>
+<dl class="py class">
+<dt class="sig sig-object py" id="bocpy.Matrix">
+<em class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></em><span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">Matrix</span></span><a class="headerlink" href="#bocpy.Matrix" title="Link to this definition">¶</a></dt>
+<dd><p>A dense 2-D matrix of double-precision floats backed by a C implementation.</p>
+<p>Supports element-wise arithmetic (<code class="docutils literal notranslate"><span class="pre">+</span></code>, <code class="docutils literal notranslate"><span class="pre">-</span></code>, <code class="docutils literal notranslate"><span class="pre">*</span></code>, <code class="docutils literal notranslate"><span class="pre">/</span></code>), matrix
+multiplication (<code class="docutils literal notranslate"><span class="pre">&#64;</span></code>), in-place variants (<code class="docutils literal notranslate"><span class="pre">+=</span></code>, <code class="docutils literal notranslate"><span class="pre">-=</span></code>, <code class="docutils literal notranslate"><span class="pre">*=</span></code>, <code class="docutils literal notranslate"><span class="pre">/=</span></code>),
+unary <code class="docutils literal notranslate"><span class="pre">-</span></code> and <code class="docutils literal notranslate"><span class="pre">abs()</span></code>, and subscript indexing with integers or slices.</p>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.Matrix.T">
+<span class="sig-name descname"><span class="pre">T</span></span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="s"><span class="pre">'Matrix'</span></span></span></span><a class="headerlink" href="#bocpy.Matrix.T" title="Link to this definition">¶</a></dt>
+<dd><p>Return a new matrix that is the transpose of this one.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.__init__">
+<span class="sig-name descname"><span class="pre">__init__</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rows</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">columns</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">values</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">float</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.__init__" title="Link to this definition">¶</a></dt>
+<dd><p>Create a new <em>rows</em> x <em>columns</em> matrix.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>rows</strong> – Number of rows (must be ≥ 1).</p></li>
+<li><p><strong>columns</strong> – Number of columns (must be ≥ 1).</p></li>
+<li><p><strong>values</strong> – Initial values.  May be <code class="docutils literal notranslate"><span class="pre">None</span></code> (zero-filled), a scalar
+(broadcast to every element), or a flat sequence of <em>rows</em> x <em>columns</em>
+numbers in row-major order.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.abs">
+<span class="sig-name descname"><span class="pre">abs</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="s"><span class="pre">'Matrix'</span></span></span></span><a class="headerlink" href="#bocpy.Matrix.abs" title="Link to this definition">¶</a></dt>
+<dd><p>Return a new matrix with the absolute value of every element.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.Matrix.acquired">
+<span class="sig-name descname"><span class="pre">acquired</span></span><a class="headerlink" href="#bocpy.Matrix.acquired" title="Link to this definition">¶</a></dt>
+<dd><p>Whether the matrix is currently acquired.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.allclose">
+<em class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">allclose</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">lhs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'Matrix'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rhs</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="s"><span class="pre">'Matrix'</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rtol</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1e-05</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">atol</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1e-08</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">equal_nan</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.allclose" title="Link to this definition">¶</a></dt>
+<dd><p>Check whether two matrices are element-wise equal within a tolerance.</p>
+<p>Uses the formula <code class="docutils literal notranslate"><span class="pre">|a</span> <span class="pre">-</span> <span class="pre">b|</span> <span class="pre">&lt;=</span> <span class="pre">atol</span> <span class="pre">+</span> <span class="pre">rtol</span> <span class="pre">*</span> <span class="pre">|b|</span></code> for each element pair.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>lhs</strong> – First matrix.</p></li>
+<li><p><strong>rhs</strong> – Second matrix (must have the same shape as <em>lhs</em>).</p></li>
+<li><p><strong>rtol</strong> – Relative tolerance.</p></li>
+<li><p><strong>atol</strong> – Absolute tolerance.</p></li>
+<li><p><strong>equal_nan</strong> – If <code class="docutils literal notranslate"><span class="pre">True</span></code>, two <code class="docutils literal notranslate"><span class="pre">NaN</span></code> values are considered equal.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p><code class="docutils literal notranslate"><span class="pre">True</span></code> if every element pair satisfies the tolerance.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.ceil">
+<span class="sig-name descname"><span class="pre">ceil</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="s"><span class="pre">'Matrix'</span></span></span></span><a class="headerlink" href="#bocpy.Matrix.ceil" title="Link to this definition">¶</a></dt>
+<dd><p>Return a new matrix with each element rounded up to the nearest integer.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.clip">
+<span class="sig-name descname"><span class="pre">clip</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">min_or_maxval</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">maxval</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="s"><span class="pre">'Matrix'</span></span></span></span><a class="headerlink" href="#bocpy.Matrix.clip" title="Link to this definition">¶</a></dt>
+<dd><p>Clip every element to a given range.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>min_or_maxval</strong> – If <em>maxval</em> is provided, this is the minimum
+clipping value.  Otherwise, this is the maximum and the minimum
+defaults to zero.</p></li>
+<li><p><strong>maxval</strong> – The maximum clipping value, or <code class="docutils literal notranslate"><span class="pre">None</span></code> to treat
+<em>min_or_maxval</em> as the maximum.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>A new clipped <a class="reference internal" href="#bocpy.Matrix" title="bocpy.Matrix"><code class="xref py py-class docutils literal notranslate"><span class="pre">Matrix</span></code></a>.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.Matrix.columns">
+<span class="sig-name descname"><span class="pre">columns</span></span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">int</span></span></span><a class="headerlink" href="#bocpy.Matrix.columns" title="Link to this definition">¶</a></dt>
+<dd><p>The number of columns in the matrix.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.concat">
+<em class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">concat</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">values</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'Matrix'</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">int</span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">axis</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="s"><span class="pre">'Matrix'</span></span></span></span><a class="headerlink" href="#bocpy.Matrix.concat" title="Link to this definition">¶</a></dt>
+<dd><p>Concatenate matrices along the given axis.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>values</strong> – The matrices or sequences to concatenate.</p></li>
+<li><p><strong>axis</strong> – <code class="docutils literal notranslate"><span class="pre">0</span></code> to concatenate vertically (stack rows),
+<code class="docutils literal notranslate"><span class="pre">1</span></code> to concatenate horizontally (stack columns).</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>A new <a class="reference internal" href="#bocpy.Matrix" title="bocpy.Matrix"><code class="xref py py-class docutils literal notranslate"><span class="pre">Matrix</span></code></a> containing the concatenated data.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.copy">
+<span class="sig-name descname"><span class="pre">copy</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="s"><span class="pre">'Matrix'</span></span></span></span><a class="headerlink" href="#bocpy.Matrix.copy" title="Link to this definition">¶</a></dt>
+<dd><p>Return a deep copy of this matrix.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.floor">
+<span class="sig-name descname"><span class="pre">floor</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="s"><span class="pre">'Matrix'</span></span></span></span><a class="headerlink" href="#bocpy.Matrix.floor" title="Link to this definition">¶</a></dt>
+<dd><p>Return a new matrix with each element rounded down to the nearest integer.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.magnitude">
+<span class="sig-name descname"><span class="pre">magnitude</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">axis</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="s"><span class="pre">'Matrix'</span></span></span></span><a class="headerlink" href="#bocpy.Matrix.magnitude" title="Link to this definition">¶</a></dt>
+<dd><p>Euclidean magnitude (L2 norm) of matrix elements.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>axis</strong> – If <code class="docutils literal notranslate"><span class="pre">None</span></code>, return the total magnitude as a float.
+If <code class="docutils literal notranslate"><span class="pre">0</span></code>, return a 1 x <em>columns</em> row vector of column magnitudes.
+If <code class="docutils literal notranslate"><span class="pre">1</span></code>, return a <em>rows</em> x 1 column vector of row magnitudes.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.max">
+<span class="sig-name descname"><span class="pre">max</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">axis</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="s"><span class="pre">'Matrix'</span></span></span></span><a class="headerlink" href="#bocpy.Matrix.max" title="Link to this definition">¶</a></dt>
+<dd><p>Maximum of matrix elements.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>axis</strong> – If <code class="docutils literal notranslate"><span class="pre">None</span></code>, return the overall maximum as a float.
+If <code class="docutils literal notranslate"><span class="pre">0</span></code>, return a 1 x <em>columns</em> row vector of column maxima.
+If <code class="docutils literal notranslate"><span class="pre">1</span></code>, return a <em>rows</em> x 1 column vector of row maxima.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.mean">
+<span class="sig-name descname"><span class="pre">mean</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">axis</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="s"><span class="pre">'Matrix'</span></span></span></span><a class="headerlink" href="#bocpy.Matrix.mean" title="Link to this definition">¶</a></dt>
+<dd><p>Arithmetic mean of matrix elements.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>axis</strong> – If <code class="docutils literal notranslate"><span class="pre">None</span></code>, return the overall mean as a float.
+If <code class="docutils literal notranslate"><span class="pre">0</span></code>, return a 1 x <em>columns</em> row vector of column means.
+If <code class="docutils literal notranslate"><span class="pre">1</span></code>, return a <em>rows</em> x 1 column vector of row means.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.min">
+<span class="sig-name descname"><span class="pre">min</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">axis</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="s"><span class="pre">'Matrix'</span></span></span></span><a class="headerlink" href="#bocpy.Matrix.min" title="Link to this definition">¶</a></dt>
+<dd><p>Minimum of matrix elements.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>axis</strong> – If <code class="docutils literal notranslate"><span class="pre">None</span></code>, return the overall minimum as a float.
+If <code class="docutils literal notranslate"><span class="pre">0</span></code>, return a 1 x <em>columns</em> row vector of column minima.
+If <code class="docutils literal notranslate"><span class="pre">1</span></code>, return a <em>rows</em> x 1 column vector of row minima.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.negate">
+<span class="sig-name descname"><span class="pre">negate</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="s"><span class="pre">'Matrix'</span></span></span></span><a class="headerlink" href="#bocpy.Matrix.negate" title="Link to this definition">¶</a></dt>
+<dd><p>Return a new matrix with every element negated.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.normal">
+<em class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">normal</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">mean</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">stddev</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">int</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="s"><span class="pre">'Matrix'</span></span></span></span><a class="headerlink" href="#bocpy.Matrix.normal" title="Link to this definition">¶</a></dt>
+<dd><p>Sample from a normal (Gaussian) distribution.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>mean</strong> – Mean of the distribution (default <code class="docutils literal notranslate"><span class="pre">0.0</span></code>).</p></li>
+<li><p><strong>stddev</strong> – Standard deviation of the distribution (default <code class="docutils literal notranslate"><span class="pre">1.0</span></code>).</p></li>
+<li><p><strong>size</strong> – A <code class="docutils literal notranslate"><span class="pre">(rows,</span> <span class="pre">columns)</span></code> tuple.  If <code class="docutils literal notranslate"><span class="pre">None</span></code>, return a single
+<code class="docutils literal notranslate"><span class="pre">float</span></code> instead of a <a class="reference internal" href="#bocpy.Matrix" title="bocpy.Matrix"><code class="xref py py-class docutils literal notranslate"><span class="pre">Matrix</span></code></a>.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.ones">
+<em class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">ones</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">int</span><span class="p"><span class="pre">]</span></span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.ones" title="Link to this definition">¶</a></dt>
+<dd><p>Create a matrix filled with ones.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>size</strong> – A <code class="docutils literal notranslate"><span class="pre">(rows,</span> <span class="pre">columns)</span></code> tuple specifying the shape.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>A new <a class="reference internal" href="#bocpy.Matrix" title="bocpy.Matrix"><code class="xref py py-class docutils literal notranslate"><span class="pre">Matrix</span></code></a> with every element set to <code class="docutils literal notranslate"><span class="pre">1.0</span></code>.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.round">
+<span class="sig-name descname"><span class="pre">round</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="s"><span class="pre">'Matrix'</span></span></span></span><a class="headerlink" href="#bocpy.Matrix.round" title="Link to this definition">¶</a></dt>
+<dd><p>Return a new matrix with each element rounded to the nearest integer.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.Matrix.rows">
+<span class="sig-name descname"><span class="pre">rows</span></span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">int</span></span></span><a class="headerlink" href="#bocpy.Matrix.rows" title="Link to this definition">¶</a></dt>
+<dd><p>The number of rows in the matrix.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.select">
+<span class="sig-name descname"><span class="pre">select</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">indices</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">list</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">axis</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.select" title="Link to this definition">¶</a></dt>
+<dd><p>Return a new matrix containing only the selected rows or columns.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>indices</strong> – The row or column indices to select.</p></li>
+<li><p><strong>axis</strong> – <code class="docutils literal notranslate"><span class="pre">0</span></code> to select rows, <code class="docutils literal notranslate"><span class="pre">1</span></code> to select columns.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.Matrix.shape">
+<span class="sig-name descname"><span class="pre">shape</span></span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">int</span><span class="p"><span class="pre">]</span></span></span></span><a class="headerlink" href="#bocpy.Matrix.shape" title="Link to this definition">¶</a></dt>
+<dd><p>The <code class="docutils literal notranslate"><span class="pre">(rows,</span> <span class="pre">columns)</span></code> shape of the matrix.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.sum">
+<span class="sig-name descname"><span class="pre">sum</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">axis</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="s"><span class="pre">'Matrix'</span></span></span></span><a class="headerlink" href="#bocpy.Matrix.sum" title="Link to this definition">¶</a></dt>
+<dd><p>Sum of matrix elements.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>axis</strong> – If <code class="docutils literal notranslate"><span class="pre">None</span></code>, return the total sum as a float.
+If <code class="docutils literal notranslate"><span class="pre">0</span></code>, return a 1 x <em>columns</em> row vector of column sums.
+If <code class="docutils literal notranslate"><span class="pre">1</span></code>, return a <em>rows</em> x 1 column vector of row sums.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.transpose">
+<span class="sig-name descname"><span class="pre">transpose</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="s"><span class="pre">'Matrix'</span></span></span></span><a class="headerlink" href="#bocpy.Matrix.transpose" title="Link to this definition">¶</a></dt>
+<dd><p>Return a new matrix that is the transpose of this one.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.transpose_in_place">
+<span class="sig-name descname"><span class="pre">transpose_in_place</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.transpose_in_place" title="Link to this definition">¶</a></dt>
+<dd><p>Transpose this matrix in place, swapping its rows and columns.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.uniform">
+<em class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">uniform</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">minval</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">maxval</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">int</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="s"><span class="pre">'Matrix'</span></span></span></span><a class="headerlink" href="#bocpy.Matrix.uniform" title="Link to this definition">¶</a></dt>
+<dd><p>Sample from a continuous uniform distribution over <code class="docutils literal notranslate"><span class="pre">[minval,</span> <span class="pre">maxval)</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>minval</strong> – Lower bound (inclusive, default <code class="docutils literal notranslate"><span class="pre">0.0</span></code>).</p></li>
+<li><p><strong>maxval</strong> – Upper bound (exclusive, default <code class="docutils literal notranslate"><span class="pre">1.0</span></code>).</p></li>
+<li><p><strong>size</strong> – A <code class="docutils literal notranslate"><span class="pre">(rows,</span> <span class="pre">columns)</span></code> tuple.  If <code class="docutils literal notranslate"><span class="pre">None</span></code>, return a single
+<code class="docutils literal notranslate"><span class="pre">float</span></code> instead of a <a class="reference internal" href="#bocpy.Matrix" title="bocpy.Matrix"><code class="xref py py-class docutils literal notranslate"><span class="pre">Matrix</span></code></a>.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.vector">
+<em class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">vector</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">values</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">int</span><span class="p"><span class="pre">]</span></span></span></em>, <em class="sig-param"><span class="n"><span class="pre">as_column</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="s"><span class="pre">'Matrix'</span></span></span></span><a class="headerlink" href="#bocpy.Matrix.vector" title="Link to this definition">¶</a></dt>
+<dd><p>Create a matrix from a flat sequence of values.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>values</strong> – The elements of the vector.</p></li>
+<li><p><strong>as_column</strong> – If <code class="docutils literal notranslate"><span class="pre">True</span></code>, return a <em>n</em> x 1 column vector instead
+of the default 1 x <em>n</em> row vector.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>A new <a class="reference internal" href="#bocpy.Matrix" title="bocpy.Matrix"><code class="xref py py-class docutils literal notranslate"><span class="pre">Matrix</span></code></a> with a single row or column.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.Matrix.w">
+<span class="sig-name descname"><span class="pre">w</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">value</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.w" title="Link to this definition">¶</a></dt>
+<dd><p>Set the fourth vector component.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.Matrix.x">
+<span class="sig-name descname"><span class="pre">x</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">value</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.x" title="Link to this definition">¶</a></dt>
+<dd><p>Set the first vector component.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.Matrix.y">
+<span class="sig-name descname"><span class="pre">y</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">value</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.y" title="Link to this definition">¶</a></dt>
+<dd><p>Set the second vector component.</p>
+</dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="bocpy.Matrix.z">
+<span class="sig-name descname"><span class="pre">z</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">value</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.z" title="Link to this definition">¶</a></dt>
+<dd><p>Set the third vector component.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="bocpy.Matrix.zeros">
+<em class="property"><span class="k"><span class="pre">classmethod</span></span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">zeros</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">int</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">int</span><span class="p"><span class="pre">]</span></span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.Matrix.zeros" title="Link to this definition">¶</a></dt>
+<dd><p>Create a matrix filled with zeros.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>size</strong> – A <code class="docutils literal notranslate"><span class="pre">(rows,</span> <span class="pre">columns)</span></code> tuple specifying the shape.</p>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>A new zero-filled <a class="reference internal" href="#bocpy.Matrix" title="bocpy.Matrix"><code class="xref py py-class docutils literal notranslate"><span class="pre">Matrix</span></code></a>.</p>
+</dd>
+</dl>
+</dd></dl>
+
+</dd></dl>
+
+</section>
+<section id="messaging">
+<h2>Messaging<a class="headerlink" href="#messaging" title="Link to this heading">¶</a></h2>
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.send">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">send</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tag</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">contents</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Any</span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.send" title="Link to this definition">¶</a></dt>
+<dd><p>Sends a message.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>tag</strong> (<em>str</em>) – The tag is an arbitrary label that can be used to receive this message.</p></li>
+<li><p><strong>contents</strong> (<em>Any</em>) – The contents of the message.</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.receive">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">receive</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tags</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">str</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">timeout</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">-1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">after</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Callable</span><span class="p"><span class="pre">[</span></span><span class="p"><span class="pre">[</span></span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">Any</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">Any</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span></span><a class="headerlink" href="#bocpy.receive" title="Link to this definition">¶</a></dt>
+<dd><p>Receives a message.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>tags</strong> (<em>Union</em><em>[</em><em>list</em><em>[</em><em>str</em><em>]</em><em>, </em><em>tuple</em><em>[</em><em>str</em><em>, </em><em>...</em><em>]</em><em>, </em><em>str</em><em>]</em>) – One or more tags. The received message will be tagged with one of these.</p></li>
+<li><p><strong>timeout</strong> (<em>float</em>) – A non-negative value indicates how many seconds receive should wait before returning.
+A negative value indicates to wait until a message is received.</p></li>
+<li><p><strong>after</strong> (<em>Optional</em><em>[</em><em>Callable</em><em>[</em><em>[</em><em>]</em><em>, </em><em>Any</em><em>]</em><em>]</em>) – Optional callback which should be called to produce a value if receive times out.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>The contents of the received message</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Any | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.set_tags">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">set_tags</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tags</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">]</span></span></span></em><span class="sig-paren">)</span><a class="headerlink" href="#bocpy.set_tags" title="Link to this definition">¶</a></dt>
+<dd><p>Set the tags for the message queues.</p>
+<p>This function (which can only be called from the main interpreter) will
+temporarily disable the messaging queues and assign new tags.  All messages
+in the queues will be cleared before the queues are re-enabled.  Passing an
+empty list resets all queues to auto-assign mode.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>tags</strong> (<em>Sequence</em><em>[</em><em>str</em><em>]</em>) – The tags to assign to the queues, or an empty list to
+reset all queues.</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="bocpy.drain">
+<span class="sig-prename descclassname"><span class="pre">bocpy.</span></span><span class="sig-name descname"><span class="pre">drain</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">tags</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Sequence</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">]</span></span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="headerlink" href="#bocpy.drain" title="Link to this definition">¶</a></dt>
+<dd><p>Drain all messages associated with one or more tags.</p>
+<p>Note that if new messages with this tag are being constantly created, this method
+may not return.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>tag</strong> – The tags to drain. All messages associated with this tag will
+be cleared.</p>
+</dd>
+</dl>
+</dd></dl>
+
+</section>
+</section>
+
+
+          </div>
+          
+        </div>
+      </div>
+      <div class="sphinxsidebar" role="navigation" aria-label="Main">
+        <div class="sphinxsidebarwrapper">
+            <p class="logo"><a href="index.html">
+              <img class="logo" src="_static/logo-200.svg" alt="Logo of bocpy"/>
+            </a></p>
+<h1 class="logo"><a href="index.html">bocpy</a></h1>
+
+
+
+
+
+
+
+
+
+<search id="searchbox" style="display: none" role="search">
+    <div class="searchformwrapper">
+    <form class="search" action="search.html" method="get">
+      <input type="text" name="q" aria-labelledby="searchlabel" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Search"/>
+      <input type="submit" value="Go" />
+    </form>
+    </div>
+</search>
+<script>document.getElementById('searchbox').style.display = "block"</script><h3>Navigation</h3>
+<p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="current reference internal" href="#">API</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#behaviors">Behaviors</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#math">Math</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#messaging">Messaging</a></li>
+</ul>
+</li>
+</ul>
+
+<div class="relations">
+<h3>Related Topics</h3>
+<ul>
+  <li><a href="index.html">Documentation overview</a><ul>
+      <li>Previous: <a href="index.html" title="previous chapter">bocpy documentation</a></li>
+  </ul></li>
+</ul>
+</div>
+
+
+
+
+
+
+
+
+        </div>
+      </div>
+      <div class="clearer"></div>
+    </div>
+    <div class="footer">
+      &#169;2026, Microsoft.
+      
+      |
+      Powered by <a href="https://www.sphinx-doc.org/">Sphinx 8.2.3</a>
+      &amp; <a href="https://alabaster.readthedocs.io">Alabaster 1.0.0</a>
+      
+      |
+      <a href="_sources/api.rst.txt"
+          rel="nofollow">Page source</a>
+    </div>
+
+    
+
+    
+  </body>
+</html>

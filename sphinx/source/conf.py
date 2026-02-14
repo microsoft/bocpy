@@ -38,6 +38,7 @@ html_theme = 'alabaster'
 html_static_path = ['_static']
 
 html_logo = "_static/logo-200.svg"
+html_favicon = "_static/favicon.ico"
 
 # ---------------------------------------------------------------------------
 # Stub-aware autodoc: pull docstrings and signatures from __init__.pyi
