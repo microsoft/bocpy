@@ -45,8 +45,8 @@ __all__ = ["send", "receive", "TIMEOUT"]
 
 
 try:
-    from .behaviors import wait, when, whencall, Behaviors, Cown, WORKER_COUNT
+    from .behaviors import start, wait, when, whencall, Behaviors, Cown, WORKER_COUNT
 
-    __all__ += ["wait", "when", "whencall", "Behaviors", "Cown", "WORKER_COUNT"]
+    __all__ += ["start", "wait", "when", "whencall", "Behaviors", "Cown", "WORKER_COUNT"]
 except AttributeError:
     print("Behaviors not supported")

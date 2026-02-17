@@ -2775,6 +2775,21 @@ static PyObject *request_finish_enqueue(PyObject *module, PyObject *args) {
   Py_RETURN_NONE;
 }
 
+static PyObject *request_target(PyObject *module, PyObject *args) {
+  PyObject *op;
+
+  if(!PyArg_ParseTuple(args, "O", &op)){
+    return NULL;
+  }
+
+  BOCRequest *request = request_unwrap(op);
+  if(request == NULL){
+    return NULL;
+  }
+
+  return PyLong_FromVoidPtr((void *)request->target);
+}
+
 /// @brief Whether this module is the "primary" module, i.e. the one owned by
 /// the scheduler.
 /// @param module The module to check
@@ -2862,6 +2877,7 @@ static PyMethodDef boc_methods[] = {
     {"request_start_enqueue", request_start_enqueue, METH_VARARGS, "internal"},
     {"request_finish_enqueue", request_finish_enqueue, METH_VARARGS,
      "internal"},
+     {"request_target", request_target, METH_VARARGS, "internal"},
     {"is_primary", is_primary, METH_NOARGS,
      "whether this is the primary BOC module"},
     {"index", boc_index, METH_NOARGS, "index of the module in the BOC system"},

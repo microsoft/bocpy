@@ -37,7 +37,10 @@ class Philosopher(NamedTuple("Philosopher", [("index", int), ("left", Cown),
             if hunger.value > 0:
                 Philosopher(index, left, right, hunger).eat()
             else:
-                send("report", ("full", index))
+                # send the report after the forks have been released
+                @when()
+                def _():
+                    send("report", ("full", index))
 
 
 if __name__ == "__main__":

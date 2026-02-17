@@ -116,6 +116,9 @@ class Request:
         """
         _boc.request_release(self.impl)
 
+    def target(self) -> int:
+        return _boc.request_target(self.impl)
+
     def start_enqueue(self, behavior: "Behavior"):
         """Start the first phase of the 2PL enqueue operation.
 
@@ -147,6 +150,7 @@ class Behavior:
         self.bid = impl.bid()
         self.thunk = impl.thunk()
         self.requests = [Request(req_impl) for req_impl in impl.create_requests()]
+        self.requests.sort(key=lambda r: r.target())
 
     def schedule(self):
         """Schedule the behavior using two-phase locking over requests."""
@@ -179,22 +183,23 @@ WORKER_MAIN_END = "# END boc_export"
 class Behaviors:
     """Coordinator that starts workers and schedules behaviors."""
 
-    def __init__(self, num_workers: int):
+    def __init__(self, num_workers: Optional[int], export_dir: Optional[str]):
         """Initialize the behavior runtime.
 
         Args:
             num_workers: the number of workers (i.e., subinterpreters) that will execute behaviors
         """
-        self.num_workers = num_workers
-        self.boc_export_dir = None
+        self.num_workers = WORKER_COUNT if num_workers is None else num_workers
+        self.export_dir = export_dir
+        self.export_tmp = export_dir is None
         self.worker_script = None
         self.classes = set()
-        self.workers = []
         self.worker_threads = []
         self.behavior_lookup: Mapping[int, BehaviorInfo] = {}
         self.logger = logging.getLogger("behaviors")
         self.logger.debug("behaviors init")
         self.scheduler = None
+        self.final_cowns: Tuple[Cown, ...] = ()
         self.bid = 0
 
     def lookup_behavior(self, line_number: int) -> BehaviorInfo:
@@ -216,26 +221,21 @@ class Behaviors:
 
         self.worker_threads.clear()
 
-        self.logger.debug("destroying subinterpreters")
-        for interp in self.workers:
+    def start_workers(self):
+        """Launch worker interpreters and wait until they signal readiness."""
+        def worker():
+            interp = interpreters.create()
+            result = interpreters.run_string(interp, dedent(self.worker_script))
+            if result is not None:
+                _boc.send("boc_behavior", result.formatted)
+
             try:
                 interpreters.destroy(interp)
             except RuntimeError:
                 pass  # already destroyed
 
-        self.workers.clear()
-
-    def start_workers(self):
-        """Launch worker interpreters and wait until they signal readiness."""
-        def worker(interp):
-            result = interpreters.run_string(interp, dedent(self.worker_script))
-            if result is not None:
-                _boc.send("boc_behavior", result.formatted)
-
         for _ in range(self.num_workers):
-            interp = interpreters.create()
-            t = threading.Thread(target=worker, args=(interp,))
-            self.workers.append(interp)
+            t = threading.Thread(target=worker)
             self.worker_threads.append(t)
             t.start()
 
@@ -266,6 +266,9 @@ class Behaviors:
                     val.acquire()
 
             frame = frame.f_back
+
+        for cown in self.final_cowns:
+            cown.acquire()
 
         self.logger.debug("stopping workers")
         for _ in range(self.num_workers):
@@ -338,9 +341,12 @@ class Behaviors:
             export = export_module_from_file(module[1])
             module_name = f"{module[0]}"
 
+        if self.export_dir is None:
+            self.export_dir = tempfile.mkdtemp()
+            self.export_tmp = True
+
         self.behavior_lookup = export.behaviors
-        self.boc_export_dir = tempfile.mkdtemp()
-        path = os.path.join(self.boc_export_dir, f"{module_name}.py")
+        path = os.path.join(self.export_dir, f"{module_name}.py")
         with open(path, "w") as file:
             file.write(export.code)
 
@@ -365,13 +371,15 @@ class Behaviors:
         """Enter context by starting the runtime."""
         self.start()
 
-    def stop(self, timeout: Optional[float] = None):
+    def stop(self, timeout: Optional[float] = None,
+             cowns: Tuple[Cown, ...] = ()):
         """Stop scheduler and workers, removing any temp exports."""
+        self.final_cowns = cowns
         _boc.send("boc_behavior", "terminator_decrement")
         self.scheduler.join(timeout)
         self.stop_workers()
-        if os.path.exists(self.boc_export_dir):
-            shutil.rmtree(self.boc_export_dir)
+        if os.path.exists(self.export_dir) and self.export_tmp:
+            shutil.rmtree(self.export_dir)
 
     def __exit__(self, exc_type, exc_value, traceback):
         """Ensure stop is called on context exit."""
@@ -385,6 +393,28 @@ def whencall(thunk: str, args: List[Cown], captures: List[Any]) -> Cown:
     logging.debug(f"whencall:behavior=Behavior(thunk={thunk}, result={result}, args={args}, captures={captures})")
     _boc.send("boc_behavior", ("schedule", behavior))
     return result
+
+
+def get_caller_module():
+    frame = inspect.currentframe().f_back.f_back
+    name = frame.f_globals["__name__"]
+    file = frame.f_globals["__file__"]
+    return (name, file)
+
+
+def start(**kwargs):
+    global BEHAVIORS
+    if BEHAVIORS is not None:
+        raise RuntimeError("Behavior scheduler already started")
+
+    if not _boc.is_primary():
+        raise RuntimeError("start() can only be called from the main interpreter")
+
+    worker_count = kwargs.get("worker_count", WORKER_COUNT)
+    export_dir = kwargs.get("export_dir", None)
+    module = kwargs.get("module", get_caller_module())
+    BEHAVIORS = Behaviors(worker_count, export_dir)
+    BEHAVIORS.start(module)
 
 
 def when(*cowns):
@@ -404,8 +434,7 @@ def when(*cowns):
 
         global BEHAVIORS
         if BEHAVIORS is None and _boc.is_primary():
-            BEHAVIORS = Behaviors(WORKER_COUNT)
-            BEHAVIORS.start((when_frame.f_globals["__name__"], when_frame.f_globals["__file__"]))
+            start(module=get_caller_module())
 
         logging.debug("when:start")
         binfo = BEHAVIORS.lookup_behavior(when_frame.f_lineno)
