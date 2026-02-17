@@ -1744,11 +1744,10 @@ static PyObject *receive(PyObject *module, PyObject *args, PyObject *keywds) {
   PyObject *tag;
   double timeout = -1;
   PyObject *after = Py_None;
-  PyObject *guard = Py_None;
-  static char *kwlist[] = {"tags", "timeout", "after", "guard", NULL};
+  static char *kwlist[] = {"tags", "timeout", "after", NULL};
 
-  if (!PyArg_ParseTupleAndKeywords(args, keywds, "O|dOO", kwlist, &tag,
-                                   &timeout, &after, &guard)) {
+  if (!PyArg_ParseTupleAndKeywords(args, keywds, "O|dO", kwlist, &tag,
+                                   &timeout, &after)) {
     return NULL;
   }
 
@@ -1860,30 +1859,6 @@ static PyObject *receive(PyObject *module, PyObject *args, PyObject *keywds) {
       Py_XDECREF(tags_fast);
       boc_message_free(message);
       return NULL;
-    }
-
-    if (!Py_IsNone(guard)) {
-      PyObject *arglist = PyTuple_Pack(2, tag, contents);
-      PyObject *result = PyObject_CallObject(guard, arglist);
-      Py_DECREF(arglist);
-      if (result == NULL) {
-        Py_XDECREF(tags_fast);
-        Py_DECREF(contents);
-        boc_message_free(message);
-        return NULL;
-      }
-
-      if (Py_IsFalse(result)) {
-        Py_DECREF(contents);
-        if (!boc_enqueue(message)) {
-          Py_XDECREF(tags_fast);
-          boc_message_free(message);
-          PyErr_SetString(PyExc_RuntimeError, "Message queue is full");
-          return NULL;
-        }
-
-        continue;
-      }
     }
 
     PyObject *result = PyTuple_Pack(2, tag, contents);

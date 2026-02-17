@@ -25,18 +25,6 @@ def test_timeout_after():
     assert value == 5
 
 
-def test_guard():
-    """Guard predicate filters messages by payload."""
-    send("a", 1)
-    send("a", 10)
-    tag, value = receive("a", 1, guard=lambda _, v: v > 5)
-    assert tag == "a"
-    assert value == 10
-    _, value = receive("a", 1)
-    assert tag == "a"
-    assert value == 1
-
-
 def test_tagset():
     """Receive across a set of tags and match each payload."""
     send("a", "alfa")

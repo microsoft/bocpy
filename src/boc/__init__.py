@@ -21,8 +21,7 @@ def send(tag: str, contents: Any):
 
 def receive(tags: Union[List[str], Tuple[str, ...], str],
             timeout: float = -1,
-            after: Optional[Callable[[], Any]] = None,
-            guard: Optional[Callable[[str, Any], bool]] = None) -> Optional[Any]:
+            after: Optional[Callable[[], Any]] = None) -> Optional[Any]:
     """Receives a message.
 
     :param tags: One or more tags. The received message will be tagged with one of these.
@@ -32,13 +31,10 @@ def receive(tags: Union[List[str], Tuple[str, ...], str],
     :type timeout: float
     :param after: Optional callback which should be called to produce a value if receive times out.
     :type after: Optional[Callable[[], Any]]
-    :param guard: Optional callback which examines the contents of a message. If it returns True, the contents are
-                  returned. If False, the message is requeued and receive will obtain the next message.
-    :type guard: Optional[Callable[[str, Any], bool]]
     :return: The contents of the received message
     :rtype: Any | None
     """
-    return _boc.receive(tags, timeout, after, guard)
+    return _boc.receive(tags, timeout, after)
 
 
 __all__ = ["send", "receive", "TIMEOUT"]

@@ -3,7 +3,7 @@ import random
 from threading import Thread
 import time
 
-from boc import receive, send, TIMEOUT
+from boc import receive, send
 
 
 def client(num_operations: int):
@@ -21,8 +21,11 @@ def server(timeout):
     num_operations = 0
     running = True
 
+    def after():
+        return "calculator", ("print", True)
+
     while running:
-        match receive("calculator", timeout):
+        match receive("calculator", timeout, after):
             case [_, ("+", x)]:
                 num_operations += 1
                 value += x
@@ -39,14 +42,10 @@ def server(timeout):
                 num_operations += 1
                 value /= x
 
-            case [_, "print"]:
-                print("Total operations:", num_operations)
-                print("Final value:", value)
-                running = False
+            case [_, ("print", timeout)]:
+                if timeout:
+                    print("Timed out")
 
-            case [tag, _]:
-                assert tag == TIMEOUT
-                print("Timed out")
                 print("Total operations:", num_operations)
                 print("Final value:", value)
                 running = False
@@ -73,7 +72,7 @@ def main():
         c.join()
 
     if args.timeout < 0:
-        send("calculator", "print")
+        send("calculator", ("print", False))
 
     server_thread.join()
 
