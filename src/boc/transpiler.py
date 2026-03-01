@@ -4,7 +4,7 @@ import ast
 import copy
 import os
 import sys
-from typing import List, Mapping, NamedTuple, Set
+from typing import Mapping, NamedTuple, Set
 
 
 class CapturedVariableFinder(ast.NodeVisitor):
@@ -146,7 +146,7 @@ class BOCModuleTransformer(ast.NodeTransformer):
         node.body[:] = new_body
 
 
-BehaviorInfo = NamedTuple("BehaviorInfo", [("name", str), ("captures", List[str])])
+BehaviorInfo = NamedTuple("BehaviorInfo", [("name", str), ("captures", list[str])])
 
 
 class WhenTransformer(ast.NodeTransformer):

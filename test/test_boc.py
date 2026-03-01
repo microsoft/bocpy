@@ -1,7 +1,7 @@
 """Behavior-oriented concurrency tests."""
 
 import functools
-from typing import List, NamedTuple
+from typing import NamedTuple
 
 from boc import Cown, receive, send, TIMEOUT, wait, when
 import pytest
@@ -114,23 +114,23 @@ def cown_grouping():
     expected = 45
 
     @when(cowns)
-    def group(group: List[Cown[int]]):
+    def group(group: list[Cown[int]]):
         return sum([c.value for c in group])
 
     @when(cowns[:9], cowns[9])
-    def group_single(group: List[Cown[int]], single: Cown[int]):
+    def group_single(group: list[Cown[int]], single: Cown[int]):
         return sum([c.value for c in group]) + single.value
 
     @when(cowns[0], cowns[1:])
-    def single_group(single: Cown[int], group: List[Cown[int]]):
+    def single_group(single: Cown[int], group: list[Cown[int]]):
         return sum([c.value for c in group]) + single.value
 
     @when(cowns[:4], cowns[4], cowns[5:])
-    def group_single_group(group0: List[Cown[int]], single: Cown[int], group1: List[Cown[int]]):
+    def group_single_group(group0: list[Cown[int]], single: Cown[int], group1: list[Cown[int]]):
         return sum([c.value for c in group0]) + single.value + sum([c.value for c in group1])
 
     @when(cowns[0], cowns[1:9], cowns[9])
-    def single_group_single(single0: Cown[int], group: List[Cown[int]], single1: Cown[int]):
+    def single_group_single(single0: Cown[int], group: list[Cown[int]], single1: Cown[int]):
         return single0.value + sum([c.value for c in group]) + single1.value
 
     return expected, [group, group_single, single_group, group_single_group, single_group_single]
@@ -264,7 +264,7 @@ class TestBOC:
         expected, results = cown_grouping()
 
         @when(results)
-        def check(results: List[Cown]):
+        def check(results: list[Cown]):
             for r in results:
                 send("assert", (r.value, expected))
 
@@ -275,12 +275,12 @@ class TestBOC:
         cowns = [Cown(i) for i in range(5)]
 
         @when(cowns)
-        def double_all(group: List[Cown[int]]):
+        def double_all(group: list[Cown[int]]):
             for c in group:
                 c.value *= 2
 
         @when(cowns)
-        def verify(group: List[Cown[int]]):
+        def verify(group: list[Cown[int]]):
             for i, c in enumerate(group):
                 send("assert", (c.value, i * 2))
 
@@ -292,7 +292,7 @@ class TestBOC:
         total = Cown(0)
 
         @when(items, total)
-        def accumulate(group: List[Cown[int]], t: Cown[int]):
+        def accumulate(group: list[Cown[int]], t: Cown[int]):
             for c in group:
                 t.value += c.value
                 c.value = 0
@@ -302,7 +302,7 @@ class TestBOC:
             send("assert", (t.value, 6))
 
         @when(items)
-        def check_zeroed(group: List[Cown[int]]):
+        def check_zeroed(group: list[Cown[int]]):
             for c in group:
                 send("assert", (c.value, 0))
 

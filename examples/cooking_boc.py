@@ -2,7 +2,7 @@
 
 import random
 import time
-from typing import Mapping, NamedTuple, Tuple
+from typing import Mapping, NamedTuple
 
 from boc import Cown, start, wait, when
 
@@ -67,7 +67,7 @@ class Utensil:
 class Recipe(NamedTuple("Recipe", [("name", str), ("ingredients", Mapping[str, str])])):
     """A recipe with required ingredients and their expected states."""
 
-    def check(self, ingredients: Tuple[Ingredient, ...]) -> bool:
+    def check(self, ingredients: tuple[Ingredient, ...]) -> bool:
         """Verify that all ingredients are present and correctly prepared."""
         valid = set()
         for i in ingredients:
@@ -99,7 +99,7 @@ class Cookware:
         """Initialize cookware."""
         self.name = name
 
-    def cook(self, recipe: Recipe, ingredients: Tuple[Ingredient, ...]):
+    def cook(self, recipe: Recipe, ingredients: tuple[Ingredient, ...]):
         """Cook a recipe if all ingredients are ready."""
         if not recipe.check(ingredients):
             return False

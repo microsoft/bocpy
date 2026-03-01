@@ -1,8 +1,11 @@
 #define PY_SSIZE_T_CLEAN
 
 #include <Python.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 #if PY_VERSION_HEX >= 0x030D0000
 #define Py_BUILD_CORE
@@ -44,6 +47,7 @@ void atomic_store(atomic_int_least64_t *ptr, int_least64_t value) {
 #define thread_local __declspec(thread)
 
 #else
+#include <math.h>
 #include <stdatomic.h>
 #endif
 
@@ -1571,7 +1575,7 @@ static PyObject *Matrix_concat(PyObject *cls, PyObject *args) {
     return NULL;
   }
 
-  Py_ssize_t size = PySequence_Fast_GET_SIZE(matrices);
+  Py_ssize_t size = PySequence_Fast_GET_SIZE(fast);
   if (size <= 0) {
     Py_DECREF(fast);
     Py_RETURN_NONE;
@@ -1585,7 +1589,7 @@ static PyObject *Matrix_concat(PyObject *cls, PyObject *args) {
   matrix_impl *out;
   if (axis == 0) {
     for (Py_ssize_t i = 0; i < size; ++i) {
-      PyObject *item = PySequence_Fast_GET_ITEM(matrices, i);
+      PyObject *item = PySequence_Fast_GET_ITEM(fast, i);
       if (unwrap_and_get_shape(item, &shape, false) < 0) {
         Py_DECREF(fast);
         return NULL;
@@ -1617,7 +1621,7 @@ static PyObject *Matrix_concat(PyObject *cls, PyObject *args) {
     columns_range.count = columns;
     columns_range.step = 1;
     for (Py_ssize_t i = 0; i < size; ++i) {
-      PyObject *item = PySequence_Fast_GET_ITEM(matrices, i);
+      PyObject *item = PySequence_Fast_GET_ITEM(fast, i);
       matrix_impl *impl = unwrap_matrix(item, false);
       if (impl == NULL) {
         Py_DECREF(fast);
@@ -1632,11 +1636,12 @@ static PyObject *Matrix_concat(PyObject *cls, PyObject *args) {
       rows_range.start = rows_range.stop;
     }
 
+    Py_DECREF(fast);
     return wrap_impl_or_free(out);
   }
 
   for (Py_ssize_t i = 0; i < size; ++i) {
-    PyObject *item = PySequence_Fast_GET_ITEM(matrices, i);
+    PyObject *item = PySequence_Fast_GET_ITEM(fast, i);
     if (unwrap_and_get_shape(item, &shape, true) < 0) {
       Py_DECREF(fast);
       return NULL;
@@ -1667,7 +1672,7 @@ static PyObject *Matrix_concat(PyObject *cls, PyObject *args) {
   rows_range.count = rows;
   rows_range.step = 1;
   for (Py_ssize_t i = 0; i < size; ++i) {
-    PyObject *item = PySequence_Fast_GET_ITEM(matrices, i);
+    PyObject *item = PySequence_Fast_GET_ITEM(fast, i);
     matrix_impl *impl = unwrap_matrix(item, true);
     if (impl == NULL) {
       Py_DECREF(fast);
@@ -1682,6 +1687,7 @@ static PyObject *Matrix_concat(PyObject *cls, PyObject *args) {
     columns_range.start = columns_range.stop;
   }
 
+  Py_DECREF(fast);
   return wrap_impl_or_free(out);
 }
 

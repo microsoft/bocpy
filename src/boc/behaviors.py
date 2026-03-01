@@ -8,7 +8,7 @@ import sys
 import tempfile
 from textwrap import dedent
 import threading
-from typing import Any, Generic, List, Mapping, Optional, Tuple, TypeVar, Union
+from typing import Any, Generic, Mapping, Optional, TypeVar, Union
 
 from . import _core, set_tags
 from .transpiler import BehaviorInfo, export_main, export_module_from_file
@@ -207,7 +207,7 @@ class Behaviors:
         self.logger = logging.getLogger("behaviors")
         self.logger.debug("behaviors init")
         self.scheduler = None
-        self.final_cowns: Tuple[Cown, ...] = ()
+        self.final_cowns: tuple[Cown, ...] = ()
         self.bid = 0
 
     def lookup_behavior(self, line_number: int) -> BehaviorInfo:
@@ -333,7 +333,7 @@ class Behaviors:
         self.scheduler = threading.Thread(target=scheduler)
         self.scheduler.start()
 
-    def start(self, module: Optional[Tuple[str, str]]):
+    def start(self, module: Optional[tuple[str, str]]):
         """Export the target module and spin up workers and scheduler."""
         path = os.path.join(os.path.dirname(__file__), "worker.py")
 
@@ -382,7 +382,7 @@ class Behaviors:
         self.start()
 
     def stop(self, timeout: Optional[float] = None,
-             cowns: Tuple[Cown, ...] = ()):
+             cowns: tuple[Cown, ...] = ()):
         """Stop scheduler and workers, removing any temp exports."""
         self.final_cowns = cowns
         _core.send("boc_behavior", "terminator_decrement")
@@ -396,7 +396,7 @@ class Behaviors:
         self.stop()
 
 
-def whencall(thunk: str, args: List[Union[Cown, List[Cown]]], captures: List[Any]) -> Cown:
+def whencall(thunk: str, args: list[Union[Cown, list[Cown]]], captures: list[Any]) -> Cown:
     """Invoke a behavior by name with cown args and captured values."""
     result = Cown(None)
 
@@ -408,7 +408,7 @@ def whencall(thunk: str, args: List[Union[Cown, List[Cown]]], captures: List[Any
             group_id += 1
             continue
 
-        if not isinstance(item, (List, Tuple)):
+        if not isinstance(item, (list, tuple)):
             raise TypeError("can only schedule over cowns or sequences of cowns")
 
         for c in item:
@@ -445,7 +445,7 @@ def start(**kwargs):
     :type export_dir: Optional[str]
     :param module: A tuple of the target module name and file path to export
         for worker import.  If None, the caller's module will be used.
-    :type module: Optional[Tuple[str, str]]
+    :type module: Optional[tuple[str, str]]
     """
     global BEHAVIORS
     if BEHAVIORS is not None:

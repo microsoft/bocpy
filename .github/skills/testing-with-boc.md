@@ -199,7 +199,7 @@ def test_transfer(self):
 
 When you have a dynamic number of cowns (e.g., a list), you can pass them to
 `@when` as a **list** (or slice) rather than individual arguments. Inside the
-behavior, that parameter is delivered as a `List[Cown]` — each element is an
+behavior, that parameter is delivered as a `list[Cown]` — each element is an
 acquired cown whose `.value` you can read or write.
 
 You can mix single cowns and groups freely in any order. Each distinct argument
@@ -207,38 +207,37 @@ to `@when` becomes its own parameter in the decorated function:
 
 | `@when(...)` arguments | Behavior parameters |
 |------------------------|---------------------|
-| `@when(list_of_cowns)` | `(group: List[Cown])` |
-| `@when(cowns[:9], cowns[9])` | `(group: List[Cown], single: Cown)` |
-| `@when(cowns[0], cowns[1:])` | `(single: Cown, group: List[Cown])` |
-| `@when(cowns[:4], cowns[4], cowns[5:])` | `(g0: List[Cown], single: Cown, g1: List[Cown])` |
-| `@when(cowns[0], cowns[1:9], cowns[9])` | `(s0: Cown, group: List[Cown], s1: Cown)` |
+| `@when(list_of_cowns)` | `(group: list[Cown])` |
+| `@when(cowns[:9], cowns[9])` | `(group: list[Cown], single: Cown)` |
+| `@when(cowns[0], cowns[1:])` | `(single: Cown, group: list[Cown])` |
+| `@when(cowns[:4], cowns[4], cowns[5:])` | `(g0: list[Cown], single: Cown, g1: list[Cown])` |
+| `@when(cowns[0], cowns[1:9], cowns[9])` | `(s0: Cown, group: list[Cown], s1: Cown)` |
 
 ### Full group example
 
 ```python
-from typing import List
 from boc import Cown, when, send, receive
 
 cowns = [Cown(i) for i in range(10)]  # values 0..9, sum = 45
 
 # All cowns as a single group
 @when(cowns)
-def group_sum(group: List[Cown[int]]):
+def group_sum(group: list[Cown[int]]):
     return sum(c.value for c in group)
 
 # Group + single cown
 @when(cowns[:9], cowns[9])
-def group_then_single(group: List[Cown[int]], single: Cown[int]):
+def group_then_single(group: list[Cown[int]], single: Cown[int]):
     return sum(c.value for c in group) + single.value
 
 # Single cown + group
 @when(cowns[0], cowns[1:])
-def single_then_group(single: Cown[int], group: List[Cown[int]]):
+def single_then_group(single: Cown[int], group: list[Cown[int]]):
     return single.value + sum(c.value for c in group)
 
 # Group + single + group
 @when(cowns[:4], cowns[4], cowns[5:])
-def group_single_group(g0: List[Cown[int]], single: Cown[int], g1: List[Cown[int]]):
+def group_single_group(g0: list[Cown[int]], single: Cown[int], g1: list[Cown[int]]):
     return sum(c.value for c in g0) + single.value + sum(c.value for c in g1)
 ```
 
@@ -253,7 +252,7 @@ def test_cown_grouping(self):
     results = [group_sum, group_then_single, single_then_group, group_single_group]
 
     @when(results)
-    def check(results: List[Cown]):
+    def check(results: list[Cown]):
         for r in results:
             send("assert", (r.value, expected))
 
@@ -263,11 +262,11 @@ def test_cown_grouping(self):
 ### Key rules for grouping
 
 - Pass a **list** (or slice) of cowns to `@when` — the behavior receives the
-  corresponding parameter as `List[Cown]`.
+  corresponding parameter as `list[Cown]`.
 - Pass a **single cown** — the parameter receives that `Cown` directly.
 - You can **interleave** singles and groups in any order. The positional mapping
   between `@when(...)` arguments and the decorated function's parameters is 1:1.
-- Type-annotate grouped parameters as `List[Cown[T]]` for clarity.
+- Type-annotate grouped parameters as `list[Cown[T]]` for clarity.
 
 ## Pattern 5 — Exception Propagation
 

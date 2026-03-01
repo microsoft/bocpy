@@ -4,7 +4,7 @@ from ast import Set
 from collections import deque
 import colorsys
 import math
-from typing import List, Mapping, NamedTuple, Tuple
+from typing import Mapping, NamedTuple
 
 from boc import Cown, Matrix, receive, send, wait, when
 
@@ -22,7 +22,7 @@ class BoundingBox(NamedTuple("BoundingBox", [("left", int), ("top", int), ("righ
         return x < self.left or x > self.right or y < self.top or y > self.bottom
 
 
-def init_boids(num_boids: int, width: int, height: int) -> Tuple[Matrix, Matrix]:
+def init_boids(num_boids: int, width: int, height: int) -> tuple[Matrix, Matrix]:
     """Initialize boids with random positions and velocities.
 
     :param num_boids: The number of boids to initialize.
@@ -44,7 +44,7 @@ def keep_within_bounds(pos: Matrix,
     :param width: The width of the simulation area.
     :param height: The height of the simulation area.
     :param margin: Distance from each edge at which turning begins.
-    :param turnFactor: Magnitude of the corrective velocity.
+    :param turn_factor: Magnitude of the corrective velocity.
     :return: A 1 × 2 velocity delta.
     """
     dv = Matrix(1, 2)
@@ -69,7 +69,7 @@ def fly_toward_center(neighbors: Matrix, boid: Matrix,
 
     :param neighbors: An *N* × 2 matrix of neighbor positions.
     :param boid: The boid's current position (1 × 2).
-    :param centeringFactor: Strength of the centering force.
+    :param centering_factor: Strength of the centering force.
     :return: A 1 × 2 velocity delta.
     """
     return (neighbors.mean(0) - boid) * centering_factor
@@ -81,8 +81,8 @@ def avoid_others(neighbors: Matrix, pos: Matrix,
 
     :param neighbors: An *N* × 2 matrix of neighbor positions.
     :param pos: The boid's current position (1 × 2).
-    :param minDistance: Radius within which neighbors are considered too close.
-    :param avoidFactor: Strength of the avoidance force.
+    :param min_distance: Radius within which neighbors are considered too close.
+    :param avoid_factor: Strength of the avoidance force.
     :return: A 1 × 2 velocity delta.
     """
     left = pos.x - min_distance
@@ -106,7 +106,7 @@ def match_velocity(velocities: Matrix, boid: Matrix, matching_factor=0.05) -> Ma
 
     :param velocities: An *N* × 2 matrix of neighbor velocities.
     :param boid: The boid's current velocity (1 × 2).
-    :param matchingFactor: Strength of the alignment force.
+    :param matching_factor: Strength of the alignment force.
     :return: A 1 × 2 velocity delta.
     """
     return (velocities.mean(0) - boid) * matching_factor
@@ -159,7 +159,7 @@ class Cell(NamedTuple("Cell", [("row", int), ("column", int)])):
     """A grid cell identified by row and column."""
 
 
-class CellData(NamedTuple("CellData", [("cell", Cell), ("boids", Tuple[int]),
+class CellData(NamedTuple("CellData", [("cell", Cell), ("boids", tuple[int]),
                                        ("positions", Cown[Matrix]), ("velocities", Cown[Matrix])])):
     """Per-cell snapshot of boid indices, positions, and velocities."""
 
@@ -200,7 +200,7 @@ class CellData(NamedTuple("CellData", [("cell", Cell), ("boids", Tuple[int]),
             return
 
         @when(positions, velocities)
-        def _(positions: List[Cown[Matrix]], velocities: List[Cown[Matrix]]):
+        def _(positions: list[Cown[Matrix]], velocities: list[Cown[Matrix]]):
             batch_positions = Matrix.concat([c.value for c in positions])
             batch_velocities = Matrix.concat([c.value for c in velocities])
 

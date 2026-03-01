@@ -1,4 +1,4 @@
-from typing import Any, Callable, Generic, Iterator, List, Optional, Sequence, Tuple, TypeVar, Union
+from typing import Any, Callable, Generic, Iterator, Optional, Sequence, TypeVar, Union
 
 
 TIMEOUT: str
@@ -21,7 +21,7 @@ def receive(tags: Union[Sequence[str], str],
     """Receives a message.
 
     :param tags: One or more tags. The received message will be tagged with one of these.
-    :type tags: Union[List[str], Tuple[str, ...], str]
+    :type tags: Union[list[str], tuple[str, ...], str]
     :param timeout: A non-negative value indicates how many seconds receive should wait before returning.
                     A negative value indicates to wait until a message is received.
     :type timeout: float
@@ -54,7 +54,8 @@ class Matrix:
     unary ``-`` and ``abs()``, and subscript indexing with integers or slices.
     """
 
-    def __init__(self, rows: int, columns: int, values: Optional[Union[int, float, Sequence[Union[int, float]]]]):
+    def __init__(self, rows: int, columns: int,
+                 values: Optional[Union[int, float, Sequence[Union[int, float]]]] = None):
         """Create a new *rows* × *columns* matrix.
 
         :param rows: Number of rows (must be ≥ 1).
@@ -113,7 +114,7 @@ class Matrix:
         """Whether the matrix is currently acquired."""
 
     @property
-    def shape(self) -> Tuple[int, int]:
+    def shape(self) -> tuple[int, int]:
         """The ``(rows, columns)`` shape of the matrix."""
 
     def transpose(self) -> "Matrix":
@@ -191,7 +192,7 @@ class Matrix:
     def copy(self) -> "Matrix":
         """Return a deep copy of this matrix."""
 
-    def select(self, indices: Union[List[int], Tuple[int]], axis=0):
+    def select(self, indices: Union[list[int], tuple[int]], axis=0):
         """Return a new matrix containing only the selected rows or columns.
 
         :param indices: The row or column indices to select.
@@ -231,10 +232,10 @@ class Matrix:
     def __len__(self) -> int:
         """Return the number of rows."""
 
-    def __getitem__(self, key: Union[int, Tuple[int, int]]) -> Union["Matrix", float]:
+    def __getitem__(self, key: Union[int, tuple[int, int]]) -> Union["Matrix", float]:
         """Retrieve a row, element, or sub-matrix by index or slice."""
 
-    def __setitem__(self, key: Union[int, Tuple[int, int]], value: Union[int,
+    def __setitem__(self, key: Union[int, tuple[int, int]], value: Union[int,
                     float, "Matrix", Sequence[Union[int, float]]]):
         """Set a row, element, or sub-matrix by index or slice."""
 
@@ -256,7 +257,7 @@ class Matrix:
         """
 
     @classmethod
-    def zeros(cls, size: Tuple[int, int]):
+    def zeros(cls, size: tuple[int, int]):
         """Create a matrix filled with zeros.
 
         :param size: A ``(rows, columns)`` tuple specifying the shape.
@@ -264,7 +265,7 @@ class Matrix:
         """
 
     @classmethod
-    def ones(cls, size: Tuple[int, int]):
+    def ones(cls, size: tuple[int, int]):
         """Create a matrix filled with ones.
 
         :param size: A ``(rows, columns)`` tuple specifying the shape.
@@ -272,7 +273,8 @@ class Matrix:
         """
 
     @classmethod
-    def normal(cls, mean: Optional[float], stddev: Optional[float], size: Optional[Tuple[int, int]]):
+    def normal(cls, mean: Optional[float], stddev: Optional[float],
+               size: Optional[tuple[int, int]] = None) -> Union[float, "Matrix"]:
         """Sample from a normal (Gaussian) distribution.
 
         :param mean: Mean of the distribution (default ``0.0``).
@@ -282,7 +284,8 @@ class Matrix:
         """
 
     @classmethod
-    def uniform(cls, minval: Optional[float], maxval: Optional[float], size: Optional[Tuple[int, int]]):
+    def uniform(cls, minval: Optional[float], maxval: Optional[float],
+                size: Optional[tuple[int, int]] = None) -> Union[float, "Matrix"]:
         """Sample from a continuous uniform distribution over ``[minval, maxval)``.
 
         :param minval: Lower bound (inclusive, default ``0.0``).
@@ -301,7 +304,9 @@ class Matrix:
         :return: A new :class:`Matrix` with a single row or column.
         """
 
-    def concat(cls, values: Sequence[Union["Matrix", Sequence[Union[float, int]]]], axis=0) -> "Matrix":
+    @classmethod
+    def concat(cls, values: Sequence[Union["Matrix",
+                                           Sequence[Union[float, int]]]], axis=0) -> "Matrix":
         """Concatenate matrices along the given axis.
 
         :param values: The matrices or sequences to concatenate.
@@ -385,12 +390,12 @@ def when(*cowns):
     the result of executing the behavior.  This :class:`Cown` can be used for
     further coordination.
 
-    :param cowns: Zero or more :class:`Cown` objects or ``List[Cown]`` groups
+    :param cowns: Zero or more :class:`Cown` objects or ``list[Cown]`` groups
         to acquire before running the decorated function.  Each argument
         becomes one parameter of the decorated function: a single
         :class:`Cown` is passed directly, while a list is delivered as a
-        ``List[Cown]``.
-    :type cowns: Union[Cown, List[Cown]]
+        ``list[Cown]``.
+    :type cowns: Union[Cown, list[Cown]]
     :return: A :class:`Cown` holding the result of the behavior.
     """
 
@@ -408,19 +413,19 @@ def start(**kwargs):
     :param module: A tuple of the target module name and file path to
         export for worker import.  If ``None``, the caller's module will
         be used.
-    :type module: Optional[Tuple[str, str]]
+    :type module: Optional[tuple[str, str]]
     """
 
 
-def whencall(thunk: str, args: List[Union[Cown, List[Cown]]], captures: List[Any]) -> Cown:
+def whencall(thunk: str, args: list[Union[Cown, list[Cown]]], captures: list[Any]) -> Cown:
     """Invoke a behavior by name with cown args and captured values.
 
     :param thunk: The name of the exported behavior function to call.
     :type thunk: str
     :param args: The cown arguments (or lists of cowns) to pass.
-    :type args: List[Union[Cown, List[Cown]]]
+    :type args: list[Union[Cown, list[Cown]]]
     :param captures: Closed-over values to pass to the behavior.
-    :type captures: List[Any]
+    :type captures: list[Any]
     :return: A :class:`Cown` that will hold the behavior's return value.
     :rtype: Cown
     """

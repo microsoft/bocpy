@@ -4,14 +4,13 @@ import logging
 import os
 import random
 import time
-from typing import List
 
 from boc import Cown, wait, when
 
 logging.basicConfig(level=logging.INFO)
 
 
-def all_known_cheeses() -> List[str]:
+def all_known_cheeses() -> list[str]:
     """Load the cheese inventory from disk."""
     path = os.path.join(os.path.dirname(__file__), "assets", "cheese.txt")
     with open(path) as file:
@@ -27,7 +26,7 @@ def is_available(logger, name: str) -> bool:
     return False
 
 
-def menu() -> List[str]:
+def menu() -> list[str]:
     """Load the menu and shuffle it."""
     path = os.path.join(os.path.dirname(__file__), "assets", "menu.txt")
     with open(path) as file:
