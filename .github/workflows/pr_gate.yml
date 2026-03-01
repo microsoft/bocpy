@@ -6,6 +6,23 @@ on:
   workflow_dispatch:
 
 jobs:
+  linting:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.14
+
+      - name: Install flake8
+        run: pip install -e .[linting]
+
+      - name: Run flake8
+        run: flake8 src/boc test examples
+
   linux:
     runs-on: ubuntu-latest
     strategy:

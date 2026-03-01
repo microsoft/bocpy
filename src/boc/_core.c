@@ -70,37 +70,11 @@ void thrd_sleep(const struct timespec *duration, struct timespec *remaining) {
 const struct timespec SLEEP_TS = {0, 1000};
 const char *BOC_TIMEOUT = "__timeout__";
 const int BOC_CAPACITY = 1024 * 16;
+const PY_INT64_T NO_OWNER = -2;
 atomic_int_least64_t BOC_COUNT = 0;
-PY_INT64_T NO_OWNER = -2;
-static thread_local int_least64_t BOC_ID;
+atomic_int_least64_t BOC_COWN_COUNT = 0;
 
 // #define BOC_TRACE
-
-#ifdef BOC_TRACE
-static inline void print_obj_debug(PyObject *obj) {
-  PyObject_Print(obj, stdout, 0);
-}
-
-static inline void print_debug(char *fmt, ...) {
-  char debug_fmt[1024];
-  va_list args;
-
-  sprintf(debug_fmt, "%" PRIdLEAST64 ": %s", BOC_ID, fmt);
-  va_start(args, fmt);
-  vprintf(debug_fmt, args);
-  va_end(args);
-}
-
-char BOC_DEBUG_FMT_BUF[1024];
-
-#define PRINTFDBG printf
-#define PRINTDBG print_debug
-#define PRINTOBJDBG print_obj_debug
-#else
-#define PRINTFDBG(...)
-#define PRINTDBG(...)
-#define PRINTOBJDBG(...)
-#endif
 
 #if PY_VERSION_HEX >= 0x030E0000 // 3.14
 
@@ -146,7 +120,6 @@ static bool xidata_supported(PyObject *op) {
 
 #elif PY_VERSION_HEX >= 0x030C0000 // 3.12
 
-#define XIDATA_FREE(xidata) PyMem_RawFree((xidata));
 #define XIDATA_NEWOBJECT _PyCrossInterpreterData_NewObject
 #define XIDATA_INIT _PyCrossInterpreterData_Init
 #define XIDATA_GETXIDATA(value, xidata)                                        \
@@ -174,8 +147,21 @@ static bool xidata_supported(PyObject *op) {
   return getdata != NULL;
 }
 
+static void xidata_free(void *arg) {
+  XIDATA_T *xidata = (XIDATA_T *)arg;
+  if (xidata->data != NULL) {
+    if (xidata->free != NULL) {
+      xidata->free(xidata->data);
+    }
+    xidata->data = NULL;
+  }
+  Py_CLEAR(xidata->obj);
+  PyMem_RawFree(arg);
+}
+
 #define XIDATA_SET_FREE xidata_set_free
 #define XIDATA_NEW xidata_new
+#define XIDATA_FREE xidata_free
 
 #else
 
@@ -279,6 +265,8 @@ typedef struct boc_recycle_queue {
   BOCRecycleNode *tail;
   /// @brief The next RecycleQueue in the list (for use in cleanup)
   atomic_intptr_t next;
+  /// @brief Dictionary mapping xidata to cowns
+  PyObject *xidata_to_cowns;
 } BOCRecycleQueue;
 
 struct boc_tag;
@@ -309,8 +297,8 @@ typedef struct boc_queue {
   /// @brief index of the tail message (monotonically increasing)
   atomic_int_least64_t tail;
 
-  /// @brief Whether a tag has been assigned to the queue
-  atomic_int_least64_t assigned;
+  /// @brief Whether the queue is unassigned, assigned, or disabled
+  atomic_int_least64_t state;
   /// @brief tag assigned to this queue.
   /// @details Messages which are sent with this tag will be assigned to this
   /// queue. Calls to receive on the tag will attempt to dequeue from this
@@ -326,11 +314,15 @@ typedef struct boc_tag {
   Py_ssize_t size;
   /// @brief A pointer to the queue that this tag is associated with
   BOCQueue *queue;
+  atomic_int_least64_t rc;
+  atomic_int_least64_t disabled;
 } BOCTag;
 
 #define BOC_QUEUE_COUNT 16
-static BOCQueue BOC_QUEUES[BOC_QUEUE_COUNT + 1];
-static BOCQueue *WILDCARD_QUEUE = BOC_QUEUES + BOC_QUEUE_COUNT;
+const int_least64_t BOC_QUEUE_UNASSIGNED = 0;
+const int_least64_t BOC_QUEUE_ASSIGNED = 1;
+const int_least64_t BOC_QUEUE_DISABLED = 2;
+static BOCQueue BOC_QUEUES[BOC_QUEUE_COUNT];
 static BOCRecycleQueue *BOC_RECYCLE_QUEUE_TAIL = NULL;
 static atomic_intptr_t BOC_RECYCLE_QUEUE_HEAD = 0;
 
@@ -340,7 +332,7 @@ static atomic_intptr_t BOC_RECYCLE_QUEUE_HEAD = 0;
 /// @param unicode A PyUnicode object
 /// @param queue The queue to associate with this tag
 /// @return a new BOCTag object
-BOCTag *BOCTag_FromPyUnicode(PyObject *unicode, BOCQueue *queue) {
+BOCTag *tag_from_PyUnicode(PyObject *unicode, BOCQueue *queue) {
   if (!PyUnicode_CheckExact(unicode)) {
     PyErr_SetString(PyExc_TypeError, "Must be a str");
     return NULL;
@@ -366,6 +358,8 @@ BOCTag *BOCTag_FromPyUnicode(PyObject *unicode, BOCQueue *queue) {
 
   memcpy(tag->str, str, tag->size + 1);
   tag->queue = queue;
+  atomic_store(&tag->rc, 0);
+  atomic_store(&tag->disabled, 0);
 
   return tag;
 }
@@ -374,7 +368,7 @@ BOCTag *BOCTag_FromPyUnicode(PyObject *unicode, BOCQueue *queue) {
 /// @note This method uses PyUnicode_FromStringAndSize() internally.
 /// @param tag The tag to convert
 /// @return A new reference to a PyUnicode object.
-PyObject *BOCTag_ToPyUnicode(BOCTag *tag) {
+PyObject *tag_to_PyUnicode(BOCTag *tag) {
   return PyUnicode_FromStringAndSize(tag->str, tag->size);
 }
 
@@ -385,14 +379,35 @@ void BOCTag_free(BOCTag *tag) {
   PyMem_RawFree(tag);
 }
 
+static int_least64_t tag_decref(BOCTag *tag) {
+  int_least64_t rc = atomic_fetch_add(&tag->rc, -1) - 1;
+  if (rc == 0) {
+    BOCTag_free(tag);
+  }
+
+  return rc;
+}
+
+#define TAG_DECREF(t) tag_decref(t)
+
+static int_least64_t tag_incref(BOCTag *tag) {
+  return atomic_fetch_add(&tag->rc, 1) + 1;
+}
+
+#define TAG_INCREF(t) tag_incref(t)
+
+bool tag_is_disabled(BOCTag *tag) { return atomic_load(&tag->disabled); }
+
+void tag_disable(BOCTag *tag) { atomic_store(&tag->disabled, 1); }
+
 /// @brief Compares a BOCTag with a UTF8 string.
 /// @details -1 if the tag should be placed before, 1 if after, 0 if equivalent
 /// @param lhs The BOCtag to compare
 /// @param rhs_str The string to compare with
 /// @param rhs_size The length of the comparison string
 /// @return -1 if before, 1 if after, 0 if equivalent
-int BOCTag_CompareWithUTF8(BOCTag *lhs, const char *rhs_str,
-                           Py_ssize_t rhs_size) {
+int tag_compare_with_utf8(BOCTag *lhs, const char *rhs_str,
+                          Py_ssize_t rhs_size) {
   Py_ssize_t size = lhs->size < rhs_size ? lhs->size : rhs_size;
   char *lhs_ptr = lhs->str;
   const char *rhs_ptr = rhs_str;
@@ -425,7 +440,7 @@ int BOCTag_CompareWithUTF8(BOCTag *lhs, const char *rhs_str,
 /// @param rhs_str The string to compare with
 /// @param rhs_size The length of the comparison string
 /// @return -1 if before, 1 if after, 0 if equivalent
-int BOCTag_CompareWithPyUnicode(BOCTag *lhs, PyObject *rhs_op) {
+int tag_compare_with_PyUnicode(BOCTag *lhs, PyObject *rhs_op) {
   if (!PyUnicode_CheckExact(rhs_op)) {
     PyErr_SetString(PyExc_TypeError, "Must be a str");
     return -2;
@@ -437,7 +452,7 @@ int BOCTag_CompareWithPyUnicode(BOCTag *lhs, PyObject *rhs_op) {
     return -2;
   }
 
-  return BOCTag_CompareWithUTF8(lhs, rhs_str, rhs_size);
+  return tag_compare_with_utf8(lhs, rhs_str, rhs_size);
 }
 
 /// @brief State for the module.
@@ -447,18 +462,51 @@ typedef struct boc_state {
   /// @brief The unique recycle tag for this module. Used for recycling
   /// messages.
   BOCRecycleQueue *recycle_queue;
-  /// @brief Dictionary mapping xidata to cowns
-  PyObject *xidata_to_cowns;
   /// @brief Cached reference to the pickle module
   PyObject *pickle;
   /// @brief Cached reference to the dumps function in the pickle module
   PyObject *dumps;
   /// @brief Cached reference to the loads function in the pickle module
   PyObject *loads;
+  PyTypeObject *cown_capsule_type;
+  PyTypeObject *behavior_capsule_type;
   /// @brief PyUnicode objects indicating the string associated with each of the
   /// queues.
   BOCTag *queue_tags[BOC_QUEUE_COUNT];
-} BOCState;
+} _core_module_state;
+
+static thread_local _core_module_state *BOC_STATE;
+
+#define BOC_STATE_SET(m)                                                       \
+  do {                                                                         \
+    BOC_STATE = (_core_module_state *)PyModule_GetState(m);                    \
+  } while (0)
+
+#ifdef BOC_TRACE
+static inline void print_obj_debug(PyObject *obj) {
+  PyObject_Print(obj, stdout, 0);
+}
+
+static inline void print_debug(char *fmt, ...) {
+  char debug_fmt[1024];
+  va_list args;
+
+  sprintf(debug_fmt, "%" PRIdLEAST64 ": %s", BOC_STATE->index, fmt);
+  va_start(args, fmt);
+  vprintf(debug_fmt, args);
+  va_end(args);
+}
+
+char BOC_DEBUG_FMT_BUF[1024];
+
+#define PRINTFDBG printf
+#define PRINTDBG print_debug
+#define PRINTOBJDBG print_obj_debug
+#else
+#define PRINTFDBG(...)
+#define PRINTDBG(...)
+#define PRINTOBJDBG(...)
+#endif
 
 /// @brief Convenience method to obtain the interpreter ID
 /// @return the ID of the currently running interpreter
@@ -490,6 +538,7 @@ static BOCRecycleQueue *BOCRecycleQueue_new(int_least64_t index) {
   node->xidata = NULL;
   intptr_t node_ptr = (intptr_t)node;
 
+  queue->xidata_to_cowns = NULL;
   queue->head = 0;
   queue->tail = NULL;
   queue->next = 0;
@@ -505,88 +554,22 @@ static BOCRecycleQueue *BOCRecycleQueue_new(int_least64_t index) {
   old_head->tail = node;
   atomic_store(&old_head->head, node_ptr);
   atomic_store(&old_head->next, queue_ptr);
+
+  old_head->xidata_to_cowns = PyDict_New();
+  if (old_head->xidata_to_cowns == NULL) {
+    return NULL;
+  }
+
   return old_head;
 }
 
-/// @brief Enqeues an xidata on the recycling queue.
-/// @param queue The queue to use
-/// @param xidata The data to enqueue
-static void BOCRecycleQueue_enqueue(BOCRecycleQueue *queue, XIDATA_T *xidata) {
-#ifdef BOC_TRACE
-  if (xidata->obj != NULL) {
-    PRINTDBG("enqueueing %s to recycle queue %" PRIdLEAST64 "\n",
-             xidata->obj->ob_type->tp_name, queue->index);
-  } else {
-    PRINTDBG("enqueueing <NULL> to recycle queue %" PRIdLEAST64 "\n",
-             queue->index);
-  }
-#endif
-
-  // allocate space for the next item
-  BOCRecycleNode *node =
-      (BOCRecycleNode *)PyMem_RawMalloc(sizeof(BOCRecycleNode));
-  node->xidata = NULL;
-  atomic_store(&node->next, 0);
-
-  // step 1: swap the new node in as the new head
-  intptr_t node_ptr = (intptr_t)node;
-  intptr_t old_head_ptr = atomic_exchange(&queue->head, node_ptr);
-  BOCRecycleNode *old_head = (BOCRecycleNode *)old_head_ptr;
-  // queue is now inconsistent
-  // step 2: store the data in this node. This node is somewhere inside the
-  // queue.
-  old_head->xidata = xidata;
-  // step 3: connect everything back together
-  atomic_store(&old_head->next, node_ptr);
-  // queue is consistent
-}
-
-/// @brief Dequeue an XIData object from the queue.
-/// @param queue The queue to use
-/// @param wait_for_consistency Whether to wait until the queue is in an
-/// consistent state before returning
-/// @return XIData object if available, NULL if queue is empty or inconsistent
-static XIDATA_T *BOCRecycleQueue_dequeue(BOCRecycleQueue *queue,
-                                         bool wait_for_consistency) {
-  BOCRecycleNode *tail = queue->tail;
-  intptr_t tail_ptr = (intptr_t)queue->tail;
-  intptr_t next_ptr = atomic_load(&tail->next);
-  if (next_ptr == 0) {
-    // two possibilities:
-    // 1. queue is empty
-    // 2. queue is inconsistent
-    if (!wait_for_consistency) {
-      // whatever this is can wait until the queue is back in a good state
-      return NULL;
-    }
-
-    if (queue->head == tail_ptr) {
-      // the queue is consistent, but empty
-      return NULL;
-    }
-
-    // the queue is inconsistent, so we spin/wait for step 3 to complete above
-    while (next_ptr == 0) {
-      next_ptr = atomic_load(&tail->next);
-    }
-  }
-
-  // we can proceed to dequeue the tail
-  XIDATA_T *data = tail->xidata;
-  queue->tail = (BOCRecycleNode *)next_ptr;
-  PyMem_RawFree(tail);
-  return data;
-}
-
-static PyObject *_PyPickle_Dumps(PyObject *module, PyObject *obj) {
-  BOCState *state = (BOCState *)PyModule_GetState(module);
-  PyObject *bytes = PyObject_CallOneArg(state->dumps, obj);
+static PyObject *_PyPickle_Dumps(PyObject *obj) {
+  PyObject *bytes = PyObject_CallOneArg(BOC_STATE->dumps, obj);
   return bytes;
 }
 
-static PyObject *_PyPickle_Loads(PyObject *module, PyObject *bytes) {
-  BOCState *state = (BOCState *)PyModule_GetState(module);
-  PyObject *obj = PyObject_CallOneArg(state->loads, bytes);
+static PyObject *_PyPickle_Loads(PyObject *bytes) {
+  PyObject *obj = PyObject_CallOneArg(BOC_STATE->loads, bytes);
   return obj;
 }
 
@@ -595,8 +578,7 @@ static PyObject *_PyPickle_Loads(PyObject *module, PyObject *bytes) {
 /// @param xidata The xidata containing the value
 /// @param pickled Whether the value is pickled
 /// @return A new instance of the object
-static PyObject *xidata_to_object(PyObject *module, XIDATA_T *xidata,
-                                  bool pickled) {
+static PyObject *xidata_to_object(XIDATA_T *xidata, bool pickled) {
   assert(xidata != NULL);
   PyObject *value = XIDATA_NEWOBJECT(xidata);
   if (value == NULL) {
@@ -608,7 +590,7 @@ static PyObject *xidata_to_object(PyObject *module, XIDATA_T *xidata,
   }
 
   PyObject *bytes = value;
-  value = _PyPickle_Loads(module, bytes);
+  value = _PyPickle_Loads(bytes);
   if (value == NULL) {
     Py_DECREF(bytes);
     return NULL;
@@ -626,8 +608,7 @@ static PyObject *xidata_to_object(PyObject *module, XIDATA_T *xidata,
 /// allocated xidata object on success)
 /// @return True if pickling was required, False if not, NULL if there was an
 /// error
-static PyObject *object_to_xidata(PyObject *module, PyObject *value,
-                                  XIDATA_T **xidata_ptr) {
+static PyObject *object_to_xidata(PyObject *value, XIDATA_T **xidata_ptr) {
   if (*xidata_ptr == NULL) {
     *xidata_ptr = XIDATA_NEW();
   }
@@ -649,7 +630,7 @@ static PyObject *object_to_xidata(PyObject *module, PyObject *value,
   PyErr_Clear();
 
   // no native support, fallback to pickle
-  PyObject *bytes = _PyPickle_Dumps(module, value);
+  PyObject *bytes = _PyPickle_Dumps(value);
   if (bytes == NULL) {
     return NULL;
   }
@@ -669,6 +650,7 @@ static PyObject *object_to_xidata(PyObject *module, PyObject *value,
 /// @brief The threadsafe cown object.
 /// @details This can be safely referenced and used from multiple processes.
 typedef struct boc_cown {
+  int_least64_t id;
   /// @brief The python object held in this cown.
   /// @details This is only non-NULL when the cown is acquired.
   PyObject *value;
@@ -690,19 +672,10 @@ typedef struct boc_cown {
   atomic_int_least64_t weak_rc;
 } BOCCown;
 
-/// @brief Lightweight capsule object for cowns
-/// @details This capsule allows the cown to be exposed to the Python code
-/// level. There can be any number of them, and the will perform atomic
-/// reference counts on the underlying cown.
-typedef struct cown_capsule_object {
-  PyObject_HEAD
-      /// @brief the actual cown object wrapped by the capsule
-      BOCCown *cown;
-} CownCapsuleObject;
-
 static inline int_least64_t cown_weak_decref(BOCCown *cown) {
   int_least64_t weak_rc = atomic_fetch_add(&cown->weak_rc, -1) - 1;
-  PRINTDBG("cown_weak_decref(%p) = %" PRIdLEAST64 "\n", cown, weak_rc);
+  PRINTDBG("cown_weak_decref(%p, cid=%ld) = %" PRIdLEAST64 "\n", cown, cown->id,
+           weak_rc);
 
   if (weak_rc == 0) {
     // reference count is truly zero, we can free the memory
@@ -727,15 +700,7 @@ static inline void report_unhandled_exception(BOCCown *cown) {
     return;
   }
 
-  PyObject *module = PyImport_ImportModule("_boc");
-  if (module == NULL) {
-    PyErr_Clear();
-    fprintf(stderr, "<fatal error: unable to import _boc module when "
-                    "deserializing exception>\n");
-    return;
-  }
-
-  cown->value = xidata_to_object(module, cown->xidata, cown->pickled);
+  cown->value = xidata_to_object(cown->xidata, cown->pickled);
 
   if (cown->value == NULL) {
     PyErr_Clear();
@@ -748,12 +713,14 @@ static inline void report_unhandled_exception(BOCCown *cown) {
   return;
 }
 
+static void BOCRecycleQueue_enqueue(BOCRecycleQueue *queue, XIDATA_T *xidata);
+
 /// @brief Atomic decref for the cown
 /// @param cown the cown to decref
 /// @return the new reference count
 static inline int_least64_t cown_decref(BOCCown *cown) {
   int_least64_t rc = atomic_fetch_add(&cown->rc, -1) - 1;
-  PRINTDBG("cown_decref(%p) = %" PRIdLEAST64 "\n", cown, rc);
+  PRINTDBG("cown_decref(%p, cid=%ld) = %" PRIdLEAST64 "\n", cown, cown->id, rc);
   if (rc != 0) {
     return rc;
   }
@@ -784,13 +751,14 @@ static inline int_least64_t cown_decref(BOCCown *cown) {
 /// @return the new reference count
 static inline int_least64_t cown_incref(BOCCown *cown) {
   int_least64_t rc = atomic_fetch_add(&cown->rc, 1) + 1;
-  PRINTDBG("cown_incref(%p) = %" PRIdLEAST64 "\n", cown, rc);
+  PRINTDBG("cown_incref(%p, cid=%ld) = %" PRIdLEAST64 "\n", cown, cown->id, rc);
   return rc;
 }
 
 static inline int_least64_t cown_weak_incref(BOCCown *cown) {
   int_least64_t rc = atomic_fetch_add(&cown->weak_rc, 1) + 1;
-  PRINTDBG("cown_weak_incref(%p) = %" PRIdLEAST64 "\n", cown, rc);
+  PRINTDBG("cown_weak_incref(%p, cid=%ld) = %" PRIdLEAST64 "\n", cown, cown->id,
+           rc);
   return rc;
 }
 
@@ -833,6 +801,7 @@ static BOCCown *BOCCown_new(PyObject *value) {
     return NULL;
   }
 
+  cown->id = atomic_fetch_add(&BOC_COWN_COUNT, 1);
   cown->value = NULL;
   cown->recycle_queue = NULL;
   cown->xidata = NULL;
@@ -847,12 +816,179 @@ static BOCCown *BOCCown_new(PyObject *value) {
   cown_set_value(cown, value);
   assert(cown->value != NULL);
   atomic_store(&cown->owner, get_interpid());
-  PRINTDBG("BOCCown_new(value=");
+  PRINTDBG("BOCCown_new(cid=%ld, value=", cown->id);
   PRINTOBJDBG(value);
   PRINTFDBG(")\n");
 
   return cown;
 }
+
+/// @brief Dequeue an XIData object from the queue.
+/// @param queue The queue to use
+/// @param wait_for_consistency Whether to wait until the queue is in an
+/// consistent state before returning
+/// @return XIData object if available, NULL if queue is empty or inconsistent
+static XIDATA_T *BOCRecycleQueue_dequeue(BOCRecycleQueue *queue,
+                                         bool wait_for_consistency) {
+  BOCRecycleNode *tail = queue->tail;
+  intptr_t tail_ptr = (intptr_t)queue->tail;
+  intptr_t next_ptr = atomic_load(&tail->next);
+  if (next_ptr == 0) {
+    // two possibilities:
+    // 1. queue is empty
+    // 2. queue is inconsistent
+    if (!wait_for_consistency) {
+      // whatever this is can wait until the queue is back in a good state
+      return NULL;
+    }
+
+    if (queue->head == tail_ptr) {
+      // the queue is consistent, but empty
+      return NULL;
+    }
+
+    // the queue is inconsistent, so we spin/wait for step 3 to complete above
+    while (next_ptr == 0) {
+      next_ptr = atomic_load(&tail->next);
+    }
+  }
+
+  // we can proceed to dequeue the tail
+  XIDATA_T *data = tail->xidata;
+  queue->tail = (BOCRecycleNode *)next_ptr;
+  PyMem_RawFree(tail);
+  return data;
+}
+
+static int BOCRecycleQueue_register(BOCRecycleQueue *queue, BOCCown *cown) {
+  cown->recycle_queue = queue;
+  if (queue->xidata_to_cowns == NULL) {
+    PyErr_Format(
+        PyExc_RuntimeError,
+        "Attempt to register cown after interpreter %ld has shut down\n",
+        queue->index);
+    return -1;
+  }
+
+  PyObject *xidata_ptr = PyLong_FromVoidPtr((void *)cown->xidata);
+  PyObject *cown_ptr = PyLong_FromVoidPtr((void *)cown);
+  if (PyDict_SetItem(queue->xidata_to_cowns, xidata_ptr, cown_ptr) < 0) {
+    Py_DECREF(xidata_ptr);
+    Py_DECREF(cown_ptr);
+    return -1;
+  }
+
+  Py_DECREF(xidata_ptr);
+  Py_DECREF(cown_ptr);
+
+  COWN_WEAK_INCREF(cown);
+
+  return 0;
+}
+
+static void BOCRecycleQueue_recycle(BOCRecycleQueue *queue, XIDATA_T *xidata) {
+  assert(queue == BOC_STATE->recycle_queue);
+  PyObject *xidata_ptr = PyLong_FromVoidPtr((void *)xidata);
+
+  if (queue->xidata_to_cowns != NULL) {
+    PyObject *cown_ptr = PyDict_GetItem(queue->xidata_to_cowns, xidata_ptr);
+    if (cown_ptr != NULL) {
+      BOCCown *cown = (BOCCown *)PyLong_AsVoidPtr(cown_ptr);
+      COWN_WEAK_DECREF(cown);
+      PyDict_DelItem(queue->xidata_to_cowns, xidata_ptr);
+    }
+  } else {
+    fprintf(stderr,
+            "Recycling xidata created on interpeter %" PRIdLEAST64 " after the interpreter "
+            "has shut down may result in cown leak.\n",
+            queue->index);
+  }
+
+  Py_DECREF(xidata_ptr);
+  XIDATA_FREE(xidata);
+}
+
+/// @brief Enqeues an xidata on the recycling queue.
+/// @param queue The queue to use
+/// @param xidata The data to enqueue
+static void BOCRecycleQueue_enqueue(BOCRecycleQueue *queue, XIDATA_T *xidata) {
+#ifdef BOC_TRACE
+  if (xidata->obj != NULL) {
+    PRINTDBG("enqueueing %s to recycle queue %" PRIdLEAST64 "\n",
+             xidata->obj->ob_type->tp_name, queue->index);
+  } else {
+    PRINTDBG("enqueueing <NULL> to recycle queue %" PRIdLEAST64 "\n",
+             queue->index);
+  }
+#endif
+
+  if (queue == BOC_STATE->recycle_queue) {
+    // no need to enqueue, this is on the local interpreter
+    BOCRecycleQueue_recycle(queue, xidata);
+    return;
+  }
+
+  // allocate space for the next item
+  BOCRecycleNode *node =
+      (BOCRecycleNode *)PyMem_RawMalloc(sizeof(BOCRecycleNode));
+  node->xidata = NULL;
+  atomic_store(&node->next, 0);
+
+  // step 1: swap the new node in as the new head
+  intptr_t node_ptr = (intptr_t)node;
+  intptr_t old_head_ptr = atomic_exchange(&queue->head, node_ptr);
+  BOCRecycleNode *old_head = (BOCRecycleNode *)old_head_ptr;
+  // queue is now inconsistent
+  // step 2: store the data in this node. This node is somewhere inside the
+  // queue.
+  old_head->xidata = xidata;
+  // step 3: connect everything back together
+  atomic_store(&old_head->next, node_ptr);
+  // queue is consistent
+}
+
+/// @brief Empty out the queue and free the contents
+/// @param queue The queue to empty
+/// @param wait_for_consistency Whether to wait until the queue is consistent
+static void BOCRecycleQueue_empty(BOCRecycleQueue *queue,
+                                  bool wait_for_consistency) {
+  XIDATA_T *xidata = BOCRecycleQueue_dequeue(queue, wait_for_consistency);
+  while (xidata != NULL) {
+    BOCRecycleQueue_recycle(queue, xidata);
+    xidata = BOCRecycleQueue_dequeue(queue, wait_for_consistency);
+  }
+
+  if (wait_for_consistency) {
+    assert((intptr_t)queue->tail == atomic_load(&queue->head));
+    assert(atomic_load(&queue->tail->next) == 0);
+  }
+}
+
+/// @brief Frees a RecycleQueue.
+/// @details This will complete the recycling of any pending XIData objects, if
+/// possible.
+/// @param queue The queue to free
+static void BOCRecycleQueue_free(BOCRecycleQueue *queue) {
+  assert(queue->xidata_to_cowns == NULL);
+  if (queue->tail != NULL && atomic_load(&queue->tail->next) != 0) {
+    printf("BOC: recycle queue %" PRIdLEAST64 " not empty during finalize\n",
+           queue->index);
+    BOCRecycleQueue_empty(queue, true);
+  }
+
+  PyMem_RawFree(queue->tail);
+  PyMem_RawFree(queue);
+}
+
+/// @brief Lightweight capsule object for cowns
+/// @details This capsule allows the cown to be exposed to the Python code
+/// level. There can be any number of them, and the will perform atomic
+/// reference counts on the underlying cown.
+typedef struct cown_capsule_object {
+  PyObject_HEAD
+      /// @brief the actual cown object wrapped by the capsule
+      BOCCown *cown;
+} CownCapsuleObject;
 
 /// @brief Deallocates the CownCapsule
 /// @note This will perform an atomic decref on the underlying cown
@@ -900,7 +1036,8 @@ static int CownCapsule_init(PyObject *op, PyObject *args,
     return -1;
   }
 
-  PRINTDBG("CownCapsule_init(%p, value=", self);
+  PRINTDBG("CownCapsule_init(%p, cown=%p, cid=%ld, value=", self, self->cown,
+           self->cown->id);
   PRINTOBJDBG(value);
   PRINTFDBG(")\n");
   return 0;
@@ -1002,9 +1139,8 @@ static PyObject *CownCapsule_acquired(PyObject *op,
 
 /// @brief Attempts to acquire the cown
 /// @param cown The cown to acquire
-/// @param boc_module The _boc module
 /// @return -1 if failure, 0 if success
-static int cown_acquire(BOCCown *cown, PyObject *boc_module) {
+static int cown_acquire(BOCCown *cown) {
   int_least64_t expected = NO_OWNER;
   int_least64_t desired = get_interpid();
   if (!atomic_compare_exchange_strong(&cown->owner, &expected, desired)) {
@@ -1022,7 +1158,7 @@ static int cown_acquire(BOCCown *cown, PyObject *boc_module) {
 
   assert(cown->value == NULL);
   assert(cown->xidata != NULL);
-  cown->value = xidata_to_object(boc_module, cown->xidata, cown->pickled);
+  cown->value = xidata_to_object(cown->xidata, cown->pickled);
 
   if (cown->value == NULL) {
     return -1;
@@ -1043,27 +1179,19 @@ static int cown_acquire(BOCCown *cown, PyObject *boc_module) {
 /// @return None on success, NULL otherwise
 static PyObject *CownCapsule_acquire(PyObject *op, PyObject *Py_UNUSED(dummy)) {
   CownCapsuleObject *self = (CownCapsuleObject *)op;
-  PyObject *module = PyImport_ImportModule("_boc");
-  if (module == NULL) {
-    return NULL;
-  }
-
   BOCCown *cown = self->cown;
 
-  if (cown_acquire(cown, module) < 0) {
-    Py_DECREF(module);
+  if (cown_acquire(cown) < 0) {
     return NULL;
   }
 
-  Py_DECREF(module);
   Py_RETURN_NONE;
 }
 
 /// @brief Releases the cown
 /// @param cown The cown to release
-/// @param boc_module The _boc module
 /// @return -1 if error, 0 otherwise
-static int cown_release(BOCCown *cown, PyObject *boc_module) {
+static int cown_release(BOCCown *cown) {
   int_least64_t expected = get_interpid();
   int_least64_t owner = atomic_load(&cown->owner);
   if (owner != expected) {
@@ -1082,27 +1210,15 @@ static int cown_release(BOCCown *cown, PyObject *boc_module) {
   assert(cown->value != NULL);
   assert(cown->xidata == NULL);
 
-  PyObject *pickled = object_to_xidata(boc_module, cown->value, &cown->xidata);
+  PyObject *pickled = object_to_xidata(cown->value, &cown->xidata);
 
   if (pickled == NULL) {
     return -1;
   }
 
-  BOCState *state = (BOCState *)PyModule_GetState(boc_module);
-
-  cown->recycle_queue = state->recycle_queue;
-  PyObject *xidata_ptr = PyLong_FromVoidPtr((void *)cown->xidata);
-  PyObject *cown_ptr = PyLong_FromVoidPtr((void *)cown);
-  if (PyDict_SetItem(state->xidata_to_cowns, xidata_ptr, cown_ptr) < 0) {
-    Py_DECREF(xidata_ptr);
-    Py_DECREF(cown_ptr);
+  if (BOCRecycleQueue_register(BOC_STATE->recycle_queue, cown) < 0) {
     return -1;
   }
-
-  Py_DECREF(xidata_ptr);
-  Py_DECREF(cown_ptr);
-
-  COWN_WEAK_INCREF(cown);
 
   cown->pickled = Py_IsTrue(pickled);
   Py_CLEAR(cown->value);
@@ -1128,17 +1244,11 @@ static int cown_release(BOCCown *cown, PyObject *boc_module) {
 static PyObject *CownCapsule_release(PyObject *op, PyObject *Py_UNUSED(dummy)) {
   CownCapsuleObject *self = (CownCapsuleObject *)op;
   BOCCown *cown = self->cown;
-  PyObject *module = PyImport_ImportModule("_boc");
-  if (module == NULL) {
+
+  if (cown_release(cown) < 0) {
     return NULL;
   }
 
-  if (cown_release(cown, module) < 0) {
-    Py_DECREF(module);
-    return NULL;
-  }
-
-  Py_DECREF(module);
   Py_RETURN_NONE;
 }
 
@@ -1188,22 +1298,49 @@ static PyObject *CownCapsule_repr(PyObject *op) {
   };
 }
 
-static PyTypeObject CownCapsule_Type = {
-    .ob_base = PyVarObject_HEAD_INIT(NULL, 0).tp_name = "_boc.CownCapsule",
-    .tp_doc = PyDoc_STR("Cown implementation"),
-    .tp_basicsize = sizeof(CownCapsuleObject),
-    .tp_itemsize = 0,
-    .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_new = CownCapsule_new,
-    .tp_init = CownCapsule_init,
-    .tp_dealloc = CownCapsule_dealloc,
-    .tp_methods = CownCapsule_methods,
-    .tp_getset = CownCapsule_getset,
-    .tp_richcompare = CownCapsule_richcompare,
-    .tp_hash = CownCapsule_hash,
-    .tp_repr = CownCapsule_repr};
+static PyType_Slot CownCapsule_slots[] = {
+    {Py_tp_doc, "Cown implementation"},
+    {Py_tp_new, CownCapsule_new},
+    {Py_tp_init, CownCapsule_init},
+    {Py_tp_dealloc, CownCapsule_dealloc},
+    {Py_tp_methods, CownCapsule_methods},
+    {Py_tp_getset, CownCapsule_getset},
+    {Py_tp_richcompare, CownCapsule_richcompare},
+    {Py_tp_hash, CownCapsule_hash},
+    {Py_tp_repr, CownCapsule_repr},
+    {0, NULL} /* sentinel */
+};
 
-#define CownCapsule_CheckExact(op) Py_IS_TYPE((op), &CownCapsule_Type)
+static PyType_Spec CownCapsule_Spec = {.name = "boc._core.CownCapsule",
+                                       .basicsize = sizeof(CownCapsuleObject),
+                                       .itemsize = 0,
+                                       .flags = Py_TPFLAGS_DEFAULT |
+                                                Py_TPFLAGS_IMMUTABLETYPE,
+                                       .slots = CownCapsule_slots};
+
+#define CownCapsule_CheckExact(op)                                             \
+  Py_IS_TYPE((op), BOC_STATE->cown_capsule_type)
+
+static PyObject *cown_capsule_wrap(BOCCown *cown, bool promote) {
+  if (promote) {
+    if (!COWN_PROMOTE(cown)) {
+      return NULL;
+    }
+  } else {
+    COWN_INCREF(cown);
+  }
+
+  PyTypeObject *type = BOC_STATE->cown_capsule_type;
+  CownCapsuleObject *capsule = (CownCapsuleObject *)type->tp_alloc(type, 0);
+  if (capsule == NULL) {
+    return NULL;
+  }
+
+  capsule->cown = cown;
+  PRINTDBG("CownCapsule_wrap(%p, rc=%ld)\n", capsule,
+           capsule->ob_base.ob_refcnt);
+  return (PyObject *)capsule;
+}
 
 /// @brief Unwraps a cown from a CownCapsule
 /// @param op The CownCapsule object
@@ -1228,47 +1365,44 @@ BOCCown *cown_unwrap(PyObject *op) {
   return self->cown;
 }
 
-/// @brief Empty out the queue and free the contents
-/// @param queue The queue to empty
-/// @param wait_for_consistency Whether to wait until the queue is consistent
-static void BOCRecycleQueue_empty(BOCRecycleQueue *queue,
-                                  PyObject *xidata_to_cowns,
-                                  bool wait_for_consistency) {
-  XIDATA_T *xidata = BOCRecycleQueue_dequeue(queue, wait_for_consistency);
-  while (xidata != NULL) {
-    PyObject *xidata_ptr = PyLong_FromVoidPtr((void *)xidata);
-    PyObject *cown_ptr = PyDict_GetItem(xidata_to_cowns, xidata_ptr);
-    if (cown_ptr != NULL) {
-      BOCCown *cown = (BOCCown *)PyLong_AsVoidPtr(cown_ptr);
-      COWN_WEAK_DECREF(cown);
-      PyDict_DelItem(xidata_to_cowns, xidata_ptr);
+static PyObject *BOCRecycleQueue_promote_cowns(BOCRecycleQueue *queue) {
+  if (queue->xidata_to_cowns == NULL) {
+    PyErr_Format(
+        PyExc_RuntimeError,
+        "Cannot promote cowns from interpreter %ld after it has been destroyed",
+        queue->index);
+    return NULL;
+  }
+
+  PyObject *items = PyDict_Items(queue->xidata_to_cowns);
+  if (items == NULL) {
+    return NULL;
+  }
+
+  Py_ssize_t size = PyList_GET_SIZE(items);
+  PyObject *cowns = PyTuple_New(size);
+  if (cowns == NULL) {
+    Py_DECREF(items);
+    return NULL;
+  }
+
+  for (Py_ssize_t i = 0; i < size; ++i) {
+    PyObject *item = PyList_GET_ITEM(items, i);
+    PyObject *cown_ptr = PyTuple_GET_ITEM(item, 1);
+    BOCCown *cown = (BOCCown *)PyLong_AsVoidPtr(cown_ptr);
+    PyObject *cown_capsule = cown_capsule_wrap(cown, true);
+    if (cown_capsule != NULL) {
+      PyTuple_SET_ITEM(cowns, i, cown_capsule);
+      continue;
     }
 
-    Py_DECREF(xidata_ptr);
-    XIDATA_FREE(xidata);
-    xidata = BOCRecycleQueue_dequeue(queue, wait_for_consistency);
+    COWN_WEAK_DECREF(cown);
+    PyTuple_SET_ITEM(cowns, i, Py_None);
   }
 
-  if (wait_for_consistency) {
-    assert((intptr_t)queue->tail == atomic_load(&queue->head));
-    assert(atomic_load(&queue->tail->next) == 0);
-  }
-}
+  Py_DECREF(items);
 
-/// @brief Frees a RecycleQueue.
-/// @details This will complete the recycling of any pending XIData objects, if
-/// possible.
-/// @param queue The queue to free
-static void BOCRecycleQueue_free(BOCRecycleQueue *queue,
-                                 PyObject *xidata_to_cowns) {
-  if (queue->tail != NULL && atomic_load(&queue->tail->next) != 0) {
-    printf("BOC: recycle queue %" PRIdLEAST64 " not empty during finalize\n",
-           queue->index);
-    BOCRecycleQueue_empty(queue, xidata_to_cowns, true);
-  }
-
-  PyMem_RawFree(queue->tail);
-  PyMem_RawFree(queue);
+  return cowns;
 }
 
 /// @brief Creates a new CownCapsule object to wrap an cown that has been sent
@@ -1278,8 +1412,8 @@ static void BOCRecycleQueue_free(BOCRecycleQueue *queue,
 static PyObject *_new_cown_object(XIDATA_T *xidata) {
   BOCCown *cown = (BOCCown *)xidata->data;
 
-  CownCapsuleObject *capsule =
-      (CownCapsuleObject *)CownCapsule_Type.tp_alloc(&CownCapsule_Type, 0);
+  PyTypeObject *type = BOC_STATE->cown_capsule_type;
+  CownCapsuleObject *capsule = (CownCapsuleObject *)type->tp_alloc(type, 0);
   if (capsule == NULL) {
     COWN_DECREF(cown);
     return NULL;
@@ -1328,10 +1462,6 @@ static void boc_message_free(BOCMessage *message) {
     BOCRecycleQueue_enqueue(message->recycle_queue, message->xidata);
   }
 
-  if (message->tag->queue == WILDCARD_QUEUE) {
-    BOCTag_free(message->tag);
-  }
-
   PyMem_RawFree(message);
 }
 
@@ -1352,32 +1482,25 @@ typedef struct shared_contents {
 /// @param xidata The data containing a pointer to the contents struct
 /// @return A PyTuple containing the contents, or NULL on error
 PyObject *_new_contents_object(XIDATA_T *xidata) {
-  BOCSharedContents *contents = (BOCSharedContents *)xidata->data;
+  BOCSharedContents *shared = (BOCSharedContents *)xidata->data;
 
-  PyObject *module = PyImport_ImportModule("_boc");
-  if (module == NULL) {
-    return NULL;
-  }
+  PRINTDBG("_new_contents_object(%p)\n", shared);
 
-  PyObject *tuple = PyTuple_New(contents->num_items);
+  PyObject *tuple = PyTuple_New(shared->num_items);
   if (tuple == NULL) {
-    Py_DECREF(module);
     return NULL;
   }
 
-  for (Py_ssize_t i = 0; i < contents->num_items; ++i) {
-    PyObject *item =
-        xidata_to_object(module, contents->xidata[i], contents->pickled[i]);
+  for (Py_ssize_t i = 0; i < shared->num_items; ++i) {
+    PyObject *item = xidata_to_object(shared->xidata[i], shared->pickled[i]);
     if (item == NULL) {
       Py_DECREF(tuple);
-      Py_DECREF(module);
       return NULL;
     }
 
     PyTuple_SET_ITEM(tuple, i, item);
   }
 
-  Py_DECREF(module);
   return tuple;
 }
 
@@ -1385,9 +1508,16 @@ PyObject *_new_contents_object(XIDATA_T *xidata) {
 /// @param data The struct to free
 void _contents_shared_free(void *data) {
   BOCSharedContents *shared = (BOCSharedContents *)data;
+  PRINTDBG("_contents_shared_free(%p)\n", shared);
   XIDATA_T **xidata_ptr = shared->xidata;
   for (Py_ssize_t i = 0; i < shared->num_items; ++i, ++xidata_ptr) {
     if (*xidata_ptr != NULL) {
+      PyObject *obj = (*xidata_ptr)->obj;
+      if (obj != NULL) {
+        PRINTDBG("_contents_shared_free(%p)[%ld] %s(%p): rc=%ld\n", shared, i,
+                 obj->ob_type->tp_name, obj, Py_REFCNT(obj));
+      }
+
       BOCRecycleQueue_enqueue(shared->recycle_queue, *xidata_ptr);
     }
   }
@@ -1410,8 +1540,7 @@ void _contents_shared_free(void *data) {
 /// @param obj The object that implements Sequence
 /// @param out_ptr The xidata that will hold the resulting contents struct
 /// @return 0 if successful, -1 otherwise
-int _contents_shared(PyObject *module, PyThreadState *tstate, PyObject *obj,
-                     XIDATA_T **out_ptr) {
+int _contents_shared(PyThreadState *tstate, PyObject *obj, XIDATA_T **out_ptr) {
   if (!PySequence_Check(obj)) {
     // not a sequence
     return -1;
@@ -1445,8 +1574,9 @@ int _contents_shared(PyObject *module, PyThreadState *tstate, PyObject *obj,
     return -1;
   }
 
-  BOCState *state = (BOCState *)PyModule_GetState(module);
-  shared->recycle_queue = state->recycle_queue;
+  PRINTDBG("contents_shared(%p)\n", shared);
+
+  shared->recycle_queue = BOC_STATE->recycle_queue;
   shared->num_items = num_items;
   for (Py_ssize_t i = 0; i < num_items; ++i) {
     shared->xidata[i] = NULL;
@@ -1459,8 +1589,11 @@ int _contents_shared(PyObject *module, PyThreadState *tstate, PyObject *obj,
       return -1;
     }
 
-    PyObject *pickled = object_to_xidata(module, item, xidata_ptr);
+    PyObject *pickled = object_to_xidata(item, xidata_ptr);
     Py_DECREF(item);
+
+    PRINTDBG("contents_shared(%p)[%ld] %s(%p): rc=%ld\n", shared, i,
+             item->ob_type->tp_name, item, Py_REFCNT(item));
 
     if (pickled == NULL) {
       // wasn't possible to convert the object to xidata
@@ -1497,45 +1630,51 @@ error:
 /// @param module The boc module
 /// @param tag The tag to query
 /// @return A reference to a BOCQueue
-static BOCQueue *get_queue_for_tag(BOCState *state, PyObject *tag) {
+static BOCQueue *get_queue_for_tag(PyObject *tag) {
   if (tag == NULL) {
-    // return the wildcard queue
-    return WILDCARD_QUEUE;
+    return NULL;
   }
 
   // First we check to see if we already have cached the queue this tag is
   // associated with
   BOCQueue *qptr = BOC_QUEUES;
   for (size_t i = 0; i < BOC_QUEUE_COUNT; ++i, ++qptr) {
-    if (state->queue_tags[i] != NULL) {
-      if (BOCTag_CompareWithPyUnicode(state->queue_tags[i], tag) == 0) {
-        // this is the dedicated queue for this tag
-        return qptr;
+    if (BOC_STATE->queue_tags[i] != NULL) {
+      if (tag_is_disabled(BOC_STATE->queue_tags[i])) {
+        TAG_DECREF(BOC_STATE->queue_tags[i]);
+        BOC_STATE->queue_tags[i] = NULL;
       } else {
-        if (PyErr_Occurred() != NULL) {
-          return NULL;
+        if (tag_compare_with_PyUnicode(BOC_STATE->queue_tags[i], tag) == 0) {
+          // this is the dedicated queue for this tag
+          return qptr;
+        } else {
+          if (PyErr_Occurred() != NULL) {
+            return NULL;
+          }
         }
-      }
 
-      // not the right queue, keep looking
-      continue;
+        // not the right queue, keep looking
+        continue;
+      }
     }
 
     // check to see if another interpreter has used this queue
-    int_least64_t expected = 0;
-    int_least64_t desired = 1;
-    if (atomic_compare_exchange_strong(&qptr->assigned, &expected, desired)) {
+    int_least64_t expected = BOC_QUEUE_UNASSIGNED;
+    int_least64_t desired = BOC_QUEUE_ASSIGNED;
+    if (atomic_compare_exchange_strong(&qptr->state, &expected, desired)) {
       // we're the first, this is the new dedicated queue for this tag
       PRINTDBG("Assigning ");
       PRINTOBJDBG(tag);
       PRINTFDBG(" to queue %zu\n", i);
-      BOCTag *qtag = BOCTag_FromPyUnicode(tag, qptr);
+      BOCTag *qtag = tag_from_PyUnicode(tag, qptr);
       if (qtag == NULL) {
         return NULL;
       }
 
       atomic_store(&qptr->tag, (intptr_t)qtag);
-      state->queue_tags[i] = qtag;
+      TAG_INCREF(qtag);
+      BOC_STATE->queue_tags[i] = qtag;
+      TAG_INCREF(qtag);
       return qptr;
     }
 
@@ -1546,11 +1685,17 @@ static BOCQueue *get_queue_for_tag(BOCState *state, PyObject *tag) {
       qtag = (BOCTag *)atomic_load(&qptr->tag);
     }
 
-    state->queue_tags[i] = qtag;
+    BOC_STATE->queue_tags[i] = qtag;
+    TAG_INCREF(qtag);
 
     PRINTDBG("Discovered %s at queue %ld\n", qtag->str, i);
-    if (BOCTag_CompareWithPyUnicode(state->queue_tags[i], tag) == 0) {
+    if (tag_compare_with_PyUnicode(BOC_STATE->queue_tags[i], tag) == 0) {
       // this is the dedicated queue for this tag
+      if (expected == BOC_QUEUE_DISABLED) {
+        // however, it is disabled right now
+        return NULL;
+      }
+
       return qptr;
     } else if (PyErr_Occurred() != NULL) {
       return NULL;
@@ -1559,8 +1704,8 @@ static BOCQueue *get_queue_for_tag(BOCState *state, PyObject *tag) {
     // not the right queue, keep looking
   }
 
-  // no dedicated queue for this tag, return the wildcard queue
-  return WILDCARD_QUEUE;
+  // no queue for this tag
+  return NULL;
 }
 
 /// @brief Creates a new message.
@@ -1568,37 +1713,41 @@ static BOCQueue *get_queue_for_tag(BOCState *state, PyObject *tag) {
 /// @param tag The tag associated with the message.
 /// @param contents The contents of the message.
 /// @return A message object
-static BOCMessage *boc_message_new(PyObject *module, PyObject *tag,
-                                   PyObject *contents) {
+static BOCMessage *boc_message_new(PyObject *tag, PyObject *contents) {
   BOCMessage *message = (BOCMessage *)PyMem_RawMalloc(sizeof(BOCMessage));
   if (message == NULL) {
     PyErr_NoMemory();
     return NULL;
   }
 
-  BOCState *state = (BOCState *)PyModule_GetState(module);
+  BOCQueue *qptr = get_queue_for_tag(tag);
+  if (qptr == NULL) {
+    PyMem_RawFree(message);
+    PyErr_SetString(PyExc_KeyError,
+                    "No queue available for tag: tag capacity exceeded");
+    return NULL;
+  }
 
-  BOCQueue *qptr = get_queue_for_tag(state, tag);
   BOCTag *qtag = (BOCTag *)atomic_load(&qptr->tag);
   if (qtag == NULL) {
     // non-assigned tag
-    message->tag = BOCTag_FromPyUnicode(tag, qptr);
+    message->tag = tag_from_PyUnicode(tag, qptr);
   } else {
     message->tag = qtag;
   }
 
-  message->recycle_queue = state->recycle_queue;
+  message->recycle_queue = BOC_STATE->recycle_queue;
   message->xidata = NULL;
   message->pickled = false;
 
   if (!xidata_supported(contents)) {
-    if (_contents_shared(module, PyThreadState_GET(), contents,
-                         &message->xidata) == 0) {
+    if (_contents_shared(PyThreadState_GET(), contents, &message->xidata) ==
+        0) {
       return message;
     }
   }
 
-  PyObject *pickled = object_to_xidata(module, contents, &message->xidata);
+  PyObject *pickled = object_to_xidata(contents, &message->xidata);
   if (pickled == NULL) {
     boc_message_free(message);
     return NULL;
@@ -1622,7 +1771,7 @@ static int boc_enqueue(BOCMessage *message) {
     int_least64_t head = atomic_load(&qptr->head);
     if (tail - head >= BOC_CAPACITY) {
       // the queue is full
-      return 0;
+      return -1;
     }
 
     // attempt to enqueue
@@ -1633,13 +1782,13 @@ static int boc_enqueue(BOCMessage *message) {
                tail - head + 1);
       assert(qptr->messages[tail % BOC_CAPACITY] == NULL);
       qptr->messages[tail % BOC_CAPACITY] = message;
-      return 1;
+      return 0;
     }
 
     // someone else got there first, try again
   }
 
-  return 0;
+  return -1;
 }
 
 /// @brief Attempt to dequeue a message
@@ -1648,16 +1797,25 @@ static int boc_enqueue(BOCMessage *message) {
 /// @param message A pointer to the message pointer (will be used to return the
 /// dequeued message)
 /// @return 0 if no message was dequeued, 1 if a message was dequeued
-static int boc_dequeue(PyObject *module, PyObject *tag, BOCMessage **message) {
-  BOCState *state = (BOCState *)PyModule_GetState(module);
-  BOCQueue *qptr = get_queue_for_tag(state, tag);
+static int_least64_t boc_dequeue(PyObject *tag, BOCMessage **message) {
+  *message = NULL;
+  if (!PyUnicode_CheckExact(tag)) {
+    PyErr_SetString(PyExc_TypeError, "tag must be a str");
+    return -3;
+  }
+
+  BOCQueue *qptr = get_queue_for_tag(tag);
+  if (qptr == NULL) {
+    PyErr_SetString(PyExc_KeyError, "No message queue found for that tag");
+    return -2;
+  }
 
   int_least64_t head = atomic_load(&qptr->head);
   int_least64_t tail = atomic_load(&qptr->tail);
   int_least64_t count = tail - head;
   if (count == 0) {
     // queue is empty
-    return 0;
+    return -1;
   }
 
   while (head < tail) {
@@ -1665,10 +1823,10 @@ static int boc_dequeue(PyObject *module, PyObject *tag, BOCMessage **message) {
     if (!atomic_compare_exchange_strong(&qptr->head, &head, head + 1)) {
       if (head >= tail) {
         // queue is empty
-        return 0;
+        return -1;
       }
 
-      PRINTDBG("Unable to dequeeu at head=%" PRIdLEAST64 "\n", head);
+      PRINTDBG("Unable to dequeue at head=%" PRIdLEAST64 "\n", head);
 
       // someone else already consumed this, try again
       tail = atomic_load(&qptr->tail);
@@ -1688,10 +1846,10 @@ static int boc_dequeue(PyObject *module, PyObject *tag, BOCMessage **message) {
               "] (%" PRIdLEAST64 " - %" PRIdLEAST64 " = %" PRIdLEAST64 ")\n",
               (*message)->tag->str, qptr->index, head, tail, head + 1,
               tail - head - 1);
-    return 1;
+    return qptr->index;
   }
 
-  return 0;
+  return -1;
 }
 
 /// @brief Returns the current time as double-precision seconds.
@@ -1709,7 +1867,8 @@ static double boc_now_s() {
 /// @param module The boc module
 /// @param args The message to send
 /// @return None if successful, NULL otherwise
-static PyObject *send(PyObject *module, PyObject *args) {
+static PyObject *_core_send(PyObject *module, PyObject *args) {
+  BOC_STATE_SET(module);
   PyObject *tag;
   PyObject *contents;
 
@@ -1717,12 +1876,12 @@ static PyObject *send(PyObject *module, PyObject *args) {
     return NULL;
   }
 
-  BOCMessage *message = boc_message_new(module, tag, contents);
+  BOCMessage *message = boc_message_new(tag, contents);
   if (message == NULL) {
     return NULL;
   }
 
-  if (!boc_enqueue(message)) {
+  if (boc_enqueue(message) < 0) {
     boc_message_free(message);
     PyErr_SetString(PyExc_RuntimeError, "Message queue is full");
     return NULL;
@@ -1740,14 +1899,17 @@ static PyObject *send(PyObject *module, PyObject *args) {
 /// @param keywds Used to pass optional arguments
 /// @return The received message, None (if timed out), or NULL if there was an
 /// error
-static PyObject *receive(PyObject *module, PyObject *args, PyObject *keywds) {
+static PyObject *_core_receive(PyObject *module, PyObject *args,
+                               PyObject *keywds) {
   PyObject *tag;
   double timeout = -1;
   PyObject *after = Py_None;
   static char *kwlist[] = {"tags", "timeout", "after", NULL};
 
-  if (!PyArg_ParseTupleAndKeywords(args, keywds, "O|dO", kwlist, &tag,
-                                   &timeout, &after)) {
+  BOC_STATE_SET(module);
+
+  if (!PyArg_ParseTupleAndKeywords(args, keywds, "O|dO", kwlist, &tag, &timeout,
+                                   &after)) {
     return NULL;
   }
 
@@ -1804,28 +1966,32 @@ static PyObject *receive(PyObject *module, PyObject *args, PyObject *keywds) {
     end_time = boc_now_s() + timeout;
   }
 
-  BOCState *state = (BOCState *)PyModule_GetState(module);
-
+  size_t tag_index = 0;
   BOCMessage *message = NULL;
   while (true) {
     Py_BEGIN_ALLOW_THREADS thrd_sleep(&SLEEP_TS, NULL);
     Py_END_ALLOW_THREADS;
 
-    BOCRecycleQueue_empty(state->recycle_queue, state->xidata_to_cowns, false);
+    BOCRecycleQueue_empty(BOC_STATE->recycle_queue, false);
+
+    int_least64_t queue_index = -1;
 
     if (tags_fast != NULL) {
       // see if there are available messages for any of the tags
-      for (Py_ssize_t i = 0; i < tags_size; ++i) {
-        tag = PySequence_Fast_GET_ITEM(tags_fast, i);
-        if (boc_dequeue(module, tag, &message)) {
-          break;
-        }
-      }
+      tag = PySequence_Fast_GET_ITEM(tags_fast, tag_index);
+      queue_index = boc_dequeue(tag, &message);
+      tag_index = (tag_index + 1) % tags_size;
     } else {
-      boc_dequeue(module, tag, &message);
+      queue_index = boc_dequeue(tag, &message);
     }
 
-    if (message == NULL) {
+    if (queue_index < 0) {
+      if (PyErr_Occurred() != NULL) {
+        assert(message == NULL);
+        Py_XDECREF(tags_fast);
+        return NULL;
+      }
+
       // no message was available
       if (do_timeout && boc_now_s() > end_time) {
         // we've timed out
@@ -1833,14 +1999,14 @@ static PyObject *receive(PyObject *module, PyObject *args, PyObject *keywds) {
           return PyObject_CallNoArgs(after);
         }
 
-        return PyTuple_Pack(2, PyUnicode_FromString(BOC_TIMEOUT), Py_None);
+        return Py_BuildValue("(sO)", BOC_TIMEOUT, Py_None);
       }
 
       continue;
     }
 
 #ifdef BOC_TRACE
-    if (BOCTag_CompareWithPyUnicode(message->tag, tag) != 0) {
+    if (tag_compare_with_PyUnicode(message->tag, tag) != 0) {
       // this should not happen, and indicates a bug in
       // boc_enqueue()/boc_dequeue()
       if (PyErr_Occurred() != NULL) {
@@ -1853,8 +2019,7 @@ static PyObject *receive(PyObject *module, PyObject *args, PyObject *keywds) {
     }
 #endif
 
-    PyObject *contents =
-        xidata_to_object(module, message->xidata, message->pickled);
+    PyObject *contents = xidata_to_object(message->xidata, message->pickled);
     if (contents == NULL) {
       Py_XDECREF(tags_fast);
       boc_message_free(message);
@@ -1876,7 +2041,9 @@ static PyObject *receive(PyObject *module, PyObject *args, PyObject *keywds) {
 /// @param module The boc module
 /// @param args The tag or tags to clear
 /// @return None if successful, NULL otherwise
-PyObject *clear(PyObject *module, PyObject *args) {
+PyObject *_core_clear(PyObject *module, PyObject *args) {
+  BOC_STATE_SET(module);
+
   PyObject *tags = NULL;
   if (!PyArg_ParseTuple(args, "O", &tags)) {
     return NULL;
@@ -1914,7 +2081,9 @@ PyObject *clear(PyObject *module, PyObject *args) {
   for (Py_ssize_t i = 0; i < tags_size; ++i) {
     PyObject *tag = PySequence_Fast_GET_ITEM(tags_fast, i);
     while (true) {
-      if (!boc_dequeue(module, tag, &message)) {
+      int_least64_t queue_index = boc_dequeue(tag, &message);
+      if (queue_index < 0) {
+        PyErr_Clear();
         break;
       }
 
@@ -1929,7 +2098,7 @@ PyObject *clear(PyObject *module, PyObject *args) {
 /// @brief Atomic counter for BOC behaviors
 atomic_int_least64_t BOC_BEHAVIOR_COUNT = 0;
 
-typedef struct behavior {
+typedef struct behavior_s {
   /// @brief Resource count, set to len(args) + 1
   atomic_int_least64_t count;
   /// @brief Atomic reference count
@@ -1941,6 +2110,8 @@ typedef struct behavior {
   BOCTag *thunk;
   /// @brief Cown which stores the result of calling the behavior
   BOCCown *result;
+  /// @brief Grouping identifiers, used for reassembling lists of cowns
+  int *group_ids;
   /// @brief The args buffer
   BOCCown **args;
   /// @brief The number of args
@@ -1967,10 +2138,11 @@ BOCBehavior *behavior_new() {
   behavior->id = atomic_fetch_add(&BOC_BEHAVIOR_COUNT, 1);
   behavior->thunk = NULL;
   behavior->result = NULL;
-  behavior->args = NULL;
   behavior->rc = 0;
+  behavior->group_ids = NULL;
   behavior->args_size = 0;
   behavior->args = NULL;
+  behavior->captures_size = 0;
   behavior->captures = NULL;
 
   return behavior;
@@ -1979,6 +2151,10 @@ BOCBehavior *behavior_new() {
 void behavior_free(BOCBehavior *behavior) {
   if (behavior->result != NULL) {
     COWN_DECREF(behavior->result);
+  }
+
+  if (behavior->group_ids != NULL) {
+    PyMem_RawFree(behavior->group_ids);
   }
 
   if (behavior->args != NULL) {
@@ -2065,9 +2241,8 @@ static PyObject *BehaviorCapsule_new(PyTypeObject *type, PyObject *args,
 /// @param op A PySequence which implements a Fast interface (e.g., PyList,
 /// PyTuple)
 /// @param size This will be set to the number of vars which were added
-/// @param module The _boc module
 /// @return A pointer to the allocated list of cowns
-static BOCCown **add_vars(PyObject *op, Py_ssize_t *size, PyObject *module) {
+static BOCCown **add_vars(PyObject *op, Py_ssize_t *size) {
   PyObject *items =
       PySequence_Fast(op, "Var sequence must provide a Fast interface");
   if (items == NULL) {
@@ -2102,7 +2277,7 @@ static BOCCown **add_vars(PyObject *op, Py_ssize_t *size, PyObject *module) {
       goto error;
     }
 
-    if (cown_release(*ptr, module) < 0) {
+    if (cown_release(*ptr) < 0) {
       goto error;
     }
   }
@@ -2122,16 +2297,17 @@ static int BehaviorCapsule_init(PyObject *op, PyObject *args,
   BehaviorCapsuleObject *self = (BehaviorCapsuleObject *)op;
   PyObject *thunk = NULL;
   PyObject *result = NULL;
-  PyObject *cowns = NULL;
+  PyObject *cowns_list = NULL;
   PyObject *captures = NULL;
 
   if (!PyArg_ParseTuple(args, "O!O!OO", &PyUnicode_Type, &thunk,
-                        &CownCapsule_Type, &result, &cowns, &captures)) {
+                        BOC_STATE->cown_capsule_type, &result, &cowns_list,
+                        &captures)) {
     return -1;
   }
 
-  if (!PySequence_Check(cowns)) {
-    PyErr_SetString(PyExc_TypeError, "cowns must be a sequence");
+  if (!PySequence_Check(cowns_list)) {
+    PyErr_SetString(PyExc_TypeError, "args must be a sequence");
     return -1;
   }
 
@@ -2150,7 +2326,7 @@ static int BehaviorCapsule_init(PyObject *op, PyObject *args,
   self->behavior = behavior;
   BEHAVIOR_INCREF(behavior);
 
-  behavior->thunk = BOCTag_FromPyUnicode(thunk, NULL);
+  behavior->thunk = tag_from_PyUnicode(thunk, NULL);
   if (behavior->thunk == NULL) {
     return -1;
   }
@@ -2164,7 +2340,34 @@ static int BehaviorCapsule_init(PyObject *op, PyObject *args,
 
   PRINTDBG("BehaviorCapsule(%" PRIdLEAST64 ") adding args...\n", behavior->id);
 
-  behavior->args = add_vars(cowns, &behavior->args_size, NULL);
+  PyObject *cowns_list_fast =
+      PySequence_Fast(cowns_list, "Args must be provided as a list or tuple");
+  if (cowns_list_fast == NULL) {
+    return -1;
+  }
+
+  Py_ssize_t args_size = PySequence_Fast_GET_SIZE(cowns_list_fast);
+  PyObject *cowns = PyTuple_New(args_size);
+  if (cowns == NULL) {
+    return -1;
+  }
+
+  behavior->group_ids = PyMem_RawCalloc((size_t)args_size, sizeof(int));
+  for (Py_ssize_t i = 0; i < args_size; ++i) {
+    PyObject *item = PySequence_Fast_GET_ITEM(cowns_list_fast, i);
+    int group_id;
+    PyObject *cown;
+    if (!PyArg_ParseTuple(item, "iO!", &group_id, BOC_STATE->cown_capsule_type,
+                          &cown)) {
+      return -1;
+    }
+
+    behavior->group_ids[i] = group_id;
+    PyTuple_SET_ITEM(cowns, i, Py_NewRef(cown));
+  }
+
+  behavior->args = add_vars(cowns, &behavior->args_size);
+  Py_DECREF(cowns);
   if (behavior->args == NULL) {
     return -1;
   }
@@ -2172,18 +2375,10 @@ static int BehaviorCapsule_init(PyObject *op, PyObject *args,
   PRINTDBG("BehaviorCapsule(%" PRIdLEAST64 ") adding captures...\n",
            behavior->id);
 
-  PyObject *module = PyImport_ImportModule("_boc");
-  if (module == NULL) {
-    return -1;
-  }
-
-  behavior->captures = add_vars(captures, &behavior->captures_size, module);
+  behavior->captures = add_vars(captures, &behavior->captures_size);
   if (behavior->captures == NULL) {
-    Py_DECREF(module);
     return -1;
   }
-
-  Py_DECREF(module);
 
   // We add two additional counts. One for the result, and another so that
   // the 2PL is finished before we start running the thunk. Without this,
@@ -2200,7 +2395,7 @@ static int BehaviorCapsule_init(PyObject *op, PyObject *args,
 /// @param module the boc module
 /// @param behavior the behavior capsule
 /// @return None on success, NULL on error
-static PyObject *behavior_resolve_one(BOCBehavior *behavior, PyObject *module) {
+static PyObject *behavior_resolve_one(BOCBehavior *behavior) {
   int_least64_t count = atomic_fetch_add(&behavior->count, -1) - 1;
   if (count == 0) {
     // send a message to the scheduler that this behavior can start
@@ -2209,61 +2404,26 @@ static PyObject *behavior_resolve_one(BOCBehavior *behavior, PyObject *module) {
       return NULL;
     }
 
-    if (module == NULL) {
-      module = PyImport_ImportModule("_boc");
-    } else {
-      Py_INCREF(module);
-    }
-
-    if (module == NULL) {
-      Py_DECREF(contents);
-      return NULL;
-    }
-
     PyObject *tag = PyUnicode_FromString("boc_behavior");
     if (tag == NULL) {
       return NULL;
     }
 
-    BOCMessage *message = boc_message_new(module, tag, contents);
+    BOCMessage *message = boc_message_new(tag, contents);
     Py_DECREF(contents);
     Py_DECREF(tag);
 
     if (message == NULL) {
-      Py_DECREF(module);
       return NULL;
     }
 
-    if (!boc_enqueue(message)) {
-      Py_DECREF(module);
+    if (boc_enqueue(message) < 0) {
+      PyErr_SetString(PyExc_RuntimeError, "Message queue is full");
       return NULL;
     }
-
-    Py_DECREF(module);
   }
 
   Py_RETURN_NONE;
-}
-
-static PyObject *cown_capsule_wrap(BOCCown *cown, bool promote) {
-  if (promote) {
-    if (!COWN_PROMOTE(cown)) {
-      return NULL;
-    }
-  } else {
-    COWN_INCREF(cown);
-  }
-
-  CownCapsuleObject *capsule =
-      (CownCapsuleObject *)CownCapsule_Type.tp_alloc(&CownCapsule_Type, 0);
-  if (capsule == NULL) {
-    return NULL;
-  }
-
-  capsule->cown = cown;
-  PRINTDBG("CownCapsule_wrap(%p, rc=%ld)\n", capsule,
-           capsule->ob_base.ob_refcnt);
-  return (PyObject *)capsule;
 }
 
 static PyObject *BehaviorCapsule_bid(PyObject *op, PyObject *Py_UNUSED(dummy)) {
@@ -2274,7 +2434,7 @@ static PyObject *BehaviorCapsule_bid(PyObject *op, PyObject *Py_UNUSED(dummy)) {
 static PyObject *BehaviorCapsule_thunk(PyObject *op,
                                        PyObject *Py_UNUSED(dummy)) {
   BehaviorCapsuleObject *self = (BehaviorCapsuleObject *)op;
-  return BOCTag_ToPyUnicode(self->behavior->thunk);
+  return tag_to_PyUnicode(self->behavior->thunk);
 }
 
 static PyObject *request_new(BOCCown *cown);
@@ -2331,71 +2491,13 @@ static PyObject *BehaviorCapsule_set_result(PyObject *op, PyObject *args) {
 static PyObject *BehaviorCapsule_resolve_one(PyObject *op,
                                              PyObject *Py_UNUSED(dummy)) {
   BehaviorCapsuleObject *self = (BehaviorCapsuleObject *)op;
-  return behavior_resolve_one(self->behavior, NULL);
+  return behavior_resolve_one(self->behavior);
 }
 
-static PyMethodDef BehaviorCapsule_methods[] = {
-    {"bid", BehaviorCapsule_bid, METH_NOARGS, "Gets the ID for the behavior"},
-    {"thunk", BehaviorCapsule_thunk, METH_NOARGS,
-     "Gets the thunk for the behavior"},
-    {"create_requests", BehaviorCapsule_create_requests, METH_NOARGS,
-     "Create requests for the cowns of the behavior"},
-    {"resolve_one", BehaviorCapsule_resolve_one, METH_NOARGS,
-     "Resolves one resource on the behavior"},
-    {"set_result", BehaviorCapsule_set_result, METH_VARARGS, "internal"},
-    {NULL} /* Sentinel */
-};
-
-static PyTypeObject BehaviorCapsuleType = {
-    .ob_base = PyVarObject_HEAD_INIT(NULL, 0).tp_name = "_boc.BehaviorCapsule",
-    .tp_basicsize = sizeof(BehaviorCapsuleObject),
-    .tp_itemsize = 0,
-    .tp_flags = Py_TPFLAGS_DEFAULT,
-    .tp_new = BehaviorCapsule_new,
-    .tp_init = BehaviorCapsule_init,
-    .tp_dealloc = BehaviorCapsule_dealloc,
-    .tp_methods = BehaviorCapsule_methods};
-
-#define BehaviorCapsule_CheckExact(op) Py_IS_TYPE((op), &BehaviorCapsuleType)
-
-static PyObject *_new_behavior_object(XIDATA_T *xidata) {
-  BOCBehavior *behavior = (BOCBehavior *)xidata->data;
-
-  BehaviorCapsuleObject *capsule =
-      (BehaviorCapsuleObject *)BehaviorCapsuleType.tp_alloc(
-          &BehaviorCapsuleType, 0);
-  if (capsule == NULL) {
-    BEHAVIOR_DECREF(behavior);
-    return NULL;
-  }
-
-  capsule->behavior = behavior;
-  PRINTDBG("_new_behavior_object(%p)\n", capsule);
-  BEHAVIOR_INCREF(behavior);
-  return (PyObject *)capsule;
-}
-
-static int _behavior_shared(
-#ifndef BOC_NO_MULTIGIL
-    PyThreadState *tstate,
-#endif
-    PyObject *obj, XIDATA_T *xidata) {
-#ifdef BOC_NO_MULTIGIL
-  PyThreadState *tstate = PyThreadState_GET();
-#endif
-
-  BehaviorCapsuleObject *capsule = (BehaviorCapsuleObject *)obj;
-  BOCBehavior *behavior = capsule->behavior;
-
-  // all we do to initialise the xidata is store a pointer to the behavior
-  XIDATA_INIT(xidata, tstate->interp, behavior, obj, _new_behavior_object);
-  return 0;
-}
-
-static int acquire_vars(BOCCown **vars, Py_ssize_t size, PyObject *boc_module) {
+static int acquire_vars(BOCCown **vars, Py_ssize_t size) {
   BOCCown **ptr = vars;
   for (Py_ssize_t i = 0; i < size; ++i, ++ptr) {
-    if (cown_acquire(*ptr, boc_module) < 0) {
+    if (cown_acquire(*ptr) < 0) {
       return -1;
     }
   }
@@ -2404,40 +2506,34 @@ static int acquire_vars(BOCCown **vars, Py_ssize_t size, PyObject *boc_module) {
 }
 
 /// @brief Acquire all the cowns for the behavior.
-/// @param module The _boc module
 /// @param args The behavior capsule
 /// @return Py_None if successful, NULL otherwise
-static PyObject *behavior_acquire(PyObject *module, PyObject *args) {
-  PyObject *op = NULL;
-
-  if (!PyArg_ParseTuple(args, "O!", &BehaviorCapsuleType, &op)) {
-    return NULL;
-  }
-
-  BehaviorCapsuleObject *capsule = (BehaviorCapsuleObject *)op;
-  BOCBehavior *behavior = capsule->behavior;
+static PyObject *BehaviorCapsule_acquire(PyObject *op,
+                                         PyObject *Py_UNUSED(dummy)) {
+  BehaviorCapsuleObject *self = (BehaviorCapsuleObject *)op;
+  BOCBehavior *behavior = self->behavior;
 
   PRINTDBG("behavior_acquire(%" PRIdLEAST64 ")\n", behavior->id);
 
-  if (cown_acquire(behavior->result, module) < 0) {
+  if (cown_acquire(behavior->result) < 0) {
     return NULL;
   }
 
-  if (acquire_vars(behavior->args, behavior->args_size, module) < 0) {
+  if (acquire_vars(behavior->args, behavior->args_size) < 0) {
     return NULL;
   }
 
-  if (acquire_vars(behavior->captures, behavior->captures_size, module) < 0) {
+  if (acquire_vars(behavior->captures, behavior->captures_size) < 0) {
     return NULL;
   }
 
   Py_RETURN_NONE;
 }
 
-static int release_vars(BOCCown **vars, Py_ssize_t size, PyObject *boc_module) {
+static int release_vars(BOCCown **vars, Py_ssize_t size) {
   BOCCown **ptr = vars;
   for (Py_ssize_t i = 0; i < size; ++i, ++ptr) {
-    if (cown_release(*ptr, boc_module) < 0) {
+    if (cown_release(*ptr) < 0) {
       return -1;
     }
   }
@@ -2446,30 +2542,24 @@ static int release_vars(BOCCown **vars, Py_ssize_t size, PyObject *boc_module) {
 }
 
 /// @brief Release the cowns for this behavior.
-/// @param module The _boc module
 /// @param args The behavior capsule
 /// @return Py_None if successful, NULL otherwise
-static PyObject *behavior_release(PyObject *module, PyObject *args) {
-  BehaviorCapsuleObject *op = NULL;
-
-  if (!PyArg_ParseTuple(args, "O!", &BehaviorCapsuleType, &op)) {
-    return NULL;
-  }
-
-  BehaviorCapsuleObject *capsule = (BehaviorCapsuleObject *)op;
-  BOCBehavior *behavior = capsule->behavior;
+static PyObject *BehaviorCapsule_release(PyObject *op,
+                                         PyObject *Py_UNUSED(dummy)) {
+  BehaviorCapsuleObject *self = (BehaviorCapsuleObject *)op;
+  BOCBehavior *behavior = self->behavior;
 
   PRINTDBG("behavior_release(%" PRIdLEAST64 ")\n", behavior->id);
 
-  if (cown_release(behavior->result, module) < 0) {
+  if (cown_release(behavior->result) < 0) {
     return NULL;
   }
 
-  if (release_vars(behavior->args, behavior->args_size, module) < 0) {
+  if (release_vars(behavior->args, behavior->args_size) < 0) {
     return NULL;
   }
 
-  if (release_vars(behavior->captures, behavior->captures_size, module) < 0) {
+  if (release_vars(behavior->captures, behavior->captures_size) < 0) {
     return NULL;
   }
 
@@ -2479,30 +2569,24 @@ static PyObject *behavior_release(PyObject *module, PyObject *args) {
 /// @brief Executes the thunk on the behavior.
 /// @details Before this function can be called, all of the cowns for the
 /// behavior must be acquired.
-/// @param module The _boc module
 /// @param args The Behavior, and the object or module which contains the named
 /// thunk function.
 /// @return The result of calling the thunk
-static PyObject *behavior_execute(PyObject *module, PyObject *args) {
-  PyObject *capsule_op = NULL;
+static PyObject *BehaviorCapsule_execute(PyObject *op, PyObject *args) {
   PyObject *boc_export = NULL;
 
-  if (!PyArg_ParseTuple(args, "O!O", &BehaviorCapsuleType, &capsule_op,
-                        &boc_export)) {
+  if (!PyArg_ParseTuple(args, "O", &boc_export)) {
     return NULL;
   }
 
-  BehaviorCapsuleObject *capsule = (BehaviorCapsuleObject *)capsule_op;
-  BOCBehavior *behavior = capsule->behavior;
+  BehaviorCapsuleObject *self = (BehaviorCapsuleObject *)op;
+  BOCBehavior *behavior = self->behavior;
 
-  PyObject *thunk = PyObject_GetAttrString(boc_export, behavior->thunk->str);
+  size_t num_groups =
+      (size_t)(abs(behavior->group_ids[behavior->args_size - 1]) +
+               behavior->captures_size);
 
-  if (thunk == NULL) {
-    return NULL;
-  }
-
-  PyObject *thunk_args =
-      PyTuple_New(behavior->args_size + behavior->captures_size);
+  PyObject *thunk_args = PyTuple_New(num_groups);
 
   if (thunk_args == NULL) {
     return NULL;
@@ -2511,10 +2595,57 @@ static PyObject *behavior_execute(PyObject *module, PyObject *args) {
   Py_ssize_t arg_idx = 0;
   BOCCown **ptr = behavior->args;
 
+  PyObject *group_list = NULL;
+  int current_group_id = 0;
   // args are passed as CownCapsule objects
-  for (Py_ssize_t i = 0; i < behavior->args_size; ++i, ++arg_idx, ++ptr) {
+  for (Py_ssize_t i = 0; i < behavior->args_size; ++i, ++ptr) {
     PyObject *capsule = cown_capsule_wrap(*ptr, false);
-    PyTuple_SET_ITEM(thunk_args, arg_idx, capsule);
+    int group_id = behavior->group_ids[i];
+
+    if (group_id == current_group_id) {
+      // in a group, append to the current group
+      if (PyList_Append(group_list, capsule) < 0) {
+        Py_DECREF(thunk_args);
+        Py_DECREF(group_list);
+        return NULL;
+      }
+
+      Py_DECREF(capsule);
+      continue;
+    }
+
+    if (group_list != NULL) {
+      // the current group is complete, add it
+      PyTuple_SET_ITEM(thunk_args, arg_idx, group_list);
+      arg_idx += 1;
+      group_list = NULL;
+      current_group_id = 0;
+    }
+
+    if (group_id > 0) {
+      // singleton
+      PyTuple_SET_ITEM(thunk_args, arg_idx, capsule);
+      arg_idx += 1;
+      continue;
+    }
+
+    // new group
+    group_list = PyList_New(1);
+    if (group_list == NULL) {
+      Py_DECREF(thunk_args);
+      return NULL;
+    }
+
+    current_group_id = group_id;
+    PyList_SET_ITEM(group_list, 0, capsule);
+  }
+
+  if (group_list != NULL) {
+    // the final arg was a group
+    PyTuple_SET_ITEM(thunk_args, arg_idx, group_list);
+    arg_idx += 1;
+    group_list = NULL;
+    current_group_id = 0;
   }
 
   // captures are passed as raw values
@@ -2522,6 +2653,12 @@ static PyObject *behavior_execute(PyObject *module, PyObject *args) {
   for (Py_ssize_t i = 0; i < behavior->captures_size; ++i, ++arg_idx, ++ptr) {
     PyObject *value = Py_NewRef((*ptr)->value);
     PyTuple_SET_ITEM(thunk_args, arg_idx, value);
+  }
+
+  PyObject *thunk = PyObject_GetAttrString(boc_export, behavior->thunk->str);
+
+  if (thunk == NULL) {
+    return NULL;
   }
 
   PRINTDBG("Executing thunk...\n");
@@ -2552,6 +2689,73 @@ static PyObject *behavior_execute(PyObject *module, PyObject *args) {
 
   cown_set_value(behavior->result, result);
   return behavior->result->value;
+}
+
+static PyMethodDef BehaviorCapsule_methods[] = {
+    {"bid", BehaviorCapsule_bid, METH_NOARGS, "Gets the ID for the behavior"},
+    {"thunk", BehaviorCapsule_thunk, METH_NOARGS,
+     "Gets the thunk for the behavior"},
+    {"create_requests", BehaviorCapsule_create_requests, METH_NOARGS,
+     "Create requests for the cowns of the behavior"},
+    {"resolve_one", BehaviorCapsule_resolve_one, METH_NOARGS,
+     "Resolves one resource on the behavior"},
+    {"set_result", BehaviorCapsule_set_result, METH_VARARGS, "internal"},
+    {"acquire", BehaviorCapsule_acquire, METH_NOARGS, "internal"},
+    {"release", BehaviorCapsule_release, METH_NOARGS, "internal"},
+    {"execute", BehaviorCapsule_execute, METH_VARARGS, "internal"},
+    {NULL} /* Sentinel */
+};
+
+static PyType_Slot BehaviorCapsule_slots[] = {
+    {Py_tp_new, BehaviorCapsule_new},
+    {Py_tp_init, BehaviorCapsule_init},
+    {Py_tp_dealloc, BehaviorCapsule_dealloc},
+    {Py_tp_methods, BehaviorCapsule_methods},
+    {0, NULL} /* Sentinel */
+};
+
+static PyType_Spec BehaviorCapsule_Spec = {
+    .name = "boc._core.BehaviorCapsule",
+    .basicsize = sizeof(BehaviorCapsuleObject),
+    .itemsize = 0,
+    .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_IMMUTABLETYPE,
+    .slots = BehaviorCapsule_slots};
+
+#define BehaviorCapsule_CheckExact(op)                                         \
+  Py_IS_TYPE((op), BOC_STATE->behavior_capsule_type)
+
+static PyObject *_new_behavior_object(XIDATA_T *xidata) {
+  BOCBehavior *behavior = (BOCBehavior *)xidata->data;
+
+  PyTypeObject *type = BOC_STATE->behavior_capsule_type;
+  BehaviorCapsuleObject *capsule =
+      (BehaviorCapsuleObject *)type->tp_alloc(type, 0);
+  if (capsule == NULL) {
+    BEHAVIOR_DECREF(behavior);
+    return NULL;
+  }
+
+  capsule->behavior = behavior;
+  PRINTDBG("_new_behavior_object(%p)\n", capsule);
+  BEHAVIOR_INCREF(behavior);
+  return (PyObject *)capsule;
+}
+
+static int _behavior_shared(
+#ifndef BOC_NO_MULTIGIL
+    PyThreadState *tstate,
+#endif
+    PyObject *obj, XIDATA_T *xidata) {
+#ifdef BOC_NO_MULTIGIL
+  PyThreadState *tstate = PyThreadState_GET();
+#endif
+
+  BehaviorCapsuleObject *capsule = (BehaviorCapsuleObject *)obj;
+  BOCBehavior *behavior = capsule->behavior;
+
+  // all we do to initialise the xidata is store a pointer to the behavior
+  XIDATA_INIT(xidata, tstate->interp, behavior, obj, _new_behavior_object);
+  return 0;
 }
 
 /// @brief Encapsulates a behavior's request for a cown
@@ -2606,6 +2810,8 @@ PyObject *request_new(BOCCown *cown) {
 /// @param args The CownCapsule object
 /// @return A capsule containing the request
 static PyObject *request_create(PyObject *module, PyObject *args) {
+  BOC_STATE_SET(module);
+
   PyObject *op;
 
   if (!PyArg_ParseTuple(args, "O", &op)) {
@@ -2645,6 +2851,8 @@ static BOCRequest *request_unwrap(PyObject *op) {
 /// @param args The request to release
 /// @return None if successful, NULL otherwise
 static PyObject *request_release(PyObject *module, PyObject *args) {
+  BOC_STATE_SET(module);
+
   PyObject *op;
 
   if (!PyArg_ParseTuple(args, "O", &op)) {
@@ -2676,7 +2884,7 @@ static PyObject *request_release(PyObject *module, PyObject *args) {
     }
   }
 
-  return behavior_resolve_one(next, module);
+  return behavior_resolve_one(next);
 }
 
 /// @brief Enqueues this request on the cown
@@ -2684,6 +2892,8 @@ static PyObject *request_release(PyObject *module, PyObject *args) {
 /// @param args The request to enqueue, and the associated behavior
 /// @return None if successful, NULL otherwise
 static PyObject *request_start_enqueue(PyObject *module, PyObject *args) {
+  BOC_STATE_SET(module);
+
   PyObject *op;
   PyObject *behavior_op;
 
@@ -2710,7 +2920,7 @@ static PyObject *request_start_enqueue(PyObject *module, PyObject *args) {
   if (prev_ptr == 0) {
     // there is no prior request queued on the cown, so we can immediately
     // proceed
-    return behavior_resolve_one(behavior, module);
+    return behavior_resolve_one(behavior);
   }
 
   intptr_t behavior_ptr = (intptr_t)behavior;
@@ -2753,12 +2963,12 @@ static PyObject *request_finish_enqueue(PyObject *module, PyObject *args) {
 static PyObject *request_target(PyObject *module, PyObject *args) {
   PyObject *op;
 
-  if(!PyArg_ParseTuple(args, "O", &op)){
+  if (!PyArg_ParseTuple(args, "O", &op)) {
     return NULL;
   }
 
   BOCRequest *request = request_unwrap(op);
-  if(request == NULL){
+  if (request == NULL) {
     return NULL;
   }
 
@@ -2770,9 +2980,10 @@ static PyObject *request_target(PyObject *module, PyObject *args) {
 /// @param module The module to check
 /// @param Py_UNUSED
 /// @return Whether this is the primary module
-static PyObject *is_primary(PyObject *module, PyObject *Py_UNUSED(dummy)) {
-  BOCState *state = (BOCState *)PyModule_GetState(module);
-  if (state->index == 0) {
+static PyObject *_core_is_primary(PyObject *module,
+                                  PyObject *Py_UNUSED(dummy)) {
+  BOC_STATE_SET(module);
+  if (BOC_STATE->index == 0) {
     Py_RETURN_TRUE;
   }
 
@@ -2783,16 +2994,15 @@ static PyObject *is_primary(PyObject *module, PyObject *Py_UNUSED(dummy)) {
 /// @param module The module to query
 /// @param Py_UNUSED
 /// @return The unique module index as a PyLong
-static PyObject *boc_index(PyObject *module, PyObject *Py_UNUSED(dummy)) {
-  BOCState *state = (BOCState *)PyModule_GetState(module);
-  return PyLong_FromLongLong(state->index);
+static PyObject *_core_index(PyObject *module, PyObject *Py_UNUSED(dummy)) {
+  BOC_STATE_SET(module);
+  return PyLong_FromLongLong(BOC_STATE->index);
 }
 
-static PyObject *recycle(PyObject *module, PyObject *Py_UNUSED(dummy)) {
-  BOCState *state = (BOCState *)PyModule_GetState(module);
-
+static PyObject *_core_recycle(PyObject *module, PyObject *Py_UNUSED(dummy)) {
+  BOC_STATE_SET(module);
   PRINTDBG("recycle()\n");
-  BOCRecycleQueue_empty(state->recycle_queue, state->xidata_to_cowns, true);
+  BOCRecycleQueue_empty(BOC_STATE->recycle_queue, true);
   Py_RETURN_NONE;
 }
 
@@ -2805,76 +3015,151 @@ static PyObject *recycle(PyObject *module, PyObject *Py_UNUSED(dummy)) {
 /// @param Py_UNUSED
 /// @return A tuple containing cowns that need to be released before the
 /// interpreter that owns this module can be destroyed.
-static PyObject *cowns(PyObject *module, PyObject *Py_UNUSED(dummy)) {
-  BOCState *state = (BOCState *)PyModule_GetState(module);
-  BOCRecycleQueue_empty(state->recycle_queue, state->xidata_to_cowns, true);
+static PyObject *_core_cowns(PyObject *module, PyObject *Py_UNUSED(dummy)) {
+  BOC_STATE_SET(module);
+  BOCRecycleQueue_empty(BOC_STATE->recycle_queue, true);
   PRINTDBG("cowns()\n");
 
-  PyObject *items = PyDict_Items(state->xidata_to_cowns);
-  if (items == NULL) {
+  return BOCRecycleQueue_promote_cowns(BOC_STATE->recycle_queue);
+}
+
+/// @brief Method to reset the message queues with new tags.
+/// @details Once this function, which can only be called from the main
+/// interpreter, is called the messaging system will be temporarily disabled.
+/// The queues will be reassigned, and then emptied and reset.
+/// @param module The _core module
+/// @param args A single argument of a sequence of PyUnicode
+/// @return NULL if an error, PyNone otherwise.
+static PyObject *_core_set_tags(PyObject *module, PyObject *args) {
+  BOC_STATE_SET(module);
+  if (BOC_STATE->index != 0) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "set_tags can only be called from the main interpreter");
     return NULL;
   }
 
-  Py_ssize_t size = PyList_GET_SIZE(items);
-  PyObject *cowns = PyTuple_New(size);
-  if (cowns == NULL) {
+  PyObject *tags = NULL;
+  if (!PyArg_ParseTuple(args, "O", &tags)) {
     return NULL;
   }
 
-  for (Py_ssize_t i = 0; i < size; ++i) {
-    PyObject *item = PyList_GET_ITEM(items, i);
-    PyObject *cown_ptr = PyTuple_GET_ITEM(item, 1);
-    BOCCown *cown = (BOCCown *)PyLong_AsVoidPtr(cown_ptr);
-    PyObject *cown_capsule = cown_capsule_wrap(cown, true);
-    if (cown_capsule != NULL) {
-      PyTuple_SET_ITEM(cowns, i, cown_capsule);
+  Py_ssize_t tags_size = PySequence_Size(tags);
+  if (tags_size < 0) {
+    PyErr_SetString(PyExc_TypeError, "Tags must provide __len__");
+    return NULL;
+  }
+
+  if (tags_size > BOC_QUEUE_COUNT) {
+    PyErr_Format(PyExc_IndexError, "Only %d or fewer tags supported",
+                 BOC_QUEUE_COUNT);
+    return NULL;
+  }
+
+  // go queue by queue, disable it, and set the new tag
+  BOCQueue *qptr = BOC_QUEUES;
+  for (Py_ssize_t i = 0; i < BOC_QUEUE_COUNT; ++i, ++qptr) {
+    // disable the queue
+    atomic_store(&qptr->state, BOC_QUEUE_DISABLED);
+
+    if (i >= tags_size) {
+      // clear the tags on these unused queues
+      BOCTag *oldtag = (BOCTag *)atomic_exchange(&qptr->tag, (intptr_t)NULL);
+      if (oldtag != NULL) {
+        tag_disable(oldtag);
+        TAG_DECREF(oldtag);
+      }
       continue;
     }
 
-    COWN_WEAK_DECREF(cown);
-    PyTuple_SET_ITEM(cowns, i, Py_None);
+    PyObject *item = PySequence_GetItem(tags, i);
+    if (!PyUnicode_CheckExact(item)) {
+      PyErr_SetString(PyExc_TypeError, "Tags must contain only str objects");
+      Py_DECREF(item);
+      return NULL;
+    }
+
+    BOCTag *qtag = tag_from_PyUnicode(item, qptr);
+    Py_DECREF(item);
+
+    if (qtag == NULL) {
+      return NULL;
+    }
+
+    // assign a new tag
+    BOCTag *oldtag = (BOCTag *)atomic_exchange(&qptr->tag, (intptr_t)qtag);
+    TAG_INCREF(qtag);
+    if (oldtag != NULL) {
+      tag_disable(oldtag);
+      TAG_DECREF(oldtag);
+    }
   }
 
-  Py_DECREF(items);
-  return cowns;
+  // now that all of the queue tags have been updated, drain all messages
+  qptr = BOC_QUEUES;
+  for (Py_ssize_t i = 0; i < BOC_QUEUE_COUNT; ++i, ++qptr) {
+    int_least64_t head = atomic_load(&qptr->head);
+    int_least64_t tail = atomic_load(&qptr->tail);
+    if (head != tail) {
+      for (int_least64_t i = head; i < tail; ++i) {
+        int_least64_t index = i % BOC_CAPACITY;
+        while (qptr->messages[index] == NULL) {
+          // spin waiting for the message to be written
+          Py_BEGIN_ALLOW_THREADS thrd_sleep(&SLEEP_TS, NULL);
+          Py_END_ALLOW_THREADS
+        }
+
+        boc_message_free(qptr->messages[index]);
+        qptr->messages[index] = NULL;
+      }
+    }
+
+    // reset the queue
+    atomic_store(&qptr->head, 0);
+    atomic_store(&qptr->tail, 0);
+    if (i < tags_size) {
+      atomic_store(&qptr->state, BOC_QUEUE_ASSIGNED);
+    } else {
+      atomic_store(&qptr->state, BOC_QUEUE_UNASSIGNED);
+    }
+  }
+
+  Py_RETURN_NONE;
 }
 
-static PyMethodDef boc_methods[] = {
-    {"send", send, METH_VARARGS, "send"},
-    {"receive", (PyCFunction)(void (*)(void))receive,
+static PyMethodDef _core_module_methods[] = {
+    {"send", _core_send, METH_VARARGS, "send"},
+    {"receive", (PyCFunction)(void (*)(void))_core_receive,
      METH_VARARGS | METH_KEYWORDS, "receive"},
-    {"clear", clear, METH_VARARGS, "clear"},
-    {"behavior_acquire", behavior_acquire, METH_VARARGS, "internal"},
-    {"behavior_release", behavior_release, METH_VARARGS, "internal"},
-    {"behavior_execute", behavior_execute, METH_VARARGS, "internal"},
+    {"clear", _core_clear, METH_VARARGS, "clear"},
     {"request_create", request_create, METH_VARARGS, "internal"},
     {"request_release", request_release, METH_VARARGS, "internal"},
     {"request_start_enqueue", request_start_enqueue, METH_VARARGS, "internal"},
     {"request_finish_enqueue", request_finish_enqueue, METH_VARARGS,
      "internal"},
-     {"request_target", request_target, METH_VARARGS, "internal"},
-    {"is_primary", is_primary, METH_NOARGS,
+    {"request_target", request_target, METH_VARARGS, "internal"},
+    {"is_primary", _core_is_primary, METH_NOARGS,
      "whether this is the primary BOC module"},
-    {"index", boc_index, METH_NOARGS, "index of the module in the BOC system"},
-    {"recycle", recycle, METH_NOARGS, "internal"},
-    {"cowns", cowns, METH_NOARGS, "internal"},
+    {"index", _core_index, METH_NOARGS,
+     "index of the module in the BOC system"},
+    {"recycle", _core_recycle, METH_NOARGS, "internal"},
+    {"cowns", _core_cowns, METH_NOARGS, "internal"},
+    {"set_tags", _core_set_tags, METH_VARARGS, "internal"},
     {NULL} /* Sentinel */
 };
 
-static int boc_exec(PyObject *module) {
+static int _core_module_exec(PyObject *module) {
   int_least64_t index = atomic_fetch_add(&BOC_COUNT, 1);
-  BOC_ID = index;
-  PRINTDBG("boc_exec(index=%" PRIdLEAST64 ")\n", index);
+  PRINTFDBG("boc_exec(index=%" PRIdLEAST64 ")\n", index);
   if (index == 0) {
     BOCQueue *qptr = BOC_QUEUES;
-    for (size_t i = 0; i < BOC_QUEUE_COUNT + 1; ++i, ++qptr) {
+    for (size_t i = 0; i < BOC_QUEUE_COUNT; ++i, ++qptr) {
       qptr->index = i;
       qptr->messages =
           (BOCMessage **)PyMem_RawCalloc(BOC_CAPACITY, sizeof(BOCMessage *));
       memset(qptr->messages, 0, BOC_CAPACITY * sizeof(BOCMessage *));
       qptr->head = 0;
       qptr->tail = 0;
-      qptr->assigned = false;
+      qptr->state = BOC_QUEUE_UNASSIGNED;
       qptr->tag = 0;
     }
 
@@ -2887,64 +3172,26 @@ static int boc_exec(PyObject *module) {
     BOC_RECYCLE_QUEUE_TAIL = queue_stub;
   }
 
-  if (PyType_Ready(&CownCapsule_Type) < 0) {
-    return -1;
-  }
-
-  if (PyModule_AddObjectRef(module, "CownCapsule",
-                            (PyObject *)&CownCapsule_Type) < 0) {
-    return -1;
-  }
-
-  if (XIDATA_REGISTERCLASS(&CownCapsule_Type, _cown_shared)) {
-    Py_FatalError(
-        "could not register CownCapsule for cross-interpreter sharing");
-    return -1;
-  }
-
-  if (PyType_Ready(&BehaviorCapsuleType) < 0) {
-    return -1;
-  }
-
-  if (PyModule_AddObjectRef(module, "BehaviorCapsule",
-                            (PyObject *)&BehaviorCapsuleType) < 0) {
-    return -1;
-  }
-
-  if (XIDATA_REGISTERCLASS(&BehaviorCapsuleType, _behavior_shared)) {
-    Py_FatalError(
-        "could not register BehaviorCapsule for cross-interpreter sharing");
-    return -1;
-  }
-
-  BOCState *state = (BOCState *)PyModule_GetState(module);
+  _core_module_state *state = (_core_module_state *)PyModule_GetState(module);
   state->index = index;
   state->recycle_queue = BOCRecycleQueue_new(index);
   if (state->recycle_queue == NULL) {
     return -1;
   }
 
-  state->xidata_to_cowns = PyDict_New();
-  if (state->xidata_to_cowns == NULL) {
-    return -1;
-  }
-
   state->pickle = PyImport_ImportModule("pickle");
   if (state->pickle == NULL) {
-    Py_DECREF(state->xidata_to_cowns);
     return -1;
   }
 
   state->dumps = PyObject_GetAttrString(state->pickle, "dumps");
   if (state->dumps == NULL) {
-    Py_DECREF(state->xidata_to_cowns);
     Py_DECREF(state->pickle);
     return -1;
   }
 
   state->loads = PyObject_GetAttrString(state->pickle, "loads");
   if (state->loads == NULL) {
-    Py_DECREF(state->xidata_to_cowns);
     Py_DECREF(state->pickle);
     Py_DECREF(state->dumps);
     return -1;
@@ -2954,26 +3201,70 @@ static int boc_exec(PyObject *module) {
     state->queue_tags[i] = NULL;
   }
 
+  state->cown_capsule_type =
+      (PyTypeObject *)PyType_FromModuleAndSpec(module, &CownCapsule_Spec, NULL);
+  if (state->cown_capsule_type == NULL) {
+    return -1;
+  }
+
+  if (PyModule_AddType(module, state->cown_capsule_type) < 0) {
+    return -1;
+  }
+
+  if (XIDATA_REGISTERCLASS(state->cown_capsule_type, _cown_shared)) {
+    Py_FatalError(
+        "could not register CownCapsule for cross-interpreter sharing");
+    return -1;
+  }
+
+  state->behavior_capsule_type = (PyTypeObject *)PyType_FromModuleAndSpec(
+      module, &BehaviorCapsule_Spec, NULL);
+  if (state->behavior_capsule_type == NULL) {
+    return -1;
+  }
+
+  if (PyModule_AddType(module, state->behavior_capsule_type) < 0) {
+    return -1;
+  }
+
+  if (XIDATA_REGISTERCLASS(state->behavior_capsule_type, _behavior_shared)) {
+    Py_FatalError(
+        "could not register BehaviorCapsule for cross-interpreter sharing");
+    return -1;
+  }
+
+  assert(BOC_STATE == NULL);
+  BOC_STATE = state;
+
   PyModule_AddStringConstant(module, "TIMEOUT", BOC_TIMEOUT);
   return 0;
 }
 
-void boc_free(void *module_ptr) {
+static int _core_module_clear(PyObject *module) {
+  _core_module_state *state = (_core_module_state *)PyModule_GetState(module);
+  Py_CLEAR(state->loads);
+  Py_CLEAR(state->dumps);
+  Py_CLEAR(state->pickle);
+  Py_CLEAR(state->cown_capsule_type);
+  Py_CLEAR(state->behavior_capsule_type);
+  // this needs to be cleared here, as it was allocated on this interpreter.
+  Py_CLEAR(state->recycle_queue->xidata_to_cowns);
+  return 0;
+}
+
+void _core_module_free(void *module_ptr) {
   PyObject *module = (PyObject *)module_ptr;
-  BOCState *state = (BOCState *)PyModule_GetState(module);
+  _core_module_state *state = (_core_module_state *)PyModule_GetState(module);
 
   PRINTDBG("begin boc_free(index=%" PRIdLEAST64 ")\n", state->index);
-  PRINTDBG("Emptying _boc recycle queue...\n");
+  PRINTDBG("Emptying _core recycle queue...\n");
 
-  BOCRecycleQueue_empty(state->recycle_queue, state->xidata_to_cowns, true);
+  BOCRecycleQueue_empty(state->recycle_queue, true);
 
-  if (state != NULL) {
-    Py_CLEAR(state->loads);
-    Py_CLEAR(state->dumps);
-    Py_CLEAR(state->pickle);
-    Py_CLEAR(state->xidata_to_cowns);
-    for (Py_ssize_t i = 0; i < BOC_QUEUE_COUNT; ++i) {
-      state->queue_tags[i] = NULL;
+  _core_module_clear(module);
+  for (size_t i = 0; i < BOC_QUEUE_COUNT; ++i) {
+    if (state->queue_tags[i] != NULL) {
+      TAG_DECREF(state->queue_tags[i]);
     }
   }
 
@@ -2982,10 +3273,10 @@ void boc_free(void *module_ptr) {
 
     // last one, clean up
     BOCQueue *qptr = BOC_QUEUES;
-    for (size_t i = 0; i < BOC_QUEUE_COUNT + 1; ++i, ++qptr) {
+    for (size_t i = 0; i < BOC_QUEUE_COUNT; ++i, ++qptr) {
       PyMem_RawFree(qptr->messages);
 
-      if (atomic_load(&qptr->assigned)) {
+      if (atomic_load(&qptr->state) == BOC_QUEUE_ASSIGNED) {
         BOCTag *qtag = (BOCTag *)atomic_load(&qptr->tag);
         assert(qtag->queue == qptr);
         BOCTag_free(qtag);
@@ -2995,11 +3286,11 @@ void boc_free(void *module_ptr) {
     BOCRecycleQueue *queue = (BOCRecycleQueue *)BOC_RECYCLE_QUEUE_TAIL;
     while (atomic_load(&queue->next) != 0) {
       BOCRecycleQueue *next = (BOCRecycleQueue *)queue->next;
-      BOCRecycleQueue_free(queue, NULL);
+      BOCRecycleQueue_free(queue);
       queue = next;
     }
 
-    BOCRecycleQueue_free(queue, NULL);
+    BOCRecycleQueue_free(queue);
     BOC_RECYCLE_QUEUE_TAIL = NULL;
     atomic_store(&BOC_RECYCLE_QUEUE_HEAD, 0);
   }
@@ -3007,9 +3298,20 @@ void boc_free(void *module_ptr) {
   PRINTDBG("end boc_free(index=%" PRIdLEAST64 ")\n", state->index);
 }
 
+static int _core_module_traverse(PyObject *module, visitproc visit, void *arg) {
+  _core_module_state *state = (_core_module_state *)PyModule_GetState(module);
+  Py_VISIT(state->loads);
+  Py_VISIT(state->dumps);
+  Py_VISIT(state->pickle);
+  Py_VISIT(state->cown_capsule_type);
+  Py_VISIT(state->behavior_capsule_type);
+  Py_VISIT(state->recycle_queue->xidata_to_cowns);
+  return 0;
+}
+
 #ifdef Py_mod_exec
-static PyModuleDef_Slot boc_slots[] = {
-    {Py_mod_exec, (void *)boc_exec},
+static PyModuleDef_Slot _core_module_slots[] = {
+    {Py_mod_exec, (void *)_core_module_exec},
 #if PY_VERSION_HEX >= 0x030C0000
     {Py_mod_multiple_interpreters, Py_MOD_PER_INTERPRETER_GIL_SUPPORTED},
 #endif
@@ -3017,28 +3319,30 @@ static PyModuleDef_Slot boc_slots[] = {
 };
 #endif
 
-static PyModuleDef bocmoduledef = {
+static PyModuleDef _core_module = {
     PyModuleDef_HEAD_INIT,
-    .m_name = "_boc",
-    .m_doc = "boc is a Python extension that adds Behavior-oriented "
-             "Concurrency built on top of cross-interpreter data.",
-    .m_methods = boc_methods,
-    .m_free = (freefunc)boc_free,
+    .m_name = "_core",
+    .m_doc = "Provides the underlying C implementation for the core BOC "
+             "functionality",
+    .m_methods = _core_module_methods,
+    .m_free = (freefunc)_core_module_free,
+    .m_traverse = _core_module_traverse,
+    .m_clear = _core_module_clear,
 #ifdef Py_mod_exec
-    .m_slots = boc_slots,
+    .m_slots = _core_module_slots,
 #endif
-    .m_size = sizeof(BOCState)};
+    .m_size = sizeof(_core_module_state)};
 
-PyMODINIT_FUNC PyInit__boc(void) {
+PyMODINIT_FUNC PyInit__core(void) {
 #ifdef Py_mod_exec
-  return PyModuleDef_Init(&bocmoduledef);
+  return PyModuleDef_Init(&_core_module);
 #else
   PyObject *module;
-  module = PyModule_Create(&bocmoduledef);
+  module = PyModule_Create(&_core_module);
   if (module == NULL)
     return NULL;
 
-  if (boc_exec(module) != 0) {
+  if (_core_exec(module) != 0) {
     Py_DECREF(module);
     return NULL;
   }

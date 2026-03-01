@@ -1,3 +1,5 @@
+"""Omelette cooking example using threads and locks."""
+
 import random
 from threading import Condition, RLock, Thread
 import time
@@ -5,7 +7,10 @@ from typing import Mapping, NamedTuple, Tuple
 
 
 class Ingredient:
+    """A cooking ingredient with a name, state, quantity, and lock."""
+
     def __init__(self, name: str, quantity=1):
+        """Initialize an ingredient."""
         self.name = name
         self.state_value = "raw"
         self.quantity = quantity
@@ -13,9 +18,11 @@ class Ingredient:
         self.condition = Condition(self.lock)
 
     def __repr__(self):
+        """Return a debug representation."""
         return f"Ingredient(name={self.name}, quantity={self.quantity})"
 
     def __str__(self):
+        """Return a human-readable description."""
         if self.quantity == 1:
             return f"{self.state} {self.name}"
 
@@ -23,6 +30,7 @@ class Ingredient:
 
     @property
     def state(self):
+        """Get the current state of the ingredient."""
         assert self.lock.locked
         return self.state_value
 
@@ -36,29 +44,36 @@ class Ingredient:
 
 
 class Utensil:
+    """A kitchen utensil with a lock for thread safety."""
+
     def __init__(self, name: str):
+        """Initialize a utensil."""
         self.name = name
         self.lock = RLock()
 
     def dice(self, ingredient: Ingredient):
+        """Dice an ingredient using a knife."""
         assert self.name == "knife" and self.lock.locked
         print("Dicing", str(ingredient))
         time.sleep(random.random())
         ingredient.state = "diced"
 
     def chop(self, ingredient: Ingredient):
+        """Chop an ingredient using a knife."""
         assert self.name == "knife" and self.lock.locked
         print("Chopping", str(ingredient))
         time.sleep(random.random())
         ingredient.state = "chopped"
 
     def beat(self, ingredient: Ingredient):
+        """Beat an ingredient using a whisk."""
         assert self.name == "whisk" and self.lock.locked
         print("Beating", str(ingredient))
         time.sleep(random.random())
         ingredient.state = "beaten"
 
     def grate(self, ingredient: Ingredient):
+        """Grate an ingredient using a grater."""
         assert self.name == "grater" and self.lock.locked
         print("Grating", str(ingredient))
         time.sleep(random.random())
@@ -66,7 +81,10 @@ class Utensil:
 
 
 class Recipe(NamedTuple("Recipe", [("name", str), ("ingredients", Mapping[str, str])])):
+    """A recipe with required ingredients and their expected states."""
+
     def check(self, ingredients: Tuple[Ingredient, ...]) -> bool:
+        """Verify that all ingredients are present and correctly prepared."""
         valid = set()
         for i in ingredients:
             if i.name not in self.ingredients:
@@ -78,24 +96,28 @@ class Recipe(NamedTuple("Recipe", [("name", str), ("ingredients", Mapping[str, s
                 return False
 
             valid.add(i.name)
-        
+
         if len(valid) < len(self.ingredients):
             print("missing ingredients:")
             for name, state in self.ingredients.items():
                 if name not in valid:
                     print(state, name)
-            
+
             return False
 
         return True
 
 
 class Cookware:
+    """A piece of cookware with a lock for thread safety."""
+
     def __init__(self, name: str):
+        """Initialize cookware."""
         self.name = name
         self.lock = RLock()
 
     def cook(self, recipe: Recipe, ingredients: Tuple[Ingredient, ...]):
+        """Cook a recipe if all ingredients are ready."""
         assert self.lock.locked
         if not recipe.check(ingredients):
             return False
@@ -107,6 +129,7 @@ class Cookware:
 
 
 def main():
+    """Set up ingredients and run two cooks on separate threads."""
     onion = Ingredient("onion")
     pepper = Ingredient("pepper")
     eggs = Ingredient("egg", 3)

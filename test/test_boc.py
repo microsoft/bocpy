@@ -1,10 +1,13 @@
 """Behavior-oriented concurrency tests."""
 
 import functools
-from typing import NamedTuple
+from typing import List, NamedTuple
 
-from boc import Cown, receive, send, wait, when
+from boc import Cown, receive, send, TIMEOUT, wait, when
 import pytest
+
+
+RECEIVE_TIMEOUT = 10
 
 
 def simple(x: Cown) -> Cown:
@@ -72,6 +75,18 @@ class Philosopher(NamedTuple("Philosopher", [("index", int), ("left", Cown),
                 send("report", ("full", index))
 
 
+class Accumulator:
+    """Simple list-based accumulator for testing."""
+
+    def __init__(self):
+        """Initialize with an empty item list."""
+        self.items = []
+
+    def add(self, item):
+        """Append an item to the list."""
+        self.items.append(item)
+
+
 @functools.lru_cache
 def fib_sequential(n: int) -> int:
     """Compute Fibonacci sequentially with memoization."""
@@ -93,6 +108,34 @@ def fib_parallel(n: int) -> Cown:
     return do_fib
 
 
+def cown_grouping():
+    """Group cowns to test grouping/ungrouping."""
+    cowns = [Cown(i) for i in range(10)]
+    expected = 45
+
+    @when(cowns)
+    def group(group: List[Cown[int]]):
+        return sum([c.value for c in group])
+
+    @when(cowns[:9], cowns[9])
+    def group_single(group: List[Cown[int]], single: Cown[int]):
+        return sum([c.value for c in group]) + single.value
+
+    @when(cowns[0], cowns[1:])
+    def single_group(single: Cown[int], group: List[Cown[int]]):
+        return sum([c.value for c in group]) + single.value
+
+    @when(cowns[:4], cowns[4], cowns[5:])
+    def group_single_group(group0: List[Cown[int]], single: Cown[int], group1: List[Cown[int]]):
+        return sum([c.value for c in group0]) + single.value + sum([c.value for c in group1])
+
+    @when(cowns[0], cowns[1:9], cowns[9])
+    def single_group_single(single0: Cown[int], group: List[Cown[int]], single1: Cown[int]):
+        return single0.value + sum([c.value for c in group]) + single1.value
+
+    return expected, [group, group_single, single_group, group_single_group, single_group_single]
+
+
 class TestBOC:
     """Integration-style tests for boc behaviors."""
 
@@ -102,10 +145,21 @@ class TestBOC:
         wait()
 
     def receive_asserts(self, count=1):
-        """Drain assertion messages and compare actual vs expected."""
+        """Drain assertion messages and compare actual vs expected.
+
+        Uses a timeout so that if a behavior never fires (e.g. due to a
+        parameter-count mismatch in @when) the test fails quickly instead
+        of hanging forever.
+        """
         failed = None
         for _ in range(count):
-            _, (actual, expected) = receive("assert")
+            result = receive("assert", RECEIVE_TIMEOUT)
+            assert result[0] != TIMEOUT, (
+                "Timed out waiting for an 'assert' message from a behavior. "
+                "Check that every @when arg count matches the decorated "
+                "function's parameter count."
+            )
+            _, (actual, expected) = result
             if actual != expected:
                 failed = (actual, expected)
 
@@ -202,5 +256,139 @@ class TestBOC:
         @when(result)
         def check(result):
             send("assert", (result.value, expected))
+
+        self.receive_asserts()
+
+    def test_cown_grouping(self):
+        """Verify cown grouping returns correct sums."""
+        expected, results = cown_grouping()
+
+        @when(results)
+        def check(results: List[Cown]):
+            for r in results:
+                send("assert", (r.value, expected))
+
+        self.receive_asserts(len(results))
+
+    def test_grouped_cown_mutation(self):
+        """Write to cowns within a group and verify mutations stick."""
+        cowns = [Cown(i) for i in range(5)]
+
+        @when(cowns)
+        def double_all(group: List[Cown[int]]):
+            for c in group:
+                c.value *= 2
+
+        @when(cowns)
+        def verify(group: List[Cown[int]]):
+            for i, c in enumerate(group):
+                send("assert", (c.value, i * 2))
+
+        self.receive_asserts(5)
+
+    def test_group_and_single_mutation(self):
+        """Mutate a group and a single cown in the same behavior."""
+        items = [Cown(1), Cown(2), Cown(3)]
+        total = Cown(0)
+
+        @when(items, total)
+        def accumulate(group: List[Cown[int]], t: Cown[int]):
+            for c in group:
+                t.value += c.value
+                c.value = 0
+
+        @when(total)
+        def check_total(t):
+            send("assert", (t.value, 6))
+
+        @when(items)
+        def check_zeroed(group: List[Cown[int]]):
+            for c in group:
+                send("assert", (c.value, 0))
+
+        self.receive_asserts(4)
+
+    def test_behavior_chain(self):
+        """Chain three behaviors where each result feeds the next."""
+        x = Cown(2)
+
+        @when(x)
+        def step1(x):
+            return x.value + 3          # 5
+
+        @when(step1)
+        def step2(s1):
+            return s1.value * 4         # 20
+
+        @when(step2)
+        def step3(s2):
+            return s2.value - 7         # 13
+
+        @when(step3)
+        def check(s3):
+            send("assert", (s3.value, 13))
+
+        self.receive_asserts()
+
+    def test_contention(self):
+        """Many behaviors on the same cown serialize correctly."""
+        counter = Cown(0)
+        n = 50
+
+        for _ in range(n):
+            @when(counter)
+            def _(c):
+                c.value += 1
+
+        @when(counter)
+        def check(c):
+            send("assert", (c.value, n))
+
+        self.receive_asserts()
+
+    def test_exception_type_error(self):
+        """Verify TypeError inside a behavior is captured in the result cown."""
+        x = Cown("hello")
+
+        @when(x)
+        def bad(x):
+            return x.value + 1          # str + int -> TypeError
+
+        @when(bad)
+        def check(b):
+            send("assert", (isinstance(b.value, TypeError), True))
+            b.value = None
+
+        self.receive_asserts()
+
+    def test_exception_key_error(self):
+        """Verify KeyError inside a behavior is captured in the result cown."""
+        x = Cown({})
+
+        @when(x)
+        def bad(x):
+            return x.value["missing"]   # KeyError
+
+        @when(bad)
+        def check(b):
+            send("assert", (isinstance(b.value, KeyError), True))
+            b.value = None
+
+        self.receive_asserts()
+
+    def test_complex_object_repeated_mutation(self):
+        """Multiple sequential behaviors mutate the same object in a cown."""
+        acc = Cown(Accumulator())
+
+        for i in range(10):
+            val_to_add = i
+
+            @when(acc)
+            def _(a):
+                a.value.add(val_to_add)  # noqa: B023
+
+        @when(acc)
+        def check(a):
+            send("assert", (sorted(a.value.items), list(range(10))))
 
         self.receive_asserts()

@@ -20,10 +20,10 @@ class Account:
         return f"Account(name='{self.name}', balance={self.balance}, frozen={self.frozen})"
 
 
-def atomic_transfer(src: Cown, dst: Cown, amount: float):
+def atomic_transfer(src: Cown[Account], dst: Cown[Account], amount: float):
     """Move funds from ``src`` to ``dst`` if both are unfrozen and funded."""
     @when(src, dst)
-    def do_transfer(src, dst):
+    def do_transfer(src: Cown[Account], dst: Cown[Account]):
         src_account = src.value
         dst_account = dst.value
         print("attempting to transfer", amount, "from", src_account.name, "to", dst_account.name)
@@ -35,18 +35,18 @@ def atomic_transfer(src: Cown, dst: Cown, amount: float):
             print("failure")
 
         @when(src)
-        def _(a):
+        def _(a: Cown[Account]):
             print("src (after transfer):", a.value)
 
         @when(dst)
-        def _(b):
+        def _(b: Cown[Account]):
             print("dst (after transfer):", b.value)
 
 
-def check_balance(message: str, account: Cown):
+def check_balance(message: str, account: Cown[Account]):
     """Log the current balance of the provided account."""
     @when(account)
-    def do_check(account):
+    def do_check(account: Cown[Account]):
         print(message, account.value)
 
 

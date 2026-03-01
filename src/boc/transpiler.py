@@ -103,7 +103,7 @@ class BOCModuleTransformer(ast.NodeTransformer):
         """Record non-when functions for later capture resolution."""
         when_dec = None
         for dec in node.decorator_list:
-            if isinstance(dec, ast.Call) and dec.func.id == "when":
+            if isinstance(dec, ast.Call) and isinstance(dec.func, ast.Name) and dec.func.id == "when":
                 when_dec = dec
                 break
 
@@ -111,6 +111,23 @@ class BOCModuleTransformer(ast.NodeTransformer):
             self.functions.add(node.name)
 
         return node
+
+    def visit_Assign(self, node: ast.Assign):  # noqa: N802
+        """Add module-level constants."""
+        if isinstance(node.value, ast.Constant):
+            return node
+
+        if len(node.targets) > 1:
+            return None
+
+        name = node.targets[0]
+
+        if isinstance(name, ast.Name):
+            # use naming convention to allow some non-constant values as well
+            if name.id.isupper():
+                return node
+
+        return None
 
     def generic_visit(self, node):
         """Ignore unknown top-level nodes."""

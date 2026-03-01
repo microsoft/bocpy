@@ -8,36 +8,19 @@
             "name": "debug.py",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/examples/sketches.py",
-            "console": "integratedTerminal"
-        },
-        {
-            "name": "test.py",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "${workspaceFolder}/test.py",
+            "program": "${workspaceFolder}/examples/bank.py",
             "console": "integratedTerminal"
         },
         {
             "name": "Debug",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/.env314asan/bin/python",
+            "program": "${workspaceFolder}/.env314d/bin/python",
             "args": [
-                "examples/sketches.py",
+                "${workspaceFolder}/examples/bank.py"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
-            "environment": [
-                {
-                    "name": "ASAN_OPTIONS",
-                    "value": "detect_leaks=1:halt_on_error=1"
-                },
-                {
-                    "name": "LSAN_OPTIONS",
-                    "value": "report_objects=1"
-                }
-            ],
             "externalConsole": false,
             "MIMode": "gdb",
             "setupCommands": [
@@ -81,32 +64,6 @@
                     "ignoreFailures": true
                 }
             ]
-        },
-        {
-            "name": "Subinterpreters",
-            "type": "cppdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/.env312/bin/python",
-            "args": [
-                "examples/subinterpreters.py"
-            ],
-            "stopAtEntry": false,
-            "cwd": "${workspaceFolder}",
-            "environment": [],
-            "externalConsole": false,
-            "MIMode": "gdb",
-            "setupCommands": [
-                {
-                    "description": "Enable pretty-printing for gdb",
-                    "text": "-enable-pretty-printing",
-                    "ignoreFailures": true
-                },
-                {
-                    "description": "Set Disassembly Flavor to Intel",
-                    "text": "-gdb-set disassembly-flavor intel",
-                    "ignoreFailures": true
-                }
-            ]
-        },
-    ]
+        }
+   ]
 }

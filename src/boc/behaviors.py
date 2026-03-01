@@ -4,13 +4,13 @@ import inspect
 import logging
 import os
 import shutil
+import sys
 import tempfile
 from textwrap import dedent
 import threading
-from typing import Any, List, Mapping, Optional, Tuple
+from typing import Any, Generic, List, Mapping, Optional, Tuple, TypeVar, Union
 
-import _boc
-
+from . import _core, set_tags
 from .transpiler import BehaviorInfo, export_main, export_module_from_file
 
 try:
@@ -27,17 +27,19 @@ except AttributeError:
     from multiprocessing import cpu_count
     WORKER_COUNT = cpu_count() - 1
 
+T = TypeVar("T")
 
-class Cown:
+
+class Cown(Generic[T]):
     """Lightweight wrapper around the underlying cown capsule."""
 
-    def __init__(self, value: Any = None):
+    def __init__(self, value: T):
         """Create a cown."""
         logging.debug(f"initialising Cown with value: {value}")
-        if isinstance(value, _boc.CownCapsule):
+        if isinstance(value, _core.CownCapsule):
             self.impl = value
         else:
-            self.impl = _boc.CownCapsule(value)
+            self.impl = _core.CownCapsule(value)
             self.impl.release()
 
     def __enter__(self):
@@ -50,12 +52,12 @@ class Cown:
         self.release()
 
     @property
-    def value(self) -> Any:
+    def value(self) -> T:
         """Return the current stored value."""
         return self.impl.get()
 
     @value.setter
-    def value(self, value: Any) -> Any:
+    def value(self, value: T):
         """Set a new stored value."""
         return self.impl.set(value)
 
@@ -114,10 +116,11 @@ class Request:
 
         If there is no next behavior, then the cown's `last` pointer is set to null.
         """
-        _boc.request_release(self.impl)
+        _core.request_release(self.impl)
 
     def target(self) -> int:
-        return _boc.request_target(self.impl)
+        """Returns the target cown of the request."""
+        return _core.request_target(self.impl)
 
     def start_enqueue(self, behavior: "Behavior"):
         """Start the first phase of the 2PL enqueue operation.
@@ -126,7 +129,7 @@ class Request:
         once any previous behavior on this cown has finished enqueueing
         on all its required cowns.  This ensures that the 2PL is obeyed.
         """
-        _boc.request_start_enqueue(self.impl, behavior.impl)
+        _core.request_start_enqueue(self.impl, behavior.impl)
 
     def finish_enqueue(self):
         """Finish the second phase of the 2PL enqueue operation.
@@ -134,7 +137,7 @@ class Request:
         This will set the scheduled flag, so subsequent behaviors on this
         cown can continue the 2PL enqueue.
         """
-        _boc.request_finish_enqueue(self.impl)
+        _core.request_finish_enqueue(self.impl)
 
 
 class Behavior:
@@ -144,7 +147,7 @@ class Behavior:
     when the body has finished.
     """
 
-    def __init__(self, impl: _boc.BehaviorCapsule):
+    def __init__(self, impl: _core.BehaviorCapsule):
         """Wrap the capsule and materialize request wrappers."""
         self.impl = impl
         self.bid = impl.bid()
@@ -169,7 +172,7 @@ class Behavior:
 
     def start(self):
         """Send the behavior to a worker to execute."""
-        _boc.send("boc_worker", self.impl)
+        _core.send("boc_worker", self.impl)
 
     def release(self):
         """Release all owned requests."""
@@ -184,10 +187,15 @@ class Behaviors:
     """Coordinator that starts workers and schedules behaviors."""
 
     def __init__(self, num_workers: Optional[int], export_dir: Optional[str]):
-        """Initialize the behavior runtime.
+        """Creates a new Behaviors scheduler.
 
-        Args:
-            num_workers: the number of workers (i.e., subinterpreters) that will execute behaviors
+        :param num_workers: The number of worker interpreters to start.  If
+            None, defaults to the number of available cores minus one.
+        :type num_workers: Optional[int]
+        :param export_dir: The directory to which the target module will be
+            exported for worker import.  If None, a temporary directory will
+            be created and removed on shutdown.
+        :type export_dir: Optional[str]
         """
         self.num_workers = WORKER_COUNT if num_workers is None else num_workers
         self.export_dir = export_dir
@@ -227,7 +235,7 @@ class Behaviors:
             interp = interpreters.create()
             result = interpreters.run_string(interp, dedent(self.worker_script))
             if result is not None:
-                _boc.send("boc_behavior", result.formatted)
+                _core.send("boc_behavior", result.formatted)
 
             try:
                 interpreters.destroy(interp)
@@ -242,7 +250,7 @@ class Behaviors:
         num_errors = 0
         self.logger.debug("waiting for workers to start")
         for _ in range(self.num_workers):
-            match _boc.receive("boc_behavior"):
+            match _core.receive("boc_behavior"):
                 case ["boc_behavior", "started"]:
                     self.logger.debug("boc_behavior/started")
 
@@ -261,7 +269,7 @@ class Behaviors:
         while frame is not None:
             for name in frame.f_globals:
                 val = frame.f_globals[name]
-                if isinstance(val, Cown) or isinstance(val, _boc.CownCapsule):
+                if isinstance(val, Cown) or isinstance(val, _core.CownCapsule):
                     self.logger.debug(f"acquiring {name}")
                     val.acquire()
 
@@ -272,14 +280,14 @@ class Behaviors:
 
         self.logger.debug("stopping workers")
         for _ in range(self.num_workers):
-            _boc.send("boc_worker", "shutdown")
+            _core.send("boc_worker", "shutdown")
 
         for _ in range(self.num_workers):
-            _, contents = _boc.receive("boc_behavior")
+            _, contents = _core.receive("boc_behavior")
             assert contents == "shutdown"
 
         for _ in range(self.num_workers):
-            _boc.send("boc_cleanup", True)
+            _core.send("boc_cleanup", True)
 
         self.teardown_workers()
         self.logger.debug("workers stopped")
@@ -293,7 +301,7 @@ class Behaviors:
             exception = None
             self.logger.debug("all workers started, scheduling")
             while terminator:
-                match _boc.receive("boc_behavior"):
+                match _core.receive("boc_behavior"):
                     case ["boc_behavior", "terminator_decrement"]:
                         terminator -= 1
                         self.logger.debug(f"boc_behavior/terminator_decrement({terminator})")
@@ -354,6 +362,7 @@ class Behaviors:
 
         if module_name == "__main__":
             lines = [f'load_boc_module("__bocmain__", r"{path}")', 'boc_export = sys.modules["__bocmain__"]']
+            sys.modules["__bocmain__"] = sys.modules["__main__"]
             for cls in export.classes:
                 lines.append(f'\n\nclass {cls}(sys.modules["__bocmain__"].{cls}):')
                 lines.append("    pass")
@@ -364,6 +373,7 @@ class Behaviors:
 
         self.worker_script = worker_script[:main_start] + "\n".join(lines) + worker_script[main_start:]
 
+        set_tags(["boc_behavior", "boc_worker", "boc_cleanup"])
         self.start_workers()
         self.start_scheduler()
 
@@ -375,7 +385,7 @@ class Behaviors:
              cowns: Tuple[Cown, ...] = ()):
         """Stop scheduler and workers, removing any temp exports."""
         self.final_cowns = cowns
-        _boc.send("boc_behavior", "terminator_decrement")
+        _core.send("boc_behavior", "terminator_decrement")
         self.scheduler.join(timeout)
         self.stop_workers()
         if os.path.exists(self.export_dir) and self.export_tmp:
@@ -386,16 +396,37 @@ class Behaviors:
         self.stop()
 
 
-def whencall(thunk: str, args: List[Cown], captures: List[Any]) -> Cown:
+def whencall(thunk: str, args: List[Union[Cown, List[Cown]]], captures: List[Any]) -> Cown:
     """Invoke a behavior by name with cown args and captured values."""
     result = Cown(None)
-    behavior = _boc.BehaviorCapsule(thunk, result.impl, args, captures)
+
+    cowns = []
+    group_id = 1
+    for item in args:
+        if isinstance(item, (Cown, _core.CownCapsule)):
+            cowns.append((group_id, item.impl))
+            group_id += 1
+            continue
+
+        if not isinstance(item, (List, Tuple)):
+            raise TypeError("can only schedule over cowns or sequences of cowns")
+
+        for c in item:
+            if not isinstance(c, (Cown, _core.CownCapsule)):
+                raise TypeError("can only schedule over cowns or sequences of cowns")
+
+            cowns.append((-group_id, c.impl))
+
+        group_id += 1
+
+    behavior = _core.BehaviorCapsule(thunk, result.impl, cowns, captures)
     logging.debug(f"whencall:behavior=Behavior(thunk={thunk}, result={result}, args={args}, captures={captures})")
-    _boc.send("boc_behavior", ("schedule", behavior))
+    _core.send("boc_behavior", ("schedule", behavior))
     return result
 
 
 def get_caller_module():
+    """Get the caller's module name and file path."""
     frame = inspect.currentframe().f_back.f_back
     name = frame.f_globals["__name__"]
     file = frame.f_globals["__file__"]
@@ -403,11 +434,24 @@ def get_caller_module():
 
 
 def start(**kwargs):
+    """Start the behavior scheduler and worker pool.
+
+    :param worker_count: The number of worker interpreters to start.  If
+        None, defaults to the number of available cores minus one.
+    :type worker_count: Optional[int]
+    :param export_dir: The directory to which the target module will be
+        exported for worker import.  If None, a temporary directory will
+        be created and removed on shutdown.
+    :type export_dir: Optional[str]
+    :param module: A tuple of the target module name and file path to export
+        for worker import.  If None, the caller's module will be used.
+    :type module: Optional[Tuple[str, str]]
+    """
     global BEHAVIORS
     if BEHAVIORS is not None:
         raise RuntimeError("Behavior scheduler already started")
 
-    if not _boc.is_primary():
+    if not _core.is_primary():
         raise RuntimeError("start() can only be called from the main interpreter")
 
     worker_count = kwargs.get("worker_count", WORKER_COUNT)
@@ -429,11 +473,11 @@ def when(*cowns):
     result of executing the behavior. This Cown can be used for further
     coordination.
     """
+
     def when_factory(func):
         when_frame = inspect.currentframe().f_back
 
-        global BEHAVIORS
-        if BEHAVIORS is None and _boc.is_primary():
+        if BEHAVIORS is None and _core.is_primary():
             start(module=get_caller_module())
 
         logging.debug("when:start")
@@ -442,8 +486,6 @@ def when(*cowns):
             print("Behavior not found at line", when_frame.f_lineno)
             print(BEHAVIORS.behavior_lookup)
             return None
-
-        args = [cown.impl for cown in cowns]
 
         logging.debug(f"when:behavior={binfo}")
         captures = []
@@ -462,7 +504,7 @@ def when(*cowns):
             if not found:
                 raise RuntimeError(f"Cannot resolve capture: {name}")
 
-        result = whencall(binfo.name, args, captures)
+        result = whencall(binfo.name, cowns, captures)
 
         logging.debug("when:end")
 
@@ -473,5 +515,7 @@ def when(*cowns):
 
 def wait(timeout: Optional[float] = None):
     """Block until all behaviors complete, with optional timeout."""
+    global BEHAVIORS
     if BEHAVIORS:
         BEHAVIORS.stop(timeout)
+        BEHAVIORS = None

@@ -1,5 +1,7 @@
 # boc
 
+![BOC Logo](docs/images/boc-logo.svg)
+
 Behavior-Oriented Concurrency (*BOC*) is a new paradigm for parallel and concurrent
 programming which is particularly well-suited to Python. In a BOC program, data is
 shared such that each behavior has unique temporal ownership of the data, removing
@@ -74,6 +76,8 @@ else:
     return_to_library()
 ```
 
+TODO this needs to actually demonstrate the possibility of deadlock.
+
 The code above will work, but requires the purveying of cheese and the navigation
 of the menu for non-spam options to happen sequentially. If we wanted to do these
 tasks in parallel, we will end up with some version of nested waiting, which can
@@ -138,7 +142,8 @@ def _(cheese, meal):
 wait()
 ```
 
-You can view the full example [here](https://github.com/microsoft/bocpy/examples/sketches.py)
+You can view the full example
+[here](https://github.com/microsoft/bocpy/blob/main/examples/sketches.py)
 
 The underlying BOC scheduler ensures that this operates without deadlock, by
 construction.
@@ -147,12 +152,16 @@ construction.
 
 We provide a few examples to show different ways of using BOC in a program:
 
-1. [Bank](https://github.com/microsoft/bocpy/examples/bank.py): Shows an example
+1. [Atomic Bank Transfer](https://github.com/microsoft/bocpy/blob/main/examples/bank.py): Shows an example
    where two objects (in this case, bank accounts), interact in an atomic way.
-2. [Dining Philosophers](https://github.com/microsoft/bocpy/examples/dining_philosophers.py):
+2. [Dining Philosophers](https://github.com/microsoft/bocpy/blob/main/examples/dining_philosophers.py):
    The classic Dining Philosphers problem implemented using BOC.
-3. [Fibonacci](https://github.com/microsoft/bocpy/examples/fibonacci.py): A
+3. [Fibonacci](https://github.com/microsoft/bocpy/blob/main/examples/fibonacci.py): A
    parallel implementation of Fibonacci calculation.
+4. [Cooking](https://github.com/microsoft/bocpy/blob/main/examples/cooking_boc.py): The example from
+   the [BOC tutorial](https://microsoft.github.io/bocpy/).
+5. [Boids](https://github.com/microsoft/bocpy/blob/main/examples/boids.py): TODO
+
 
 
 ## Why BOC for Python?
@@ -175,8 +184,9 @@ parallel.
 In addition the providing the `when` function decorator, the library also exposes
 low-level Erlang-style `send` and selective `receive` functions which enable
 lock-free communication across threads and subinterpreters. See the
-[Primes](https://github.com/microsoft/bocpy/examples/primes.py) example for the
-usage of these lower-level functions.
+[Primes](https://github.com/microsoft/bocpy/blob/main/examples/primes.py) and
+[Calculator](https://github.com/microsoft/bocpy/blob/main/examples/calculator.py)
+examples for the usage of these lower-level functions.
 
 ### Additional Info
 BOC is built on a solid foundation of serious scholarship and engineering. For further reading, please see:

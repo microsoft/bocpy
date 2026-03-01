@@ -4,11 +4,11 @@ import importlib.util
 import logging
 import sys
 
-from boc import _boc, receive, send
+from boc import _core, receive, send
 
 
 logging.basicConfig(level=logging.NOTSET)
-index = _boc.index()
+index = _core.index()
 logger = logging.getLogger(f"worker{index}")
 
 
@@ -40,14 +40,14 @@ boc_export = None
 def run_behavior(behavior):
     """Execute a single behavior and notify the scheduler."""
     bid = behavior.bid()
-    _boc.behavior_acquire(behavior)
+    behavior.acquire()
     try:
-        _boc.behavior_execute(behavior, boc_export)
+        behavior.execute(boc_export)
     except Exception as ex:
         logger.exception(ex)
         behavior.set_result(ex)
 
-    _boc.behavior_release(behavior)
+    behavior.release()
     send("boc_behavior", ("release", bid))
 
 
@@ -78,7 +78,7 @@ def cleanup():
     try:
         receive("boc_cleanup")
 
-        orphan_cowns = _boc.cowns()
+        orphan_cowns = _core.cowns()
         if len(orphan_cowns) != 0:
             logger.debug("acquiring orphan cowns")
             # at this stage all behaviors have exited, but it may be the case
@@ -90,7 +90,7 @@ def cleanup():
                     cown.acquire()
 
         orphan_cowns = None
-        _boc.recycle()
+        _core.recycle()
     except Exception as ex:
         logger.exception(ex)
 

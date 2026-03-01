@@ -1,3 +1,5 @@
+"""Concurrent calculator using message-passing channels."""
+
 import argparse
 import random
 from threading import Thread
@@ -7,6 +9,7 @@ from boc import receive, send
 
 
 def client(num_operations: int):
+    """Send random arithmetic operations to the calculator channel."""
     actions = ["+", "-", "/", "*"]
 
     for _ in range(num_operations):
@@ -17,6 +20,7 @@ def client(num_operations: int):
 
 
 def server(timeout):
+    """Receive and process arithmetic operations until stopped."""
     value = 0
     num_operations = 0
     running = True
@@ -52,6 +56,7 @@ def server(timeout):
 
 
 def main():
+    """Parse arguments and run the calculator server and clients."""
     parser = argparse.ArgumentParser("Calculator")
     parser.add_argument("--num-clients", "-n", type=int, default=8)
     parser.add_argument("--num-operations", "-a", type=int, default=10)

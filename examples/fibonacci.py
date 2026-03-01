@@ -22,7 +22,7 @@ def parallel(n: int) -> Cown:
         return Cown(sequential(n))
 
     @when(parallel(n - 1), parallel(n - 2))
-    def do_fib(f1, f2):
+    def do_fib(f1: Cown[int], f2: Cown[int]):
         return f1.value + f2.value
 
     return do_fib
@@ -31,7 +31,7 @@ def parallel(n: int) -> Cown:
 def check(message: str, f: Cown, value: int):
     """Validate a computed Fibonacci value against the sequential result."""
     @when(f)
-    def do_check(f):
+    def do_check(f: Cown[int]):
         print(f"{message}: {f.value} (expected: {value})")
 
 

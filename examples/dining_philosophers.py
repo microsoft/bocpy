@@ -29,7 +29,7 @@ class Philosopher(NamedTuple("Philosopher", [("index", int), ("left", Cown),
         index = self.index
 
         @when(self.left, self.right, self.hunger)
-        def take_bite(left, right, hunger):
+        def take_bite(left: Cown[Fork], right: Cown[Fork], hunger: Cown[int]):
             left.value.use()
             right.value.use()
             send("report", ("bite", index))
