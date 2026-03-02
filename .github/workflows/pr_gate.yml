@@ -1,0 +1,137 @@
+name: PR Gate
+
+on:
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  linting:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.14
+
+      - name: Install flake8
+        run: pip install -e .[linting]
+
+      - name: Run flake8
+        run: flake8 src/bocpy test examples
+
+  cpp-format:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        path: 
+          - check: src/bocpy
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run clang-format style check
+        uses: jidicula/clang-format-action@v4.8.0
+        with:
+          clang-format-version: '18'
+          check-path: ${{matrix.path['check']}}
+          exclude-regex: ${{matrix.path['exclude']}}
+
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Use Python ${{matrix.python_version}}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{matrix.python_version}}
+
+      - name: Get dependencies
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Python build
+        run: pip install -e .[test] --verbose
+
+      - name: Python test
+        run: pytest -vv
+
+  windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Use Python ${{matrix.python_version}}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{matrix.python_version}}
+
+      - name: Get dependencies
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Python build
+        run: pip install -e .[test] --verbose
+
+      - name: Python test
+        run: pytest -vv
+
+  macos-arm64:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Use Python ${{matrix.python_version}}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{matrix.python_version}}
+
+      - name: Get dependencies
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Python build
+        run: pip install -e .[test] --verbose
+
+      - name: Python test
+        run: pytest -vv
+
+  macos-x86_64:
+    runs-on: macos-15-intel
+    strategy:
+      matrix:
+        python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Use Python ${{matrix.python_version}}
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{matrix.python_version}}
+
+      - name: Get dependencies
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Python build
+        run: pip install -e .[test] --verbose
+
+      - name: Python test
+        run: pytest -vv
