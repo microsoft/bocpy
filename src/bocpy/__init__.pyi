@@ -5,6 +5,17 @@ TIMEOUT: str
 """Sentinel value returned by :func:`receive` when a timeout occurs."""
 
 
+def drain(tags: Union[str, Sequence[str]]) -> None:
+    """Drain all messages associated with one or more tags.
+
+    Note that if new messages with this tag are being constantly created, this method
+    may not return.
+
+    :param tag: The tags to drain. All messages associated with this tag will
+                be cleared.
+    """
+
+
 def send(tag: str, contents: Any):
     """Sends a message.
 
@@ -56,12 +67,12 @@ class Matrix:
 
     def __init__(self, rows: int, columns: int,
                  values: Optional[Union[int, float, Sequence[Union[int, float]]]] = None):
-        """Create a new *rows* × *columns* matrix.
+        """Create a new *rows* x *columns* matrix.
 
         :param rows: Number of rows (must be ≥ 1).
         :param columns: Number of columns (must be ≥ 1).
         :param values: Initial values.  May be ``None`` (zero-filled), a scalar
-            (broadcast to every element), or a flat sequence of *rows* × *columns*
+            (broadcast to every element), or a flat sequence of *rows* x *columns*
             numbers in row-major order.
         """
 
@@ -127,40 +138,40 @@ class Matrix:
         """Sum of matrix elements.
 
         :param axis: If ``None``, return the total sum as a float.
-            If ``0``, return a 1 × *columns* row vector of column sums.
-            If ``1``, return a *rows* × 1 column vector of row sums.
+            If ``0``, return a 1 x *columns* row vector of column sums.
+            If ``1``, return a *rows* x 1 column vector of row sums.
         """
 
     def mean(self, axis: Optional[int] = None) -> Union[float, "Matrix"]:
         """Arithmetic mean of matrix elements.
 
         :param axis: If ``None``, return the overall mean as a float.
-            If ``0``, return a 1 × *columns* row vector of column means.
-            If ``1``, return a *rows* × 1 column vector of row means.
+            If ``0``, return a 1 x *columns* row vector of column means.
+            If ``1``, return a *rows* x 1 column vector of row means.
         """
 
     def magnitude(self, axis: Optional[int] = None) -> Union[float, "Matrix"]:
         """Euclidean magnitude (L2 norm) of matrix elements.
 
         :param axis: If ``None``, return the total magnitude as a float.
-            If ``0``, return a 1 × *columns* row vector of column magnitudes.
-            If ``1``, return a *rows* × 1 column vector of row magnitudes.
+            If ``0``, return a 1 x *columns* row vector of column magnitudes.
+            If ``1``, return a *rows* x 1 column vector of row magnitudes.
         """
 
     def min(self, axis: Optional[int] = None) -> Union[float, "Matrix"]:
         """Minimum of matrix elements.
 
         :param axis: If ``None``, return the overall minimum as a float.
-            If ``0``, return a 1 × *columns* row vector of column minima.
-            If ``1``, return a *rows* × 1 column vector of row minima.
+            If ``0``, return a 1 x *columns* row vector of column minima.
+            If ``1``, return a *rows* x 1 column vector of row minima.
         """
 
     def max(self, axis: Optional[int] = None) -> Union[float, "Matrix"]:
         """Maximum of matrix elements.
 
         :param axis: If ``None``, return the overall maximum as a float.
-            If ``0``, return a 1 × *columns* row vector of column maxima.
-            If ``1``, return a *rows* × 1 column vector of row maxima.
+            If ``0``, return a 1 x *columns* row vector of column maxima.
+            If ``1``, return a *rows* x 1 column vector of row maxima.
         """
 
     def ceil(self) -> "Matrix":
@@ -299,8 +310,8 @@ class Matrix:
         """Create a matrix from a flat sequence of values.
 
         :param values: The elements of the vector.
-        :param as_column: If ``True``, return a *n* × 1 column vector instead
-            of the default 1 × *n* row vector.
+        :param as_column: If ``True``, return a *n* x 1 column vector instead
+            of the default 1 x *n* row vector.
         :return: A new :class:`Matrix` with a single row or column.
         """
 
@@ -370,6 +381,9 @@ class Cown(Generic[T]):
 
 def wait(timeout: Optional[float] = None):
     """Block until all behaviors complete, with optional timeout.
+
+    Note that holding on to references to Cown objects such that they
+    are deallocated after wait() is called results in undefined behavior.
 
     :param timeout: Maximum number of seconds to wait, or ``None`` to
         wait indefinitely.

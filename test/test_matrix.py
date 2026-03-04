@@ -754,7 +754,7 @@ class TestSelect:
                 assert result[r, c] == pytest.approx(mat[0, c])
 
     def test_select_single_row(self, mat, shape):
-        """Selecting a single row returns a 1×cols matrix."""
+        """Selecting a single row returns a 1xcols matrix."""
         rows, cols = shape
         result = mat.select([0])
         assert result.rows == 1
@@ -763,7 +763,7 @@ class TestSelect:
             assert result[0, c] == pytest.approx(mat[0, c])
 
     def test_select_single_column(self, mat, shape):
-        """Selecting a single column returns a rows×1 matrix."""
+        """Selecting a single column returns a rowsx1 matrix."""
         rows, cols = shape
         result = mat.select([0], 1)
         assert result.rows == rows
@@ -810,13 +810,13 @@ class TestVectorLen:
 
     @pytest.mark.parametrize("n", VECTOR_LENGTHS)
     def test_row_vector_len(self, n):
-        """len() of a 1×N row vector returns 1 (the number of rows)."""
+        """len() of a 1xN row vector returns 1 (the number of rows)."""
         v = Matrix(1, n, [float(i) for i in range(n)])
         assert len(v) == 1
 
     @pytest.mark.parametrize("n", VECTOR_LENGTHS)
     def test_column_vector_len(self, n):
-        """len() of an N×1 column vector returns N (the number of rows)."""
+        """len() of an Nx1 column vector returns N (the number of rows)."""
         v = Matrix(n, 1, [float(i) for i in range(n)])
         assert len(v) == n
 
@@ -831,12 +831,12 @@ class TestVectorItemAccess:
 
     @pytest.mark.parametrize("n", VECTOR_LENGTHS)
     def test_row_vector_item(self, n):
-        """Indexing a 1×N row vector with [0] returns the row as a Matrix."""
+        """Indexing a 1xN row vector with [0] returns the row as a Matrix."""
         vals = [float(i) * 1.5 for i in range(n)]
         v = Matrix(1, n, vals)
         row = v[0]
         if n == 1:
-            # 1×1 matrix: single-element row returns a float
+            # 1x1 matrix: single-element row returns a float
             assert isinstance(row, float)
             assert row == pytest.approx(vals[0])
         else:
@@ -849,7 +849,7 @@ class TestVectorItemAccess:
 
     @pytest.mark.parametrize("n", VECTOR_LENGTHS)
     def test_column_vector_item(self, n):
-        """Indexing an N×1 column vector with an integer returns the element as a float."""
+        """Indexing an Nx1 column vector with an integer returns the element as a float."""
         vals = [float(i) * 2.0 for i in range(n)]
         v = Matrix(n, 1, vals)
         for i in range(n):
@@ -859,7 +859,7 @@ class TestVectorItemAccess:
 
     @pytest.mark.parametrize("n", [3, 5, 10])
     def test_row_vector_iteration(self, n):
-        """Iterating a 1×N row vector yields one Matrix (the single row)."""
+        """Iterating a 1xN row vector yields one Matrix (the single row)."""
         vals = [float(i) for i in range(n)]
         v = Matrix(1, n, vals)
         collected = list(v)
@@ -870,7 +870,7 @@ class TestVectorItemAccess:
 
     @pytest.mark.parametrize("n", [3, 5, 10])
     def test_column_vector_iteration(self, n):
-        """Iterating an N×1 column vector yields individual float elements."""
+        """Iterating an Nx1 column vector yields individual float elements."""
         vals = [float(i) for i in range(n)]
         v = Matrix(n, 1, vals)
         collected = list(v)
@@ -905,7 +905,7 @@ class TestVectorBroadcastArithmetic:
 
     @pytest.mark.parametrize("rows,cols", [(3, 4), (5, 3), (10, 10)])
     def test_row_vector_add_broadcast(self, rows, cols):
-        """A (1×cols) row vector added to (rows×cols) broadcasts across rows."""
+        """A (1xcols) row vector added to (rowsxcols) broadcasts across rows."""
         m_vals = [float(i) for i in range(rows * cols)]
         m = Matrix(rows, cols, m_vals)
         v_vals = [float(j) * 100 for j in range(cols)]
@@ -950,7 +950,7 @@ class TestVectorBroadcastArithmetic:
 
     @pytest.mark.parametrize("rows,cols", [(3, 4), (5, 3), (10, 10)])
     def test_column_vector_add_broadcast(self, rows, cols):
-        """An (rows×1) column vector added to (rows×cols) broadcasts across columns."""
+        """An (rowsx1) column vector added to (rowsxcols) broadcasts across columns."""
         m_vals = [float(i) for i in range(rows * cols)]
         m = Matrix(rows, cols, m_vals)
         v_vals = [float(i) * 100 for i in range(rows)]
@@ -1023,7 +1023,7 @@ class TestVectorBroadcastAssignment:
     """Broadcasting when assigning a vector into a matrix slice."""
 
     def test_assign_row_vector_broadcasts(self):
-        """Assigning a 1×cols vector into multiple rows broadcasts."""
+        """Assigning a 1xcols vector into multiple rows broadcasts."""
         m = Matrix.zeros((4, 3))
         v = Matrix(1, 3, [10.0, 20.0, 30.0])
         m[:, :] = v
@@ -1032,7 +1032,7 @@ class TestVectorBroadcastAssignment:
                 assert m[i, j] == pytest.approx(v[0, j])
 
     def test_assign_column_vector_broadcasts(self):
-        """Assigning an rows×1 vector into multiple columns broadcasts."""
+        """Assigning an rowsx1 vector into multiple columns broadcasts."""
         m = Matrix.zeros((3, 5))
         v = Matrix(3, 1, [10.0, 20.0, 30.0])
         m[:, :] = v
@@ -1166,7 +1166,7 @@ class TestVectorMatmul:
 
     @pytest.mark.parametrize("n", [1, 3, 5, 8])
     def test_row_times_column_dot_product(self, n):
-        """(1×n) @ (n×1) yields a 1×1 matrix (dot product)."""
+        """(1xn) @ (nx1) yields a 1x1 matrix (dot product)."""
         a_vals = [float(i + 1) for i in range(n)]
         b_vals = [float(i + 1) * 2 for i in range(n)]
         a = Matrix(1, n, a_vals)
@@ -1179,7 +1179,7 @@ class TestVectorMatmul:
 
     @pytest.mark.parametrize("n", [1, 3, 5, 8])
     def test_column_times_row_outer_product(self, n):
-        """(n×1) @ (1×n) yields an n×n matrix (outer product)."""
+        """(nx1) @ (1xn) yields an nxn matrix (outer product)."""
         a_vals = [float(i + 1) for i in range(n)]
         b_vals = [float(i + 1) * 2 for i in range(n)]
         a = Matrix(n, 1, a_vals)
@@ -1192,7 +1192,7 @@ class TestVectorMatmul:
                 assert result[i, j] == pytest.approx(a_vals[i] * b_vals[j])
 
     def test_matrix_times_column_vector(self):
-        """(M×N) @ (N×1) yields an M×1 column vector."""
+        """(MxN) @ (Nx1) yields an Mx1 column vector."""
         m, n = 4, 3
         mat = Matrix.uniform(0.0, 5.0, size=(m, n))
         v = Matrix.uniform(0.0, 5.0, size=(n, 1))
@@ -1204,7 +1204,7 @@ class TestVectorMatmul:
             assert result[i, 0] == pytest.approx(expected, rel=1e-9)
 
     def test_row_vector_times_matrix(self):
-        """(1×M) @ (M×N) yields a 1×N row vector."""
+        """(1xM) @ (MxN) yields a 1xN row vector."""
         m, n = 3, 5
         v = Matrix.uniform(0.0, 5.0, size=(1, m))
         mat = Matrix.uniform(0.0, 5.0, size=(m, n))
@@ -1221,7 +1221,7 @@ class TestVectorTranspose:
 
     @pytest.mark.parametrize("n", VECTOR_LENGTHS)
     def test_row_to_column(self, n):
-        """Transposing a 1×n row vector produces an n×1 column vector."""
+        """Transposing a 1xn row vector produces an nx1 column vector."""
         vals = [float(i) for i in range(n)]
         v = Matrix(1, n, vals)
         t = v.transpose()
@@ -1232,7 +1232,7 @@ class TestVectorTranspose:
 
     @pytest.mark.parametrize("n", VECTOR_LENGTHS)
     def test_column_to_row(self, n):
-        """Transposing an n×1 column vector produces a 1×n row vector."""
+        """Transposing an nx1 column vector produces a 1xn row vector."""
         vals = [float(i) for i in range(n)]
         v = Matrix(n, 1, vals)
         t = v.transpose()
@@ -1575,7 +1575,7 @@ class TestConcat:
         assert Matrix.allclose(result, a)
 
     def test_concat_with_list_as_row(self):
-        """Concatenating a list along axis 0 treats it as a 1×N row vector."""
+        """Concatenating a list along axis 0 treats it as a 1xN row vector."""
         a = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
         result = Matrix.concat([a, [7.0, 8.0, 9.0]])
         assert result.rows == 3
@@ -1584,7 +1584,7 @@ class TestConcat:
             assert result[2, j] == pytest.approx(float(j + 7))
 
     def test_concat_with_list_as_column(self):
-        """Concatenating a list along axis 1 treats it as an N×1 column vector."""
+        """Concatenating a list along axis 1 treats it as an Nx1 column vector."""
         a = Matrix(3, 2, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
         result = Matrix.concat([a, [10.0, 20.0, 30.0]], 1)
         assert result.rows == 3
@@ -1916,7 +1916,7 @@ class TestScalarInplaceArithmetic:
 class TestListTupleBinaryArithmetic:
     """Verify list/tuple broadcast arithmetic.
 
-    A plain list or tuple of numbers is interpreted as a 1×N row vector
+    A plain list or tuple of numbers is interpreted as a 1xN row vector
     and broadcast across rows for all four operators.
     """
 
@@ -2060,7 +2060,7 @@ class TestListTupleAssignment:
     """Verify list/tuple assignment into matrix slices.
 
     A list or tuple can be assigned into a matrix row, a column slice,
-    or a full slice, being interpreted as a 1×N row vector.
+    or a full slice, being interpreted as a 1xN row vector.
     """
 
     def test_set_row_from_list(self):

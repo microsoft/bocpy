@@ -74,6 +74,7 @@ const PY_INT64_T NO_OWNER = -2;
 atomic_int_least64_t BOC_COUNT = 0;
 atomic_int_least64_t BOC_COWN_COUNT = 0;
 
+// #define BOC_REF_TRACKING
 // #define BOC_TRACE
 
 #if PY_VERSION_HEX >= 0x030E0000 // 3.14
@@ -508,6 +509,61 @@ char BOC_DEBUG_FMT_BUF[1024];
 #define PRINTOBJDBG(...)
 #endif
 
+#ifdef BOC_REF_TRACKING
+atomic_int_least64_t BOC_ACTIVE_COWNS = 0;
+atomic_int_least64_t BOC_TOTAL_COWNS = 0;
+atomic_int_least64_t BOC_ACTIVE_BEHAVIORS = 0;
+atomic_int_least64_t BOC_TOTAL_BEHAVIORS = 0;
+struct timespec BOC_LAST_REF_TRACKING_REPORT;
+
+static void boc_ref_tracking_report(const char *prefix) {
+  struct timespec ts;
+  timespec_get(&ts, TIME_UTC);
+  if (ts.tv_sec - BOC_LAST_REF_TRACKING_REPORT.tv_sec > 1) {
+    int_least64_t alive = atomic_load(&BOC_ACTIVE_COWNS);
+    int_least64_t total = atomic_load(&BOC_TOTAL_COWNS);
+    printf("%s%" PRIdLEAST64 ": cowns=(%" PRIdLEAST64 "/%" PRIdLEAST64 ")\n",
+           prefix, ts.tv_sec, alive, total);
+    alive = atomic_load(&BOC_ACTIVE_BEHAVIORS);
+    total = atomic_load(&BOC_TOTAL_BEHAVIORS);
+    printf("%s%" PRIdLEAST64 ": behaviors=(%" PRIdLEAST64 "/%" PRIdLEAST64
+           ")\n",
+           prefix, ts.tv_sec, alive, total);
+    BOC_LAST_REF_TRACKING_REPORT = ts;
+  }
+}
+
+static void boc_ref_tracking(bool is_cown, int_least64_t delta) {
+  if (is_cown) {
+    atomic_fetch_add(&BOC_ACTIVE_COWNS, delta);
+    if (delta > 0) {
+      atomic_fetch_add(&BOC_TOTAL_COWNS, delta);
+    }
+  } else {
+    atomic_fetch_add(&BOC_ACTIVE_BEHAVIORS, delta);
+    if (delta > 0) {
+      atomic_fetch_add(&BOC_TOTAL_BEHAVIORS, delta);
+    }
+  }
+
+  if (BOC_STATE->index == 0) {
+    boc_ref_tracking_report("");
+  }
+}
+
+#define BOC_REF_TRACKING_ADD_COWN() boc_ref_tracking(true, 1)
+#define BOC_REF_TRACKING_REMOVE_COWN() boc_ref_tracking(true, -1)
+#define BOC_REF_TRACKING_ADD_BEHAVIOR() boc_ref_tracking(false, 1)
+#define BOC_REF_TRACKING_REMOVE_BEHAVIOR() boc_ref_tracking(false, -1)
+#define BOC_REF_TRACKING_REPORT() boc_ref_tracking_report("final")
+#else
+#define BOC_REF_TRACKING_ADD_COWN(...)
+#define BOC_REF_TRACKING_REMOVE_COWN(...)
+#define BOC_REF_TRACKING_ADD_BEHAVIOR(...)
+#define BOC_REF_TRACKING_REMOVE_BEHAVIOR(...)
+#define BOC_REF_TRACKING_REPORT(...)
+#endif
+
 /// @brief Convenience method to obtain the interpreter ID
 /// @return the ID of the currently running interpreter
 static inline PY_INT64_T get_interpid() {
@@ -674,12 +730,13 @@ typedef struct boc_cown {
 
 static inline int_least64_t cown_weak_decref(BOCCown *cown) {
   int_least64_t weak_rc = atomic_fetch_add(&cown->weak_rc, -1) - 1;
-  PRINTDBG("cown_weak_decref(%p, cid=%ld) = %" PRIdLEAST64 "\n", cown, cown->id,
-           weak_rc);
+  PRINTDBG("cown_weak_decref(%p, cid=%" PRIdLEAST64 ") = %" PRIdLEAST64 "\n",
+           cown, cown->id, weak_rc);
 
   if (weak_rc == 0) {
     // reference count is truly zero, we can free the memory
     PyMem_RawFree(cown);
+    BOC_REF_TRACKING_REMOVE_COWN();
   }
 
   return weak_rc;
@@ -720,7 +777,8 @@ static void BOCRecycleQueue_enqueue(BOCRecycleQueue *queue, XIDATA_T *xidata);
 /// @return the new reference count
 static inline int_least64_t cown_decref(BOCCown *cown) {
   int_least64_t rc = atomic_fetch_add(&cown->rc, -1) - 1;
-  PRINTDBG("cown_decref(%p, cid=%ld) = %" PRIdLEAST64 "\n", cown, cown->id, rc);
+  PRINTDBG("cown_decref(%p, cid=%" PRIdLEAST64 ") = %" PRIdLEAST64 "\n", cown,
+           cown->id, rc);
   if (rc != 0) {
     return rc;
   }
@@ -732,7 +790,10 @@ static inline int_least64_t cown_decref(BOCCown *cown) {
   }
 
   // we can clear the object and recycle the xidata
-  Py_XDECREF(cown->value);
+  if (cown->value != NULL) {
+    assert(cown->owner == get_interpid());
+    Py_CLEAR(cown->value);
+  }
 
   if (cown->xidata != NULL) {
     BOCRecycleQueue_enqueue(cown->recycle_queue, cown->xidata);
@@ -751,14 +812,15 @@ static inline int_least64_t cown_decref(BOCCown *cown) {
 /// @return the new reference count
 static inline int_least64_t cown_incref(BOCCown *cown) {
   int_least64_t rc = atomic_fetch_add(&cown->rc, 1) + 1;
-  PRINTDBG("cown_incref(%p, cid=%ld) = %" PRIdLEAST64 "\n", cown, cown->id, rc);
+  PRINTDBG("cown_incref(%p, cid=%" PRIdLEAST64 ") = %" PRIdLEAST64 "\n", cown,
+           cown->id, rc);
   return rc;
 }
 
 static inline int_least64_t cown_weak_incref(BOCCown *cown) {
   int_least64_t rc = atomic_fetch_add(&cown->weak_rc, 1) + 1;
-  PRINTDBG("cown_weak_incref(%p, cid=%ld) = %" PRIdLEAST64 "\n", cown, cown->id,
-           rc);
+  PRINTDBG("cown_weak_incref(%p, cid=%" PRIdLEAST64 ") = %" PRIdLEAST64 "\n",
+           cown, cown->id, rc);
   return rc;
 }
 
@@ -816,9 +878,11 @@ static BOCCown *BOCCown_new(PyObject *value) {
   cown_set_value(cown, value);
   assert(cown->value != NULL);
   atomic_store(&cown->owner, get_interpid());
-  PRINTDBG("BOCCown_new(cid=%ld, value=", cown->id);
+  PRINTDBG("BOCCown_new(cid=%" PRIdLEAST64 ", value=", cown->id);
   PRINTOBJDBG(value);
   PRINTFDBG(")\n");
+
+  BOC_REF_TRACKING_ADD_COWN();
 
   return cown;
 }
@@ -863,10 +927,10 @@ static XIDATA_T *BOCRecycleQueue_dequeue(BOCRecycleQueue *queue,
 static int BOCRecycleQueue_register(BOCRecycleQueue *queue, BOCCown *cown) {
   cown->recycle_queue = queue;
   if (queue->xidata_to_cowns == NULL) {
-    PyErr_Format(
-        PyExc_RuntimeError,
-        "Attempt to register cown after interpreter %ld has shut down\n",
-        queue->index);
+    PyErr_Format(PyExc_RuntimeError,
+                 "Attempt to register cown after interpreter %" PRIdLEAST64
+                 " has shut down\n",
+                 queue->index);
     return -1;
   }
 
@@ -996,7 +1060,8 @@ typedef struct cown_capsule_object {
 /// @param op Pointer to the CownCapsule object
 static void CownCapsule_dealloc(PyObject *op) {
   CownCapsuleObject *self = (CownCapsuleObject *)op;
-  PRINTDBG("CownCapsule_dealloc(%p, rc=%ld)\n", self, op->ob_refcnt);
+  PRINTDBG("CownCapsule_dealloc(%p, rc=%" PRIdLEAST64 ")\n", self,
+           op->ob_refcnt);
   COWN_DECREF(self->cown);
   Py_TYPE(self)->tp_free(self);
 }
@@ -1037,8 +1102,8 @@ static int CownCapsule_init(PyObject *op, PyObject *args,
     return -1;
   }
 
-  PRINTDBG("CownCapsule_init(%p, cown=%p, cid=%ld, value=", self, self->cown,
-           self->cown->id);
+  PRINTDBG("CownCapsule_init(%p, cown=%p, cid=%" PRIdLEAST64 ", value=", self,
+           self->cown, self->cown->id);
   PRINTOBJDBG(value);
   PRINTFDBG(")\n");
   return 0;
@@ -1337,7 +1402,7 @@ static PyObject *cown_capsule_wrap(BOCCown *cown, bool promote) {
   }
 
   capsule->cown = cown;
-  PRINTDBG("CownCapsule_wrap(%p, rc=%ld)\n", capsule,
+  PRINTDBG("CownCapsule_wrap(%p, rc=%zu)\n", capsule,
            capsule->ob_base.ob_refcnt);
   return (PyObject *)capsule;
 }
@@ -1354,23 +1419,25 @@ BOCCown *cown_unwrap(PyObject *op) {
 
     if (!CownCapsule_CheckExact(impl)) {
       PyErr_SetString(PyExc_ValueError, "Expected a CownCapsule");
+      Py_DECREF(impl);
       return NULL;
     }
 
     op = impl;
+    Py_DECREF(impl);
   }
 
   CownCapsuleObject *self = (CownCapsuleObject *)op;
-  PRINTDBG("cown_unwrap(%p, rc=%ld)\n", self, op->ob_refcnt);
+  PRINTDBG("CownCapsule_unwrap(%p, rc=%zu)\n", self, op->ob_refcnt);
   return self->cown;
 }
 
 static PyObject *BOCRecycleQueue_promote_cowns(BOCRecycleQueue *queue) {
   if (queue->xidata_to_cowns == NULL) {
-    PyErr_Format(
-        PyExc_RuntimeError,
-        "Cannot promote cowns from interpreter %ld after it has been destroyed",
-        queue->index);
+    PyErr_Format(PyExc_RuntimeError,
+                 "Cannot promote cowns from interpreter %" PRIdLEAST64
+                 " after it has been destroyed",
+                 queue->index);
     return NULL;
   }
 
@@ -1415,7 +1482,6 @@ static PyObject *_new_cown_object(XIDATA_T *xidata) {
   PyTypeObject *type = BOC_STATE->cown_capsule_type;
   CownCapsuleObject *capsule = (CownCapsuleObject *)type->tp_alloc(type, 0);
   if (capsule == NULL) {
-    COWN_DECREF(cown);
     return NULL;
   }
 
@@ -1514,8 +1580,9 @@ void _contents_shared_free(void *data) {
     if (*xidata_ptr != NULL) {
       PyObject *obj = (*xidata_ptr)->obj;
       if (obj != NULL) {
-        PRINTDBG("_contents_shared_free(%p)[%ld] %s(%p): rc=%ld\n", shared, i,
-                 obj->ob_type->tp_name, obj, Py_REFCNT(obj));
+        PRINTDBG("_contents_shared_free(%p)[%" PRIdLEAST64
+                 "] %s(%p): rc=%" PRIdLEAST64 "\n",
+                 shared, i, obj->ob_type->tp_name, obj, Py_REFCNT(obj));
       }
 
       BOCRecycleQueue_enqueue(shared->recycle_queue, *xidata_ptr);
@@ -1592,8 +1659,9 @@ int _contents_shared(PyThreadState *tstate, PyObject *obj, XIDATA_T **out_ptr) {
     PyObject *pickled = object_to_xidata(item, xidata_ptr);
     Py_DECREF(item);
 
-    PRINTDBG("contents_shared(%p)[%ld] %s(%p): rc=%ld\n", shared, i,
-             item->ob_type->tp_name, item, Py_REFCNT(item));
+    PRINTDBG("contents_shared(%p)[%" PRIdLEAST64 "] %s(%p): rc=%" PRIdLEAST64
+             "\n",
+             shared, i, item->ob_type->tp_name, item, Py_REFCNT(item));
 
     if (pickled == NULL) {
       // wasn't possible to convert the object to xidata
@@ -1688,7 +1756,7 @@ static BOCQueue *get_queue_for_tag(PyObject *tag) {
     BOC_STATE->queue_tags[i] = qtag;
     TAG_INCREF(qtag);
 
-    PRINTDBG("Discovered %s at queue %ld\n", qtag->str, i);
+    PRINTDBG("Discovered %s at queue %" PRIdLEAST64 "\n", qtag->str, i);
     if (tag_compare_with_PyUnicode(BOC_STATE->queue_tags[i], tag) == 0) {
       // this is the dedicated queue for this tag
       if (expected == BOC_QUEUE_DISABLED) {
@@ -2037,21 +2105,37 @@ static PyObject *_core_receive(PyObject *module, PyObject *args,
   Py_RETURN_NONE;
 }
 
-/// @brief Clear all the messages associated with a particular tag
+/// @brief Drain all the messages associated with a particular tag
 /// @param module The _core module
 /// @param args The tag or tags to clear
 /// @return None if successful, NULL otherwise
-PyObject *_core_clear(PyObject *module, PyObject *args) {
+PyObject *_core_drain(PyObject *module, PyObject *args) {
   BOC_STATE_SET(module);
 
+  BOCMessage *message;
   PyObject *tags = NULL;
   if (!PyArg_ParseTuple(args, "O", &tags)) {
     return NULL;
   }
 
-  PyObject *tags_fast =
-      PySequence_Fast(tags, "tags must either be a single str or a list/tuple");
-  ;
+  if (PyUnicode_CheckExact(tags)) {
+    PRINTDBG("drain(");
+    PRINTOBJDBG(tags);
+    PRINTFDBG(")\n");
+    while (true) {
+      int_least64_t queue_index = boc_dequeue(tags, &message);
+      if (queue_index < 0) {
+        PyErr_Clear();
+        break;
+      }
+
+      boc_message_free(message);
+    }
+
+    Py_RETURN_NONE;
+  }
+
+  PyObject *tags_fast = PySequence_Fast(tags, "tags must be a list/tuple");
   Py_ssize_t tags_size = 0;
   if (tags_fast == NULL) {
     return NULL;
@@ -2062,7 +2146,7 @@ PyObject *_core_clear(PyObject *module, PyObject *args) {
     Py_RETURN_NONE;
   }
 
-  PRINTDBG("clear( ");
+  PRINTDBG("drain( ");
   for (Py_ssize_t i = 0; i < tags_size; ++i) {
     PyObject *tag = PySequence_Fast_GET_ITEM(tags_fast, i);
     if (!PyUnicode_CheckExact(tag)) {
@@ -2077,7 +2161,6 @@ PyObject *_core_clear(PyObject *module, PyObject *args) {
 
   PRINTFDBG(")\n");
 
-  BOCMessage *message;
   for (Py_ssize_t i = 0; i < tags_size; ++i) {
     PyObject *tag = PySequence_Fast_GET_ITEM(tags_fast, i);
     while (true) {
@@ -2144,6 +2227,7 @@ BOCBehavior *behavior_new() {
   behavior->args = NULL;
   behavior->captures_size = 0;
   behavior->captures = NULL;
+  BOC_REF_TRACKING_ADD_BEHAVIOR();
 
   return behavior;
 }
@@ -2188,6 +2272,7 @@ void behavior_free(BOCBehavior *behavior) {
   }
 
   PyMem_RawFree(behavior);
+  BOC_REF_TRACKING_REMOVE_BEHAVIOR();
 }
 
 static inline int_least64_t behavior_decref(BOCBehavior *behavior) {
@@ -2254,6 +2339,7 @@ static BOCCown **add_vars(PyObject *op, Py_ssize_t *size) {
       (BOCCown **)PyMem_RawCalloc((size_t)num_vars, sizeof(BOCCown *));
   if (vars == NULL) {
     PyErr_NoMemory();
+    Py_DECREF(items);
     return NULL;
   }
 
@@ -2349,6 +2435,7 @@ static int BehaviorCapsule_init(PyObject *op, PyObject *args,
   Py_ssize_t args_size = PySequence_Fast_GET_SIZE(cowns_list_fast);
   PyObject *cowns = PyTuple_New(args_size);
   if (cowns == NULL) {
+    Py_DECREF(cowns_list_fast);
     return -1;
   }
 
@@ -2359,12 +2446,15 @@ static int BehaviorCapsule_init(PyObject *op, PyObject *args,
     PyObject *cown;
     if (!PyArg_ParseTuple(item, "iO!", &group_id, BOC_STATE->cown_capsule_type,
                           &cown)) {
+      Py_DECREF(cowns_list_fast);
       return -1;
     }
 
     behavior->group_ids[i] = group_id;
     PyTuple_SET_ITEM(cowns, i, Py_NewRef(cown));
   }
+
+  Py_DECREF(cowns_list_fast);
 
   behavior->args = add_vars(cowns, &behavior->args_size);
   Py_DECREF(cowns);
@@ -2731,7 +2821,6 @@ static PyObject *_new_behavior_object(XIDATA_T *xidata) {
   BehaviorCapsuleObject *capsule =
       (BehaviorCapsuleObject *)type->tp_alloc(type, 0);
   if (capsule == NULL) {
-    BEHAVIOR_DECREF(behavior);
     return NULL;
   }
 
@@ -3130,7 +3219,7 @@ static PyMethodDef _core_module_methods[] = {
     {"send", _core_send, METH_VARARGS, NULL},
     {"receive", (PyCFunction)(void (*)(void))_core_receive,
      METH_VARARGS | METH_KEYWORDS, NULL},
-    {"clear", _core_clear, METH_VARARGS, NULL},
+    {"drain", _core_drain, METH_VARARGS, NULL},
     {"request_create", request_create, METH_VARARGS, NULL},
     {"request_release", request_release, METH_VARARGS, NULL},
     {"request_start_enqueue", request_start_enqueue, METH_VARARGS, NULL},
@@ -3167,6 +3256,10 @@ static int _core_module_exec(PyObject *module) {
     queue_stub->next = 0;
     atomic_store(&BOC_RECYCLE_QUEUE_HEAD, (intptr_t)queue_stub);
     BOC_RECYCLE_QUEUE_TAIL = queue_stub;
+
+#ifdef BOC_REF_TRACKING
+    timespec_get(&BOC_LAST_REF_TRACKING_REPORT, TIME_UTC);
+#endif
   }
 
   _core_module_state *state = (_core_module_state *)PyModule_GetState(module);
@@ -3238,6 +3331,7 @@ static int _core_module_exec(PyObject *module) {
 }
 
 static int _core_module_clear(PyObject *module) {
+  PRINTDBG("_core_module_clear\n");
   _core_module_state *state = (_core_module_state *)PyModule_GetState(module);
   Py_CLEAR(state->loads);
   Py_CLEAR(state->dumps);
@@ -3265,7 +3359,8 @@ void _core_module_free(void *module_ptr) {
     }
   }
 
-  if (atomic_fetch_sub(&BOC_COUNT, 1) == 1) {
+  int_least64_t remaining = atomic_fetch_sub(&BOC_COUNT, 1) - 1;
+  if (remaining == 0) {
     PRINTDBG("All _core modules have been freed, cleaning up\n");
 
     // last one, clean up
@@ -3290,6 +3385,7 @@ void _core_module_free(void *module_ptr) {
     BOCRecycleQueue_free(queue);
     BOC_RECYCLE_QUEUE_TAIL = NULL;
     atomic_store(&BOC_RECYCLE_QUEUE_HEAD, 0);
+    BOC_REF_TRACKING_REPORT();
   }
 
   PRINTDBG("end boc_free(index=%" PRIdLEAST64 ")\n", state->index);

@@ -8,7 +8,7 @@
             "name": "debug.py",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/examples/bank.py",
+            "program": "${workspaceFolder}/src/bocpy/examples/bank.py",
             "console": "integratedTerminal"
         },
         {
@@ -17,7 +17,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/.env314d/bin/python",
             "args": [
-                "${workspaceFolder}/examples/bank.py"
+                "${workspaceFolder}/src/bocpy/examples/bank.py"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",

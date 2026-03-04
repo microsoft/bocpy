@@ -35,9 +35,10 @@ def check(message: str, f: Cown, value: int):
         print(f"{message}: {f.value} (expected: {value})")
 
 
-if __name__ == "__main__":
+def main():
+    """Parse arguments, compute Fibonacci, and verify the result."""
     parser = argparse.ArgumentParser("Fibonacci")
-    parser.add_argument("n", type=int)
+    parser.add_argument("n", type=int, nargs="?", default=10)
     parser.add_argument("--loglevel", "-l", type=str, default=logging.WARNING)
     args = parser.parse_args()
 
@@ -46,3 +47,7 @@ if __name__ == "__main__":
     check(f"fib({args.n})", parallel(args.n), sequential(args.n))
 
     wait()
+
+
+if __name__ == "__main__":
+    main()

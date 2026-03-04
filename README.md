@@ -156,7 +156,7 @@ wait()
 ```
 
 You can view the full example
-[here](https://github.com/microsoft/bocpy/blob/main/examples/sketches.py)
+[here](https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/sketches.py)
 
 The underlying BOC scheduler ensures that this operates without deadlock, by
 construction.
@@ -165,16 +165,17 @@ construction.
 
 We provide a few examples to show different ways of using BOC in a program:
 
-1. [Atomic Bank Transfer](https://github.com/microsoft/bocpy/blob/main/examples/bank.py): Shows an example
+1. [`bocpy-bank`](https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/bank.py): Shows an example
    where two objects (in this case, bank accounts), interact in an atomic way.
-2. [Dining Philosophers](https://github.com/microsoft/bocpy/blob/main/examples/dining_philosophers.py):
+2. [`bocpy-dining-philosophers`](https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/dining_philosophers.py):
    The classic Dining Philosphers problem implemented using BOC.
-3. [Fibonacci](https://github.com/microsoft/bocpy/blob/main/examples/fibonacci.py): A
+3. [`bocpy-fibonacci`](https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/fibonacci.py): A
    parallel implementation of Fibonacci calculation.
-4. [Cooking](https://github.com/microsoft/bocpy/blob/main/examples/cooking_boc.py): The example from
+4. [`bocpy-cooking-boc`](https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/cooking_boc.py): The example from
    the [BOC tutorial](https://microsoft.github.io/bocpy/).
-5. [Boids](https://github.com/microsoft/bocpy/blob/main/examples/boids.py): An agent-based bird flocking
+5. [`bocpy-boids`](https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/boids.py): An agent-based bird flocking
    example demonstrating the `Matrix` class to do distributed computation over cores.
+   Note: you'll need to install `pyglet` first in order to run the `bocpy-boids` example.
 
 
 ## Why BOC for Python?
@@ -197,8 +198,8 @@ parallel.
 In addition the providing the `when` function decorator, the library also exposes
 low-level Erlang-style `send` and selective `receive` functions which enable
 lock-free communication across threads and subinterpreters. See the
-[Primes](https://github.com/microsoft/bocpy/blob/main/examples/primes.py) and
-[Calculator](https://github.com/microsoft/bocpy/blob/main/examples/calculator.py)
+[`bocpy-primes`](https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/primes.py) and
+[`bocpy-calculator`](https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/calculator.py)
 examples for the usage of these lower-level functions.
 
 ### Additional Info

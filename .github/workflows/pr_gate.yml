@@ -21,7 +21,7 @@ jobs:
         run: pip install -e .[linting]
 
       - name: Run flake8
-        run: flake8 src/bocpy test examples
+        run: flake8 src/bocpy test
 
   cpp-format:
     runs-on: ubuntu-latest

@@ -28,7 +28,7 @@ def init_boids(num_boids: int, width: int, height: int) -> tuple[Matrix, Matrix]
     :param num_boids: The number of boids to initialize.
     :param width: The initial width of the space.
     :param height: The initial height of the space.
-    :return: A ``(positions, velocities)`` tuple of *N* × 2 matrices.
+    :return: A ``(positions, velocities)`` tuple of *N* x 2 matrices.
     """
     positions = Matrix.uniform(size=(num_boids, 2)) * [width, height]
     velocities = Matrix.uniform(-5, 5, (num_boids, 2))
@@ -40,12 +40,12 @@ def keep_within_bounds(pos: Matrix,
                        margin=200, turn_factor=1) -> Matrix:
     """Compute a turn-away velocity adjustment to keep a boid in bounds.
 
-    :param pos: The boid's current position (1 × 2).
+    :param pos: The boid's current position (1 x 2).
     :param width: The width of the simulation area.
     :param height: The height of the simulation area.
     :param margin: Distance from each edge at which turning begins.
     :param turn_factor: Magnitude of the corrective velocity.
-    :return: A 1 × 2 velocity delta.
+    :return: A 1 x 2 velocity delta.
     """
     dv = Matrix(1, 2)
     if pos.x < margin:
@@ -67,10 +67,10 @@ def fly_toward_center(neighbors: Matrix, boid: Matrix,
                       centering_factor=0.005) -> Matrix:
     """Compute a velocity adjustment that steers toward the flock center.
 
-    :param neighbors: An *N* × 2 matrix of neighbor positions.
-    :param boid: The boid's current position (1 × 2).
+    :param neighbors: An *N* x 2 matrix of neighbor positions.
+    :param boid: The boid's current position (1 x 2).
     :param centering_factor: Strength of the centering force.
-    :return: A 1 × 2 velocity delta.
+    :return: A 1 x 2 velocity delta.
     """
     return (neighbors.mean(0) - boid) * centering_factor
 
@@ -79,11 +79,11 @@ def avoid_others(neighbors: Matrix, pos: Matrix,
                  min_distance=20, avoid_factor=0.05) -> Matrix:
     """Compute a velocity adjustment that steers away from nearby boids.
 
-    :param neighbors: An *N* × 2 matrix of neighbor positions.
-    :param pos: The boid's current position (1 × 2).
+    :param neighbors: An *N* x 2 matrix of neighbor positions.
+    :param pos: The boid's current position (1 x 2).
     :param min_distance: Radius within which neighbors are considered too close.
     :param avoid_factor: Strength of the avoidance force.
-    :return: A 1 × 2 velocity delta.
+    :return: A 1 x 2 velocity delta.
     """
     left = pos.x - min_distance
     top = pos.y - min_distance
@@ -104,10 +104,10 @@ def avoid_others(neighbors: Matrix, pos: Matrix,
 def match_velocity(velocities: Matrix, boid: Matrix, matching_factor=0.05) -> Matrix:
     """Compute a velocity adjustment that aligns with the flock's average heading.
 
-    :param velocities: An *N* × 2 matrix of neighbor velocities.
-    :param boid: The boid's current velocity (1 × 2).
+    :param velocities: An *N* x 2 matrix of neighbor velocities.
+    :param boid: The boid's current velocity (1 x 2).
     :param matching_factor: Strength of the alignment force.
-    :return: A 1 × 2 velocity delta.
+    :return: A 1 x 2 velocity delta.
     """
     return (velocities.mean(0) - boid) * matching_factor
 
@@ -115,7 +115,7 @@ def match_velocity(velocities: Matrix, boid: Matrix, matching_factor=0.05) -> Ma
 def limit_speed(velocity: Matrix, speed_limit=15):
     """Clamp a boid's velocity to the speed limit in place.
 
-    :param velocity: A 1 × 2 velocity vector (modified in place).
+    :param velocity: A 1 x 2 velocity vector (modified in place).
     :param speed_limit: The maximum speed for a boid
     """
     speed = velocity.magnitude()
@@ -249,7 +249,7 @@ class Simulation:
     def spatial_hashing(self, positions: Matrix):
         """Bin every boid into a hash-grid cell.
 
-        :param positions: An *N* × 2 matrix of boid positions.
+        :param positions: An *N* x 2 matrix of boid positions.
         """
         # clear cell start
         for i in range(self.num_cells + 1):
@@ -287,8 +287,8 @@ class Simulation:
     def build_cell_data(self, positions: Matrix, velocities: Matrix, row: int, column: int) -> CellData:
         """Build a :class:`CellData` snapshot for a single grid cell.
 
-        :param positions: The full *N* × 2 positions matrix.
-        :param velocities: The full *N* × 2 velocities matrix.
+        :param positions: The full *N* x 2 positions matrix.
+        :param velocities: The full *N* x 2 velocities matrix.
         :param row: The grid row.
         :param column: The grid column.
         :return: A :class:`CellData` containing the boids that fall within this cell.
@@ -325,7 +325,6 @@ class Simulation:
         """
         self.spatial_hashing(self.positions)
 
-        self.cell_data.clear()
         for cell in self.grid_cells:
             self.cell_data[cell] = self.build_cell_data(self.positions, self.velocities, cell.row, cell.column)
 
@@ -341,9 +340,12 @@ class Simulation:
                 self.positions[b] = pos
                 self.velocities[b] = vel
 
+        self.cell_data.clear()
+
 
 def main():
     """Launch the pyglet window and run the boids simulation."""
+    import argparse
     import pyglet
 
     class Boids(pyglet.window.Window):
@@ -365,12 +367,10 @@ def main():
             self.samples = deque()
 
             self.num_boids_label = pyglet.text.Label(f"#boids: {num_boids}",
-                                                     font_name="monospace",
                                                      font_size=24, x=5, y=5,
                                                      color=(100, 100, 100, 255))
 
             self.behaviors_label = pyglet.text.Label("behavior/s: ",
-                                                     font_name="monospace",
                                                      font_size=24, x=5, y=50,
                                                      color=(100, 100, 100, 255))
 
@@ -388,6 +388,10 @@ def main():
             self.batch.draw()
             self.num_boids_label.draw()
             self.behaviors_label.draw()
+
+        def on_close(self):
+            wait()
+            self.close()
 
         def update(self, delta_time: float):
             """Advance the simulation by one frame.
@@ -423,13 +427,16 @@ def main():
                 t.position = pos.x, pos.y
                 t.rotation = -angle * 180 / math.pi
 
-    boids = Boids(1200, 800, 300)
+    parser = argparse.ArgumentParser("Boids")
+    parser.add_argument("--boids", "-b", type=int, default=300)
+    parser.add_argument("--width", type=int, default=1200)
+    parser.add_argument("--height", type=int, default=800)
+    args = parser.parse_args()
+
+    boids = Boids(args.width, args.height, args.boids)
     pyglet.clock.schedule_interval(boids.update, 1/30)
     pyglet.app.run()
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    finally:
-        wait()
+    main()

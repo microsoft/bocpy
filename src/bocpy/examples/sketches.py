@@ -7,8 +7,6 @@ import time
 
 from bocpy import Cown, wait, when
 
-logging.basicConfig(level=logging.INFO)
-
 
 def all_known_cheeses() -> list[str]:
     """Load the cheese inventory from disk."""
@@ -98,28 +96,33 @@ def order_meal(exclude: str):
     return order
 
 
-cheese = buy_cheese()
-meal = order_meal(exclude="spam")
+def main():
+    """Run the cheese shop and greasy spoon sketches concurrently."""
+    logging.basicConfig(level=logging.INFO)
+
+    cheese = buy_cheese()
+    meal = order_meal(exclude="spam")
+
+    @when(cheese, meal)
+    def _(cheese, meal):
+        if meal.value is not None:
+            eat(meal.value)
+        elif cheese.value is not None:
+            eat(cheese.value)
+        else:
+            print("<stomach rumbles>")
+
+    @when(cheese, meal)
+    def _(cheese, meal):
+        if meal.value is not None:
+            print("I really wanted cheese...")
+        elif cheese.value is not None:
+            print("Cheesy comestibles!")
+
+        return_to_library()
+
+    wait()
 
 
-@when(cheese, meal)
-def _(cheese, meal):
-    if meal.value is not None:
-        eat(meal.value)
-    elif cheese.value is not None:
-        eat(cheese.value)
-    else:
-        print("<stomach rumbles>")
-
-
-@when(cheese, meal)
-def _(cheese, meal):
-    if meal.value is not None:
-        print("I really wanted cheese...")
-    elif cheese.value is not None:
-        print("Cheesy comestibles!")
-
-    return_to_library()
-
-
-wait()
+if __name__ == "__main__":
+    main()

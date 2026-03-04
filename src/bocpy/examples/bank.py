@@ -50,22 +50,26 @@ def check_balance(message: str, account: Cown[Account]):
         print(message, account.value)
 
 
-def main(amount: int):
-    """Set up two accounts, perform a transfer, and display balances."""
-    alice = Cown(Account("Alice", 100))
-    bob = Cown(Account("Bob", 0))
-
-    check_balance("src (before transfer):", alice)
-    check_balance("dst (before transfer):", bob)
-    atomic_transfer(alice, bob, amount)
-
-
-if __name__ == "__main__":
+def main(amount: int = None):
+    """Parse arguments, set up accounts, transfer, and display balances."""
     parser = argparse.ArgumentParser("Bank Transfer")
     parser.add_argument("--amount", "-a", type=int, default=50)
     parser.add_argument("--loglevel", "-l", type=str, default=logging.WARNING)
     args = parser.parse_args()
 
     logging.basicConfig(level=args.loglevel)
-    main(args.amount)
+
+    if amount is None:
+        amount = args.amount
+
+    alice = Cown(Account("Alice", 100))
+    bob = Cown(Account("Bob", 0))
+
+    check_balance("src (before transfer):", alice)
+    check_balance("dst (before transfer):", bob)
+    atomic_transfer(alice, bob, amount)
     wait()
+
+
+if __name__ == "__main__":
+    main()

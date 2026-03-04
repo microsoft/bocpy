@@ -97,7 +97,8 @@ def run(num_workers, max_value, num_values):
     return result
 
 
-if __name__ == "__main__":
+def main():
+    """Parse arguments, distribute work to threads, and count primes."""
     parser = argparse.ArgumentParser("Primes threads")
     parser.add_argument("--num-workers", "-w", type=int, default=8, help="Number of worker threads")
     parser.add_argument("--max-value", "-m", type=int, default=10000, help="Maximum value for generated values")
@@ -106,3 +107,7 @@ if __name__ == "__main__":
 
     num_primes = run(args.num_workers, args.max_value, args.num_values)
     print("Number of primes:", num_primes)
+
+
+if __name__ == "__main__":
+    main()

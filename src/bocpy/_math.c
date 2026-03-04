@@ -2478,7 +2478,10 @@ static PyObject *_new_matrix_object(XIDATA_T *xidata) {
   PyTypeObject *type = LOCAL_STATE->matrix_type;
   MatrixObject *matrix = (MatrixObject *)type->tp_alloc(type, 0);
   if (matrix == NULL) {
-    IMPL_DECREF(impl);
+    // attempt to roll back the ownership change
+    int_least64_t rollback_expected = desired;
+    desired = NO_OWNER;
+    atomic_compare_exchange_strong(&impl->owner, &rollback_expected, desired);
     return NULL;
   }
 

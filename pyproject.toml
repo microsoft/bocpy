@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bocpy"
-version = "0.1.0"
+version = "0.2.0"
 authors = [
     {name = "bocpy Team", email="bocpy@microsoft.com"}
 ]
@@ -30,3 +30,17 @@ test = ["pytest-md", "pytest-emoji", "pytest-cov", "pytest"]
 linting = ["flake8", "flake8-bugbear", "flake8-builtins", "flake8-docstrings", "flake8-import-order", "flake8-quotes", "pep8-naming"]
 docs = ["sphinx", "sphinx-autodoc-typehints", "enum-tools[sphinx]"]
 boids = ["pyglet"]
+
+[project.scripts]
+bocpy-bank = "bocpy.examples.bank:main"
+bocpy-boids = "bocpy.examples.boids:main"
+bocpy-calculator = "bocpy.examples.calculator:main"
+bocpy-cooking-boc = "bocpy.examples.cooking_boc:main"
+bocpy-cooking-threads = "bocpy.examples.cooking_threads:main"
+bocpy-dining-philosophers = "bocpy.examples.dining_philosophers:main"
+bocpy-fibonacci = "bocpy.examples.fibonacci:main"
+bocpy-primes = "bocpy.examples.primes:main"
+bocpy-sketches = "bocpy.examples.sketches:main"
+
+[tool.setuptools.package-data]
+"bocpy.examples" = ["assets/*.txt"]

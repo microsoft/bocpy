@@ -43,7 +43,7 @@ class Philosopher(NamedTuple("Philosopher", [("index", int), ("left", Cown),
                     send("report", ("full", index))
 
 
-if __name__ == "__main__":
+def main():
     """Run the dining philosophers example."""
     parser = argparse.ArgumentParser("Dining Philosophers")
     parser.add_argument("--hunger", "-g", type=int, default=4)
@@ -71,3 +71,7 @@ if __name__ == "__main__":
             print(f"Fork {i}: uses={fork.uses}, hunger={fork.hunger}")
 
     wait()
+
+
+if __name__ == "__main__":
+    main()

@@ -112,6 +112,8 @@ class Cookware:
 
 def main():
     """Set up ingredients and schedule cooking behaviors."""
+    start(worker_count=2)
+
     onion = Cown(Ingredient("onion"))
     pepper = Cown(Ingredient("pepper"))
     eggs = Cown(Ingredient("egg", 3))
@@ -149,8 +151,8 @@ def main():
                       pan: Cown[Cookware]):
         pan.value.cook(omelette, (onion.value, pepper.value, eggs.value, cheese.value))
 
+    wait()
+
 
 if __name__ == "__main__":
-    start(worker_count=2)
     main()
-    wait()

@@ -267,8 +267,14 @@ class Behaviors:
         self.logger.debug("acquiring any cowns in the global context")
         frame = inspect.currentframe()
         while frame is not None:
-            for name in frame.f_globals:
+            for name in list(frame.f_globals):
                 val = frame.f_globals[name]
+                if isinstance(val, Cown) or isinstance(val, _core.CownCapsule):
+                    self.logger.debug(f"acquiring {name}")
+                    val.acquire()
+
+            for name in list(frame.f_locals):
+                val = frame.f_locals[name]
                 if isinstance(val, Cown) or isinstance(val, _core.CownCapsule):
                     self.logger.debug(f"acquiring {name}")
                     val.acquire()
@@ -300,7 +306,7 @@ class Behaviors:
             terminator = 1
             exception = None
             self.logger.debug("all workers started, scheduling")
-            while terminator:
+            while terminator > 0:
                 match _core.receive("boc_behavior"):
                     case ["boc_behavior", "terminator_decrement"]:
                         terminator -= 1
@@ -381,10 +387,8 @@ class Behaviors:
         """Enter context by starting the runtime."""
         self.start()
 
-    def stop(self, timeout: Optional[float] = None,
-             cowns: tuple[Cown, ...] = ()):
+    def stop(self, timeout: Optional[float] = None):
         """Stop scheduler and workers, removing any temp exports."""
-        self.final_cowns = cowns
         _core.send("boc_behavior", "terminator_decrement")
         self.scheduler.join(timeout)
         self.stop_workers()
@@ -433,7 +437,9 @@ def get_caller_module():
     return (name, file)
 
 
-def start(**kwargs):
+def start(worker_count: Optional[int] = None,
+          export_dir: Optional[str] = None,
+          module: Optional[tuple[str, str]] = None):
     """Start the behavior scheduler and worker pool.
 
     :param worker_count: The number of worker interpreters to start.  If
@@ -451,12 +457,14 @@ def start(**kwargs):
     if BEHAVIORS is not None:
         raise RuntimeError("Behavior scheduler already started")
 
+    if worker_count is None:
+        worker_count = WORKER_COUNT
+
     if not _core.is_primary():
         raise RuntimeError("start() can only be called from the main interpreter")
 
-    worker_count = kwargs.get("worker_count", WORKER_COUNT)
-    export_dir = kwargs.get("export_dir", None)
-    module = kwargs.get("module", get_caller_module())
+    if module is None:
+        module = get_caller_module()
     BEHAVIORS = Behaviors(worker_count, export_dir)
     BEHAVIORS.start(module)
 

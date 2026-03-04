@@ -19,7 +19,7 @@ ensure a clean slate.
 import threading
 import time
 
-from bocpy import receive, send, set_tags, TIMEOUT
+from bocpy import drain, receive, send, set_tags, TIMEOUT
 import pytest
 
 
@@ -673,3 +673,97 @@ class TestWorkerPool:
             t.join()
 
         assert result == (max_value * (max_value - 1)) // 2
+
+
+# ===================================================================
+# drain(): clear pending messages for specific tags
+# ===================================================================
+
+
+class TestDrain:
+    """Verify that drain() removes pending messages for the specified tags."""
+
+    def test_drain_single_tag(self):
+        """Draining a single tag removes all its pending messages."""
+        send("d_one", "a")
+        send("d_one", "b")
+        send("d_one", "c")
+
+        drain(["d_one"])
+
+        tag, val = receive("d_one", 0.1)
+        assert tag == TIMEOUT
+
+    def test_drain_multiple_tags(self):
+        """Draining multiple tags removes messages from all of them."""
+        send("d_m1", 1)
+        send("d_m2", 2)
+        send("d_m3", 3)
+
+        drain(["d_m1", "d_m2", "d_m3"])
+
+        assert receive("d_m1", 0.1)[0] == TIMEOUT
+        assert receive("d_m2", 0.1)[0] == TIMEOUT
+        assert receive("d_m3", 0.1)[0] == TIMEOUT
+
+    def test_drain_leaves_other_tags(self):
+        """Draining one tag does not affect messages on other tags."""
+        send("d_keep", "survive")
+        send("d_drop", "gone")
+
+        drain(["d_drop"])
+
+        assert receive("d_drop", 0.1)[0] == TIMEOUT
+        _, val = receive("d_keep", 1)
+        assert val == "survive"
+
+    def test_drain_empty_tag(self):
+        """Draining a tag with no pending messages is a no-op."""
+        send("d_empty", "x")
+        receive("d_empty", 1)  # consume the only message
+
+        drain(["d_empty"])  # should not raise
+
+        assert receive("d_empty", 0.1)[0] == TIMEOUT
+
+    def test_drain_empty_list(self):
+        """Draining an empty list is a no-op."""
+        send("d_noop", "still_here")
+
+        drain([])
+
+        _, val = receive("d_noop", 1)
+        assert val == "still_here"
+
+    def test_drain_with_tuple(self):
+        """drain() accepts a tuple of tags."""
+        send("d_t1", "x")
+        send("d_t2", "y")
+
+        drain(("d_t1", "d_t2"))
+
+        assert receive("d_t1", 0.1)[0] == TIMEOUT
+        assert receive("d_t2", 0.1)[0] == TIMEOUT
+
+    def test_drain_then_send_new(self):
+        """New messages sent after drain are still received."""
+        send("d_renew", "old")
+        drain(["d_renew"])
+
+        send("d_renew", "new")
+        _, val = receive("d_renew", 1)
+        assert val == "new"
+
+    def test_drain_single_string(self):
+        """drain() accepts a bare string instead of a list."""
+        send("d_str", "a")
+        send("d_str", "b")
+
+        drain("d_str")
+
+        assert receive("d_str", 0.1)[0] == TIMEOUT
+
+    def test_drain_non_string_tag_raises(self):
+        """Passing non-string elements in the tag list raises TypeError."""
+        with pytest.raises(TypeError):
+            drain([123])
