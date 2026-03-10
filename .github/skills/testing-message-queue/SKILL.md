@@ -1,3 +1,8 @@
+---
+name: testing-message-queue
+description: "Write tests for the bocpy message queue — the lock-free tag-based MPSC ring buffer. Use when: testing send/receive, FIFO ordering, selective receive, timeouts, cross-thread messaging, multi-producer scenarios, tag capacity limits, set_tags behavior, or payload round-trip fidelity."
+---
+
 # Testing the Message Queue
 
 This skill describes how to write tests for the `bocpy` message queue — the

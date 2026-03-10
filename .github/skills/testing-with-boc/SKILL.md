@@ -1,3 +1,8 @@
+---
+name: testing-with-boc
+description: "Write tests for bocpy Behavior-Oriented Concurrency code. Use when: writing pytest tests for @when behaviors, Cown scheduling, send/receive messaging, cown grouping, chained behaviors, exception propagation. Covers parameter-count rules, module-level class requirements, and the send/receive assertion pattern."
+---
+
 # Testing with Behavior-Oriented Concurrency (BOC)
 
 This skill describes how to write tests for code that uses the `bocpy` library for

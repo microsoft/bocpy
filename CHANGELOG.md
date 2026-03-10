@@ -1,3 +1,15 @@
+## 2026-03-11 - Version 0.2.1
+Point release.
+
+**Improvements**
+- Adding a repository-level copilot-instructions file
+- Properly added the skills files as copilot agent skills
+
+**Bug Fixes**
+- Fixed a false positive warning message for deallocation of xidata on the main
+  interpreter after module shutdown.
+- Changed the clear logic when recycling
+
 ## 2026-03-04 - Version 0.2.0
 Bugfix release including some minor improvements.
 

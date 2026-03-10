@@ -961,16 +961,24 @@ static void BOCRecycleQueue_recycle(BOCRecycleQueue *queue, XIDATA_T *xidata) {
       COWN_WEAK_DECREF(cown);
       PyDict_DelItem(queue->xidata_to_cowns, xidata_ptr);
     }
-  } else {
+  } else if (queue->index > 0) {
     fprintf(stderr,
-            "Recycling xidata created on interpeter %" PRIdLEAST64
+            "Recycling xidata created on interpreter %" PRIdLEAST64
             " after the interpreter "
             "has shut down may result in cown leak.\n",
             queue->index);
   }
 
-  Py_DECREF(xidata_ptr);
-  XIDATA_FREE(xidata);
+  // manual clear
+  if (xidata->data != NULL) {
+    if (xidata->free != NULL) {
+      xidata->free(xidata->data);
+    }
+    xidata->data = NULL;
+  }
+
+  Py_CLEAR(xidata->obj);
+  PyMem_RawFree(xidata->obj);
 }
 
 /// @brief Enqeues an xidata on the recycling queue.
@@ -1193,7 +1201,7 @@ static int CownCapsule_set_value(PyObject *op, PyObject *value,
   return 0;
 }
 
-/// @brief Returns whether the current interpereter has acquired the cown
+/// @brief Returns whether the current interpreter has acquired the cown
 /// @param op The CownCapsule object
 /// @param Py_UNUSED ignored
 /// @return True if acquired, False otherwise
@@ -1237,8 +1245,8 @@ static int cown_acquire(BOCCown *cown) {
 }
 
 /// @brief Attempts to acquire the cown
-/// @note This will throw an exception of the cown has already been acquired by
-/// another interpreter It will also thrown an exception if deserialization
+/// @note This will throw an exception if the cown has already been acquired by
+/// another interpreter. It will also throw an exception if deserialization
 /// fails.
 /// @param op The CownCapsule object
 /// @param Py_UNUSED (ignored)
