@@ -1,3 +1,8 @@
+---
+name: commenting-c-and-python
+description: "Follow bocpy commenting and documentation conventions. Use when: adding comments to C or Python files, writing docstrings, documenting structs or classes, adding Doxygen doc-comments, using Sphinx param style, suppressing linter warnings with noqa, or following flake8 style rules (Q000, D205, D209, N802)."
+---
+
 # Commenting C and Python Files
 
 This skill describes the commenting conventions used across the `bocpy` project.
