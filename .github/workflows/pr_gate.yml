@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Use Python 3.14
         uses: actions/setup-python@v5
@@ -31,7 +31,7 @@ jobs:
           - check: src/bocpy
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Run clang-format style check
         uses: jidicula/clang-format-action@v4.8.0
@@ -47,10 +47,10 @@ jobs:
         python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Use Python ${{matrix.python_version}}
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: ${{matrix.python_version}}
 
@@ -71,10 +71,10 @@ jobs:
         python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Use Python ${{matrix.python_version}}
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: ${{matrix.python_version}}
 
@@ -95,10 +95,10 @@ jobs:
         python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Use Python ${{matrix.python_version}}
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: ${{matrix.python_version}}
 
@@ -119,10 +119,10 @@ jobs:
         python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Use Python ${{matrix.python_version}}
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: ${{matrix.python_version}}
 
@@ -135,3 +135,53 @@ jobs:
 
       - name: Python test
         run: pytest -vv
+
+  asan:
+    runs-on: ubuntu-latest
+    env:
+      CPYTHON_VERSION: v3.14.2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm build-essential pkg-config \
+            libbz2-dev libffi-dev libgdbm-dev libgdbm-compat-dev liblzma-dev \
+            libncurses5-dev libreadline6-dev libsqlite3-dev libssl-dev \
+            lzma lzma-dev tk-dev uuid-dev zlib1g-dev libzstd-dev
+
+      - name: Download CPython ${{ env.CPYTHON_VERSION }}
+        run: |
+          git clone --depth 1 --branch ${{ env.CPYTHON_VERSION }} \
+            https://github.com/python/cpython.git "$RUNNER_TEMP/cpython-src"
+
+      - name: Build CPython with ASAN and UBSAN
+        working-directory: ${{ runner.temp }}/cpython-src
+        run: |
+          CC=clang ./configure \
+            --with-address-sanitizer \
+            --without-pymalloc \
+            --with-undefined-behavior-sanitizer \
+            --without-system-libmpdec
+          make -j"$(nproc)"
+
+      - name: Create virtual environment
+        run: |
+          "$RUNNER_TEMP/cpython-src/python" -m venv "$RUNNER_TEMP/asan-venv"
+
+      - name: Build bocpy
+        run: |
+          source "$RUNNER_TEMP/asan-venv/bin/activate"
+          python -m pip install --upgrade pip
+          CC="clang -fsanitize=address,undefined -fno-sanitize=vptr" \
+            pip install -e .[test] --verbose
+
+      - name: Run tests
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          source "$RUNNER_TEMP/asan-venv/bin/activate"
+          pytest -vv

@@ -1,3 +1,20 @@
+## 2026-03-17 - Version 0.2.2
+Point release.
+
+**Improvements**
+- Added an ASAN/UBSAN CI job that builds CPython 3.14.2 from source with
+  AddressSanitizer and UndefinedBehaviorSanitizer, then runs the full test suite
+  against instrumented builds of bocpy.
+- Updated GitHub Actions to latest versions (`actions/checkout@v6`,
+  `actions/setup-python@v5`).
+- Added a Copilot skill for version bumping.
+
+**Bug Fixes**
+- Fixed a missing `Py_DECREF` on a temporary `PyObject` in the xidata recycling
+  path, plugging a reference leak.
+- Fixed `PyMem_RawFree` freeing the wrong pointer (`xidata->obj` instead of
+  `xidata`) in the recycling queue cleanup.
+
 ## 2026-03-11 - Version 0.2.1
 Point release.
 
