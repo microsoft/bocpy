@@ -969,6 +969,8 @@ static void BOCRecycleQueue_recycle(BOCRecycleQueue *queue, XIDATA_T *xidata) {
             queue->index);
   }
 
+  Py_DECREF(xidata_ptr);
+
   // manual clear
   if (xidata->data != NULL) {
     if (xidata->free != NULL) {
@@ -978,7 +980,7 @@ static void BOCRecycleQueue_recycle(BOCRecycleQueue *queue, XIDATA_T *xidata) {
   }
 
   Py_CLEAR(xidata->obj);
-  PyMem_RawFree(xidata->obj);
+  PyMem_RawFree(xidata);
 }
 
 /// @brief Enqeues an xidata on the recycling queue.
