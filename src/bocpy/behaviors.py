@@ -152,7 +152,17 @@ class Behavior:
         self.impl = impl
         self.bid = impl.bid()
         self.thunk = impl.thunk()
-        self.requests = [Request(req_impl) for req_impl in impl.create_requests()]
+        seen = set()
+        self.requests = []
+        for req_impl in impl.create_requests():
+            r = Request(req_impl)
+            if r.target() in seen:
+                # Duplicate cown: compensate behavior count since this request
+                # won't enter the MCS queue and thus won't call resolve_one.
+                self.impl.resolve_one()
+            else:
+                seen.add(r.target())
+                self.requests.append(r)
         self.requests.sort(key=lambda r: r.target())
 
     def schedule(self):

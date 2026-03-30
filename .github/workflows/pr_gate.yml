@@ -13,7 +13,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Use Python 3.14
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: 3.14
 
@@ -34,7 +34,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Run clang-format style check
-        uses: jidicula/clang-format-action@v4.8.0
+        uses: jidicula/clang-format-action@v4.18.0
         with:
           clang-format-version: '18'
           check-path: ${{matrix.path['check']}}
@@ -50,7 +50,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Use Python ${{matrix.python_version}}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{matrix.python_version}}
 
@@ -74,7 +74,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Use Python ${{matrix.python_version}}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{matrix.python_version}}
 
@@ -98,7 +98,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Use Python ${{matrix.python_version}}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{matrix.python_version}}
 
@@ -122,7 +122,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Use Python ${{matrix.python_version}}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{matrix.python_version}}
 
@@ -135,6 +135,40 @@ jobs:
 
       - name: Python test
         run: pytest -vv
+
+  free-threaded:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python_version: ["3.13t", "3.14t"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Use Python ${{matrix.python_version}}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{matrix.python_version}}
+
+      - name: Get dependencies
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Python build
+        run: pip install -e .[test] --verbose
+
+      - name: Verify GIL is disabled
+        run: python -c "import sys; assert not sys._is_gil_enabled(), 'GIL should be disabled'"
+
+      - name: Verify import does not re-enable GIL
+        run: python -c "import bocpy; import sys; assert not sys._is_gil_enabled(), 'GIL re-enabled on import'"
+
+      - name: Python test
+        uses: nick-fields/retry@v4
+        with:
+          max_attempts: 3
+          timeout_minutes: 10
+          command: pytest -vv
 
   asan:
     runs-on: ubuntu-latest

@@ -88,6 +88,7 @@ def cleanup():
             for cown in orphan_cowns:
                 if cown is not None:
                     cown.acquire()
+                    cown.disown()
 
         orphan_cowns = None
         _core.recycle()

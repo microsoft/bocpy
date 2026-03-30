@@ -16,6 +16,7 @@ the auto-assignment path and use a ``set_tags([])`` call only in the fixture to
 ensure a clean slate.
 """
 
+import random
 import threading
 import time
 
@@ -767,3 +768,190 @@ class TestDrain:
         """Passing non-string elements in the tag list raises TypeError."""
         with pytest.raises(TypeError):
             drain([123])
+
+
+# ===================================================================
+# Spin-then-park: lost-wake stress
+# ===================================================================
+
+
+class TestLostWakeStress:
+    """Verify that the spin-then-park strategy never loses a wake signal."""
+
+    def test_single_producer_random_delays(self):
+        """One slow producer, one consumer — consumer must never hang."""
+        n = 200
+
+        def producer():
+            for i in range(n):
+                if random.random() < 0.3:
+                    time.sleep(random.uniform(0.0001, 0.005))
+                send("lw_rand", i)
+
+        t = threading.Thread(target=producer)
+        t.start()
+
+        for i in range(n):
+            tag, val = receive("lw_rand", 10)
+            assert tag == "lw_rand", f"Timed out waiting for message {i}"
+            assert val == i
+
+        t.join()
+
+    def test_bursty_producer(self):
+        """Producer sends bursts with pauses — consumer must not deadlock."""
+        bursts = 10
+        per_burst = 50
+
+        def producer():
+            for b in range(bursts):
+                for i in range(per_burst):
+                    send("lw_burst", b * per_burst + i)
+                time.sleep(random.uniform(0.005, 0.02))
+
+        t = threading.Thread(target=producer)
+        t.start()
+
+        total = bursts * per_burst
+        for i in range(total):
+            tag, val = receive("lw_burst", 10)
+            assert tag == "lw_burst", f"Timed out at message {i}"
+            assert val == i
+
+        t.join()
+
+    @pytest.mark.parametrize("iteration", range(20))
+    def test_single_message_wake(self, iteration):
+        """A single message wakes a parked consumer — repeated to catch races."""
+        def delayed_send():
+            time.sleep(random.uniform(0.001, 0.01))
+            send("lw_single", iteration)
+
+        t = threading.Thread(target=delayed_send)
+        t.start()
+        tag, val = receive("lw_single", 5)
+        t.join()
+        assert tag == "lw_single"
+        assert val == iteration
+
+
+# ===================================================================
+# Spin-then-park: multi-tag receive
+# ===================================================================
+
+
+class TestMultiTagBackoff:
+    """Multi-tag receive correctness under the exponential backoff path."""
+
+    def test_message_on_second_tag(self):
+        """Multi-tag receive finds a message on a non-first tag."""
+        send("mtb_b", "found")
+        tag, val = receive(["mtb_a", "mtb_b", "mtb_c"], 5)
+        assert tag == "mtb_b"
+        assert val == "found"
+
+    def test_multi_tag_delayed_arrival(self):
+        """Multi-tag receive waits for a message arriving after a delay."""
+        def delayed_send():
+            time.sleep(0.05)
+            send("mtd_c", "late")
+
+        t = threading.Thread(target=delayed_send)
+        t.start()
+        tag, val = receive(["mtd_a", "mtd_b", "mtd_c"], 5)
+        t.join()
+        assert tag == "mtd_c"
+        assert val == "late"
+
+    def test_multi_tag_fifo_per_tag(self):
+        """Multi-tag receive preserves per-tag FIFO ordering."""
+        for i in range(5):
+            send("mf_x", ("x", i))
+            send("mf_y", ("y", i))
+
+        results = {"mf_x": [], "mf_y": []}
+        for _ in range(10):
+            tag, val = receive(["mf_x", "mf_y"], 5)
+            results[tag].append(val[1])
+
+        assert results["mf_x"] == list(range(5))
+        assert results["mf_y"] == list(range(5))
+
+    def test_multi_tag_timeout(self):
+        """Multi-tag receive times out when no message arrives."""
+        tag, val = receive(["mtt_a", "mtt_b"], 0.1)
+        assert tag == TIMEOUT
+        assert val is None
+
+    def test_multi_tag_interleaved_producers(self):
+        """Multiple producers on different tags, multi-tag consumer."""
+        n = 100
+
+        def producer(tag, offset):
+            for i in range(n):
+                if random.random() < 0.2:
+                    time.sleep(random.uniform(0.0001, 0.002))
+                send(tag, offset + i)
+
+        tags = ["mti_a", "mti_b", "mti_c"]
+        threads = [threading.Thread(target=producer, args=(t, i * n))
+                   for i, t in enumerate(tags)]
+        for t in threads:
+            t.start()
+
+        received = []
+        for _ in range(len(tags) * n):
+            tag, val = receive(tags, 10)
+            assert tag in tags
+            received.append((tag, val))
+
+        for t in threads:
+            t.join()
+
+        per_tag = {t: [] for t in tags}
+        for tag, val in received:
+            per_tag[tag].append(val)
+
+        for i, t in enumerate(tags):
+            expected = [i * n + j for j in range(n)]
+            assert sorted(per_tag[t]) == expected
+
+
+# ===================================================================
+# Spin-then-park: timeout accuracy
+# ===================================================================
+
+
+class TestTimeoutAccuracy:
+    """Verify that timed receives return within a reasonable time window."""
+
+    @pytest.mark.parametrize("timeout", [0.05, 0.1, 0.2])
+    def test_timeout_lower_bound(self, timeout):
+        """Receive does not return before the timeout elapses."""
+        start = time.monotonic()
+        tag, _ = receive("ta_lower", timeout)
+        elapsed = time.monotonic() - start
+        assert tag == TIMEOUT
+        assert elapsed >= timeout * 0.9, (
+            f"Returned too early: {elapsed:.4f}s < {timeout * 0.9:.4f}s"
+        )
+
+    @pytest.mark.parametrize("timeout", [0.05, 0.1, 0.2])
+    def test_timeout_upper_bound(self, timeout):
+        """Receive returns within a generous upper bound of the timeout."""
+        start = time.monotonic()
+        tag, _ = receive("ta_upper", timeout)
+        elapsed = time.monotonic() - start
+        assert tag == TIMEOUT
+        upper = timeout + 0.1  # 100 ms grace for scheduling jitter
+        assert elapsed <= upper, (
+            f"Returned too late: {elapsed:.4f}s > {upper:.4f}s"
+        )
+
+    def test_zero_timeout_immediate(self):
+        """Zero timeout returns immediately (sub-millisecond)."""
+        start = time.monotonic()
+        tag, _ = receive("ta_zero", 0)
+        elapsed = time.monotonic() - start
+        assert tag == TIMEOUT
+        assert elapsed < 0.01, f"Zero timeout took {elapsed:.4f}s"

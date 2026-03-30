@@ -134,20 +134,12 @@ Before modifying any code:
 
 ### Review every non-trivial change
 
-After implementing a change, follow this review process:
+After implementing a change, run the **review-loop** skill to get an independent
+review. This may be skipped for trivial changesets, but you do not decide what
+qualifies as trivial — ask for approval first.
 
-1. **Spawn a subagent** with a fresh context to review the changed code.
-2. **Make a plan** to address the reviewer's comments. Present that plan for
-   approval before acting on it.
-3. **Repeat** — go back to step 1 until the reviewer has no further comments.
-
-This process may be skipped for trivial changesets, but you do not decide what
-qualifies as trivial. If you believe a change is a candidate for skipping
-review, ask for approval first.
-
-The review process removes me as gatekeeper but I am still your collaborator.
-If you are unsure how to address a reviewer's comment, ask me rather than
-guessing.
+I am still your collaborator. If you are unsure how to address a reviewer's
+comment, ask me rather than guessing.
 
 ### Fix root causes, not symptoms
 

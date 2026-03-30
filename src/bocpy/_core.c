@@ -42,25 +42,82 @@ void atomic_store(atomic_int_least64_t *ptr, int_least64_t value) {
   *ptr = value;
 }
 
+// All Interlocked* intrinsics on x86/x64 are full barriers, so the
+// memory_order argument is accepted but ignored.
+// Note: atomic_load_explicit is a plain volatile read. On x86/x64 this
+// provides acquire semantics due to TSO. Correctness of the parking
+// protocol relies on the mutex-protected re-check, not on seq_cst ordering.
+#define atomic_load_explicit(ptr, order) (*(ptr))
+#define atomic_fetch_add_explicit(ptr, val, order)                             \
+  InterlockedExchangeAdd64((ptr), (val))
+#define atomic_fetch_sub_explicit(ptr, val, order)                             \
+  InterlockedExchangeAdd64((ptr), -(val))
+#define memory_order_seq_cst 0
+
 #define thread_local __declspec(thread)
 
-#else
-#include <stdatomic.h>
-#endif
+typedef SRWLOCK BOCParkMutex;
+typedef CONDITION_VARIABLE BOCParkCond;
 
-#if defined __APPLE__
-#define thrd_sleep nanosleep
-#define thread_local _Thread_local
-#elif defined _WIN32
 void thrd_sleep(const struct timespec *duration, struct timespec *remaining) {
   const DWORD MS_PER_NS = 1000000;
   DWORD ms = (DWORD)duration->tv_sec * 1000;
   ms += (DWORD)duration->tv_nsec / MS_PER_NS;
   Sleep(ms);
 }
-#else
+
+#elif defined __APPLE__
+#include <pthread.h>
+#include <stdatomic.h>
+#define thrd_sleep nanosleep
+#define thread_local _Thread_local
+
+typedef pthread_mutex_t BOCParkMutex;
+typedef pthread_cond_t BOCParkCond;
+
+#else // Linux
+#include <stdatomic.h>
 #include <threads.h>
+
+typedef mtx_t BOCParkMutex;
+typedef cnd_t BOCParkCond;
+
 #endif
+
+// Forward declaration — BOCQueue is defined below.
+typedef struct boc_queue BOCQueue;
+
+/// @brief Initialize the park mutex and condition variable for a queue
+/// @param q The queue to initialize
+static inline void boc_park_init(BOCQueue *q);
+
+/// @brief Destroy the park mutex and condition variable for a queue
+/// @param q The queue to destroy
+static inline void boc_park_destroy(BOCQueue *q);
+
+/// @brief Lock the park mutex for a queue
+/// @param q The queue whose mutex to lock
+static inline void boc_park_lock(BOCQueue *q);
+
+/// @brief Unlock the park mutex for a queue
+/// @param q The queue whose mutex to unlock
+static inline void boc_park_unlock(BOCQueue *q);
+
+/// @brief Wake one thread parked on a queue's condition variable
+/// @note Caller MUST hold park_mutex
+/// @param q The queue to signal
+static inline void boc_park_signal(BOCQueue *q);
+
+/// @brief Wake all threads parked on a queue's condition variable
+/// @note Caller MUST hold park_mutex
+/// @param q The queue to broadcast
+static inline void boc_park_broadcast(BOCQueue *q);
+
+/// @brief Park the calling thread on a queue's condition variable
+/// @note Caller MUST hold park_mutex. The mutex is atomically released during
+/// the wait and re-acquired before returning.
+/// @param q The queue to park on
+static inline void boc_park_wait(BOCQueue *q);
 
 #if PY_VERSION_HEX >= 0x030D0000
 #define Py_BUILD_CORE
@@ -73,6 +130,17 @@ const int BOC_CAPACITY = 1024 * 16;
 const PY_INT64_T NO_OWNER = -2;
 atomic_int_least64_t BOC_COUNT = 0;
 atomic_int_least64_t BOC_COWN_COUNT = 0;
+
+#define BOC_SPIN_COUNT 64
+#define BOC_BACKOFF_CAP_NS 1000000 // 1 ms
+
+// Portable yield: relinquish current CPU timeslice.
+#ifdef _WIN32
+#define boc_yield() SwitchToThread()
+#else
+#include <sched.h>
+#define boc_yield() sched_yield()
+#endif
 
 // #define BOC_REF_TRACKING
 // #define BOC_TRACE
@@ -305,6 +373,13 @@ typedef struct boc_queue {
   /// queue. Calls to receive on the tag will attempt to dequeue from this
   /// queue.
   atomic_intptr_t tag; // (BOCTag *)
+
+  /// @brief Number of threads parked on this queue's condvar
+  atomic_int_least64_t waiters;
+  /// @brief Mutex protecting condvar signal/wait
+  BOCParkMutex park_mutex;
+  /// @brief Condition variable for parking receivers
+  BOCParkCond park_cond;
 } BOCQueue;
 
 /// @brief A tag for a BOC message.
@@ -326,6 +401,102 @@ const int_least64_t BOC_QUEUE_DISABLED = 2;
 static BOCQueue BOC_QUEUES[BOC_QUEUE_COUNT];
 static BOCRecycleQueue *BOC_RECYCLE_QUEUE_TAIL = NULL;
 static atomic_intptr_t BOC_RECYCLE_QUEUE_HEAD = 0;
+
+// ---------------------------------------------------------------------------
+// Platform condvar implementation
+// ---------------------------------------------------------------------------
+
+#ifdef _WIN32
+
+static inline void boc_park_init(BOCQueue *q) {
+  InitializeSRWLock(&q->park_mutex);
+  InitializeConditionVariable(&q->park_cond);
+}
+
+static inline void boc_park_destroy(BOCQueue *q) {
+  // Windows SRWLOCK and CONDITION_VARIABLE have no destroy function.
+  (void)q;
+}
+
+static inline void boc_park_lock(BOCQueue *q) {
+  AcquireSRWLockExclusive(&q->park_mutex);
+}
+
+static inline void boc_park_unlock(BOCQueue *q) {
+  ReleaseSRWLockExclusive(&q->park_mutex);
+}
+
+static inline void boc_park_signal(BOCQueue *q) {
+  WakeConditionVariable(&q->park_cond);
+}
+
+static inline void boc_park_broadcast(BOCQueue *q) {
+  WakeAllConditionVariable(&q->park_cond);
+}
+
+static inline void boc_park_wait(BOCQueue *q) {
+  SleepConditionVariableSRW(&q->park_cond, &q->park_mutex, INFINITE, 0);
+}
+
+#elif defined __APPLE__ // macOS — pthreads
+
+static inline void boc_park_init(BOCQueue *q) {
+  pthread_mutex_init(&q->park_mutex, NULL);
+  pthread_cond_init(&q->park_cond, NULL);
+}
+
+static inline void boc_park_destroy(BOCQueue *q) {
+  pthread_cond_destroy(&q->park_cond);
+  pthread_mutex_destroy(&q->park_mutex);
+}
+
+static inline void boc_park_lock(BOCQueue *q) {
+  pthread_mutex_lock(&q->park_mutex);
+}
+
+static inline void boc_park_unlock(BOCQueue *q) {
+  pthread_mutex_unlock(&q->park_mutex);
+}
+
+static inline void boc_park_signal(BOCQueue *q) {
+  pthread_cond_signal(&q->park_cond);
+}
+
+static inline void boc_park_broadcast(BOCQueue *q) {
+  pthread_cond_broadcast(&q->park_cond);
+}
+
+static inline void boc_park_wait(BOCQueue *q) {
+  pthread_cond_wait(&q->park_cond, &q->park_mutex);
+}
+
+#else // Linux — C11 threads
+
+static inline void boc_park_init(BOCQueue *q) {
+  mtx_init(&q->park_mutex, mtx_plain);
+  cnd_init(&q->park_cond);
+}
+
+static inline void boc_park_destroy(BOCQueue *q) {
+  cnd_destroy(&q->park_cond);
+  mtx_destroy(&q->park_mutex);
+}
+
+static inline void boc_park_lock(BOCQueue *q) { mtx_lock(&q->park_mutex); }
+
+static inline void boc_park_unlock(BOCQueue *q) { mtx_unlock(&q->park_mutex); }
+
+static inline void boc_park_signal(BOCQueue *q) { cnd_signal(&q->park_cond); }
+
+static inline void boc_park_broadcast(BOCQueue *q) {
+  cnd_broadcast(&q->park_cond);
+}
+
+static inline void boc_park_wait(BOCQueue *q) {
+  cnd_wait(&q->park_cond, &q->park_mutex);
+}
+
+#endif
 
 /// @brief Creates a new BOCTag object from a Python Unicode string.
 /// @details The result object will not be dependent on the argument in any way
@@ -955,12 +1126,22 @@ static void BOCRecycleQueue_recycle(BOCRecycleQueue *queue, XIDATA_T *xidata) {
   PyObject *xidata_ptr = PyLong_FromVoidPtr((void *)xidata);
 
   if (queue->xidata_to_cowns != NULL) {
+#if PY_VERSION_HEX >= 0x030D0000
+    PyObject *cown_ptr = NULL;
+    if (PyDict_GetItemRef(queue->xidata_to_cowns, xidata_ptr, &cown_ptr) > 0) {
+      BOCCown *cown = (BOCCown *)PyLong_AsVoidPtr(cown_ptr);
+      Py_DECREF(cown_ptr);
+      COWN_WEAK_DECREF(cown);
+      PyDict_DelItem(queue->xidata_to_cowns, xidata_ptr);
+    }
+#else
     PyObject *cown_ptr = PyDict_GetItem(queue->xidata_to_cowns, xidata_ptr);
     if (cown_ptr != NULL) {
       BOCCown *cown = (BOCCown *)PyLong_AsVoidPtr(cown_ptr);
       COWN_WEAK_DECREF(cown);
       PyDict_DelItem(queue->xidata_to_cowns, xidata_ptr);
     }
+#endif
   } else if (queue->index > 0) {
     fprintf(stderr,
             "Recycling xidata created on interpreter %" PRIdLEAST64
@@ -1328,6 +1509,57 @@ static PyObject *CownCapsule_release(PyObject *op, PyObject *Py_UNUSED(dummy)) {
   Py_RETURN_NONE;
 }
 
+/// @brief Abandons the cown value without serializing it
+/// @details Clears the value and resets ownership to NO_OWNER. This is used
+/// during worker cleanup to safely discard orphan cowns before the owning
+/// interpreter is destroyed.
+/// @param cown The cown to disown
+/// @return -1 if error, 0 otherwise
+static int cown_disown(BOCCown *cown) {
+  int_least64_t expected = get_interpid();
+  int_least64_t owner = atomic_load(&cown->owner);
+  if (owner != expected) {
+    PyErr_Format(PyExc_RuntimeError,
+                 "%" PRIdLEAST64
+                 " cannot disown cown (acquired by %" PRIdLEAST64 ")",
+                 expected, owner);
+    return -1;
+  }
+
+  assert(cown->value != NULL);
+  assert(cown->xidata == NULL);
+
+  Py_CLEAR(cown->value);
+
+  int_least64_t desired = NO_OWNER;
+  if (!atomic_compare_exchange_strong(&cown->owner, &expected, desired)) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "Panic: contention on cown during disown");
+    return -1;
+  }
+
+  return 0;
+}
+
+/// @brief Abandons the cown
+/// @note Clears the value without serializing and resets ownership. Used during
+/// worker shutdown to avoid dangling pointers after interpreter destruction.
+/// Will raise an error if the cown is not currently acquired by this
+/// interpreter.
+/// @param op The CownCapsule object
+/// @param Py_UNUSED (ignored)
+/// @return None if successful, NULL otherwise
+static PyObject *CownCapsule_disown(PyObject *op, PyObject *Py_UNUSED(dummy)) {
+  CownCapsuleObject *self = (CownCapsuleObject *)op;
+  BOCCown *cown = self->cown;
+
+  if (cown_disown(cown) < 0) {
+    return NULL;
+  }
+
+  Py_RETURN_NONE;
+}
+
 static PyObject *CownCapsule_get_impl(PyObject *op, void *Py_UNUSED(dummy)) {
   return Py_NewRef(op);
 }
@@ -1338,6 +1570,7 @@ static PyMethodDef CownCapsule_methods[] = {
     {"acquired", CownCapsule_acquired, METH_NOARGS, NULL},
     {"acquire", CownCapsule_acquire, METH_NOARGS, NULL},
     {"release", CownCapsule_release, METH_NOARGS, NULL},
+    {"disown", CownCapsule_disown, METH_NOARGS, NULL},
     {NULL} /* Sentinel */
 };
 
@@ -1757,6 +1990,11 @@ static BOCQueue *get_queue_for_tag(PyObject *tag) {
     }
 
     // this queue has already been assigned
+    if (expected == BOC_QUEUE_DISABLED) {
+      // queue is being reconfigured by set_tags — skip it
+      continue;
+    }
+
     BOCTag *qtag = (BOCTag *)atomic_load(&qptr->tag);
     while (qtag == NULL) {
       // waiting for another interpreter to allocate and assign
@@ -1769,11 +2007,6 @@ static BOCQueue *get_queue_for_tag(PyObject *tag) {
     PRINTDBG("Discovered %s at queue %" PRIdLEAST64 "\n", qtag->str, i);
     if (tag_compare_with_PyUnicode(BOC_STATE->queue_tags[i], tag) == 0) {
       // this is the dedicated queue for this tag
-      if (expected == BOC_QUEUE_DISABLED) {
-        // however, it is disabled right now
-        return NULL;
-      }
-
       return qptr;
     } else if (PyErr_Occurred() != NULL) {
       return NULL;
@@ -1860,6 +2093,17 @@ static int boc_enqueue(BOCMessage *message) {
                tail - head + 1);
       assert(qptr->messages[tail % BOC_CAPACITY] == NULL);
       qptr->messages[tail % BOC_CAPACITY] = message;
+
+      // If any receiver is parked on this queue's condvar, wake it.
+      // The seq_cst load synchronizes with the consumer's seq_cst increment
+      // of waiters, ensuring that either we see the waiter and signal, or the
+      // consumer's re-check dequeue (under the same mutex) finds our message.
+      if (atomic_load_explicit(&qptr->waiters, memory_order_seq_cst) > 0) {
+        boc_park_lock(qptr);
+        boc_park_signal(qptr);
+        boc_park_unlock(qptr);
+      }
+
       return 0;
     }
 
@@ -1965,10 +2209,227 @@ static PyObject *_core_send(PyObject *module, PyObject *args) {
     return NULL;
   }
 
-  Py_BEGIN_ALLOW_THREADS thrd_sleep(&SLEEP_TS, NULL);
+  Py_BEGIN_ALLOW_THREADS;
+  boc_yield();
   Py_END_ALLOW_THREADS;
 
   Py_RETURN_NONE;
+}
+
+/// @brief Double the exponential backoff duration, capped at BOC_BACKOFF_CAP_NS
+/// @param backoff The timespec whose tv_nsec field will be doubled
+static inline void boc_backoff_double(struct timespec *backoff) {
+  backoff->tv_nsec *= 2;
+  if (backoff->tv_nsec > BOC_BACKOFF_CAP_NS) {
+    backoff->tv_nsec = BOC_BACKOFF_CAP_NS;
+  }
+}
+
+/// @brief Wake any receivers parked on the queue associated with a tag
+/// @param tag The tag whose queue should be signalled (borrowed reference)
+static inline void boc_wake_parked_receivers(PyObject *tag) {
+  BOCQueue *qptr = get_queue_for_tag(tag);
+  if (qptr != NULL &&
+      atomic_load_explicit(&qptr->waiters, memory_order_seq_cst) > 0) {
+    boc_park_lock(qptr);
+    boc_park_broadcast(qptr);
+    boc_park_unlock(qptr);
+  }
+}
+
+/// @brief Receives a message on a single tag using spin-then-park (untimed) or
+/// spin-then-backoff (timed)
+/// @param tag The tag to receive on (borrowed reference)
+/// @param do_timeout Whether a timeout was requested
+/// @param end_time Deadline as double-precision seconds (only if do_timeout)
+/// @param after Callback to invoke on timeout (or Py_None)
+/// @return The received (tag, contents) tuple, timeout sentinel, or NULL on
+/// error
+static PyObject *receive_single_tag(PyObject *tag, bool do_timeout,
+                                    double end_time, PyObject *after) {
+  BOCQueue *qptr = get_queue_for_tag(tag);
+  BOCMessage *message = NULL;
+  struct timespec backoff = {0, 1000}; // 1 µs, only used when do_timeout
+
+  while (true) {
+    // Phase 1: Spin
+    for (int spin = 0; spin < BOC_SPIN_COUNT; ++spin) {
+      BOCRecycleQueue_empty(BOC_STATE->recycle_queue, false);
+
+      int_least64_t queue_index = boc_dequeue(tag, &message);
+      if (queue_index >= 0) {
+        goto got_message;
+      }
+
+      if (PyErr_Occurred() != NULL) {
+        return NULL;
+      }
+
+      if (do_timeout && boc_now_s() > end_time) {
+        goto timed_out;
+      }
+    }
+
+    // Phase 2a: Timed — exponential backoff (no parking)
+    if (do_timeout) {
+      if (boc_now_s() > end_time) {
+        goto timed_out;
+      }
+
+      Py_BEGIN_ALLOW_THREADS;
+      thrd_sleep(&backoff, NULL);
+      Py_END_ALLOW_THREADS;
+
+      boc_backoff_double(&backoff);
+
+      continue;
+    }
+
+    // Phase 2b: Untimed — park on condvar (indefinite wait)
+    if (qptr == NULL) {
+      PyErr_SetString(PyExc_KeyError, "No message queue found for that tag");
+      return NULL;
+    }
+
+    boc_park_lock(qptr);
+    // seq_cst increment synchronizes with the seq_cst load in boc_enqueue,
+    // ensuring that either the producer sees our waiter count and signals,
+    // or our re-check dequeue below finds the producer's message.
+    atomic_fetch_add_explicit(&qptr->waiters, 1, memory_order_seq_cst);
+
+    // Re-check under lock (prevents lost wake)
+    int_least64_t queue_index = boc_dequeue(tag, &message);
+    if (queue_index >= 0) {
+      atomic_fetch_sub_explicit(&qptr->waiters, 1, memory_order_seq_cst);
+      boc_park_unlock(qptr);
+      goto got_message;
+    }
+
+    if (PyErr_Occurred() != NULL) {
+      atomic_fetch_sub_explicit(&qptr->waiters, 1, memory_order_seq_cst);
+      boc_park_unlock(qptr);
+      return NULL;
+    }
+
+    Py_BEGIN_ALLOW_THREADS;
+    boc_park_wait(qptr);
+    // Wake: we hold park_mutex but NOT the GIL.
+    // Release mutex BEFORE re-acquiring GIL to avoid ABBA deadlock:
+    // consumer (mutex → GIL) vs producer (GIL → mutex).
+    atomic_fetch_sub_explicit(&qptr->waiters, 1, memory_order_seq_cst);
+    boc_park_unlock(qptr);
+    Py_END_ALLOW_THREADS;
+
+    // Re-resolve queue pointer (set_tags may have reassigned it)
+    BOCQueue *new_qptr = get_queue_for_tag(tag);
+    if (new_qptr == NULL) {
+      PyErr_SetString(PyExc_RuntimeError, "Tag invalidated during receive");
+      return NULL;
+    }
+
+    if (new_qptr != qptr) {
+      qptr = new_qptr;
+    }
+
+    BOCRecycleQueue_empty(BOC_STATE->recycle_queue, false);
+  }
+
+got_message:;
+#ifdef BOC_TRACE
+  if (tag_compare_with_PyUnicode(message->tag, tag) != 0) {
+    if (PyErr_Occurred() != NULL) {
+      boc_message_free(message);
+      return NULL;
+    }
+  }
+#endif
+
+  PyObject *contents = xidata_to_object(message->xidata, message->pickled);
+  if (contents == NULL) {
+    boc_message_free(message);
+    return NULL;
+  }
+
+  PyObject *result = PyTuple_Pack(2, tag, contents);
+  Py_DECREF(contents);
+  boc_message_free(message);
+  return result;
+
+timed_out:
+  if (!Py_IsNone(after)) {
+    return PyObject_CallNoArgs(after);
+  }
+  return Py_BuildValue("(sO)", BOC_TIMEOUT, Py_None);
+}
+
+/// @brief Receives a message on multiple tags using round-robin with
+/// exponential backoff
+/// @param tags_fast A PySequence_Fast of tag strings (borrowed reference)
+/// @param tags_size The number of tags
+/// @param do_timeout Whether a timeout was requested
+/// @param end_time Deadline as double-precision seconds (only if do_timeout)
+/// @param after Callback to invoke on timeout (or Py_None)
+/// @return The received (tag, contents) tuple, timeout sentinel, or NULL on
+/// error
+static PyObject *receive_multi_tag(PyObject *tags_fast, Py_ssize_t tags_size,
+                                   bool do_timeout, double end_time,
+                                   PyObject *after) {
+  BOCMessage *message = NULL;
+  size_t tag_index = 0;
+  struct timespec backoff = {0, 1000}; // 1 µs
+
+  while (true) {
+    BOCRecycleQueue_empty(BOC_STATE->recycle_queue, false);
+
+    // Round-robin: try one tag per iteration
+    PyObject *tag = PySequence_Fast_GET_ITEM(tags_fast, tag_index);
+    tag_index = (tag_index + 1) % tags_size;
+
+    int_least64_t queue_index = boc_dequeue(tag, &message);
+    if (queue_index >= 0) {
+#ifdef BOC_TRACE
+      if (tag_compare_with_PyUnicode(message->tag, tag) != 0) {
+        if (PyErr_Occurred() != NULL) {
+          boc_message_free(message);
+          Py_DECREF(tags_fast);
+          return NULL;
+        }
+      }
+#endif
+
+      PyObject *contents = xidata_to_object(message->xidata, message->pickled);
+      if (contents == NULL) {
+        boc_message_free(message);
+        Py_DECREF(tags_fast);
+        return NULL;
+      }
+
+      PyObject *result = PyTuple_Pack(2, tag, contents);
+      Py_DECREF(contents);
+      boc_message_free(message);
+      Py_DECREF(tags_fast);
+      return result;
+    }
+
+    if (PyErr_Occurred() != NULL) {
+      Py_DECREF(tags_fast);
+      return NULL;
+    }
+
+    if (do_timeout && boc_now_s() > end_time) {
+      Py_DECREF(tags_fast);
+      if (!Py_IsNone(after)) {
+        return PyObject_CallNoArgs(after);
+      }
+      return Py_BuildValue("(sO)", BOC_TIMEOUT, Py_None);
+    }
+
+    Py_BEGIN_ALLOW_THREADS;
+    thrd_sleep(&backoff, NULL);
+    Py_END_ALLOW_THREADS;
+
+    boc_backoff_double(&backoff);
+  }
 }
 
 /// @brief Receives a message
@@ -2035,8 +2496,6 @@ static PyObject *_core_receive(PyObject *module, PyObject *args,
     }
   }
 
-  // determine if a timeout has been requested, and what clock time that would
-  // be
   bool do_timeout = false;
   double end_time = 0;
   if (timeout >= 0) {
@@ -2044,75 +2503,12 @@ static PyObject *_core_receive(PyObject *module, PyObject *args,
     end_time = boc_now_s() + timeout;
   }
 
-  size_t tag_index = 0;
-  BOCMessage *message = NULL;
-  while (true) {
-    Py_BEGIN_ALLOW_THREADS thrd_sleep(&SLEEP_TS, NULL);
-    Py_END_ALLOW_THREADS;
-
-    BOCRecycleQueue_empty(BOC_STATE->recycle_queue, false);
-
-    int_least64_t queue_index = -1;
-
-    if (tags_fast != NULL) {
-      // see if there are available messages for any of the tags
-      tag = PySequence_Fast_GET_ITEM(tags_fast, tag_index);
-      queue_index = boc_dequeue(tag, &message);
-      tag_index = (tag_index + 1) % tags_size;
-    } else {
-      queue_index = boc_dequeue(tag, &message);
-    }
-
-    if (queue_index < 0) {
-      if (PyErr_Occurred() != NULL) {
-        assert(message == NULL);
-        Py_XDECREF(tags_fast);
-        return NULL;
-      }
-
-      // no message was available
-      if (do_timeout && boc_now_s() > end_time) {
-        // we've timed out
-        if (!Py_IsNone(after)) {
-          return PyObject_CallNoArgs(after);
-        }
-
-        return Py_BuildValue("(sO)", BOC_TIMEOUT, Py_None);
-      }
-
-      continue;
-    }
-
-#ifdef BOC_TRACE
-    if (tag_compare_with_PyUnicode(message->tag, tag) != 0) {
-      // this should not happen, and indicates a bug in
-      // boc_enqueue()/boc_dequeue()
-      if (PyErr_Occurred() != NULL) {
-        Py_XDECREF(tags_fast);
-        boc_message_free(message);
-        return NULL;
-      }
-
-      continue;
-    }
-#endif
-
-    PyObject *contents = xidata_to_object(message->xidata, message->pickled);
-    if (contents == NULL) {
-      Py_XDECREF(tags_fast);
-      boc_message_free(message);
-      return NULL;
-    }
-
-    PyObject *result = PyTuple_Pack(2, tag, contents);
-    Py_DECREF(contents);
-
-    boc_message_free(message);
-    Py_XDECREF(tags_fast);
-    return result;
+  // Dispatch: single-tag vs multi-tag
+  if (tags_fast != NULL) {
+    return receive_multi_tag(tags_fast, tags_size, do_timeout, end_time, after);
   }
 
-  Py_RETURN_NONE;
+  return receive_single_tag(tag, do_timeout, end_time, after);
 }
 
 /// @brief Drain all the messages associated with a particular tag
@@ -2141,6 +2537,8 @@ PyObject *_core_drain(PyObject *module, PyObject *args) {
 
       boc_message_free(message);
     }
+
+    boc_wake_parked_receivers(tags);
 
     Py_RETURN_NONE;
   }
@@ -2182,6 +2580,8 @@ PyObject *_core_drain(PyObject *module, PyObject *args) {
 
       boc_message_free(message);
     }
+
+    boc_wake_parked_receivers(tag);
   }
 
   Py_DECREF(tags_fast);
@@ -3222,6 +3622,16 @@ static PyObject *_core_set_tags(PyObject *module, PyObject *args) {
     }
   }
 
+  // Wake any receivers parked on condvars so they re-resolve their tags
+  qptr = BOC_QUEUES;
+  for (Py_ssize_t i = 0; i < BOC_QUEUE_COUNT; ++i, ++qptr) {
+    if (atomic_load_explicit(&qptr->waiters, memory_order_seq_cst) > 0) {
+      boc_park_lock(qptr);
+      boc_park_broadcast(qptr);
+      boc_park_unlock(qptr);
+    }
+  }
+
   Py_RETURN_NONE;
 }
 
@@ -3257,6 +3667,8 @@ static int _core_module_exec(PyObject *module) {
       qptr->tail = 0;
       qptr->state = BOC_QUEUE_UNASSIGNED;
       qptr->tag = 0;
+      qptr->waiters = 0;
+      boc_park_init(qptr);
     }
 
     BOCRecycleQueue *queue_stub =
@@ -3377,6 +3789,7 @@ void _core_module_free(void *module_ptr) {
     BOCQueue *qptr = BOC_QUEUES;
     for (size_t i = 0; i < BOC_QUEUE_COUNT; ++i, ++qptr) {
       PyMem_RawFree(qptr->messages);
+      boc_park_destroy(qptr);
 
       if (atomic_load(&qptr->state) == BOC_QUEUE_ASSIGNED) {
         BOCTag *qtag = (BOCTag *)atomic_load(&qptr->tag);
@@ -3417,6 +3830,9 @@ static PyModuleDef_Slot _core_module_slots[] = {
     {Py_mod_exec, (void *)_core_module_exec},
 #if PY_VERSION_HEX >= 0x030C0000
     {Py_mod_multiple_interpreters, Py_MOD_PER_INTERPRETER_GIL_SUPPORTED},
+#endif
+#if PY_VERSION_HEX >= 0x030D0000
+    {Py_mod_gil, Py_MOD_GIL_NOT_USED},
 #endif
     {0, NULL},
 };

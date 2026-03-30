@@ -394,3 +394,75 @@ class TestBOC:
             send("assert", (sorted(a.value.items), list(range(10))))
 
         self.receive_asserts()
+
+    def test_duplicate_cown_same_twice(self):
+        """Same cown passed twice to @when completes without deadlock."""
+        c = Cown(5)
+
+        @when(c, c)
+        def add(a, b):
+            return a.value + b.value
+
+        @when(add)
+        def check(r):
+            send("assert", (r.value, 10))
+
+        self.receive_asserts()
+
+    def test_duplicate_cown_same_thrice(self):
+        """Same cown passed three times to @when completes without deadlock."""
+        c = Cown(3)
+
+        @when(c, c, c)
+        def triple(a, b, d):
+            return a.value + b.value + d.value
+
+        @when(triple)
+        def check(r):
+            send("assert", (r.value, 9))
+
+        self.receive_asserts()
+
+    def test_duplicate_cown_non_adjacent(self):
+        """Non-adjacent duplicate cowns in @when complete correctly."""
+        a = Cown(10)
+        b = Cown(20)
+
+        @when(a, b, a)
+        def mixed(x, y, z):
+            return x.value + y.value + z.value
+
+        @when(mixed)
+        def check(r):
+            send("assert", (r.value, 40))
+
+        self.receive_asserts()
+
+    def test_duplicate_cown_in_group(self):
+        """Duplicate cowns within a group complete without deadlock."""
+        c = Cown(7)
+
+        @when([c, c])
+        def group_sum(group):
+            return sum(g.value for g in group)
+
+        @when(group_sum)
+        def check(r):
+            send("assert", (r.value, 14))
+
+        self.receive_asserts()
+
+    def test_duplicate_cown_mutation(self):
+        """Mutating a cown passed twice reflects same underlying value."""
+        c = Cown(1)
+
+        @when(c, c)
+        def mutate(a, b):
+            a.value = 42
+            return b.value
+
+        @when(mutate)
+        def check(r):
+            send("assert", (r.value, 42))
+
+        self.receive_asserts()
