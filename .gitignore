@@ -209,3 +209,4 @@ __marimo__/
 # venvs
 .env*
 .vscode
+.copilot

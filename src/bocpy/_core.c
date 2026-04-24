@@ -43,6 +43,43 @@ void atomic_store(atomic_int_least64_t *ptr, int_least64_t value) {
   *ptr = value;
 }
 
+// ----- atomic_intptr_t siblings ---------------------------------------------
+// The MSVC polyfill defines `atomic_intptr_t` and `atomic_int_least64_t` as
+// distinct typedefs; the plain `atomic_load` / `atomic_store` / etc. above
+// only accept `atomic_int_least64_t *`. Without these siblings, code that
+// touches an `atomic_intptr_t` field (e.g. BOCRequest::next, BOCCown::last,
+// BOCRecycleQueue::head, BOCQueue::tag, NB_NOTICEBOARD_TID) would silently
+// pass a mistyped pointer to the int64 polyfill on Windows. On POSIX C11 the
+// same names are aliased to the generic atomic_* macros (which already
+// dispatch on type via _Generic), so user code below is platform-uniform.
+//
+// All Interlocked*Pointer intrinsics on x86/x64 are full barriers; the
+// pointer-width matches `intptr_t` on both Win32 and Win64 (CPython itself
+// requires a sane intptr_t == void* relationship).
+static inline intptr_t atomic_load_intptr(atomic_intptr_t *ptr) { return *ptr; }
+
+static inline void atomic_store_intptr(atomic_intptr_t *ptr, intptr_t value) {
+  *ptr = value;
+}
+
+static inline intptr_t atomic_exchange_intptr(atomic_intptr_t *ptr,
+                                              intptr_t value) {
+  return (intptr_t)InterlockedExchangePointer((PVOID volatile *)ptr,
+                                              (PVOID)value);
+}
+
+static inline bool atomic_compare_exchange_strong_intptr(atomic_intptr_t *ptr,
+                                                         intptr_t *expected,
+                                                         intptr_t desired) {
+  intptr_t prev = (intptr_t)InterlockedCompareExchangePointer(
+      (PVOID volatile *)ptr, (PVOID)desired, (PVOID)*expected);
+  if (prev == *expected) {
+    return true;
+  }
+  *expected = prev;
+  return false;
+}
+
 // All Interlocked* intrinsics on x86/x64 are full barriers, so the
 // memory_order argument is accepted but ignored.
 // Note: atomic_load_explicit is a plain volatile read. On x86/x64 this
@@ -57,8 +94,43 @@ void atomic_store(atomic_int_least64_t *ptr, int_least64_t value) {
 
 #define thread_local __declspec(thread)
 
-typedef SRWLOCK BOCParkMutex;
-typedef CONDITION_VARIABLE BOCParkCond;
+typedef SRWLOCK BOCMutex;
+typedef CONDITION_VARIABLE BOCCond;
+
+static inline void boc_mtx_init(BOCMutex *m) { InitializeSRWLock(m); }
+
+static inline void mtx_destroy(BOCMutex *m) { (void)m; }
+
+static inline void mtx_lock(BOCMutex *m) { AcquireSRWLockExclusive(m); }
+
+static inline void mtx_unlock(BOCMutex *m) { ReleaseSRWLockExclusive(m); }
+
+static inline void cnd_init(BOCCond *c) { InitializeConditionVariable(c); }
+
+static inline void cnd_destroy(BOCCond *c) { (void)c; }
+
+static inline void cnd_signal(BOCCond *c) { WakeConditionVariable(c); }
+
+static inline void cnd_broadcast(BOCCond *c) { WakeAllConditionVariable(c); }
+
+static inline void cnd_wait(BOCCond *c, BOCMutex *m) {
+  SleepConditionVariableSRW(c, m, INFINITE, 0);
+}
+
+/// @brief Wait on a condition variable for at most @p seconds.
+/// @param c The condition variable
+/// @param m The mutex (must be held by caller)
+/// @return true if signalled (or spurious wake), false if the timeout expired
+static inline bool cnd_timedwait_s(BOCCond *c, BOCMutex *m, double seconds) {
+  if (seconds < 0)
+    seconds = 0;
+  DWORD ms = (DWORD)(seconds * 1000.0);
+  BOOL ok = SleepConditionVariableSRW(c, m, ms, 0);
+  if (!ok && GetLastError() == ERROR_TIMEOUT) {
+    return false;
+  }
+  return true;
+}
 
 void thrd_sleep(const struct timespec *duration, struct timespec *remaining) {
   const DWORD MS_PER_NS = 1000000;
@@ -68,21 +140,98 @@ void thrd_sleep(const struct timespec *duration, struct timespec *remaining) {
 }
 
 #elif defined __APPLE__
+#include <errno.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #define thrd_sleep nanosleep
 #define thread_local _Thread_local
 
-typedef pthread_mutex_t BOCParkMutex;
-typedef pthread_cond_t BOCParkCond;
+typedef pthread_mutex_t BOCMutex;
+typedef pthread_cond_t BOCCond;
+
+static inline void boc_mtx_init(BOCMutex *m) { pthread_mutex_init(m, NULL); }
+
+static inline void mtx_destroy(BOCMutex *m) { pthread_mutex_destroy(m); }
+
+static inline void mtx_lock(BOCMutex *m) { pthread_mutex_lock(m); }
+
+static inline void mtx_unlock(BOCMutex *m) { pthread_mutex_unlock(m); }
+
+static inline void cnd_init(BOCCond *c) { pthread_cond_init(c, NULL); }
+
+static inline void cnd_destroy(BOCCond *c) { pthread_cond_destroy(c); }
+
+static inline void cnd_signal(BOCCond *c) { pthread_cond_signal(c); }
+
+static inline void cnd_broadcast(BOCCond *c) { pthread_cond_broadcast(c); }
+
+static inline void cnd_wait(BOCCond *c, BOCMutex *m) {
+  pthread_cond_wait(c, m);
+}
+
+/// @brief Wait on a condition variable for at most @p seconds.
+/// @param c The condition variable
+/// @param m The mutex (must be held by caller)
+/// @return true if signalled (or spurious wake), false if the timeout expired
+static inline bool cnd_timedwait_s(BOCCond *c, BOCMutex *m, double seconds) {
+  if (seconds < 0)
+    seconds = 0;
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  double total = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9 + seconds;
+  ts.tv_sec = (time_t)total;
+  ts.tv_nsec = (long)((total - (double)ts.tv_sec) * 1e9);
+  if (ts.tv_nsec >= 1000000000L) {
+    ts.tv_sec += 1;
+    ts.tv_nsec -= 1000000000L;
+  }
+  int rc = pthread_cond_timedwait(c, m, &ts);
+  return rc != ETIMEDOUT;
+}
 
 #else // Linux
+#include <errno.h>
 #include <stdatomic.h>
 #include <threads.h>
 
-typedef mtx_t BOCParkMutex;
-typedef cnd_t BOCParkCond;
+typedef mtx_t BOCMutex;
+typedef cnd_t BOCCond;
 
+static inline void boc_mtx_init(BOCMutex *m) { mtx_init(m, mtx_plain); }
+
+/// @brief Wait on a condition variable for at most @p seconds.
+/// @param c The condition variable
+/// @param m The mutex (must be held by caller)
+/// @return true if signalled (or spurious wake), false if the timeout expired
+static inline bool cnd_timedwait_s(BOCCond *c, BOCMutex *m, double seconds) {
+  if (seconds < 0)
+    seconds = 0;
+  struct timespec ts;
+  clock_gettime(CLOCK_REALTIME, &ts);
+  double total = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9 + seconds;
+  ts.tv_sec = (time_t)total;
+  ts.tv_nsec = (long)((total - (double)ts.tv_sec) * 1e9);
+  if (ts.tv_nsec >= 1000000000L) {
+    ts.tv_sec += 1;
+    ts.tv_nsec -= 1000000000L;
+  }
+  int rc = cnd_timedwait(c, m, &ts);
+  return rc != thrd_timedout;
+}
+
+#endif
+
+#ifndef _WIN32
+// On POSIX the C11 atomic_* macros dispatch on type via _Generic, so the
+// `atomic_load(&intptr_var)` form Just Works. The `_intptr` siblings are
+// aliased to the generic forms purely so the source reads the same on
+// every platform; on Windows they expand to dedicated InterlockedXxxPointer
+// shims (see polyfill block above).
+#define atomic_load_intptr(ptr) atomic_load(ptr)
+#define atomic_store_intptr(ptr, val) atomic_store((ptr), (val))
+#define atomic_exchange_intptr(ptr, val) atomic_exchange((ptr), (val))
+#define atomic_compare_exchange_strong_intptr(ptr, expected, desired)          \
+  atomic_compare_exchange_strong((ptr), (expected), (desired))
 #endif
 
 // Forward declaration — BOCQueue is defined below.
@@ -119,6 +268,10 @@ static inline void boc_park_broadcast(BOCQueue *q);
 /// the wait and re-acquired before returning.
 /// @param q The queue to park on
 static inline void boc_park_wait(BOCQueue *q);
+
+/// @brief Returns the current time as double-precision seconds.
+/// @return the current time
+static double boc_now_s(void);
 
 #if PY_VERSION_HEX >= 0x030D0000
 #define Py_BUILD_CORE
@@ -379,9 +532,9 @@ typedef struct boc_queue {
   /// @brief Number of threads parked on this queue's condvar
   atomic_int_least64_t waiters;
   /// @brief Mutex protecting condvar signal/wait
-  BOCParkMutex park_mutex;
+  BOCMutex park_mutex;
   /// @brief Condition variable for parking receivers
-  BOCParkCond park_cond;
+  BOCCond park_cond;
 } BOCQueue;
 
 /// @brief A tag for a BOC message.
@@ -405,77 +558,193 @@ static BOCRecycleQueue *BOC_RECYCLE_QUEUE_TAIL = NULL;
 static atomic_intptr_t BOC_RECYCLE_QUEUE_HEAD = 0;
 
 // ---------------------------------------------------------------------------
+// Noticeboard
+// ---------------------------------------------------------------------------
+
+#define NB_MAX_ENTRIES 64
+#define NB_KEY_SIZE 64
+
+// Forward declarations needed by NoticeboardEntry and the noticeboard
+// helpers below. The full definitions of BOCCown and its refcount helpers
+// appear further down the file (the noticeboard predates the cown
+// machinery in source order, but the new pin-tracking support added for
+// the snapshot cache needs the cown refcount macros).
+typedef struct boc_cown BOCCown;
+static int_least64_t cown_incref(BOCCown *cown);
+static int_least64_t cown_decref(BOCCown *cown);
+#define COWN_INCREF(c) cown_incref((c))
+#define COWN_DECREF(c) cown_decref(c)
+
+// CownCapsule forward declaration so the noticeboard pin helper can fish
+// the underlying BOCCown out of a Python CownCapsule. The struct body is
+// defined alongside the type's PyTypeObject further down.
+typedef struct cown_capsule_object {
+  PyObject_HEAD BOCCown *cown;
+} CownCapsuleObject;
+
+/// @brief A single noticeboard entry
+typedef struct nb_entry {
+  /// @brief The key for this entry (null-terminated UTF-8)
+  char key[NB_KEY_SIZE];
+  /// @brief The serialized cross-interpreter data
+  XIDATA_T *value;
+  /// @brief Whether the value was pickled during serialization
+  bool pickled;
+  /// @brief BOCCowns referenced by @ref value, pinned by this entry
+  /// @details Allocated with @c PyMem_RawMalloc; each pointer holds one
+  /// strong reference (COWN_INCREF). When the entry is overwritten,
+  /// deleted, or cleared, every pointer is COWN_DECREFed and the array
+  /// is freed. This is the noticeboard's mechanism for keeping the
+  /// underlying BOCCowns alive across the 1-pickle / N-unpickle cycle:
+  /// pickling no longer adds a pin (see @ref CownCapsule_reduce).
+  BOCCown **pinned_cowns;
+  /// @brief Number of entries in @ref pinned_cowns
+  int pinned_count;
+} NoticeboardEntry;
+
+/// @brief Global noticeboard for cross-behavior key-value storage
+typedef struct noticeboard {
+  /// @brief The stored entries
+  NoticeboardEntry entries[NB_MAX_ENTRIES];
+  /// @brief The number of entries currently stored
+  int count;
+  /// @brief Mutex protecting the noticeboard
+  BOCMutex mutex;
+} Noticeboard;
+
+static Noticeboard NB;
+
+/// @brief Monotonic version counter for the noticeboard
+/// @details Incremented under @ref Noticeboard::mutex on every successful
+/// write, delete, or clear. Threads use this to lazily invalidate their
+/// thread-local snapshot cache without taking the noticeboard mutex on
+/// every read. Exposed to Python via @ref _core_noticeboard_version for
+/// users who want to detect noticeboard changes without taking a full
+/// snapshot.
+static atomic_int_least64_t NB_VERSION = 0;
+
+/// @brief Thread-local snapshot cache for the current behavior
+static thread_local PyObject *NB_SNAPSHOT_CACHE = NULL;
+
+/// @brief Version of the noticeboard at the time the cached snapshot was built
+/// @details Captured under @ref Noticeboard::mutex during the rebuild. A
+/// reader that finds @ref NB_VERSION equal to this value can reuse the
+/// cached dict without rebuilding.
+static thread_local int_least64_t NB_SNAPSHOT_VERSION = -1;
+
+/// @brief Whether the cached snapshot has been version-checked this behavior
+/// @details Cleared by @ref _core_noticeboard_cache_clear at every behavior
+/// boundary (see @c worker.py). Set to @c true on the first snapshot call
+/// of a behavior. Subsequent calls within the same behavior return the
+/// cached dict without consulting @ref NB_VERSION at all, preserving the
+/// no-polling invariant: the noticeboard cannot be used as a synchronous
+/// communication channel between behaviors.
+static thread_local bool NB_VERSION_CHECKED = false;
+
+/// @brief Read-only proxy wrapping the cached snapshot dict
+/// @details A @c types.MappingProxyType created over @ref NB_SNAPSHOT_CACHE
+/// once per rebuild and returned to callers in place of the dict. Prevents
+/// user code from mutating the cached snapshot, which would otherwise
+/// corrupt every subsequent reader on the same thread until the next
+/// @ref NB_VERSION bump.
+static thread_local PyObject *NB_SNAPSHOT_PROXY = NULL;
+
+/// @brief Thread identity of the noticeboard mutator thread, or 0 if unset
+/// @details Set by @ref _core_set_noticeboard_thread at runtime startup
+/// and checked by @ref _core_noticeboard_write_direct and
+/// @ref _core_noticeboard_delete to enforce the invariant that only the
+/// noticeboard thread mutates the noticeboard. This eliminates the TOCTOU
+/// window in the Python-level read-modify-write performed by
+/// @c noticeboard_update.
+static atomic_intptr_t NB_NOTICEBOARD_TID = 0;
+
+// ---------------------------------------------------------------------------
+// notice_sync() — opt-in barrier for the noticeboard thread.
+//
+// The noticeboard thread runs independently of the behavior dispatch path, so
+// notice_write/_update/_delete are fire-and-forget. Callers that need
+// read-your-writes ordering use notice_sync():
+//   1. notice_sync_request() atomically allocates a monotonic sequence
+//      number and returns it.
+//   2. The caller posts ("sync", N) on the boc_noticeboard tag.
+//   3. The noticeboard-thread arm calls notice_sync_complete(N), which
+//      stores N into NB_SYNC_PROCESSED (monotonic, max-of) and broadcasts
+//      NB_SYNC_COND.
+//   4. The caller blocks in notice_sync_wait(my_seq, timeout) on
+//      NB_SYNC_COND until NB_SYNC_PROCESSED >= my_seq, or returns false
+//      on timeout.
+//
+// All synchronization lives in C primitives so the barrier works across
+// sub-interpreters (Python locks do not span interpreters).
+// ---------------------------------------------------------------------------
+
+/// @brief Monotonic counter incremented by every notice_sync caller.
+/// @details Sized for ~292 years of continuous 1 GHz fetch_add traffic
+/// before wrap; treated as effectively non-wrapping. If the wrap
+/// precondition ever becomes plausible (e.g. a much faster mutator),
+/// switch to @c atomic_uint_least64_t and update the wrap arithmetic
+/// in @ref _core_notice_sync_wait.
+static atomic_int_least64_t NB_SYNC_REQUESTED = 0;
+
+/// @brief Highest sequence number processed by the noticeboard thread.
+static atomic_int_least64_t NB_SYNC_PROCESSED = 0;
+
+/// @brief Mutex protecting NB_SYNC_COND.
+static BOCMutex NB_SYNC_MUTEX;
+
+/// @brief Condition variable signalled when NB_SYNC_PROCESSED advances.
+static BOCCond NB_SYNC_COND;
+
+// ---------------------------------------------------------------------------
+// Terminator — C-level run-down counter.
+//
+// Process-global rundown counter that gates @c terminator_wait. Used by the
+// Python @c wait()/@c stop() lifecycle to block until every in-flight
+// behavior has retired. The counter is incremented from caller threads in
+// @c whencall (before the schedule call) and decremented from worker
+// threads after @c behavior_release_all completes. A one-shot "Pyrona
+// seed" of 1 keeps the count positive between the runtime starting and
+// @c stop() taking it down via @c terminator_seed_dec.
+//
+// Lifecycle:
+//   - @c terminator_reset arms a fresh runtime: count = 1 (the seed),
+//     seeded = 1, closed = 0. Returns the prior (count, seeded) so
+//     @c Behaviors.start can detect drift carried over from a previous
+//     run that died without reconciliation.
+//   - @c terminator_inc returns -1 once @c terminator_close has been
+//     called, so the @c whencall fast path can refuse new work without
+//     racing teardown.
+//   - @c terminator_seed_dec is the idempotent one-shot that drops the
+//     seed; subsequent calls are no-ops.
+//   - @c terminator_wait blocks on the condvar until count reaches 0.
+//   - @c terminator_close raises the closed bit so any straggler
+//     @c terminator_inc returns -1.
+//
+// State is process-global (file-scope statics, NOT per-interpreter) so
+// every sub-interpreter sees the same counter, mutex, and condvar.
+// ---------------------------------------------------------------------------
+
+/// @brief Active behavior count + the Pyrona seed.
+static atomic_int_least64_t TERMINATOR_COUNT = 0;
+
+/// @brief Set to 1 by terminator_close() to refuse further increments.
+static atomic_int_least64_t TERMINATOR_CLOSED = 0;
+
+/// @brief One-shot guard for the Pyrona seed: 1 = seed still present.
+static atomic_int_least64_t TERMINATOR_SEEDED = 0;
+
+/// @brief Mutex protecting TERMINATOR_COND.
+static BOCMutex TERMINATOR_MUTEX;
+
+/// @brief Condition variable signalled when TERMINATOR_COUNT reaches 0.
+static BOCCond TERMINATOR_COND;
+
+// ---------------------------------------------------------------------------
 // Platform condvar implementation
 // ---------------------------------------------------------------------------
 
-#ifdef _WIN32
-
 static inline void boc_park_init(BOCQueue *q) {
-  InitializeSRWLock(&q->park_mutex);
-  InitializeConditionVariable(&q->park_cond);
-}
-
-static inline void boc_park_destroy(BOCQueue *q) {
-  // Windows SRWLOCK and CONDITION_VARIABLE have no destroy function.
-  (void)q;
-}
-
-static inline void boc_park_lock(BOCQueue *q) {
-  AcquireSRWLockExclusive(&q->park_mutex);
-}
-
-static inline void boc_park_unlock(BOCQueue *q) {
-  ReleaseSRWLockExclusive(&q->park_mutex);
-}
-
-static inline void boc_park_signal(BOCQueue *q) {
-  WakeConditionVariable(&q->park_cond);
-}
-
-static inline void boc_park_broadcast(BOCQueue *q) {
-  WakeAllConditionVariable(&q->park_cond);
-}
-
-static inline void boc_park_wait(BOCQueue *q) {
-  SleepConditionVariableSRW(&q->park_cond, &q->park_mutex, INFINITE, 0);
-}
-
-#elif defined __APPLE__ // macOS — pthreads
-
-static inline void boc_park_init(BOCQueue *q) {
-  pthread_mutex_init(&q->park_mutex, NULL);
-  pthread_cond_init(&q->park_cond, NULL);
-}
-
-static inline void boc_park_destroy(BOCQueue *q) {
-  pthread_cond_destroy(&q->park_cond);
-  pthread_mutex_destroy(&q->park_mutex);
-}
-
-static inline void boc_park_lock(BOCQueue *q) {
-  pthread_mutex_lock(&q->park_mutex);
-}
-
-static inline void boc_park_unlock(BOCQueue *q) {
-  pthread_mutex_unlock(&q->park_mutex);
-}
-
-static inline void boc_park_signal(BOCQueue *q) {
-  pthread_cond_signal(&q->park_cond);
-}
-
-static inline void boc_park_broadcast(BOCQueue *q) {
-  pthread_cond_broadcast(&q->park_cond);
-}
-
-static inline void boc_park_wait(BOCQueue *q) {
-  pthread_cond_wait(&q->park_cond, &q->park_mutex);
-}
-
-#else // Linux — C11 threads
-
-static inline void boc_park_init(BOCQueue *q) {
-  mtx_init(&q->park_mutex, mtx_plain);
+  boc_mtx_init(&q->park_mutex);
   cnd_init(&q->park_cond);
 }
 
@@ -498,7 +767,7 @@ static inline void boc_park_wait(BOCQueue *q) {
   cnd_wait(&q->park_cond, &q->park_mutex);
 }
 
-#endif
+// Noticeboard function implementations are below object_to_xidata
 
 /// @brief Creates a new BOCTag object from a Python Unicode string.
 /// @details The result object will not be dependent on the argument in any way
@@ -691,7 +960,11 @@ struct timespec BOC_LAST_REF_TRACKING_REPORT;
 
 static void boc_ref_tracking_report(const char *prefix) {
   struct timespec ts;
+#ifdef _WIN32
   timespec_get(&ts, TIME_UTC);
+#else
+  clock_gettime(CLOCK_REALTIME, &ts);
+#endif
   if (ts.tv_sec - BOC_LAST_REF_TRACKING_REPORT.tv_sec > 1) {
     int_least64_t alive = atomic_load(&BOC_ACTIVE_COWNS);
     int_least64_t total = atomic_load(&BOC_TOTAL_COWNS);
@@ -773,7 +1046,8 @@ static BOCRecycleQueue *BOCRecycleQueue_new(int_least64_t index) {
   queue->next = 0;
 
   intptr_t queue_ptr = (intptr_t)queue;
-  intptr_t old_head_ptr = atomic_exchange(&BOC_RECYCLE_QUEUE_HEAD, queue_ptr);
+  intptr_t old_head_ptr =
+      atomic_exchange_intptr(&BOC_RECYCLE_QUEUE_HEAD, queue_ptr);
   if (old_head_ptr == 0) {
     return queue;
   }
@@ -781,8 +1055,8 @@ static BOCRecycleQueue *BOCRecycleQueue_new(int_least64_t index) {
   BOCRecycleQueue *old_head = (BOCRecycleQueue *)old_head_ptr;
   old_head->index = index;
   old_head->tail = node;
-  atomic_store(&old_head->head, node_ptr);
-  atomic_store(&old_head->next, queue_ptr);
+  atomic_store_intptr(&old_head->head, node_ptr);
+  atomic_store_intptr(&old_head->next, queue_ptr);
 
   old_head->xidata_to_cowns = PyDict_New();
   if (old_head->xidata_to_cowns == NULL) {
@@ -876,7 +1150,1076 @@ static PyObject *object_to_xidata(PyObject *value, XIDATA_T **xidata_ptr) {
   return NULL;
 }
 
-/// @brief The threadsafe cown object.
+// ---------------------------------------------------------------------------
+// Noticeboard C functions
+// ---------------------------------------------------------------------------
+
+/// @brief Reject a noticeboard mutation called from outside the noticeboard
+/// thread.
+/// @details Sets a Python @c RuntimeError if a noticeboard thread has been
+/// registered (via @ref _core_set_noticeboard_thread) and the calling thread
+/// is not it. Prior to runtime startup the check is permissive so that
+/// @c Behaviors.stop and unit tests can drive the noticeboard from the
+/// main thread before the noticeboard thread is up. The single-writer
+/// invariant is what makes the Python-level read-modify-write in
+/// @c noticeboard_update TOCTOU-free.
+/// @param op_name Name of the operation, used in the error message
+/// @return 0 on success, -1 on error (with exception set)
+static int nb_check_noticeboard_thread(const char *op_name) {
+  uintptr_t owner = (uintptr_t)atomic_load_intptr(&NB_NOTICEBOARD_TID);
+  if (owner == 0) {
+    return 0;
+  }
+  uintptr_t current = (uintptr_t)PyThread_get_thread_ident();
+  if (current != owner) {
+    PyErr_Format(PyExc_RuntimeError,
+                 "%s must be called from the noticeboard thread", op_name);
+    return -1;
+  }
+  return 0;
+}
+
+/// @brief Take strong references to every CownCapsule in @p cowns
+/// @details Allocates a fresh @c BOCCown** array (or returns NULL if
+/// @p cowns is empty), iterates the sequence calling @c COWN_INCREF on
+/// each entry's underlying BOCCown, and writes the resulting array and
+/// count to @p out_array / @p out_count. On error, no INCREFs leak: any
+/// already-taken pins are dropped before return.
+/// @param cowns A Python sequence of CownCapsule objects (may be NULL or
+///   None for "no pins")
+/// @param out_array Out param for the allocated array
+/// @param out_count Out param for the number of entries
+/// @return 0 on success, -1 on error (with exception set)
+///
+/// @details The caller is expected to pass a sequence of integer pointers
+/// to BOCCown structs that have already been COWN_INCREFed by the writer
+/// thread (typically via @ref _core_cown_pin_pointers). This function
+/// **transfers** those refs into the noticeboard entry: it does not take
+/// any additional ref. On error every transferred ref is released so the
+/// caller can treat -1 as "ownership not taken, original refs already
+/// released".
+static int nb_pin_cowns(PyObject *cowns, BOCCown ***out_array, int *out_count) {
+  *out_array = NULL;
+  *out_count = 0;
+
+  if (cowns == NULL || cowns == Py_None) {
+    return 0;
+  }
+
+  PyObject *seq =
+      PySequence_Fast(cowns, "noticeboard pin list must be a sequence");
+  if (seq == NULL) {
+    return -1;
+  }
+
+  Py_ssize_t n = PySequence_Fast_GET_SIZE(seq);
+  if (n == 0) {
+    Py_DECREF(seq);
+    return 0;
+  }
+
+  BOCCown **pins = (BOCCown **)PyMem_RawMalloc(sizeof(BOCCown *) * n);
+  if (pins == NULL) {
+    Py_DECREF(seq);
+    PyErr_NoMemory();
+    return -1;
+  }
+
+  int taken = 0;
+  for (Py_ssize_t i = 0; i < n; i++) {
+    PyObject *item = PySequence_Fast_GET_ITEM(seq, i);
+    BOCCown *cown = (BOCCown *)PyLong_AsVoidPtr(item);
+    if (cown == NULL) {
+      // PyLong_AsVoidPtr returns NULL both on error and for integer 0.
+      // Reject both paths explicitly: a NULL pin would be dereferenced
+      // downstream (COWN_DECREF on NULL is UB), and an integer 0 is
+      // indistinguishable from a crafted attacker pin pointing at the
+      // zero page.
+      if (!PyErr_Occurred()) {
+        PyErr_SetString(PyExc_ValueError,
+                        "noticeboard pin list must not contain NULL / "
+                        "integer 0 entries");
+      } else {
+        PyErr_SetString(PyExc_TypeError,
+                        "noticeboard pin list must contain only integer "
+                        "BOCCown pointers (use _core.cown_pin_pointers())");
+      }
+      goto fail;
+    }
+    pins[taken++] = cown;
+  }
+
+  Py_DECREF(seq);
+  *out_array = pins;
+  *out_count = taken;
+  return 0;
+
+fail:
+  // Release every transferred ref the writer pre-INCREFed for us. The
+  // ones we already stashed into `pins` plus the rest of the sequence
+  // we never reached.
+  for (int i = 0; i < taken; i++) {
+    COWN_DECREF(pins[i]);
+  }
+  for (Py_ssize_t i = (Py_ssize_t)taken + 1; i < n; i++) {
+    PyObject *item = PySequence_Fast_GET_ITEM(seq, i);
+    BOCCown *c = (BOCCown *)PyLong_AsVoidPtr(item);
+    if (c != NULL) {
+      COWN_DECREF(c);
+    } else {
+      PyErr_Clear();
+    }
+  }
+  PyMem_RawFree(pins);
+  Py_DECREF(seq);
+  return -1;
+}
+
+/// @brief Drop the calling thread's snapshot cache and proxy
+/// @details Both objects are decref-cleared and the per-behavior version
+/// state is reset. Safe to call when nothing is cached.
+static void nb_drop_local_cache(void) {
+  Py_CLEAR(NB_SNAPSHOT_PROXY);
+  Py_CLEAR(NB_SNAPSHOT_CACHE);
+  NB_SNAPSHOT_VERSION = -1;
+  NB_VERSION_CHECKED = false;
+}
+
+/// @brief Write a key-value pair into the noticeboard under mutex
+/// @details The value is serialized to XIData here (in the main interpreter),
+/// so XIDATA_FREE is always safe to call from the same interpreter. The
+/// optional third argument is a sequence of CownCapsule objects whose
+/// underlying BOCCowns are referenced by the serialized bytes; the
+/// noticeboard takes a strong reference on each so that they outlive
+/// every reader's pickled view, regardless of whether the original
+/// CownCapsule is dropped by user code.
+/// @param self The module
+/// @param args Tuple of (key: str, value: object[, cowns: sequence])
+/// @return Py_None on success, NULL on error
+static PyObject *_core_noticeboard_write_direct(PyObject *self,
+                                                PyObject *args) {
+  BOC_STATE_SET(self);
+
+  if (BOC_STATE->index != 0) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "noticeboard_write_direct must be called from the primary "
+                    "interpreter");
+    return NULL;
+  }
+
+  if (nb_check_noticeboard_thread("noticeboard_write_direct") < 0) {
+    return NULL;
+  }
+
+  const char *key;
+  Py_ssize_t key_len;
+  PyObject *value;
+  PyObject *cowns = Py_None;
+
+  if (!PyArg_ParseTuple(args, "s#O|O", &key, &key_len, &value, &cowns)) {
+    return NULL;
+  }
+
+  if (key_len >= NB_KEY_SIZE) {
+    PyErr_SetString(PyExc_ValueError,
+                    "noticeboard key too long (max 63 UTF-8 bytes)");
+    return NULL;
+  }
+
+  if (memchr(key, '\0', key_len) != NULL) {
+    PyErr_SetString(PyExc_ValueError,
+                    "noticeboard key must not contain NUL characters");
+    return NULL;
+  }
+
+  // Pin the cowns BEFORE serializing so an error here does not leave us
+  // with a stored entry whose cowns can be freed under us.
+  BOCCown **new_pins = NULL;
+  int new_pin_count = 0;
+  if (nb_pin_cowns(cowns, &new_pins, &new_pin_count) < 0) {
+    return NULL;
+  }
+
+  // Serialize the value to XIData in the main interpreter
+  XIDATA_T *xidata = NULL;
+  PyObject *pickled = object_to_xidata(value, &xidata);
+  if (pickled == NULL) {
+    if (xidata != NULL) {
+      XIDATA_FREE(xidata);
+    }
+    // Roll back the pins we just took.
+    for (int i = 0; i < new_pin_count; i++) {
+      COWN_DECREF(new_pins[i]);
+    }
+    PyMem_RawFree(new_pins);
+    return NULL;
+  }
+
+  bool is_pickled = (pickled == Py_True);
+  Py_DECREF(pickled);
+
+  mtx_lock(&NB.mutex);
+
+  // find existing entry or allocate new one
+  NoticeboardEntry *target = NULL;
+  for (int i = 0; i < NB.count; i++) {
+    if (strncmp(NB.entries[i].key, key, NB_KEY_SIZE) == 0) {
+      target = &NB.entries[i];
+      break;
+    }
+  }
+
+  if (target == NULL) {
+    if (NB.count >= NB_MAX_ENTRIES) {
+      mtx_unlock(&NB.mutex);
+      XIDATA_FREE(xidata);
+      for (int i = 0; i < new_pin_count; i++) {
+        COWN_DECREF(new_pins[i]);
+      }
+      PyMem_RawFree(new_pins);
+      PyErr_SetString(PyExc_RuntimeError, "Noticeboard is full (max 64)");
+      return NULL;
+    }
+    target = &NB.entries[NB.count++];
+    strncpy(target->key, key, NB_KEY_SIZE - 1);
+    target->key[NB_KEY_SIZE - 1] = '\0';
+    target->value = NULL;
+    target->pinned_cowns = NULL;
+    target->pinned_count = 0;
+  }
+
+  // Stash old value and old pins to free after releasing the mutex —
+  // XIDATA_FREE / COWN_DECREF may invoke Python __del__ which could
+  // re-enter the noticeboard.
+  XIDATA_T *old_value = target->value;
+  BOCCown **old_pins = target->pinned_cowns;
+  int old_pin_count = target->pinned_count;
+
+  target->value = xidata;
+  target->pickled = is_pickled;
+  target->pinned_cowns = new_pins;
+  target->pinned_count = new_pin_count;
+
+  // Bump the version under mutex so readers' acquire loads can lazily
+  // invalidate their thread-local snapshot caches without us touching
+  // their cache directly.
+  atomic_fetch_add(&NB_VERSION, 1);
+
+  mtx_unlock(&NB.mutex);
+
+  if (old_value != NULL) {
+    XIDATA_FREE(old_value);
+  }
+  if (old_pins != NULL) {
+    for (int i = 0; i < old_pin_count; i++) {
+      COWN_DECREF(old_pins[i]);
+    }
+    PyMem_RawFree(old_pins);
+  }
+
+  // Note: this thread's NB_SNAPSHOT_CACHE is intentionally NOT cleared.
+  // Within a behavior, a writer must not observe its own write — that is
+  // the no-polling invariant. The cache will be lazily revalidated at
+  // the next behavior boundary (see _core_noticeboard_cache_clear).
+
+  Py_RETURN_NONE;
+}
+
+/// @brief Return a cached read-only snapshot of the noticeboard
+/// @details Three fast paths, in order:
+///   1. If @ref NB_VERSION_CHECKED is true, the cached proxy was already
+///      validated for this behavior; return it without consulting
+///      @ref NB_VERSION. This preserves the no-polling invariant: a
+///      behavior cannot observe writes that happened mid-flight, even
+///      its own.
+///   2. If the cached dict's @ref NB_SNAPSHOT_VERSION matches the
+///      current @ref NB_VERSION, the cache is still fresh; mark it
+///      checked and return the proxy.
+///   3. Otherwise, drop the cache and fall through to the rebuild.
+/// The rebuild reads all entries under @ref Noticeboard::mutex,
+/// captures the version while still holding the mutex (so a writer
+/// cannot race past us), deserializes non-pickled values immediately,
+/// and defers @c pickle.loads to after the mutex is released. The
+/// returned object is a @c types.MappingProxyType wrapping the cached
+/// dict; user code cannot mutate the cache through it.
+/// @param self The module
+/// @return A read-only mapping (MappingProxyType) of str → Python object
+static PyObject *_core_noticeboard_snapshot(PyObject *self,
+                                            PyObject *Py_UNUSED(dummy)) {
+  BOC_STATE_SET(self);
+
+  if (NB_SNAPSHOT_PROXY != NULL) {
+    if (NB_VERSION_CHECKED) {
+      // Within-behavior repeat call: same proxy, no atomic load.
+      Py_INCREF(NB_SNAPSHOT_PROXY);
+      return NB_SNAPSHOT_PROXY;
+    }
+    // First snapshot call this behavior: do exactly one version check.
+    int_least64_t current = atomic_load(&NB_VERSION);
+    if (current == NB_SNAPSHOT_VERSION) {
+      NB_VERSION_CHECKED = true;
+      Py_INCREF(NB_SNAPSHOT_PROXY);
+      return NB_SNAPSHOT_PROXY;
+    }
+    nb_drop_local_cache();
+  }
+
+  PyObject *dict = PyDict_New();
+  if (dict == NULL) {
+    return NULL;
+  }
+
+  // Deferred entries: pickled values whose bytes were extracted under mutex
+  // but need unpickling outside the lock.
+  PyObject *deferred_keys[NB_MAX_ENTRIES];
+  PyObject *deferred_bytes[NB_MAX_ENTRIES];
+  int deferred_count = 0;
+
+  // Keepalive pins: while we hold the mutex we take an extra COWN_INCREF
+  // on every pin reachable from a deferred (pickled) entry. The bytes we
+  // are about to unpickle outside the mutex contain raw BOCCown pointers
+  // whose validity depends on the entry's pin list. Without this extra
+  // ref, a concurrent writer could overwrite the entry the instant we
+  // drop the mutex, release the old pins, and free the BOCCowns before
+  // we touch them — UAF in _cown_capsule_from_pointer. Released after
+  // the deferred unpickling completes. Each deferred entry contributes
+  // a heap-allocated pin pointer array sized to its pin count.
+  BOCCown **keepalive_pins[NB_MAX_ENTRIES];
+  int keepalive_counts[NB_MAX_ENTRIES];
+  for (int i = 0; i < NB_MAX_ENTRIES; i++) {
+    keepalive_pins[i] = NULL;
+    keepalive_counts[i] = 0;
+  }
+
+  mtx_lock(&NB.mutex);
+
+  // Capture the noticeboard version while still holding the mutex so
+  // that no concurrent writer can bump it between snapshot completion
+  // and version capture.
+  int_least64_t built_version = atomic_load(&NB_VERSION);
+
+  for (int i = 0; i < NB.count; i++) {
+    NoticeboardEntry *entry = &NB.entries[i];
+    if (entry->value == NULL) {
+      continue;
+    }
+
+    // XIDATA_NEWOBJECT is lightweight (no Python code execution)
+    PyObject *raw = XIDATA_NEWOBJECT(entry->value);
+    if (raw == NULL) {
+      mtx_unlock(&NB.mutex);
+      goto fail_deferred;
+    }
+
+    PyObject *key = PyUnicode_FromString(entry->key);
+    if (key == NULL) {
+      Py_DECREF(raw);
+      mtx_unlock(&NB.mutex);
+      goto fail_deferred;
+    }
+
+    if (!entry->pickled) {
+      // Non-pickled: add directly to dict
+      if (PyDict_SetItem(dict, key, raw) < 0) {
+        Py_DECREF(key);
+        Py_DECREF(raw);
+        mtx_unlock(&NB.mutex);
+        goto fail_deferred;
+      }
+      Py_DECREF(key);
+      Py_DECREF(raw);
+    } else {
+      // Pickled: defer unpickling to outside the mutex. Take a fresh
+      // COWN_INCREF on every pin so the BOCCowns referenced by the bytes
+      // survive past mtx_unlock — see keepalive_pins comment above.
+      if (entry->pinned_count > 0) {
+        BOCCown **pins = (BOCCown **)PyMem_RawMalloc(sizeof(BOCCown *) *
+                                                     entry->pinned_count);
+        if (pins == NULL) {
+          Py_DECREF(key);
+          Py_DECREF(raw);
+          mtx_unlock(&NB.mutex);
+          PyErr_NoMemory();
+          goto fail_deferred;
+        }
+        for (int j = 0; j < entry->pinned_count; j++) {
+          pins[j] = entry->pinned_cowns[j];
+          COWN_INCREF(pins[j]);
+        }
+        keepalive_pins[deferred_count] = pins;
+        keepalive_counts[deferred_count] = entry->pinned_count;
+      }
+      deferred_keys[deferred_count] = key;
+      deferred_bytes[deferred_count] = raw;
+      deferred_count++;
+    }
+  }
+
+  mtx_unlock(&NB.mutex);
+
+  // Unpickle deferred entries outside the mutex
+  for (int i = 0; i < deferred_count; i++) {
+    PyObject *value = _PyPickle_Loads(deferred_bytes[i]);
+    Py_DECREF(deferred_bytes[i]);
+    deferred_bytes[i] = NULL;
+
+    if (value == NULL) {
+      Py_DECREF(deferred_keys[i]);
+      deferred_keys[i] = NULL;
+      // Clean up remaining deferred entries
+      for (int j = i + 1; j < deferred_count; j++) {
+        Py_DECREF(deferred_keys[j]);
+        Py_DECREF(deferred_bytes[j]);
+      }
+      // Release every keepalive pin (including the one for this entry).
+      for (int j = 0; j < deferred_count; j++) {
+        if (keepalive_pins[j] != NULL) {
+          for (int k = 0; k < keepalive_counts[j]; k++) {
+            COWN_DECREF(keepalive_pins[j][k]);
+          }
+          PyMem_RawFree(keepalive_pins[j]);
+          keepalive_pins[j] = NULL;
+        }
+      }
+      Py_DECREF(dict);
+      return NULL;
+    }
+
+    if (PyDict_SetItem(dict, deferred_keys[i], value) < 0) {
+      Py_DECREF(deferred_keys[i]);
+      Py_DECREF(value);
+      for (int j = i + 1; j < deferred_count; j++) {
+        Py_DECREF(deferred_keys[j]);
+        Py_DECREF(deferred_bytes[j]);
+      }
+      for (int j = 0; j < deferred_count; j++) {
+        if (keepalive_pins[j] != NULL) {
+          for (int k = 0; k < keepalive_counts[j]; k++) {
+            COWN_DECREF(keepalive_pins[j][k]);
+          }
+          PyMem_RawFree(keepalive_pins[j]);
+          keepalive_pins[j] = NULL;
+        }
+      }
+      Py_DECREF(dict);
+      return NULL;
+    }
+
+    Py_DECREF(deferred_keys[i]);
+    Py_DECREF(value);
+
+    // Successful unpickle: the snapshot dict (and its CownCapsules)
+    // now hold their own refs on every BOCCown referenced by the bytes.
+    // Drop our keepalive pin for this entry.
+    if (keepalive_pins[i] != NULL) {
+      for (int k = 0; k < keepalive_counts[i]; k++) {
+        COWN_DECREF(keepalive_pins[i][k]);
+      }
+      PyMem_RawFree(keepalive_pins[i]);
+      keepalive_pins[i] = NULL;
+    }
+  }
+
+  PyObject *proxy = PyDictProxy_New(dict);
+  if (proxy == NULL) {
+    Py_DECREF(dict);
+    return NULL;
+  }
+
+  // The proxy holds a strong reference to dict; we keep our own as well so
+  // that the dict is reachable for direct mutation in the rebuild path
+  // and the proxy survives at least as long as the dict.
+  NB_SNAPSHOT_CACHE = dict;
+  NB_SNAPSHOT_PROXY = proxy;
+  NB_SNAPSHOT_VERSION = built_version;
+  NB_VERSION_CHECKED = true;
+  Py_INCREF(proxy);
+  return proxy;
+
+fail_deferred:
+  for (int i = 0; i < deferred_count; i++) {
+    Py_DECREF(deferred_keys[i]);
+    Py_DECREF(deferred_bytes[i]);
+    if (keepalive_pins[i] != NULL) {
+      for (int k = 0; k < keepalive_counts[i]; k++) {
+        COWN_DECREF(keepalive_pins[i][k]);
+      }
+      PyMem_RawFree(keepalive_pins[i]);
+      keepalive_pins[i] = NULL;
+    }
+  }
+  Py_DECREF(dict);
+  return NULL;
+}
+
+/// @brief Clear all noticeboard entries and free their XIData and pins
+/// @details Safe to call XIDATA_FREE directly because all noticeboard XIData
+/// is created by the main interpreter (in write_direct). Also drops every
+/// entry's pinned cowns (COWN_DECREF) and clears the calling thread's
+/// snapshot cache so that any cached proxy from before the clear is not
+/// reused after a runtime restart. Other threads' caches will lazily
+/// revalidate on their next snapshot call thanks to the @ref NB_VERSION
+/// bump; their cached CownCapsules keep the underlying BOCCowns alive
+/// until each cache is dropped.
+/// @param self The module (unused)
+/// @param args Unused
+/// @return Py_None
+static PyObject *_core_noticeboard_clear(PyObject *self,
+                                         PyObject *Py_UNUSED(args)) {
+  BOC_STATE_SET(self);
+
+  if (BOC_STATE->index != 0) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "noticeboard_clear must be called from the primary "
+                    "interpreter");
+    return NULL;
+  }
+
+  // Collect entries to free after releasing the mutex — XIDATA_FREE and
+  // COWN_DECREF may invoke Python __del__ which could re-enter the
+  // noticeboard.
+  XIDATA_T *to_free[NB_MAX_ENTRIES];
+  BOCCown **to_unpin[NB_MAX_ENTRIES];
+  int to_unpin_count[NB_MAX_ENTRIES];
+  int to_free_count = 0;
+  int to_unpin_entries = 0;
+
+  mtx_lock(&NB.mutex);
+
+  for (int i = 0; i < NB.count; i++) {
+    if (NB.entries[i].value != NULL) {
+      to_free[to_free_count++] = NB.entries[i].value;
+      NB.entries[i].value = NULL;
+    }
+    if (NB.entries[i].pinned_cowns != NULL) {
+      to_unpin[to_unpin_entries] = NB.entries[i].pinned_cowns;
+      to_unpin_count[to_unpin_entries] = NB.entries[i].pinned_count;
+      to_unpin_entries++;
+      NB.entries[i].pinned_cowns = NULL;
+      NB.entries[i].pinned_count = 0;
+    }
+  }
+  NB.count = 0;
+  memset(NB.entries, 0, sizeof(NB.entries));
+
+  // Bump the version under mutex; see noticeboard_write_direct for
+  // rationale.
+  atomic_fetch_add(&NB_VERSION, 1);
+
+  mtx_unlock(&NB.mutex);
+
+  for (int i = 0; i < to_free_count; i++) {
+    XIDATA_FREE(to_free[i]);
+  }
+  for (int i = 0; i < to_unpin_entries; i++) {
+    for (int j = 0; j < to_unpin_count[i]; j++) {
+      COWN_DECREF(to_unpin[i][j]);
+    }
+    PyMem_RawFree(to_unpin[i]);
+  }
+
+  // Drop this thread's cache so a subsequent runtime cycle does not
+  // reuse a stale proxy. Other threads will revalidate via NB_VERSION.
+  nb_drop_local_cache();
+
+  Py_RETURN_NONE;
+}
+
+/// @brief Delete a single noticeboard entry by key
+/// @details Acquires mutex, finds the entry, frees its XIData and pinned
+/// cowns, shifts remaining entries down, and decrements count. No-op if
+/// key not found.
+/// @param self The module
+/// @param args Tuple of (key: str)
+/// @return Py_None on success, NULL on error
+static PyObject *_core_noticeboard_delete(PyObject *self, PyObject *args) {
+  BOC_STATE_SET(self);
+
+  if (BOC_STATE->index != 0) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "noticeboard_delete must be called from the primary "
+                    "interpreter");
+    return NULL;
+  }
+
+  if (nb_check_noticeboard_thread("noticeboard_delete") < 0) {
+    return NULL;
+  }
+
+  const char *key;
+  Py_ssize_t key_len;
+
+  if (!PyArg_ParseTuple(args, "s#", &key, &key_len)) {
+    return NULL;
+  }
+
+  if (key_len >= NB_KEY_SIZE) {
+    PyErr_SetString(PyExc_ValueError,
+                    "noticeboard key too long (max 63 UTF-8 bytes)");
+    return NULL;
+  }
+
+  if (memchr(key, '\0', key_len) != NULL) {
+    PyErr_SetString(PyExc_ValueError,
+                    "noticeboard key must not contain NUL characters");
+    return NULL;
+  }
+
+  mtx_lock(&NB.mutex);
+
+  int found = -1;
+  for (int i = 0; i < NB.count; i++) {
+    if (strncmp(NB.entries[i].key, key, NB_KEY_SIZE) == 0) {
+      found = i;
+      break;
+    }
+  }
+
+  // Stash the entry's XIData and pins to free after releasing the mutex.
+  XIDATA_T *deleted_value = NULL;
+  BOCCown **deleted_pins = NULL;
+  int deleted_pin_count = 0;
+
+  if (found >= 0) {
+    deleted_value = NB.entries[found].value;
+    deleted_pins = NB.entries[found].pinned_cowns;
+    deleted_pin_count = NB.entries[found].pinned_count;
+
+    // shift remaining entries down
+    for (int i = found; i < NB.count - 1; i++) {
+      NB.entries[i] = NB.entries[i + 1];
+    }
+
+    // clear the last slot and decrement
+    memset(&NB.entries[NB.count - 1], 0, sizeof(NoticeboardEntry));
+    NB.count--;
+
+    // Bump the version under mutex; see noticeboard_write_direct.
+    atomic_fetch_add(&NB_VERSION, 1);
+  }
+
+  mtx_unlock(&NB.mutex);
+
+  if (deleted_value != NULL) {
+    XIDATA_FREE(deleted_value);
+  }
+  if (deleted_pins != NULL) {
+    for (int i = 0; i < deleted_pin_count; i++) {
+      COWN_DECREF(deleted_pins[i]);
+    }
+    PyMem_RawFree(deleted_pins);
+  }
+
+  // Note: this thread's NB_SNAPSHOT_CACHE is intentionally NOT cleared;
+  // the no-polling invariant applies equally to deletes.
+
+  Py_RETURN_NONE;
+}
+
+/// @brief Re-arm the per-behavior version check on the cached snapshot
+/// @details Called by the worker loop at every behavior boundary. Does
+/// NOT drop @ref NB_SNAPSHOT_PROXY: the cache may still be valid, and
+/// the next call to @ref _core_noticeboard_snapshot will perform exactly
+/// one atomic load against @ref NB_VERSION to find out. Within a
+/// behavior, the cache is then returned unconditionally for any further
+/// calls, preserving the no-polling invariant.
+/// @param self The module (unused)
+/// @param args Unused
+/// @return Py_None
+static PyObject *_core_noticeboard_cache_clear(PyObject *self,
+                                               PyObject *Py_UNUSED(args)) {
+  BOC_STATE_SET(self);
+
+  NB_VERSION_CHECKED = false;
+
+  Py_RETURN_NONE;
+}
+
+/// @brief Return the current noticeboard version counter
+/// @details The counter is incremented under @ref Noticeboard::mutex on
+/// every successful @c notice_write, @c notice_delete, or
+/// @c noticeboard_clear. Read with sequentially-consistent semantics.
+/// Two reads returning the same value mean no commit happened between
+/// them; a strictly larger value means at least one commit happened.
+/// Useful for detecting noticeboard changes without taking a full
+/// snapshot.
+/// @param self The module (unused)
+/// @param args Unused
+/// @return A Python int with the current noticeboard version
+static PyObject *_core_noticeboard_version(PyObject *self,
+                                           PyObject *Py_UNUSED(args)) {
+  BOC_STATE_SET(self);
+  return PyLong_FromLongLong((long long)atomic_load(&NB_VERSION));
+}
+
+/// @brief Register the calling thread as the noticeboard mutator thread
+/// @details Must be called from the noticeboard thread before it processes
+/// any noticeboard mutation messages. Subsequent calls to
+/// @ref _core_noticeboard_write_direct or @ref _core_noticeboard_delete
+/// from any other thread will raise @c RuntimeError. Pass with no
+/// arguments to install the current thread; the registration is global
+/// and persists until the runtime stops.
+/// @param self The module (unused)
+/// @param args Unused
+/// @return Py_None
+static PyObject *_core_set_noticeboard_thread(PyObject *self,
+                                              PyObject *Py_UNUSED(args)) {
+  BOC_STATE_SET(self);
+  if (BOC_STATE->index != 0) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "set_noticeboard_thread must be called from the primary "
+                    "interpreter");
+    return NULL;
+  }
+  uintptr_t tid = (uintptr_t)PyThread_get_thread_ident();
+  // One-shot per runtime: refuse if the slot is already owned.
+  // clear_noticeboard_thread() resets NB_NOTICEBOARD_TID to 0 at stop(),
+  // so a fresh start() cycle is fine. This closes the hijack-the-
+  // mutator-slot hole identified by the security lens.
+  intptr_t expected = 0;
+  if (!atomic_compare_exchange_strong_intptr(&NB_NOTICEBOARD_TID, &expected,
+                                             (intptr_t)tid)) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "set_noticeboard_thread: noticeboard mutator thread "
+                    "is already registered");
+    return NULL;
+  }
+  Py_RETURN_NONE;
+}
+
+/// @brief Clear the registered noticeboard mutator thread
+/// @details Restores the permissive (pre-startup) check. Called by the
+/// Python @c Behaviors.stop path after the noticeboard thread has joined
+/// so that subsequent main-thread calls (e.g. @c noticeboard_clear from
+/// a runtime restart cycle) are not rejected.
+/// @param self The module (unused)
+/// @param args Unused
+/// @return Py_None
+static PyObject *_core_clear_noticeboard_thread(PyObject *self,
+                                                PyObject *Py_UNUSED(args)) {
+  BOC_STATE_SET(self);
+  if (BOC_STATE->index != 0) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "clear_noticeboard_thread must be called from the "
+                    "primary interpreter");
+    return NULL;
+  }
+  (void)atomic_exchange_intptr(&NB_NOTICEBOARD_TID, (intptr_t)0);
+  Py_RETURN_NONE;
+}
+
+/// @brief Allocate a fresh notice_sync sequence number.
+/// @details Atomically increments @ref NB_SYNC_REQUESTED and returns the
+/// new value. The caller posts @c ("sync", N) on the @c boc_noticeboard
+/// tag and then waits via @ref _core_notice_sync_wait until that sequence
+/// has been processed.
+/// @param self The module (unused)
+/// @param args Unused
+/// @return A Python int with the caller's seq.
+static PyObject *_core_notice_sync_request(PyObject *self,
+                                           PyObject *Py_UNUSED(args)) {
+  BOC_STATE_SET(self);
+  int_least64_t seq = atomic_fetch_add(&NB_SYNC_REQUESTED, 1) + 1;
+  return PyLong_FromLongLong((long long)seq);
+}
+
+/// @brief Mark a notice_sync sequence as processed and wake waiters.
+/// @details Called from the noticeboard-thread Python arm when it pops
+/// a @c ("sync", N) sentinel off the queue. Stores @c max(processed, N)
+/// into @ref NB_SYNC_PROCESSED (defensive against any reordering, though
+/// the MPSC tag is FIFO) and broadcasts @ref NB_SYNC_COND.
+/// @param self The module (unused)
+/// @param args A tuple @c (N,) — the sequence number being completed
+/// @return Py_None
+static PyObject *_core_notice_sync_complete(PyObject *self, PyObject *args) {
+  BOC_STATE_SET(self);
+  if (BOC_STATE->index != 0) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "notice_sync_complete must be called from the primary "
+                    "interpreter");
+    return NULL;
+  }
+  long long seq;
+  if (!PyArg_ParseTuple(args, "L", &seq)) {
+    return NULL;
+  }
+
+  Py_BEGIN_ALLOW_THREADS mtx_lock(&NB_SYNC_MUTEX);
+  // Defense in depth: with a single noticeboard thread draining the
+  // FIFO boc_noticeboard tag, `seq` arrives strictly monotonically and
+  // a plain `atomic_store(seq)` would be correct. We keep the max-of
+  // pattern so that if a future change introduces a second mutator
+  // thread or any out-of-order delivery, NB_SYNC_PROCESSED can never
+  // regress and unblock waiters early. Both load and store happen under
+  // NB_SYNC_MUTEX (the only writer is here), so this is not a TOCTOU.
+  int_least64_t cur = atomic_load(&NB_SYNC_PROCESSED);
+  if ((int_least64_t)seq > cur) {
+    atomic_store(&NB_SYNC_PROCESSED, (int_least64_t)seq);
+  }
+  cnd_broadcast(&NB_SYNC_COND);
+  mtx_unlock(&NB_SYNC_MUTEX);
+  Py_END_ALLOW_THREADS
+
+      Py_RETURN_NONE;
+}
+
+/// @brief Block until @p my_seq has been processed by the noticeboard thread.
+/// @details Loops on @ref NB_SYNC_COND under @ref NB_SYNC_MUTEX until
+/// @ref NB_SYNC_PROCESSED is at least @p my_seq, or until @p timeout
+/// seconds elapse. A negative or @c None timeout means wait forever.
+/// Releases the GIL across the wait.
+/// @param self The module (unused)
+/// @param args A tuple @c (my_seq, timeout) — int and float-or-None
+/// @return @c True on success, @c False on timeout.
+static PyObject *_core_notice_sync_wait(PyObject *self, PyObject *args) {
+  BOC_STATE_SET(self);
+  long long my_seq;
+  PyObject *timeout_obj;
+  if (!PyArg_ParseTuple(args, "LO", &my_seq, &timeout_obj)) {
+    return NULL;
+  }
+
+  bool do_timeout = false;
+  double end_time = 0.0;
+  if (timeout_obj != Py_None) {
+    double timeout = PyFloat_AsDouble(timeout_obj);
+    if (timeout == -1.0 && PyErr_Occurred()) {
+      return NULL;
+    }
+    if (timeout >= 0.0) {
+      do_timeout = true;
+      end_time = boc_now_s() + timeout;
+    }
+  }
+
+  bool ok = true;
+  Py_BEGIN_ALLOW_THREADS mtx_lock(&NB_SYNC_MUTEX);
+  while (atomic_load(&NB_SYNC_PROCESSED) < (int_least64_t)my_seq) {
+    if (do_timeout) {
+      double now = boc_now_s();
+      if (now >= end_time) {
+        ok = false;
+        break;
+      }
+      cnd_timedwait_s(&NB_SYNC_COND, &NB_SYNC_MUTEX, end_time - now);
+    } else {
+      cnd_wait(&NB_SYNC_COND, &NB_SYNC_MUTEX);
+    }
+  }
+  mtx_unlock(&NB_SYNC_MUTEX);
+  Py_END_ALLOW_THREADS
+
+      if (ok) {
+    Py_RETURN_TRUE;
+  }
+  Py_RETURN_FALSE;
+}
+
+// ---------------------------------------------------------------------------
+// Terminator entry points.
+// ---------------------------------------------------------------------------
+
+/// @brief Try to register a new behavior with the terminator.
+/// @details Returns the post-increment count on success, or -1 if the
+/// terminator is closed (runtime is shutting down). The double-check of
+/// TERMINATOR_CLOSED around the fetch_add closes the close-vs-inc race:
+/// if close() lands between our first check and our fetch_add, the
+/// second check sees it and we undo, signalling on a 0-transition so a
+/// concurrent terminator_wait() does not miss the wakeup. Uses the
+/// portable plain-atomic forms (seq_cst) — see the polyfill block at
+/// the top of this file; the terminator is not on a hot path so the
+/// stronger ordering is free.
+/// @param self The module (unused)
+/// @param args Unused
+/// @return Python int — new count on success, -1 if closed.
+static PyObject *_core_terminator_inc(PyObject *self,
+                                      PyObject *Py_UNUSED(args)) {
+  BOC_STATE_SET(self);
+  if (atomic_load(&TERMINATOR_CLOSED)) {
+    return PyLong_FromLongLong(-1);
+  }
+  int_least64_t newval = atomic_fetch_add(&TERMINATOR_COUNT, 1) + 1;
+  if (atomic_load(&TERMINATOR_CLOSED)) {
+    int_least64_t after = atomic_fetch_add(&TERMINATOR_COUNT, -1) - 1;
+    if (after == 0) {
+      mtx_lock(&TERMINATOR_MUTEX);
+      cnd_broadcast(&TERMINATOR_COND);
+      mtx_unlock(&TERMINATOR_MUTEX);
+    }
+    return PyLong_FromLongLong(-1);
+  }
+  return PyLong_FromLongLong((long long)newval);
+}
+
+/// @brief Decrement the terminator. Wakes terminator_wait on 0-transition.
+/// @param self The module (unused)
+/// @param args Unused
+/// @return Python int — the new count.
+static PyObject *_core_terminator_dec(PyObject *self,
+                                      PyObject *Py_UNUSED(args)) {
+  BOC_STATE_SET(self);
+  int_least64_t newval = atomic_fetch_add(&TERMINATOR_COUNT, -1) - 1;
+  if (newval == 0) {
+    mtx_lock(&TERMINATOR_MUTEX);
+    cnd_broadcast(&TERMINATOR_COND);
+    mtx_unlock(&TERMINATOR_MUTEX);
+  }
+  return PyLong_FromLongLong((long long)newval);
+}
+
+/// @brief Set the closed bit. Future terminator_inc() calls return -1.
+/// @param self The module (unused)
+/// @param args Unused
+/// @return Py_None
+static PyObject *_core_terminator_close(PyObject *self,
+                                        PyObject *Py_UNUSED(args)) {
+  BOC_STATE_SET(self);
+  if (BOC_STATE->index != 0) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "terminator_close must be called from the primary "
+                    "interpreter");
+    return NULL;
+  }
+  atomic_store(&TERMINATOR_CLOSED, 1);
+  Py_RETURN_NONE;
+}
+
+/// @brief Block until TERMINATOR_COUNT reaches 0.
+/// @details A negative or @c None timeout means wait forever.
+/// Releases the GIL across the wait.
+/// @param self The module (unused)
+/// @param args A tuple @c (timeout,) — float-or-None
+/// @return @c True on success, @c False on timeout.
+static PyObject *_core_terminator_wait(PyObject *self, PyObject *args) {
+  BOC_STATE_SET(self);
+  PyObject *timeout_obj;
+  if (!PyArg_ParseTuple(args, "O", &timeout_obj)) {
+    return NULL;
+  }
+
+  bool do_timeout = false;
+  double end_time = 0.0;
+  if (timeout_obj != Py_None) {
+    double timeout = PyFloat_AsDouble(timeout_obj);
+    if (timeout == -1.0 && PyErr_Occurred()) {
+      return NULL;
+    }
+    if (timeout >= 0.0) {
+      do_timeout = true;
+      end_time = boc_now_s() + timeout;
+    }
+  }
+
+  bool ok = true;
+  Py_BEGIN_ALLOW_THREADS mtx_lock(&TERMINATOR_MUTEX);
+  while (atomic_load(&TERMINATOR_COUNT) != 0) {
+    if (do_timeout) {
+      double now = boc_now_s();
+      if (now >= end_time) {
+        ok = false;
+        break;
+      }
+      cnd_timedwait_s(&TERMINATOR_COND, &TERMINATOR_MUTEX, end_time - now);
+    } else {
+      cnd_wait(&TERMINATOR_COND, &TERMINATOR_MUTEX);
+    }
+  }
+  mtx_unlock(&TERMINATOR_MUTEX);
+  Py_END_ALLOW_THREADS
+
+      if (ok) {
+    Py_RETURN_TRUE;
+  }
+  Py_RETURN_FALSE;
+}
+
+/// @brief Idempotent one-shot decrement of the Pyrona seed.
+/// @details Called by stop()/wait() to remove the seed that keeps the
+/// terminator count above zero across momentary quiescence. Safe to call
+/// any number of times — only the first call performs the decrement.
+/// @param self The module (unused)
+/// @param args Unused
+/// @return Python bool — True if this call removed the seed, False if
+/// the seed was already removed.
+static PyObject *_core_terminator_seed_dec(PyObject *self,
+                                           PyObject *Py_UNUSED(args)) {
+  BOC_STATE_SET(self);
+  if (BOC_STATE->index != 0) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "terminator_seed_dec must be called from the primary "
+                    "interpreter");
+    return NULL;
+  }
+  int_least64_t prev = atomic_exchange(&TERMINATOR_SEEDED, 0);
+  if (prev == 1) {
+    int_least64_t newval = atomic_fetch_add(&TERMINATOR_COUNT, -1) - 1;
+    if (newval == 0) {
+      mtx_lock(&TERMINATOR_MUTEX);
+      cnd_broadcast(&TERMINATOR_COND);
+      mtx_unlock(&TERMINATOR_MUTEX);
+    }
+    Py_RETURN_TRUE;
+  }
+  Py_RETURN_FALSE;
+}
+
+/// @brief Restore terminator state for a fresh runtime start.
+/// @details Sets count=1 (the Pyrona seed), clears the closed bit, and
+/// re-arms the seed one-shot. Called from Behaviors.start(). Returns
+/// the prior @c (count, seeded) tuple so callers can detect drift left
+/// over from a previous run that died without reaching its
+/// reconciliation point (e.g. KeyboardInterrupt or stop() that raised
+/// before the assertion).
+/// @param self The module (unused)
+/// @param args Unused
+/// @return A 2-tuple @c (prior_count, prior_seeded).
+static PyObject *_core_terminator_reset(PyObject *self,
+                                        PyObject *Py_UNUSED(args)) {
+  BOC_STATE_SET(self);
+  if (BOC_STATE->index != 0) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "terminator_reset must be called from the primary "
+                    "interpreter");
+    return NULL;
+  }
+  // Fence: raise the closed bit before we touch anything else so any
+  // stray thread still holding a reference to the previous runtime
+  // (e.g. a late whencall call) is refused by terminator_inc rather
+  // than slipping a new behavior past the reset boundary. We clear
+  // the bit again at the end, once the new COUNT/SEEDED values have
+  // been published, so a fresh start() sees closed=0.
+  atomic_store(&TERMINATOR_CLOSED, 1);
+  mtx_lock(&TERMINATOR_MUTEX);
+  int_least64_t prior_count = atomic_load(&TERMINATOR_COUNT);
+  int_least64_t prior_seeded = atomic_load(&TERMINATOR_SEEDED);
+  atomic_store(&TERMINATOR_COUNT, 1);
+  atomic_store(&TERMINATOR_SEEDED, 1);
+  atomic_store(&TERMINATOR_CLOSED, 0);
+  cnd_broadcast(&TERMINATOR_COND);
+  mtx_unlock(&TERMINATOR_MUTEX);
+  return Py_BuildValue("(LL)", (long long)prior_count, (long long)prior_seeded);
+}
+
+/// @brief Read the current TERMINATOR_SEEDED flag (for reconciliation).
+/// @param self The module (unused)
+/// @param args Unused
+/// @return Python int — 0 or 1.
+static PyObject *_core_terminator_seeded(PyObject *self,
+                                         PyObject *Py_UNUSED(args)) {
+  BOC_STATE_SET(self);
+  return PyLong_FromLongLong((long long)atomic_load(&TERMINATOR_SEEDED));
+}
+
+/// @brief Read the current terminator count (for reconciliation tests).
+/// @param self The module (unused)
+/// @param args Unused
+/// @return Python int — the current TERMINATOR_COUNT.
+static PyObject *_core_terminator_count(PyObject *self,
+                                        PyObject *Py_UNUSED(args)) {
+  BOC_STATE_SET(self);
+  return PyLong_FromLongLong((long long)atomic_load(&TERMINATOR_COUNT));
+}
+
 /// @details This can be safely referenced and used from multiple processes.
 typedef struct boc_cown {
   int_least64_t id;
@@ -948,7 +2291,7 @@ static void BOCRecycleQueue_enqueue(BOCRecycleQueue *queue, XIDATA_T *xidata);
 /// @brief Atomic decref for the cown
 /// @param cown the cown to decref
 /// @return the new reference count
-static inline int_least64_t cown_decref(BOCCown *cown) {
+static int_least64_t cown_decref(BOCCown *cown) {
   int_least64_t rc = atomic_fetch_add(&cown->rc, -1) - 1;
   PRINTDBG("cown_decref(%p, cid=%" PRIdLEAST64 ") = %" PRIdLEAST64 "\n", cown,
            cown->id, rc);
@@ -977,13 +2320,12 @@ static inline int_least64_t cown_decref(BOCCown *cown) {
   return 0;
 }
 
-#define COWN_DECREF(c) cown_decref(c)
 #define COWN_WEAK_DECREF(c) cown_weak_decref(c)
 
 /// @brief Atomic incref for the cown
 /// @param cown the cown to incref
 /// @return the new reference count
-static inline int_least64_t cown_incref(BOCCown *cown) {
+static int_least64_t cown_incref(BOCCown *cown) {
   int_least64_t rc = atomic_fetch_add(&cown->rc, 1) + 1;
   PRINTDBG("cown_incref(%p, cid=%" PRIdLEAST64 ") = %" PRIdLEAST64 "\n", cown,
            cown->id, rc);
@@ -1012,18 +2354,22 @@ static inline bool cown_promote(BOCCown *cown) {
   return true;
 }
 
-#define COWN_INCREF(c) cown_incref((c))
 #define COWN_WEAK_INCREF(c) cown_weak_incref((c))
 #define COWN_PROMOTE(c) cown_promote((c))
 
+/// @brief Set the value of a cown, clearing the exception flag
+/// @note Callers that store an exception must set cown->exception = true
+/// after calling this function.
 static inline void cown_set_value(BOCCown *cown, PyObject *value) {
   if (value == NULL) {
     Py_XDECREF(cown->value);
+    cown->value = NULL;
+    cown->exception = false;
     return;
   }
 
   Py_XSETREF(cown->value, Py_NewRef(value));
-  cown->exception = PyExceptionInstance_Check(value);
+  cown->exception = false;
 }
 
 /// @brief Create a new BOCCown.
@@ -1042,7 +2388,7 @@ static BOCCown *BOCCown_new(PyObject *value) {
   cown->xidata = NULL;
   cown->pickled = false;
   cown->exception = false;
-  atomic_store(&cown->last, 0);
+  atomic_store_intptr(&cown->last, 0);
   // each cown starts with both a strong and weak reference
   // the weak reference will only be decremented when the strong
   // reference count is zero.
@@ -1069,7 +2415,7 @@ static XIDATA_T *BOCRecycleQueue_dequeue(BOCRecycleQueue *queue,
                                          bool wait_for_consistency) {
   BOCRecycleNode *tail = queue->tail;
   intptr_t tail_ptr = (intptr_t)queue->tail;
-  intptr_t next_ptr = atomic_load(&tail->next);
+  intptr_t next_ptr = atomic_load_intptr(&tail->next);
   if (next_ptr == 0) {
     // two possibilities:
     // 1. queue is empty
@@ -1086,7 +2432,7 @@ static XIDATA_T *BOCRecycleQueue_dequeue(BOCRecycleQueue *queue,
 
     // the queue is inconsistent, so we spin/wait for step 3 to complete above
     while (next_ptr == 0) {
-      next_ptr = atomic_load(&tail->next);
+      next_ptr = atomic_load_intptr(&tail->next);
     }
   }
 
@@ -1190,18 +2536,18 @@ static void BOCRecycleQueue_enqueue(BOCRecycleQueue *queue, XIDATA_T *xidata) {
   BOCRecycleNode *node =
       (BOCRecycleNode *)PyMem_RawMalloc(sizeof(BOCRecycleNode));
   node->xidata = NULL;
-  atomic_store(&node->next, 0);
+  atomic_store_intptr(&node->next, 0);
 
   // step 1: swap the new node in as the new head
   intptr_t node_ptr = (intptr_t)node;
-  intptr_t old_head_ptr = atomic_exchange(&queue->head, node_ptr);
+  intptr_t old_head_ptr = atomic_exchange_intptr(&queue->head, node_ptr);
   BOCRecycleNode *old_head = (BOCRecycleNode *)old_head_ptr;
   // queue is now inconsistent
   // step 2: store the data in this node. This node is somewhere inside the
   // queue.
   old_head->xidata = xidata;
   // step 3: connect everything back together
-  atomic_store(&old_head->next, node_ptr);
+  atomic_store_intptr(&old_head->next, node_ptr);
   // queue is consistent
 }
 
@@ -1217,8 +2563,8 @@ static void BOCRecycleQueue_empty(BOCRecycleQueue *queue,
   }
 
   if (wait_for_consistency) {
-    assert((intptr_t)queue->tail == atomic_load(&queue->head));
-    assert(atomic_load(&queue->tail->next) == 0);
+    assert((intptr_t)queue->tail == atomic_load_intptr(&queue->head));
+    assert(atomic_load_intptr(&queue->tail->next) == 0);
   }
 }
 
@@ -1228,7 +2574,7 @@ static void BOCRecycleQueue_empty(BOCRecycleQueue *queue,
 /// @param queue The queue to free
 static void BOCRecycleQueue_free(BOCRecycleQueue *queue) {
   assert(queue->xidata_to_cowns == NULL);
-  if (queue->tail != NULL && atomic_load(&queue->tail->next) != 0) {
+  if (queue->tail != NULL && atomic_load_intptr(&queue->tail->next) != 0) {
     printf("BOC: recycle queue %" PRIdLEAST64 " not empty during finalize\n",
            queue->index);
     BOCRecycleQueue_empty(queue, true);
@@ -1242,11 +2588,10 @@ static void BOCRecycleQueue_free(BOCRecycleQueue *queue) {
 /// @details This capsule allows the cown to be exposed to the Python code
 /// level. There can be any number of them, and the will perform atomic
 /// reference counts on the underlying cown.
-typedef struct cown_capsule_object {
-  PyObject_HEAD
-      /// @brief the actual cown object wrapped by the capsule
-      BOCCown *cown;
-} CownCapsuleObject;
+/// @note The struct is forward-declared near the top of the file (next to
+/// the noticeboard helpers) so @c nb_pin_cowns can extract @c BOCCown
+/// pointers from a Python CownCapsule. This block carries the doc only;
+/// keep the field set in sync with the forward declaration.
 
 /// @brief Deallocates the CownCapsule
 /// @note This will perform an atomic decref on the underlying cown
@@ -1372,6 +2717,11 @@ static PyObject *CownCapsule_get_value(PyObject *op, void *Py_UNUSED(dummy)) {
 
 static int CownCapsule_set_value(PyObject *op, PyObject *value,
                                  void *Py_UNUSED(dummy)) {
+  if (value == NULL) {
+    PyErr_SetString(PyExc_TypeError, "cannot delete value attribute");
+    return -1;
+  }
+
   CownCapsuleObject *self = (CownCapsuleObject *)op;
 
   if (!cown_check_acquired(self->cown, true)) {
@@ -1379,10 +2729,6 @@ static int CownCapsule_set_value(PyObject *op, PyObject *value,
   }
 
   cown_set_value(self->cown, value);
-  if (self->cown->value == NULL) {
-    return -1;
-  }
-
   return 0;
 }
 
@@ -1567,8 +2913,18 @@ static PyObject *CownCapsule_get_impl(PyObject *op, void *Py_UNUSED(dummy)) {
 }
 
 /// @brief Pickle support for CownCapsule
-/// @details Pins the inner BOCCown via COWN_INCREF so it stays alive between
-/// pickle and unpickle. The reconstructor inherits this pin (no extra INCREF).
+/// @details Returns a (reconstructor, (pointer, pid)) tuple. Does NOT take a
+/// COWN_INCREF on the inner BOCCown: the bytes produced by pickling are
+/// dead data, not a reference. The caller is responsible for ensuring the
+/// underlying BOCCown is kept alive between pickling and unpickling. For
+/// transient pickles (send/receive on the message queue), the original
+/// CownCapsule held by the sender provides that liveness; for long-lived
+/// pickles (the noticeboard), the noticeboard layer pins the BOCCown
+/// independently via @ref nb_collect_cowns at write time.
+/// @note An earlier design did COWN_INCREF here as a "pin" and had the
+/// reconstructor inherit it. That assumed a 1-pickle / 1-unpickle pairing
+/// and was broken by the noticeboard, where one write is unpickled by
+/// every reader on every worker.
 /// @param op The CownCapsule object
 /// @param Py_UNUSED (ignored)
 /// @return A tuple (reconstructor, (pointer, pid)) for pickle, or NULL on error
@@ -1576,12 +2932,8 @@ static PyObject *CownCapsule_reduce(PyObject *op, PyObject *Py_UNUSED(dummy)) {
   CownCapsuleObject *self = (CownCapsuleObject *)op;
   BOCCown *cown = self->cown;
 
-  // pin the cown alive through the pickle/unpickle cycle
-  COWN_INCREF(cown);
-
   PyObject *ptr = PyLong_FromVoidPtr(cown);
   if (ptr == NULL) {
-    COWN_DECREF(cown);
     return NULL;
   }
 
@@ -1593,7 +2945,6 @@ static PyObject *CownCapsule_reduce(PyObject *op, PyObject *Py_UNUSED(dummy)) {
   PyObject *pid_obj = PyLong_FromLong(pid);
   if (pid_obj == NULL) {
     Py_DECREF(ptr);
-    COWN_DECREF(cown);
     return NULL;
   }
 
@@ -1601,7 +2952,6 @@ static PyObject *CownCapsule_reduce(PyObject *op, PyObject *Py_UNUSED(dummy)) {
   if (module == NULL) {
     Py_DECREF(pid_obj);
     Py_DECREF(ptr);
-    COWN_DECREF(cown);
     return NULL;
   }
 
@@ -1611,7 +2961,6 @@ static PyObject *CownCapsule_reduce(PyObject *op, PyObject *Py_UNUSED(dummy)) {
   if (reconstructor == NULL) {
     Py_DECREF(pid_obj);
     Py_DECREF(ptr);
-    COWN_DECREF(cown);
     return NULL;
   }
 
@@ -1620,18 +2969,12 @@ static PyObject *CownCapsule_reduce(PyObject *op, PyObject *Py_UNUSED(dummy)) {
   Py_DECREF(pid_obj);
   if (args == NULL) {
     Py_DECREF(reconstructor);
-    COWN_DECREF(cown);
     return NULL;
   }
 
   PyObject *result = PyTuple_Pack(2, reconstructor, args);
   Py_DECREF(reconstructor);
   Py_DECREF(args);
-  if (result == NULL) {
-    COWN_DECREF(cown);
-    return NULL;
-  }
-
   return result;
 }
 
@@ -1646,9 +2989,53 @@ static PyMethodDef CownCapsule_methods[] = {
     {NULL} /* Sentinel */
 };
 
+/// @brief Returns whether the cown holds an unhandled exception
+/// @param op The CownCapsule object
+/// @param Py_UNUSED ignored
+/// @return True if the cown holds an exception, False otherwise
+static PyObject *CownCapsule_get_exception(PyObject *op,
+                                           void *Py_UNUSED(dummy)) {
+  CownCapsuleObject *self = (CownCapsuleObject *)op;
+
+  if (!cown_check_acquired(self->cown, true)) {
+    return NULL;
+  }
+
+  return PyBool_FromLong(self->cown->exception);
+}
+
+/// @brief Sets the exception flag on the cown
+/// @param op The CownCapsule object
+/// @param value A truthy/falsy Python object
+/// @param Py_UNUSED ignored
+/// @return 0 on success, -1 on error
+static int CownCapsule_set_exception(PyObject *op, PyObject *value,
+                                     void *Py_UNUSED(dummy)) {
+  if (value == NULL) {
+    PyErr_SetString(PyExc_TypeError, "cannot delete exception attribute");
+    return -1;
+  }
+
+  CownCapsuleObject *self = (CownCapsuleObject *)op;
+
+  if (!cown_check_acquired(self->cown, true)) {
+    return -1;
+  }
+
+  int truthy = PyObject_IsTrue(value);
+  if (truthy < 0) {
+    return -1;
+  }
+
+  self->cown->exception = (bool)truthy;
+  return 0;
+}
+
 static PyGetSetDef CownCapsule_getset[] = {
     {"value", (getter)CownCapsule_get_value, (setter)CownCapsule_set_value,
      NULL, NULL},
+    {"exception", (getter)CownCapsule_get_exception,
+     (setter)CownCapsule_set_exception, NULL, NULL},
     {"impl", (getter)CownCapsule_get_impl, NULL, NULL, NULL},
     {NULL} /* Sentinel */
 };
@@ -2049,7 +3436,7 @@ static BOCQueue *get_queue_for_tag(PyObject *tag) {
         return NULL;
       }
 
-      atomic_store(&qptr->tag, (intptr_t)qtag);
+      atomic_store_intptr(&qptr->tag, (intptr_t)qtag);
       TAG_INCREF(qtag);
       BOC_STATE->queue_tags[i] = qtag;
       TAG_INCREF(qtag);
@@ -2062,10 +3449,10 @@ static BOCQueue *get_queue_for_tag(PyObject *tag) {
       continue;
     }
 
-    BOCTag *qtag = (BOCTag *)atomic_load(&qptr->tag);
+    BOCTag *qtag = (BOCTag *)atomic_load_intptr(&qptr->tag);
     while (qtag == NULL) {
       // waiting for another interpreter to allocate and assign
-      qtag = (BOCTag *)atomic_load(&qptr->tag);
+      qtag = (BOCTag *)atomic_load_intptr(&qptr->tag);
     }
 
     BOC_STATE->queue_tags[i] = qtag;
@@ -2082,7 +3469,24 @@ static BOCQueue *get_queue_for_tag(PyObject *tag) {
     // not the right queue, keep looking
   }
 
-  // no queue for this tag
+  // No queue for this tag — dump observed slot state to stderr so that
+  // intermittent failures (e.g. memory-ordering races on weak-memory
+  // architectures) leave a forensic trail even in release builds.
+  fprintf(stderr, "[bocpy] get_queue_for_tag: no queue found for tag ");
+  PyObject_Print(tag, stderr, Py_PRINT_RAW);
+  fprintf(stderr, " (interpreter index=%" PRIdLEAST64 ")\n", BOC_STATE->index);
+  qptr = BOC_QUEUES;
+  for (size_t i = 0; i < BOC_QUEUE_COUNT; ++i, ++qptr) {
+    int_least64_t state = atomic_load(&qptr->state);
+    BOCTag *qtag = (BOCTag *)atomic_load_intptr(&qptr->tag);
+    BOCTag *cached = BOC_STATE->queue_tags[i];
+    fprintf(stderr,
+            "[bocpy]   slot %2zu: state=%" PRIdLEAST64
+            " tag=%p tag_str=%s cached=%p cached_str=%s\n",
+            i, state, (void *)qtag, qtag != NULL ? qtag->str : "(null)",
+            (void *)cached, cached != NULL ? cached->str : "(null)");
+  }
+  fflush(stderr);
   return NULL;
 }
 
@@ -2101,12 +3505,12 @@ static BOCMessage *boc_message_new(PyObject *tag, PyObject *contents) {
   BOCQueue *qptr = get_queue_for_tag(tag);
   if (qptr == NULL) {
     PyMem_RawFree(message);
-    PyErr_SetString(PyExc_KeyError,
-                    "No queue available for tag: tag capacity exceeded");
+    PyErr_Format(PyExc_KeyError,
+                 "No queue available for tag %R: tag capacity exceeded", tag);
     return NULL;
   }
 
-  BOCTag *qtag = (BOCTag *)atomic_load(&qptr->tag);
+  BOCTag *qtag = (BOCTag *)atomic_load_intptr(&qptr->tag);
   if (qtag == NULL) {
     // non-assigned tag
     message->tag = tag_from_PyUnicode(tag, qptr);
@@ -2136,6 +3540,25 @@ static BOCMessage *boc_message_new(PyObject *tag, PyObject *contents) {
 }
 
 /// @brief Enqueues a message.
+/// @details The @c boc_worker queue is a fixed-capacity ring
+/// (@c BOC_CAPACITY = 16384 slots). Reaching that bound requires more
+/// than 16k behaviors to be simultaneously runnable but not yet picked
+/// up by any worker -- in practice, only a producer scheduling against
+/// many disjoint cowns far faster than every worker can drain. MCS
+/// chaining keeps behaviors that share a cown out of the queue until
+/// their predecessor releases, so chains do not exhaust capacity.
+///
+/// On overflow this returns -1 without setting a Python exception; the
+/// caller (typically @c behavior_resolve_one) reports the error. Once
+/// a behavior's MCS chains are linked the schedule cannot be undone:
+/// the behavior may still execute later if a predecessor releases and
+/// re-tries the resolve, otherwise its cowns leak until process exit.
+/// A robust fix is a queue redesign (e.g. linked-list MPSC instead of
+/// the fixed-capacity ring) rather than the half-step of producer-side
+/// reservations -- the latter trades a never-observed failure for an
+/// audit surface that silently shrinks queue capacity on any leaked
+/// reservation. If the failure is ever observed in practice, redesign
+/// the queue.
 /// @param module the _core module
 /// @param message the message to enqueue
 /// @return 1 if the message was enqueue, 0 otherwise
@@ -2195,7 +3618,7 @@ static int_least64_t boc_dequeue(PyObject *tag, BOCMessage **message) {
 
   BOCQueue *qptr = get_queue_for_tag(tag);
   if (qptr == NULL) {
-    PyErr_SetString(PyExc_KeyError, "No message queue found for that tag");
+    PyErr_Format(PyExc_KeyError, "No message queue found for tag: %R", tag);
     return -2;
   }
 
@@ -2246,7 +3669,16 @@ static int_least64_t boc_dequeue(PyObject *tag, BOCMessage **message) {
 static double boc_now_s() {
   const double S_PER_NS = 1.0e-9;
   struct timespec ts;
+  // Prefer clock_gettime on POSIX: timespec_get requires macOS 10.15+ while
+  // Python's default macOS deployment target is older, producing an
+  // -Wunguarded-availability-new warning. clock_gettime has been available on
+  // macOS since 10.12. Windows UCRT provides timespec_get but not
+  // clock_gettime, so fall back there.
+#ifdef _WIN32
   timespec_get(&ts, TIME_UTC);
+#else
+  clock_gettime(CLOCK_REALTIME, &ts);
+#endif
   double time = (double)ts.tv_sec;
   time += ts.tv_nsec * S_PER_NS;
   return time;
@@ -2354,7 +3786,7 @@ static PyObject *receive_single_tag(PyObject *tag, bool do_timeout,
 
     // Phase 2b: Untimed — park on condvar (indefinite wait)
     if (qptr == NULL) {
-      PyErr_SetString(PyExc_KeyError, "No message queue found for that tag");
+      PyErr_Format(PyExc_KeyError, "No message queue found for tag: %R", tag);
       return NULL;
     }
 
@@ -2658,6 +4090,34 @@ PyObject *_core_drain(PyObject *module, PyObject *args) {
 /// @brief Atomic counter for BOC behaviors
 atomic_int_least64_t BOC_BEHAVIOR_COUNT = 0;
 
+// Forward declaration so BOCBehavior can hold an array of request pointers;
+// the BOCRequest struct itself is defined further down (next to the request
+// helpers).
+struct boc_request;
+
+/// @brief Encapsulates a behavior's request for a cown.
+/// @details Hoisted ahead of BOCBehavior so the latter can carry a sized
+/// array of these. The actual helpers live further down with the rest of
+/// the request lifecycle code.
+typedef struct boc_request {
+  /// @brief The cown that has been requested
+  BOCCown *target;
+  /// @brief The ID of the next behavior
+  atomic_intptr_t next;
+  /// @brief Whether the request has been scheduled
+  atomic_int_least64_t scheduled;
+  /// @brief Atomic reference count.
+  /// @details Starts at 1 (the owner @c BOCBehavior's @c requests array).
+  /// A successor that observes this request as its predecessor during
+  /// @c request_start_enqueue_inner takes a second ref *immediately
+  /// before* publishing @c prev->next, so the predecessor cannot retire
+  /// during the spin on @c prev->scheduled that follows. The owner
+  /// releases its ref from @c behavior_release_all (or @c behavior_free,
+  /// defensively); the successor releases its ref after the spin
+  /// completes. The last drop frees the struct. See @c request_decref.
+  atomic_int_least64_t rc;
+} BOCRequest;
+
 typedef struct behavior_s {
   /// @brief Resource count, set to len(args) + 1
   atomic_int_least64_t count;
@@ -2680,12 +4140,36 @@ typedef struct behavior_s {
   BOCCown **captures;
   /// @brief The number of captured variables
   Py_ssize_t captures_size;
+  /// @brief Owned, deduped, target-sorted request array.
+  /// @details Populated by BehaviorCapsule_create_requests; freed either by
+  /// behavior_release_all (the normal MCS-unlink path) or by behavior_free
+  /// (defensive fallback if the behavior is destroyed without dispatch).
+  struct boc_request **requests;
+  /// @brief Number of entries in @c requests (post-dedup, ≤ args_size + 1).
+  Py_ssize_t requests_size;
+  /// @brief Pre-built dispatch message for the BehaviorCapsule.
+  /// @details Allocated by behavior_prepare_start before the 2PL link loop,
+  /// claimed by the unique caller that observes @c count → 0 inside
+  /// behavior_resolve_one. Targets @c boc_worker directly with the bare
+  /// BehaviorCapsule as the payload. Visibility is carried by the acq-rel
+  /// fetch_sub on @c count — no separate atomic on this field is required.
+  /// Freed defensively by behavior_free if a behavior is destroyed without
+  /// dispatching.
+  struct boc_message *start_message;
 } BOCBehavior;
 
 /// @brief Capsule for holding a pointer to a behavior
 typedef struct behavior_capsule_object {
   PyObject_HEAD BOCBehavior *behavior;
 } BehaviorCapsuleObject;
+
+#define BehaviorCapsule_CheckExact(op)                                         \
+  Py_IS_TYPE((op), BOC_STATE->behavior_capsule_type)
+
+// Forward declaration: defined alongside the request helpers further down.
+// behavior_free uses it to clean up any unreleased request array if a
+// behavior is destroyed without going through behavior_release_all.
+static void request_decref(BOCRequest *request);
 
 BOCBehavior *behavior_new() {
   BOCBehavior *behavior;
@@ -2704,6 +4188,9 @@ BOCBehavior *behavior_new() {
   behavior->args = NULL;
   behavior->captures_size = 0;
   behavior->captures = NULL;
+  behavior->requests = NULL;
+  behavior->requests_size = 0;
+  behavior->start_message = NULL;
   BOC_REF_TRACKING_ADD_BEHAVIOR();
 
   return behavior;
@@ -2742,6 +4229,29 @@ void behavior_free(BOCBehavior *behavior) {
     }
 
     PyMem_RawFree(behavior->captures);
+  }
+
+  if (behavior->requests != NULL) {
+    // Defensive cleanup: if a behavior is destroyed without
+    // behavior_release_all having been called (e.g. a scheduling failure
+    // mid-2PL), drop the owner ref on each request. If a successor is
+    // still holding a concurrent ref (unlikely here since the behavior
+    // never linked), the free is deferred until that successor's decref.
+    for (Py_ssize_t i = 0; i < behavior->requests_size; ++i) {
+      if (behavior->requests[i] != NULL) {
+        request_decref(behavior->requests[i]);
+      }
+    }
+    PyMem_RawFree(behavior->requests);
+  }
+
+  if (behavior->start_message != NULL) {
+    // Defensive cleanup: prepare_start succeeded but the message was
+    // never claimed (e.g. resolve_one was never called because
+    // schedule() failed mid-link). Free the unclaimed message — it
+    // never made it onto the queue, so this is just our private
+    // allocation.
+    boc_message_free(behavior->start_message);
   }
 
   if (behavior->thunk != NULL) {
@@ -2958,87 +4468,361 @@ static int BehaviorCapsule_init(PyObject *op, PyObject *args,
 
 /// @brief Resolves a single outstanding request for this behavior.
 /// @details Called when a request is at the head of the queue for a particular
-/// cown. If this is the last request, then the thunk is scheduled.
-/// @param module the _core module
-/// @param behavior the behavior capsule
-/// @return None on success, NULL on error
-static PyObject *behavior_resolve_one(BOCBehavior *behavior) {
+/// cown. If this is the last request, then the thunk is scheduled. The unique
+/// caller that observes count -> 0 claims the pre-built start message stashed
+/// by behavior_prepare_start and enqueues it.
+/// Visibility of the start_message pointer is carried by the acq-rel
+/// fetch_sub on count -- the only writer (prepare_start) ran before the link
+/// loop began, and only one decrementer can transition to 0. This path
+/// performs no allocation and therefore cannot fail past prepare.
+///
+/// Returns @c int rather than @c PyObject* so the count > 0 path is
+/// pure-atomic and can be invoked from inside a @c Py_BEGIN_ALLOW_THREADS
+/// span (no @c Py_RETURN_NONE = no Py_None refcount touch). The only
+/// Python-state operation remaining is @c PyErr_SetString on the
+/// @c boc_enqueue-full error path; that path requires @c count == 0 which
+/// is unreachable mid link-loop because @c BehaviorCapsule_init sizes
+/// @c count to @c args_size + 2. Callers that hit the error path must hold
+/// the GIL.
+///
+/// If @c boc_enqueue overflows the @c boc_worker ring, this raises
+/// @c RuntimeError("Message queue is full"); see @c boc_enqueue for the
+/// queue-full failure mode and recovery analysis.
+/// @param behavior the behavior whose count to decrement
+/// @return 0 on success, -1 on error with a Python exception set (caller
+///         must hold the GIL on the error path)
+static int behavior_resolve_one(BOCBehavior *behavior) {
   int_least64_t count = atomic_fetch_add(&behavior->count, -1) - 1;
   if (count == 0) {
-    // send a message to the scheduler that this behavior can start
-    PyObject *contents = Py_BuildValue("(si)", "start", behavior->id);
-    if (contents == NULL) {
-      return NULL;
-    }
-
-    PyObject *tag = PyUnicode_FromString("boc_behavior");
-    if (tag == NULL) {
-      return NULL;
-    }
-
-    BOCMessage *message = boc_message_new(tag, contents);
-    Py_DECREF(contents);
-    Py_DECREF(tag);
-
+    BOCMessage *message = behavior->start_message;
+    behavior->start_message = NULL;
     if (message == NULL) {
-      return NULL;
+      // Defensive: prepare_start was never called. This should not happen
+      // on the production path; raise so the failure is loud.
+      PyErr_SetString(PyExc_RuntimeError,
+                      "behavior_resolve_one: start message not prepared");
+      return -1;
     }
 
     if (boc_enqueue(message) < 0) {
+      boc_message_free(message);
       PyErr_SetString(PyExc_RuntimeError, "Message queue is full");
-      return NULL;
+      return -1;
     }
   }
 
-  Py_RETURN_NONE;
+  return 0;
 }
 
-static PyObject *BehaviorCapsule_bid(PyObject *op, PyObject *Py_UNUSED(dummy)) {
-  BehaviorCapsuleObject *self = (BehaviorCapsuleObject *)op;
-  return PyLong_FromLongLong(self->behavior->id);
+/// @brief Pre-allocate the dispatch message for the BehaviorCapsule.
+/// @details Performs every fallible operation up front so the subsequent 2PL
+/// link loop is infallible. On success, the
+/// message is stashed on behavior->start_message and consumed by the unique
+/// caller that drives behavior->count to 0 in behavior_resolve_one. On
+/// failure, no state is published -- the caller (whencall) rolls back the
+/// terminator. Dispatch goes directly to @c boc_worker carrying the
+/// bare BehaviorCapsule (no @c ("start", ...) tuple, no central scheduler hop).
+/// @param behavior The behavior to prepare
+/// @return 0 on success, -1 on failure with a Python exception set
+static int behavior_prepare_start(BOCBehavior *behavior) {
+  if (behavior->start_message != NULL) {
+    PyErr_SetString(PyExc_RuntimeError, "behavior_prepare_start called twice");
+    return -1;
+  }
+
+  // Wrap the BOCBehavior in a fresh BehaviorCapsule. The queue's XIData
+  // layer will keep this object alive until the message is consumed.
+  PyTypeObject *type = BOC_STATE->behavior_capsule_type;
+  BehaviorCapsuleObject *capsule =
+      (BehaviorCapsuleObject *)type->tp_alloc(type, 0);
+  if (capsule == NULL) {
+    return -1;
+  }
+  capsule->behavior = behavior;
+  BEHAVIOR_INCREF(behavior);
+
+  // Dispatch the BehaviorCapsule directly to a worker. Workers match
+  // ["boc_worker", behavior] and run it. The capsule is the message
+  // payload; the queue's XIData layer keeps it alive in flight.
+  PyObject *contents = (PyObject *)capsule; // borrow the new reference
+  PyObject *tag = PyUnicode_FromString("boc_worker");
+  if (tag == NULL) {
+    Py_DECREF(capsule);
+    return -1;
+  }
+
+  BOCMessage *message = boc_message_new(tag, contents);
+  Py_DECREF(capsule);
+  Py_DECREF(tag);
+  if (message == NULL) {
+    return -1;
+  }
+
+  behavior->start_message = message;
+  return 0;
 }
 
-static PyObject *BehaviorCapsule_thunk(PyObject *op,
-                                       PyObject *Py_UNUSED(dummy)) {
-  BehaviorCapsuleObject *self = (BehaviorCapsuleObject *)op;
-  return tag_to_PyUnicode(self->behavior->thunk);
+static PyObject *request_wrap_borrowed(BOCRequest *request);
+static BOCRequest *request_new_inner(BOCCown *cown);
+static int request_release_inner(BOCRequest *request);
+static int request_start_enqueue_inner(BOCRequest *request,
+                                       BOCBehavior *behavior);
+static void request_finish_enqueue_inner(BOCRequest *request);
+
+/// @brief Comparator for qsort: order requests by target cown pointer.
+/// @param a Pointer to a BOCRequest *
+/// @param b Pointer to a BOCRequest *
+/// @return Negative / zero / positive per the cown pointer ordering
+static int request_cmp_target(const void *a, const void *b) {
+  BOCRequest *ra = *(BOCRequest *const *)a;
+  BOCRequest *rb = *(BOCRequest *const *)b;
+  if (ra->target < rb->target) {
+    return -1;
+  }
+  if (ra->target > rb->target) {
+    return 1;
+  }
+  return 0;
 }
 
-static PyObject *request_new(BOCCown *cown);
-
+/// @brief Build the deduped, target-sorted request array for this behavior.
+/// @details Allocates @c behavior->requests (owned by the BOCBehavior;
+/// freed by @c behavior_release_all on the normal path or @c behavior_free
+/// defensively) and returns a Python list of non-owning PyCapsules pointing
+/// into that array. Duplicate requests targeting the same cown are dropped
+/// and compensated for via @c behavior_resolve_one — the count was sized
+/// for the original args list and the dropped requests would never enter
+/// the MCS queue. Sorting in C ensures the Python @c Behavior.schedule()
+/// 2PL loop walks requests in deterministic cown order without a
+/// Python-level sort.
+/// @param op The BehaviorCapsule
+/// @return A list of borrowed-pointer PyCapsules in MCS-enqueue order
 static PyObject *BehaviorCapsule_create_requests(PyObject *op,
                                                  PyObject *Py_UNUSED(dummy)) {
   BehaviorCapsuleObject *self = (BehaviorCapsuleObject *)op;
   BOCBehavior *behavior = self->behavior;
 
-  PyObject *list = PyList_New(self->behavior->args_size + 1);
-  if (list == NULL) {
+  if (behavior->requests != NULL) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "create_requests called twice on the same behavior");
     return NULL;
   }
 
-  PyObject *capsule = request_new(self->behavior->result);
-  if (capsule == NULL) {
-    Py_DECREF(list);
+  Py_ssize_t max_size = behavior->args_size + 1;
+  BOCRequest **requests =
+      (BOCRequest **)PyMem_RawCalloc((size_t)max_size, sizeof(BOCRequest *));
+  if (requests == NULL) {
+    PyErr_NoMemory();
     return NULL;
   }
 
-  PyList_SET_ITEM(list, 0, capsule);
+  // Result cown always gets a request (it cannot collide with any args
+  // cown — args cowns are user-visible, the result cown is fresh).
+  BOCRequest *result_request = request_new_inner(behavior->result);
+  if (result_request == NULL) {
+    PyMem_RawFree(requests);
+    return NULL;
+  }
+  requests[0] = result_request;
+  Py_ssize_t count = 1;
 
   BOCCown **ptr = behavior->args;
-  for (Py_ssize_t i = 1; i <= self->behavior->args_size; ++i, ++ptr) {
-    capsule = request_new(*ptr);
+  for (Py_ssize_t i = 0; i < behavior->args_size; ++i, ++ptr) {
+    BOCCown *cown = *ptr;
+    // Linear dedup against the existing entries. args_size is small in
+    // practice (bounded by the cown count of a single @when call), so
+    // O(n^2) here is fine.
+    bool seen = false;
+    for (Py_ssize_t j = 1; j < count; ++j) {
+      if (requests[j]->target == cown) {
+        seen = true;
+        break;
+      }
+    }
+
+    if (seen) {
+      // Compensate behavior->count for the duplicate that won't enter
+      // the MCS queue (and therefore won't call resolve_one itself).
+      if (behavior_resolve_one(behavior) < 0) {
+        for (Py_ssize_t k = 0; k < count; ++k) {
+          request_decref(requests[k]);
+        }
+        PyMem_RawFree(requests);
+        return NULL;
+      }
+      continue;
+    }
+
+    BOCRequest *request = request_new_inner(cown);
+    if (request == NULL) {
+      for (Py_ssize_t k = 0; k < count; ++k) {
+        request_decref(requests[k]);
+      }
+      PyMem_RawFree(requests);
+      return NULL;
+    }
+    requests[count++] = request;
+  }
+
+  // Sort by target so the 2PL enqueue order is deterministic.
+  qsort(requests, (size_t)count, sizeof(BOCRequest *), request_cmp_target);
+
+  // Hand ownership of the array to the BOCBehavior.
+  behavior->requests = requests;
+  behavior->requests_size = count;
+
+  PyObject *list = PyList_New(count);
+  if (list == NULL) {
+    // Ownership has already been transferred — behavior_free (or
+    // behavior_release_all if the caller still tries to dispatch) will
+    // clean up.
+    return NULL;
+  }
+
+  for (Py_ssize_t i = 0; i < count; ++i) {
+    PyObject *capsule = request_wrap_borrowed(requests[i]);
     if (capsule == NULL) {
       Py_DECREF(list);
       return NULL;
     }
-
     PyList_SET_ITEM(list, i, capsule);
   }
 
   return list;
 }
 
-static PyObject *BehaviorCapsule_set_result(PyObject *op, PyObject *args) {
+/// @brief Release every request the behavior owns and free the array.
+/// @details Walks @c behavior->requests, calling @c request_release_inner
+/// (MCS unlink + handoff to next behavior) on each, then frees the
+/// per-request structs and the array itself. Invoked by the worker's
+/// release arm in place of the per-request Python @c Request.release loop.
+/// @param op The BehaviorCapsule whose requests should be released
+/// @return Py_None on success, NULL on error
+static PyObject *BehaviorCapsule_release_all(PyObject *op,
+                                             PyObject *Py_UNUSED(dummy)) {
+  BehaviorCapsuleObject *capsule = (BehaviorCapsuleObject *)op;
+  BOCBehavior *behavior = capsule->behavior;
+
+  if (behavior->requests == NULL) {
+    Py_RETURN_NONE;
+  }
+
+  // Detach the array from the behavior up front so behavior_free's
+  // defensive cleanup will not double-free if anything below raises.
+  BOCRequest **requests = behavior->requests;
+  Py_ssize_t requests_size = behavior->requests_size;
+  behavior->requests = NULL;
+  behavior->requests_size = 0;
+
+  for (Py_ssize_t i = 0; i < requests_size; ++i) {
+    if (request_release_inner(requests[i]) < 0) {
+      // Free the rest of the array even on error to limit the leak.
+      for (Py_ssize_t k = i; k < requests_size; ++k) {
+        request_decref(requests[k]);
+      }
+      PyMem_RawFree(requests);
+      return NULL;
+    }
+    request_decref(requests[i]);
+  }
+
+  PyMem_RawFree(requests);
+  Py_RETURN_NONE;
+}
+
+/// @brief Schedule a behavior: prepare-then-link, infallible past prepare.
+/// @details Two-phase locking entry point that consolidates create_requests,
+/// prepare_start, and the link/finish loops into one C call.
+/// All allocations happen before the first
+/// MCS link op, so failures cannot leave the cown queues in a partial
+/// state. The Python @c Behavior.schedule() collapses to a single call to
+/// this function.
+/// @param op The BehaviorCapsule to schedule
+/// @return Py_None on success, NULL on error
+static PyObject *BehaviorCapsule_schedule(PyObject *op,
+                                          PyObject *Py_UNUSED(dummy)) {
+  BehaviorCapsuleObject *capsule = (BehaviorCapsuleObject *)op;
+  BOCBehavior *behavior = capsule->behavior;
+
+  // Build the request array if it has not already been built (e.g. by an
+  // external caller having invoked create_requests first). create_requests
+  // is idempotent only via its own guard; here we just skip if populated.
+  if (behavior->requests == NULL) {
+    PyObject *list = BehaviorCapsule_create_requests(op, NULL);
+    if (list == NULL) {
+      return NULL;
+    }
+    Py_DECREF(list);
+  }
+
+  // Pre-allocate the start message. From this point onwards the link loop
+  // is infallible: no Python allocation, no callbacks.
+  if (behavior_prepare_start(behavior) < 0) {
+    return NULL;
+  }
+
+  BOCRequest **requests = behavior->requests;
+  Py_ssize_t n = behavior->requests_size;
+
+  // Drop the GIL across the pure-atomic 2PL link/finish span. The
+  // inner ops (atomic_exchange on target->last, atomic_store on prev->next,
+  // BEHAVIOR_INCREF, the spin on prev->scheduled, behavior_resolve_one's
+  // count decrement) touch no Python state. behavior_resolve_one was made
+  // int-returning specifically so it has no Py_RETURN_NONE on the hot path.
+  //
+  // The only Python-state operation reachable from the inner code is the
+  // PyErr_SetString / boc_message_free pair on the count==0 + queue-full
+  // branch. count is sized args_size + 2 by BehaviorCapsule_init, and the
+  // link loop applies at most args_size decrements, so count >= 2 on every
+  // iteration -- the count==0 branch is unreachable here. The final
+  // behavior_resolve_one below runs UNDER the GIL and may legitimately
+  // hit that branch (queue full); it remains the only PyErr surface.
+  bool ok = true;
+  Py_BEGIN_ALLOW_THREADS for (Py_ssize_t i = 0; i < n; ++i) {
+    // Phase 1: link this request into its cown's MCS queue. The only
+    // failure mode is the unreachable PyErr path documented above; if it
+    // somehow fires, surface it as a generic error after re-acquiring
+    // the GIL (we cannot raise here).
+    if (request_start_enqueue_inner(requests[i], behavior) < 0) {
+      ok = false;
+      break;
+    }
+  }
+  if (ok) {
+    // Phase 2: mark each request scheduled. Pure atomic stores; releases
+    // the spin in any successor that started linking concurrently.
+    for (Py_ssize_t i = 0; i < n; ++i) {
+      request_finish_enqueue_inner(requests[i]);
+    }
+  }
+  Py_END_ALLOW_THREADS
+
+      if (!ok) {
+    if (!PyErr_Occurred()) {
+      PyErr_SetString(PyExc_RuntimeError,
+                      "behavior_schedule: link phase failed");
+    }
+    return NULL;
+  }
+
+  // Final resolve_one to account for the +1 the constructor added so
+  // dispatch waits for the 2PL to complete (see BehaviorCapsule_init).
+  // Runs UNDER the GIL: it is the legitimate dispatcher of the start
+  // message and may set a Python exception on a queue-full failure.
+  if (behavior_resolve_one(behavior) < 0) {
+    return NULL;
+  }
+
+  Py_RETURN_NONE;
+}
+
+/// @brief Store an exception as the behavior's result
+/// @details Sets the result value and marks the exception flag. Intended for
+/// the worker exception handler.
+/// @param op The BehaviorCapsule object
+/// @param args The exception value
+/// @return Py_None on success, NULL on error
+static PyObject *BehaviorCapsule_set_exception(PyObject *op, PyObject *args) {
   PyObject *value = NULL;
 
   if (!PyArg_ParseTuple(args, "O", &value)) {
@@ -3048,17 +4832,8 @@ static PyObject *BehaviorCapsule_set_result(PyObject *op, PyObject *args) {
   BehaviorCapsuleObject *self = (BehaviorCapsuleObject *)op;
   BOCBehavior *behavior = self->behavior;
   cown_set_value(behavior->result, value);
+  behavior->result->exception = true;
   Py_RETURN_NONE;
-}
-
-/// @brief Resolves a single outstanding request for this behavior.
-/// @param module The _core module
-/// @param args The behavior capsule
-/// @return None on success, NULL on error
-static PyObject *BehaviorCapsule_resolve_one(PyObject *op,
-                                             PyObject *Py_UNUSED(dummy)) {
-  BehaviorCapsuleObject *self = (BehaviorCapsuleObject *)op;
-  return behavior_resolve_one(self->behavior);
 }
 
 static int acquire_vars(BOCCown **vars, Py_ssize_t size) {
@@ -3249,7 +5024,10 @@ static PyObject *BehaviorCapsule_execute(PyObject *op, PyObject *args) {
     result = capsule;
   }
 
+  bool is_error = false;
+
   if (result == NULL) {
+    is_error = true;
     result = PyErr_GetRaisedException();
     if (result == NULL) {
       result = PyObject_CallFunction(PyExc_RuntimeError, "s",
@@ -3258,17 +5036,18 @@ static PyObject *BehaviorCapsule_execute(PyObject *op, PyObject *args) {
   }
 
   cown_set_value(behavior->result, result);
+  if (is_error) {
+    behavior->result->exception = true;
+  }
   return behavior->result->value;
 }
 
 static PyMethodDef BehaviorCapsule_methods[] = {
-    {"bid", BehaviorCapsule_bid, METH_NOARGS, NULL},
-    {"thunk", BehaviorCapsule_thunk, METH_NOARGS, NULL},
-    {"create_requests", BehaviorCapsule_create_requests, METH_NOARGS, NULL},
-    {"resolve_one", BehaviorCapsule_resolve_one, METH_NOARGS, NULL},
-    {"set_result", BehaviorCapsule_set_result, METH_VARARGS, NULL},
+    {"set_exception", BehaviorCapsule_set_exception, METH_VARARGS, NULL},
     {"acquire", BehaviorCapsule_acquire, METH_NOARGS, NULL},
     {"release", BehaviorCapsule_release, METH_NOARGS, NULL},
+    {"release_all", BehaviorCapsule_release_all, METH_NOARGS, NULL},
+    {"schedule", BehaviorCapsule_schedule, METH_NOARGS, NULL},
     {"execute", BehaviorCapsule_execute, METH_VARARGS, NULL},
     {NULL} /* Sentinel */
 };
@@ -3287,9 +5066,6 @@ static PyType_Spec BehaviorCapsule_Spec = {
     .itemsize = 0,
     .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_IMMUTABLETYPE,
     .slots = BehaviorCapsule_slots};
-
-#define BehaviorCapsule_CheckExact(op)                                         \
-  Py_IS_TYPE((op), BOC_STATE->behavior_capsule_type)
 
 static PyObject *_new_behavior_object(XIDATA_T *xidata) {
   BOCBehavior *behavior = (BOCBehavior *)xidata->data;
@@ -3324,32 +5100,42 @@ static int _behavior_shared(
   return 0;
 }
 
-/// @brief Encapsulates a behavior's request for a cown
-typedef struct boc_request {
-  /// @brief The cown that has been requested
-  BOCCown *target;
-  /// @brief The ID of the next behavior
-  atomic_intptr_t next;
-  /// @brief Whether the request has been scheduled
-  atomic_int_least64_t scheduled;
-} BOCRequest;
-
-/// @brief Frees the request capsule
-/// @param capsule A capsule containing a request object
-void request_free(PyObject *capsule) {
-  BOCRequest *request =
-      (BOCRequest *)PyCapsule_GetPointer(capsule, "boc_request");
-  PRINTDBG("request_free(%p)\n", request);
+/// @brief Free a BOCRequest's owned references and the struct itself.
+/// @details Private to @c request_decref. Drops the cown ref taken in
+/// @c request_new_inner and the behavior ref taken when a successor was
+/// linked into @c next during @c request_start_enqueue.
+/// @param request The request to free
+static void request_free_inner(BOCRequest *request) {
+  PRINTDBG("request_free_inner(%p)\n", request);
   COWN_DECREF(request->target);
-  BOCBehavior *behavior = (BOCBehavior *)atomic_load(&request->next);
+  BOCBehavior *behavior = (BOCBehavior *)atomic_load_intptr(&request->next);
   if (behavior != NULL) {
     BEHAVIOR_DECREF(behavior);
   }
-
   PyMem_RawFree(request);
 }
 
-PyObject *request_new(BOCCown *cown) {
+/// @brief Drop one reference to a BOCRequest; free on last drop.
+/// @details Starts with the owner ref (@c rc = 1) from @c request_new_inner.
+/// A successor acquires a second ref in @c request_start_enqueue_inner
+/// before reading @c prev->scheduled, so the predecessor cannot be freed
+/// under the successor's spin. See the @c rc field comment on BOCRequest.
+/// @param request The request to decref
+static void request_decref(BOCRequest *request) {
+  int_least64_t newval = atomic_fetch_add(&request->rc, -1) - 1;
+  assert(newval >= 0);
+  if (newval == 0) {
+    request_free_inner(request);
+  }
+}
+
+/// @brief Allocate a new BOCRequest targeting @p cown.
+/// @details Increments the cown's refcount; the request takes ownership of
+/// that reference until @c request_free_inner releases it. Starts with
+/// refcount 1 (the owner ref held by the behavior's @c requests array).
+/// @param cown The cown the request targets
+/// @return A new BOCRequest, or NULL on allocation failure
+static BOCRequest *request_new_inner(BOCCown *cown) {
   BOCRequest *request = (BOCRequest *)PyMem_RawMalloc(sizeof(BOCRequest));
   if (request == NULL) {
     PyErr_NoMemory();
@@ -3357,142 +5143,109 @@ PyObject *request_new(BOCCown *cown) {
   }
 
   request->target = cown;
-  PRINTDBG("request_new(%p)\n", request);
+  PRINTDBG("request_new_inner(%p)\n", request);
   COWN_INCREF(cown);
   request->next = 0;
   request->scheduled = 0;
-  PyObject *capsule =
-      PyCapsule_New((void *)request, "boc_request", request_free);
-  if (capsule == NULL) {
-    COWN_DECREF(cown);
-    return NULL;
-  }
-
-  return capsule;
+  atomic_store(&request->rc, 1);
+  return request;
 }
 
-/// @brief Creates a request for a cown.
-/// @param module The _core module
-/// @param args The CownCapsule object
-/// @return A capsule containing the request
-static PyObject *request_create(PyObject *module, PyObject *args) {
-  BOC_STATE_SET(module);
-
-  PyObject *op;
-
-  if (!PyArg_ParseTuple(args, "O", &op)) {
-    return NULL;
-  }
-
-  BOCCown *cown = cown_unwrap(op);
-  if (cown == NULL) {
-    return NULL;
-  }
-
-  return request_new(cown);
+/// @brief Wrap an existing BOCRequest in a non-owning PyCapsule.
+/// @details The capsule shares the BOCRequest pointer with the C array on
+/// the owning BOCBehavior. The destructor is NULL — the C array is
+/// responsible for freeing the request via @c behavior_release_all.
+/// @param request The request to wrap
+/// @return A new PyCapsule, or NULL on error
+static PyObject *request_wrap_borrowed(BOCRequest *request) {
+  return PyCapsule_New((void *)request, "boc_request", NULL);
 }
 
-/// @brief Unwraps a request from its capsule.
-/// @param op The Capsule object
-/// @return a reference to a request, or NULL if there was an error
-static BOCRequest *request_unwrap(PyObject *op) {
-  if (!PyCapsule_CheckExact(op)) {
-    PyErr_SetString(PyExc_ValueError, "Expected a capsule");
-    return NULL;
-  }
-
-  return (BOCRequest *)PyCapsule_GetPointer(op, "boc_request");
-}
-
-// Release the cown to the next behavior.
-// This is called when the associated behavior has completed, and thus can
-// allow any waiting behavior to run.
-// If there is no next behavior, then the cown's `last` pointer is set to null.
-
-/// @brief Release the cown to the next behavior.
-/// @details This is called when the associated behavior has completed, and thus
-/// can allow any waiting behavior to run. If there is no next behavior, then
-/// the cown's `last` pointer is set to null.
-/// @param module The _core module
-/// @param args The request to release
-/// @return None if successful, NULL otherwise
-static PyObject *request_release(PyObject *module, PyObject *args) {
-  BOC_STATE_SET(module);
-
-  PyObject *op;
-
-  if (!PyArg_ParseTuple(args, "O", &op)) {
-    return NULL;
-  }
-
-  BOCRequest *request = request_unwrap(op);
-  if (request == NULL) {
-    return NULL;
-  }
-
+/// @brief Release a single request, walking the MCS queue to hand off.
+/// @details Called by @c behavior_release_all on every request in the
+/// behavior's owned array. The request struct itself is NOT freed here —
+/// the caller frees the array as a whole afterwards.
+/// @param request The request to release
+/// @return 0 on success, -1 on error (Python exception set)
+static int request_release_inner(BOCRequest *request) {
   // This code is effectively a MCS-style queue lock release.
-  BOCBehavior *next = (BOCBehavior *)atomic_load(&request->next);
+  BOCBehavior *next = (BOCBehavior *)atomic_load_intptr(&request->next);
   if (next == NULL) {
     intptr_t expected_ptr = (intptr_t)request;
-    if (atomic_compare_exchange_strong(&request->target->last, &expected_ptr,
-                                       0)) {
-      Py_RETURN_NONE;
+    if (atomic_compare_exchange_strong_intptr(&request->target->last,
+                                              &expected_ptr, 0)) {
+      return 0;
     }
   }
 
-  // Wait for the next pointer to be set. The target.last != this request
-  // so this should not take long.
-
-  while (true) {
-    next = (BOCBehavior *)atomic_load(&request->next);
+  // Wait for the next pointer to be set by a successor's
+  // request_start_enqueue_inner. Release the GIL across the spin: the
+  // successor is advancing on another thread, may itself be under
+  // Py_BEGIN_ALLOW_THREADS (see BehaviorCapsule_schedule's link loop),
+  // and should not be blocked here. target->last has already been set
+  // past this request by the successor, so this spin terminates as
+  // soon as the successor's `atomic_store(&prev->next, behavior_ptr)`
+  // is visible. The spin is therefore bounded by another thread's
+  // atomic store; if it failed to terminate the runtime invariants
+  // would already be violated, so there is no useful interrupt to
+  // poll for here.
+  Py_BEGIN_ALLOW_THREADS while (true) {
+    next = (BOCBehavior *)atomic_load_intptr(&request->next);
     if (next) {
       break;
     }
   }
+  Py_END_ALLOW_THREADS
 
-  return behavior_resolve_one(next);
+      if (behavior_resolve_one(next) < 0) {
+    return -1;
+  }
+  return 0;
 }
 
-/// @brief Enqueues this request on the cown
-/// @param module The _core module
-/// @param args The request to enqueue, and the associated behavior
-/// @return None if successful, NULL otherwise
-static PyObject *request_start_enqueue(PyObject *module, PyObject *args) {
-  BOC_STATE_SET(module);
+/// @brief Release the cown to the next behavior.
+/// @details The public release entry point is @c behavior_release_all; the
+/// @c request_release_inner helper above is what walks the MCS queue.
 
-  PyObject *op;
-  PyObject *behavior_op;
-
-  if (!PyArg_ParseTuple(args, "OO", &op, &behavior_op)) {
-    return NULL;
-  }
-
-  BOCRequest *request = request_unwrap(op);
-  if (request == NULL) {
-    return NULL;
-  }
-
-  if (!BehaviorCapsule_CheckExact(behavior_op)) {
-    PyErr_SetString(PyExc_TypeError, "Expected a BehaviorCapsule object");
-    return NULL;
-  }
-
-  BehaviorCapsuleObject *behavior_capsule =
-      (BehaviorCapsuleObject *)behavior_op;
-  BOCBehavior *behavior = behavior_capsule->behavior;
-
+/// @brief Enqueue body called by @c behavior_schedule.
+/// @details Pure C, no Python allocation, no exception. The only failure
+/// surface is propagated by behavior_resolve_one (which can fail if the
+/// queue is full); we return its NULL/non-NULL via int. Callers that have
+/// already pre-allocated the start message via behavior_prepare_start can
+/// treat this as infallible from the link-loop perspective.
+/// @param request The request to enqueue
+/// @param behavior The behavior owning the request
+/// @return 0 on success, -1 on error with a Python exception set
+static int request_start_enqueue_inner(BOCRequest *request,
+                                       BOCBehavior *behavior) {
   intptr_t request_ptr = (intptr_t)request;
-  intptr_t prev_ptr = atomic_exchange(&request->target->last, request_ptr);
+  intptr_t prev_ptr =
+      atomic_exchange_intptr(&request->target->last, request_ptr);
   if (prev_ptr == 0) {
     // there is no prior request queued on the cown, so we can immediately
     // proceed
-    return behavior_resolve_one(behavior);
+    if (behavior_resolve_one(behavior) < 0) {
+      return -1;
+    }
+    return 0;
   }
 
   intptr_t behavior_ptr = (intptr_t)behavior;
   BOCRequest *prev = (BOCRequest *)prev_ptr;
-  assert(atomic_load(&prev->next) == 0);
-  atomic_store(&prev->next, behavior_ptr);
+  // Take a temporary ref on the predecessor request: we are about to
+  // spin on prev->scheduled below, and prev's owning behavior can run
+  // release_all concurrently once we have stored prev->next. Without
+  // this ref, the predecessor could be freed between our store of
+  // prev->next and our next load of prev->scheduled -- a UAF the
+  // distributed-release design must guard against because release runs
+  // on the worker thread, not on the same thread as the link loop. The
+  // matching decref happens after the spin completes. At the moment of
+  // the fetch_add, prev is still in
+  // the MCS queue for this cown (our exchange on target->last showed
+  // prev_ptr there), so prev cannot have been freed yet.
+  atomic_fetch_add(&prev->rc, 1);
+  assert(atomic_load_intptr(&prev->next) == 0);
+  atomic_store_intptr(&prev->next, behavior_ptr);
   PRINTDBG("request->next = bid=%" PRIdLEAST64 "\n", behavior->id);
   BEHAVIOR_INCREF(behavior);
   // wait for the previous request to be scheduled
@@ -3501,48 +5254,23 @@ static PyObject *request_start_enqueue(PyObject *module, PyObject *args) {
       break;
     }
   }
+  // Drop the temporary ref; this may be the final ref if the
+  // predecessor's owner has already run release_all.
+  request_decref(prev);
 
-  Py_RETURN_NONE;
+  return 0;
 }
 
-/// @brief Finalises the scheduling of the request.
-/// @param module The _core module
-/// @param args The request
-/// @return None if successful, NULL otherwise
-static PyObject *request_finish_enqueue(PyObject *module, PyObject *args) {
-  PyObject *op;
-
-  if (!PyArg_ParseTuple(args, "O", &op)) {
-    return NULL;
-  }
-
-  BOCRequest *request = request_unwrap(op);
-  if (request == NULL) {
-    return NULL;
-  }
-
+/// @brief Atomic-only finish of the second 2PL phase.
+/// @details Releases the spin in @c request_start_enqueue_inner waiting on
+/// the predecessor's scheduled flag. Pure atomic store, infallible.
+/// @param request The request to mark scheduled
+static void request_finish_enqueue_inner(BOCRequest *request) {
   atomic_exchange(&request->scheduled, true);
-
-  Py_RETURN_NONE;
-}
-
-static PyObject *request_target(PyObject *module, PyObject *args) {
-  PyObject *op;
-
-  if (!PyArg_ParseTuple(args, "O", &op)) {
-    return NULL;
-  }
-
-  BOCRequest *request = request_unwrap(op);
-  if (request == NULL) {
-    return NULL;
-  }
-
-  return PyLong_FromVoidPtr((void *)request->target);
 }
 
 /// @brief Whether this module is the "primary" module, i.e. the one owned by
-/// the scheduler.
+/// the main interpreter that drives runtime lifecycle.
 /// @param module The module to check
 /// @param Py_UNUSED
 /// @return Whether this is the primary module
@@ -3629,7 +5357,8 @@ static PyObject *_core_set_tags(PyObject *module, PyObject *args) {
 
     if (i >= tags_size) {
       // clear the tags on these unused queues
-      BOCTag *oldtag = (BOCTag *)atomic_exchange(&qptr->tag, (intptr_t)NULL);
+      BOCTag *oldtag =
+          (BOCTag *)atomic_exchange_intptr(&qptr->tag, (intptr_t)NULL);
       if (oldtag != NULL) {
         tag_disable(oldtag);
         TAG_DECREF(oldtag);
@@ -3652,7 +5381,8 @@ static PyObject *_core_set_tags(PyObject *module, PyObject *args) {
     }
 
     // assign a new tag
-    BOCTag *oldtag = (BOCTag *)atomic_exchange(&qptr->tag, (intptr_t)qtag);
+    BOCTag *oldtag =
+        (BOCTag *)atomic_exchange_intptr(&qptr->tag, (intptr_t)qtag);
     TAG_INCREF(qtag);
     if (oldtag != NULL) {
       tag_disable(oldtag);
@@ -3739,17 +5469,95 @@ static PyObject *_cown_capsule_from_pointer(PyObject *module, PyObject *args) {
     return NULL;
   }
 
-  // manually allocate without cown_capsule_wrap to avoid double INCREF;
-  // inherits the pin from __reduce__
+  // Take a fresh strong reference for this capsule. Each unpickle is an
+  // independent live reference to the BOCCown; the dealloc path does the
+  // matching COWN_DECREF. The caller must guarantee the BOCCown is still
+  // alive at this point (see CownCapsule_reduce for the contract).
   PyTypeObject *type = BOC_STATE->cown_capsule_type;
   CownCapsuleObject *capsule = (CownCapsuleObject *)type->tp_alloc(type, 0);
   if (capsule == NULL) {
-    COWN_DECREF(cown);
     return NULL;
   }
 
+  COWN_INCREF(cown);
   capsule->cown = cown;
   return (PyObject *)capsule;
+}
+
+/// @brief Pre-pin a list of CownCapsules and return their pointers as ints.
+/// @details Used by the Python @c notice_write helper to keep every
+/// BOCCown reachable from a noticeboard value alive across the message
+/// queue's pickle/unpickle gap. The writer thread calls this **before**
+/// sending the noticeboard_write message; the returned integer pointers
+/// are sent as part of the message and consumed by
+/// @ref nb_pin_cowns (which transfers ownership into the noticeboard
+/// entry without an extra INCREF). Without this, every CownCapsule in
+/// the value would be reduced to a bare pointer at pickle-time, the
+/// writer behavior would return and drop its CownCapsule wrappers, the
+/// underlying BOCCowns would be freed to recycle memory, and the
+/// receiving worker would unpickle and INCREF dangling pointers.
+/// @param module Unused
+/// @param args Tuple of (pins: sequence of CownCapsule)
+/// @return A new Python list of int (BOCCown* cast to integer) on success,
+///   NULL on error. On error every INCREF taken so far is rolled back.
+static PyObject *_core_cown_pin_pointers(PyObject *module, PyObject *args) {
+  BOC_STATE_SET(module);
+
+  PyObject *seq_arg;
+  if (!PyArg_ParseTuple(args, "O", &seq_arg)) {
+    return NULL;
+  }
+
+  PyObject *seq =
+      PySequence_Fast(seq_arg, "cown_pin_pointers requires a sequence");
+  if (seq == NULL) {
+    return NULL;
+  }
+
+  Py_ssize_t n = PySequence_Fast_GET_SIZE(seq);
+  PyObject *result = PyList_New(n);
+  if (result == NULL) {
+    Py_DECREF(seq);
+    return NULL;
+  }
+
+  PyTypeObject *capsule_type = BOC_STATE->cown_capsule_type;
+  Py_ssize_t i = 0;
+  for (; i < n; i++) {
+    PyObject *item = PySequence_Fast_GET_ITEM(seq, i);
+    if (!PyObject_TypeCheck(item, capsule_type)) {
+      PyErr_SetString(PyExc_TypeError,
+                      "cown_pin_pointers requires CownCapsule objects");
+      goto fail;
+    }
+    BOCCown *cown = ((CownCapsuleObject *)item)->cown;
+    COWN_INCREF(cown);
+    PyObject *ptr = PyLong_FromVoidPtr(cown);
+    if (ptr == NULL) {
+      // Roll back the ref we just took before joining the cleanup loop.
+      COWN_DECREF(cown);
+      goto fail;
+    }
+    PyList_SET_ITEM(result, i, ptr); // steals ref
+  }
+
+  Py_DECREF(seq);
+  return result;
+
+fail:
+  // Drop INCREFs for entries we already pre-pinned (indices 0..i-1).
+  for (Py_ssize_t j = 0; j < i; j++) {
+    PyObject *ptr_obj = PyList_GET_ITEM(result, j);
+    BOCCown *c = (BOCCown *)PyLong_AsVoidPtr(ptr_obj);
+    if (c != NULL) {
+      COWN_DECREF(c);
+    } else {
+      PyErr_Clear();
+    }
+  }
+  Py_DECREF(result);
+  Py_DECREF(seq);
+  return NULL;
 }
 
 static PyMethodDef _core_module_methods[] = {
@@ -3761,11 +5569,6 @@ static PyMethodDef _core_module_methods[] = {
      "Receives a message."},
     {"drain", _core_drain, METH_VARARGS,
      "drain($module, tags, /)\n--\n\nDrains all messages for the given tags."},
-    {"request_create", request_create, METH_VARARGS, NULL},
-    {"request_release", request_release, METH_VARARGS, NULL},
-    {"request_start_enqueue", request_start_enqueue, METH_VARARGS, NULL},
-    {"request_finish_enqueue", request_finish_enqueue, METH_VARARGS, NULL},
-    {"request_target", request_target, METH_VARARGS, NULL},
     {"is_primary", _core_is_primary, METH_NOARGS, NULL},
     {"index", _core_index, METH_NOARGS, NULL},
     {"recycle", _core_recycle, METH_NOARGS, NULL},
@@ -3774,6 +5577,68 @@ static PyMethodDef _core_module_methods[] = {
      "set_tags($module, tags, /)\n--\n\nAssigns tags to message queues."},
     {"_cown_capsule_from_pointer", _cown_capsule_from_pointer, METH_VARARGS,
      NULL},
+    {"cown_pin_pointers", _core_cown_pin_pointers, METH_VARARGS,
+     "cown_pin_pointers($module, pins, /)\n--\n\n"
+     "INCREF each CownCapsule and return raw pointer ints (transfers refs)."},
+    {"noticeboard_write_direct", _core_noticeboard_write_direct, METH_VARARGS,
+     "noticeboard_write_direct($module, key, value, /)"
+     "\n--\n\nWrites a key-value pair to the noticeboard."},
+    {"noticeboard_snapshot", _core_noticeboard_snapshot, METH_NOARGS,
+     "noticeboard_snapshot($module, /)"
+     "\n--\n\nReturns a cached snapshot of the noticeboard as a dict."},
+    {"noticeboard_clear", _core_noticeboard_clear, METH_NOARGS,
+     "noticeboard_clear($module, /)"
+     "\n--\n\nClears all noticeboard entries."},
+    {"noticeboard_delete", _core_noticeboard_delete, METH_VARARGS,
+     "noticeboard_delete($module, key, /)"
+     "\n--\n\nDeletes a single noticeboard entry by key."},
+    {"noticeboard_cache_clear", _core_noticeboard_cache_clear, METH_NOARGS,
+     "noticeboard_cache_clear($module, /)"
+     "\n--\n\nClears the thread-local snapshot cache."},
+    {"noticeboard_version", _core_noticeboard_version, METH_NOARGS,
+     "noticeboard_version($module, /)"
+     "\n--\n\nReturns the global noticeboard version counter."},
+    {"set_noticeboard_thread", _core_set_noticeboard_thread, METH_NOARGS,
+     "set_noticeboard_thread($module, /)"
+     "\n--\n\nRegisters the calling thread as the noticeboard mutator "
+     "thread."},
+    {"clear_noticeboard_thread", _core_clear_noticeboard_thread, METH_NOARGS,
+     "clear_noticeboard_thread($module, /)"
+     "\n--\n\nClears the registered noticeboard mutator thread."},
+    {"notice_sync_request", _core_notice_sync_request, METH_NOARGS,
+     "notice_sync_request($module, /)"
+     "\n--\n\nAllocates a fresh notice_sync sequence number."},
+    {"notice_sync_complete", _core_notice_sync_complete, METH_VARARGS,
+     "notice_sync_complete($module, seq, /)"
+     "\n--\n\nMarks a notice_sync sequence as processed and wakes waiters."},
+    {"notice_sync_wait", _core_notice_sync_wait, METH_VARARGS,
+     "notice_sync_wait($module, seq, timeout, /)"
+     "\n--\n\nBlocks until the given notice_sync sequence is processed."},
+    {"terminator_inc", _core_terminator_inc, METH_NOARGS,
+     "terminator_inc($module, /)"
+     "\n--\n\nIncrement the terminator. Returns new count or -1 if closed."},
+    {"terminator_dec", _core_terminator_dec, METH_NOARGS,
+     "terminator_dec($module, /)"
+     "\n--\n\nDecrement the terminator. Wakes terminator_wait on 0."},
+    {"terminator_close", _core_terminator_close, METH_NOARGS,
+     "terminator_close($module, /)"
+     "\n--\n\nMark the terminator closed; future terminator_inc returns -1."},
+    {"terminator_wait", _core_terminator_wait, METH_VARARGS,
+     "terminator_wait($module, timeout, /)"
+     "\n--\n\nBlock until the terminator count reaches 0 or timeout."},
+    {"terminator_seed_dec", _core_terminator_seed_dec, METH_NOARGS,
+     "terminator_seed_dec($module, /)"
+     "\n--\n\nIdempotent one-shot decrement of the Pyrona seed."},
+    {"terminator_reset", _core_terminator_reset, METH_NOARGS,
+     "terminator_reset($module, /)"
+     "\n--\n\nRestore terminator state for a fresh runtime start. "
+     "Returns the prior (count, seeded) for drift detection."},
+    {"terminator_count", _core_terminator_count, METH_NOARGS,
+     "terminator_count($module, /)"
+     "\n--\n\nRead the current terminator count."},
+    {"terminator_seeded", _core_terminator_seeded, METH_NOARGS,
+     "terminator_seeded($module, /)"
+     "\n--\n\nRead the current terminator SEEDED flag."},
     {NULL} /* Sentinel */
 };
 
@@ -3800,11 +5665,29 @@ static int _core_module_exec(PyObject *module) {
     queue_stub->head = 0;
     queue_stub->tail = NULL;
     queue_stub->next = 0;
-    atomic_store(&BOC_RECYCLE_QUEUE_HEAD, (intptr_t)queue_stub);
+    atomic_store_intptr(&BOC_RECYCLE_QUEUE_HEAD, (intptr_t)queue_stub);
     BOC_RECYCLE_QUEUE_TAIL = queue_stub;
 
+    // Initialize the noticeboard
+    memset(&NB, 0, sizeof(NB));
+    boc_mtx_init(&NB.mutex);
+
+    // Initialize the notice_sync barrier primitives.
+    boc_mtx_init(&NB_SYNC_MUTEX);
+    cnd_init(&NB_SYNC_COND);
+
+    // Initialize the terminator primitives.
+    // The Pyrona seed (count=1, seeded=1) is set by terminator_reset()
+    // when the runtime starts; here we only initialize the kernel objects.
+    boc_mtx_init(&TERMINATOR_MUTEX);
+    cnd_init(&TERMINATOR_COND);
+
 #ifdef BOC_REF_TRACKING
+#ifdef _WIN32
     timespec_get(&BOC_LAST_REF_TRACKING_REPORT, TIME_UTC);
+#else
+    clock_gettime(CLOCK_REALTIME, &BOC_LAST_REF_TRACKING_REPORT);
+#endif
 #endif
   }
 
@@ -3886,6 +5769,9 @@ static int _core_module_clear(PyObject *module) {
   Py_CLEAR(state->behavior_capsule_type);
   // this needs to be cleared here, as it was allocated on this interpreter.
   Py_CLEAR(state->recycle_queue->xidata_to_cowns);
+  // Clear the thread-local snapshot cache so the GC can collect any
+  // reference cycles anchored through the cached dict / proxy.
+  nb_drop_local_cache();
   return 0;
 }
 
@@ -3916,14 +5802,14 @@ void _core_module_free(void *module_ptr) {
       boc_park_destroy(qptr);
 
       if (atomic_load(&qptr->state) == BOC_QUEUE_ASSIGNED) {
-        BOCTag *qtag = (BOCTag *)atomic_load(&qptr->tag);
+        BOCTag *qtag = (BOCTag *)atomic_load_intptr(&qptr->tag);
         assert(qtag->queue == qptr);
         BOCTag_free(qtag);
       }
     }
 
     BOCRecycleQueue *queue = (BOCRecycleQueue *)BOC_RECYCLE_QUEUE_TAIL;
-    while (atomic_load(&queue->next) != 0) {
+    while (atomic_load_intptr(&queue->next) != 0) {
       BOCRecycleQueue *next = (BOCRecycleQueue *)queue->next;
       BOCRecycleQueue_free(queue);
       queue = next;
@@ -3931,7 +5817,32 @@ void _core_module_free(void *module_ptr) {
 
     BOCRecycleQueue_free(queue);
     BOC_RECYCLE_QUEUE_TAIL = NULL;
-    atomic_store(&BOC_RECYCLE_QUEUE_HEAD, 0);
+    atomic_store_intptr(&BOC_RECYCLE_QUEUE_HEAD, 0);
+
+    // Clear the thread-local snapshot cache before freeing entries
+    Py_CLEAR(NB_SNAPSHOT_CACHE);
+
+    // Collect noticeboard entries to free after releasing the mutex.
+    XIDATA_T *nb_to_free[NB_MAX_ENTRIES];
+    int nb_to_free_count = 0;
+
+    mtx_lock(&NB.mutex);
+    for (int i = 0; i < NB.count; i++) {
+      if (NB.entries[i].value != NULL) {
+        nb_to_free[nb_to_free_count++] = NB.entries[i].value;
+        NB.entries[i].value = NULL;
+      }
+    }
+    NB.count = 0;
+    mtx_unlock(&NB.mutex);
+
+    for (int i = 0; i < nb_to_free_count; i++) {
+      XIDATA_FREE(nb_to_free[i]);
+    }
+
+    // Destroy noticeboard mutex
+    mtx_destroy(&NB.mutex);
+
     BOC_REF_TRACKING_REPORT();
   }
 

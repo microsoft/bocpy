@@ -62,7 +62,7 @@ jobs:
         run: pip install -e .[test] --verbose
 
       - name: Python test
-        run: pytest -vv
+        run: pytest -vv -s
 
   windows:
     runs-on: windows-latest
@@ -86,7 +86,7 @@ jobs:
         run: pip install -e .[test] --verbose
 
       - name: Python test
-        run: pytest -vv
+        run: pytest -vv -s
 
   macos-arm64:
     runs-on: macos-latest
@@ -110,7 +110,7 @@ jobs:
         run: pip install -e .[test] --verbose
 
       - name: Python test
-        run: pytest -vv
+        run: pytest -vv -s
 
   macos-x86_64:
     runs-on: macos-15-intel
@@ -134,7 +134,7 @@ jobs:
         run: pip install -e .[test] --verbose
 
       - name: Python test
-        run: pytest -vv
+        run: pytest -vv -s
 
   free-threaded:
     runs-on: ubuntu-latest
@@ -168,7 +168,7 @@ jobs:
         with:
           max_attempts: 3
           timeout_minutes: 10
-          command: pytest -vv
+          command: pytest -vv -s
 
   asan:
     runs-on: ubuntu-latest
@@ -218,4 +218,4 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
           source "$RUNNER_TEMP/asan-venv/bin/activate"
-          pytest -vv
+          pytest -vv -s

@@ -42,6 +42,10 @@ Gather the full content of the target so it can be passed to the reviewer.
 
 ### 2. Spawn Reviewer Subagent
 
+If a specific lens is requested (e.g., `correctness-lens`, `security-lens`,
+`adversarial-lens`, etc.), use that named lens agent operating in **review
+mode**. Otherwise, use a generic reviewer.
+
 Launch a subagent with the following prompt structure:
 
 > You are a code reviewer performing a thorough review of the following target.

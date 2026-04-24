@@ -77,16 +77,16 @@ class BOCModuleTransformer(ast.NodeTransformer):
     def visit_Import(self, node: ast.Import):  # noqa: N802
         """Record imported names and keep the node."""
         for name in node.names:
-            self.imports.add(name.name)
+            self.imports.add(name.asname if name.asname else name.name)
 
         return node
 
     def visit_ImportFrom(self, node: ast.ImportFrom):  # noqa: N802
         """Record imported names and ensure whencall is available."""
         for name in node.names:
-            self.imports.add(name.name)
+            self.imports.add(name.asname if name.asname else name.name)
 
-        if node.module == "bocpy" and "whencall" not in node.names:
+        if node.module == "bocpy" and not any((a.asname or a.name) == "whencall" for a in node.names):
             node.names.append(ast.alias(name="whencall"))
             self.imports.add("whencall")
 
@@ -207,7 +207,9 @@ class WhenTransformer(ast.NodeTransformer):
         # no longer function properly.
         self.cap_finder.clear()
         self.cap_finder.visit(behavior_node)
-        captures = list(self.cap_finder.captured_vars)
+        # __file__ is rewritten to a string constant by visit_Name below,
+        # so it must not be added to the parameter list as a capture.
+        captures = [c for c in self.cap_finder.captured_vars if c != "__file__"]
 
         # add the additional arguments to the function
         for name in captures:
@@ -248,6 +250,16 @@ ExportResult = NamedTuple("ExportResult", [("code", str), ("classes", Set[str]),
                                            ("behaviors", Mapping[int, BehaviorInfo])])
 
 
+# Module-level dunders (__name__, __doc__, __package__, __spec__, __loader__)
+# are exposed via __builtins__, but inside a behavior they should refer to the
+# *user* module's value, not the worker's exported module. Removing them from
+# `known_vars` lets the capture mechanism pick them up from the call-site
+# frame's globals at runtime. __file__ is handled separately via inlining in
+# WhenTransformer.visit_Name.
+MODULE_DUNDERS = {"__name__", "__doc__", "__package__",
+                  "__spec__", "__loader__"}
+
+
 def export_module(tree: ast.Module, path: str = None) -> ExportResult:
     """Extract an AST as a BOC-enlightened module with generated behaviors.
 
@@ -256,7 +268,7 @@ def export_module(tree: ast.Module, path: str = None) -> ExportResult:
     :return: An export result with code and metadata
     :rtype: ExportResult
     """
-    builtins = set(globals()["__builtins__"].keys())
+    builtins = set(globals()["__builtins__"].keys()) - MODULE_DUNDERS
 
     boc_export = BOCModuleTransformer()
     boc_export.visit(tree)

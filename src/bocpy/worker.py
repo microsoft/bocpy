@@ -38,17 +38,67 @@ boc_export = None
 
 
 def run_behavior(behavior):
-    """Execute a single behavior and notify the scheduler."""
-    bid = behavior.bid()
-    behavior.acquire()
+    """Execute a single behavior and release its requests inline."""
     try:
-        behavior.execute(boc_export)
-    except Exception as ex:
-        logger.exception(ex)
-        behavior.set_result(ex)
+        try:
+            _core.noticeboard_cache_clear()
+            behavior.acquire()
+        except Exception as ex:
+            # acquire() / cache_clear() failed before the body ran. The
+            # MCS chain for this behavior is still linked (behavior_schedule
+            # established the links on the caller thread), so we must
+            # unwind it here or every successor blocks forever. Mark
+            # the result Cown with the exception so any caller awaiting
+            # it sees a diagnostic instead of a permanent None.
+            logger.exception(ex)
+            try:
+                behavior.set_exception(ex)
+            except Exception as inner:
+                logger.exception(inner)
+            # acquire() is sequential (result -> args -> captures) and
+            # bails on first failure, so on a partial-success raise some
+            # cowns are owned by this worker and some are not. release()
+            # is similarly tolerant (it short-circuits NO_OWNER cowns),
+            # so calling it here releases the ones we did acquire before
+            # release_all hands the request to a successor. Without this
+            # the successor's cown_acquire fails with "already acquired
+            # by <this interp>" and every behavior on that cown strands.
+            try:
+                behavior.release()
+            except Exception as inner:
+                logger.exception(inner)
+            try:
+                behavior.release_all()
+            except Exception as inner:
+                logger.exception(inner)
+            return
 
-    behavior.release()
-    send("boc_behavior", ("release", bid))
+        try:
+            behavior.execute(boc_export)
+        except Exception as ex:
+            logger.exception(ex)
+            behavior.set_exception(ex)
+
+        try:
+            behavior.release()
+        except Exception as ex:
+            logger.exception(ex)
+        # Release the request array on the worker thread instead of
+        # round-tripping ("release", capsule) through the (now-gone)
+        # central scheduler thread.
+        try:
+            behavior.release_all()
+        except Exception as ex:
+            logger.exception(ex)
+    finally:
+        # Drop the terminator hold unconditionally. If anything above
+        # raised, failing to decrement here would leave wait() hung
+        # forever. Log and swallow so a single misbehaving worker step
+        # cannot strand the runtime.
+        try:
+            _core.terminator_dec()
+        except Exception as ex:
+            logger.exception(ex)
 
 
 def do_work():
@@ -58,19 +108,36 @@ def do_work():
         logger.debug("worker starting")
         send("boc_behavior", "started")
         while running:
-            match receive("boc_worker"):
-                case ["boc_worker", "shutdown"]:
-                    logger.debug("boc_worker/shutdown")
-                    running = False
+            try:
+                match receive("boc_worker"):
+                    case ["boc_worker", "shutdown"]:
+                        logger.debug("boc_worker/shutdown")
+                        running = False
 
-                case ["boc_worker", behavior]:
-                    run_behavior(behavior)
-                    behavior = None
+                    case ["boc_worker", behavior]:
+                        run_behavior(behavior)
+                        behavior = None
+            except Exception as ex:
+                # A failure inside run_behavior or receive must not
+                # break the loop -- if it did, this worker would exit
+                # without sending its "shutdown" reply and stop_workers
+                # would block forever waiting for it.
+                logger.exception(ex)
 
         logger.debug("worker stopped")
-        send("boc_behavior", "shutdown")
     except Exception as ex:
         logger.exception(ex)
+    finally:
+        # Always tell stop_workers we are leaving the loop, even on an
+        # unexpected exception, so it never hangs in receive("boc_behavior").
+        try:
+            send("boc_behavior", "shutdown")
+        except Exception as ex:
+            logger.exception(ex)
+        try:
+            _core.noticeboard_cache_clear()
+        except Exception as ex:
+            logger.exception(ex)
 
 
 def cleanup():

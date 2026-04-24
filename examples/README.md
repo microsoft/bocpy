@@ -45,6 +45,15 @@ tens of thousands of behaviors and cowns every second. Lots of thanks to
 [Ben Eater's Boids repo](https://github.com/beneater/boids.git), which proved
 a helpful starting point.
 
+## [Prime Factor](prime_factor.py)
+This example generates a semiprime (a product of two primes) and then factors it
+in parallel using multiple search lanes. Each lane is a chain of small behaviors
+that check the [noticeboard](http://microsoft.github.io/bocpy/sphinx/api.html#bocpy.noticeboard)
+for a result before doing a batch of trial divisions. When any lane finds a
+factor it writes to the noticeboard, and the remaining lanes see the result on
+their next check and stop early. Demonstrates the "behavior loop" pattern and
+cross-behavior coordination via the noticeboard.
+
 ## Send/Receive
 In addition to exposing the higher-level behavior primitives (*i.e.*,
 `when`, `Cown`, `wait`), the library also exposes the lower-level functions

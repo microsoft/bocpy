@@ -1,3 +1,95 @@
+## 2026-04-17 - Version 0.4.0
+Noticeboard, distributed scheduler, and a relocated examples package.
+
+**New Features**
+
+- **Noticeboard** — a shared key-value store (up to 64 keys) that
+  behaviors can read and write without acquiring cowns. Writes
+  (`notice_write`, `notice_delete`) are non-blocking; reads
+  (`noticeboard`, `notice_read`) return a cached snapshot taken once
+  per behavior execution. Atomic read-modify-write is available via
+  `notice_update`, which accepts a picklable function and an optional
+  default. Returning the `REMOVED` sentinel from the update function
+  deletes the entry. Mutations are serialized through a single
+  dedicated noticeboard thread so the C-level read-modify-write stays
+  consistent without forcing behaviors to take a mutex.
+- **`notice_sync`** — new public API that blocks until the caller's
+  prior `notice_write` / `notice_update` / `notice_delete` mutations
+  have been committed, providing a read-your-writes barrier for code
+  that hands work off to a subsequent behavior.
+- **`noticeboard_version`** — new public API returning a global,
+  monotonic version counter that increments on every successful
+  noticeboard commit. Useful as a cheap change-detection hint without
+  taking a full snapshot.
+- **Distributed scheduler** — the central scheduler thread has been
+  removed. Two-phase locking, request linking, and dispatch now run
+  in C (`BehaviorCapsule.schedule`) directly on the caller's thread,
+  and cown release runs on the worker thread that just executed the
+  behavior. Waiters are tracked with an MCS-style intrusive linked
+  list per cown, so resolving a behavior hands off straight to the
+  next waiter without bouncing through any central queue. The
+  C-level terminator is now the only pending counter.
+- **`Cown.exception` property** — new boolean property on `Cown` that
+  indicates whether the held value is the result of an unhandled
+  exception. Workers now call `set_exception` instead of `set_result`
+  when a behavior raises.
+- **Prime factor example** (`examples/prime_factor.py`, entry point
+  `bocpy-prime-factor`) — demonstrates parallel factorisation using
+  Pollard's rho algorithm with early termination coordinated via the
+  noticeboard.
+- **Benchmark harness** (`examples/benchmark.py`, entry point
+  `bocpy-bench`) — a new micro-benchmark suite covering scheduling
+  throughput, message-queue latency, and noticeboard contention.
+
+**Bug Fixes**
+
+- **Transpiler aliased imports** — `visit_Import` and `visit_ImportFrom`
+  now track the alias name (`import X as Y` / `from X import Y as Z`)
+  instead of the original name, preventing spurious "name not found"
+  errors and duplicate `whencall` injection.
+- **Global variable capture** — `@when` closure capture now falls back
+  to `frame.f_globals` when a name is not found in any local scope,
+  fixing `NameError` for module-level variables used inside behaviors.
+
+**Improvements**
+
+- **C mutex abstraction** — platform-specific mutex and condition-variable
+  code (`SRWLock`/`pthread`/C11 `mtx_t`) is now wrapped behind a
+  unified `BOCMutex`/`BOCCond` inline API, reducing `#ifdef` clutter
+  and simplifying future platform work.
+- **Matrix docstrings** — all `Matrix` C methods now carry built-in
+  docstrings visible to `help()` and Sphinx autodoc.
+- **Worker noticeboard hygiene** — workers clear the per-thread
+  noticeboard cache before each behavior and on shutdown, preventing
+  stale reads across behaviors.
+- **Examples package relocated** — example scripts moved from
+  `src/bocpy/examples/` to a top-level `examples/` directory, mapped
+  back into the `bocpy.examples` package via
+  `[tool.setuptools.package-dir]`. Console-script entry points are
+  unchanged.
+- **Filtered PyPI README** — `setup.py` now strips
+  `<!-- pypi-skip-start -->...<!-- pypi-skip-end -->` regions from
+  `README.md` before publishing, so unsupported content (e.g. Mermaid
+  diagrams) does not appear as raw text on PyPI. The project metadata
+  switches to `dynamic = ["readme"]` to enable this.
+- **Documentation refresh** — `README.md`, `sphinx/source/index.rst`,
+  and `sphinx/source/api.rst` have been substantially expanded to
+  cover the noticeboard, the distributed scheduler model, and the new
+  public APIs.
+- **New `thinking-in-boc` skill** — guidance for writing BOC code
+  without reaching for classical synchronization primitives.
+
+**Tests**
+
+- **`test/test_noticeboard.py`** — new suite covering snapshot
+  semantics, `notice_update` atomicity, `REMOVED`, `notice_sync`,
+  and version-counter monotonicity.
+- **`test/test_scheduling_stress.py`** — new stress suite for the
+  distributed scheduler covering 2PL ordering, duplicate-cown
+  handling, exception propagation, and high-fan-out workloads.
+- **`test/test_transpiler.py`** — new direct tests for AST extraction,
+  capture rewriting, aliased imports, and module export.
+
 ## 2026-04-02 - Version 0.3.1
 CownCapsule serialization support for nested cowns.
 

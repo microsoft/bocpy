@@ -4,14 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bocpy"
-version = "0.3.1"
+version = "0.4.0"
 authors = [
     {name = "bocpy Team", email="bocpy@microsoft.com"}
 ]
 description = "bocpy is a Python extension that adds Behavior-oriented concurrency built on top of cross-interpreter data."
-readme = "README.md"
+dynamic = ["readme"]
 keywords = ["behavior-oriented", "concurrency", "subinterpreters"]
 license = "MIT"
+requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Programming Language :: Python :: 3",
@@ -22,7 +23,7 @@ classifiers = [
 [project.urls]
 homepage = "https://microsoft.github.io/bocpy/"
 source = "https://github.com/microsoft/bocpy"
-documentation = "https://microsoft.github.io/bocpy/docs"
+documentation = "https://microsoft.github.io/bocpy/sphinx/index.html"
 issues = "https://github.com/microsoft/bocpy/issues"
 
 [project.optional-dependencies]
@@ -35,12 +36,21 @@ boids = ["pyglet"]
 bocpy-bank = "bocpy.examples.bank:main"
 bocpy-boids = "bocpy.examples.boids:main"
 bocpy-calculator = "bocpy.examples.calculator:main"
+bocpy-bench = "bocpy.examples.benchmark:main"
 bocpy-cooking-boc = "bocpy.examples.cooking_boc:main"
 bocpy-cooking-threads = "bocpy.examples.cooking_threads:main"
 bocpy-dining-philosophers = "bocpy.examples.dining_philosophers:main"
 bocpy-fibonacci = "bocpy.examples.fibonacci:main"
+bocpy-prime-factor = "bocpy.examples.prime_factor:main"
 bocpy-primes = "bocpy.examples.primes:main"
 bocpy-sketches = "bocpy.examples.sketches:main"
+
+[tool.setuptools]
+packages = ["bocpy", "bocpy.examples"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+"bocpy.examples" = "examples"
 
 [tool.setuptools.package-data]
 "bocpy.examples" = ["assets/*.txt"]

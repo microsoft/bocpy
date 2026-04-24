@@ -1,8 +1,11 @@
-from typing import Any, Callable, Generic, Iterator, Optional, Sequence, TypeVar, Union
+from typing import Any, Callable, Generic, Iterator, Mapping, Optional, Sequence, TypeVar, Union
 
 
 TIMEOUT: str
 """Sentinel value returned by :func:`receive` when a timeout occurs."""
+
+REMOVED: object
+"""Sentinel returned by a ``notice_update`` fn to delete the entry."""
 
 
 def drain(tags: Union[str, Sequence[str]]) -> None:
@@ -360,11 +363,19 @@ class Cown(Generic[T]):
         """Releases the cown."""
 
     @property
+    def exception(self) -> bool:
+        """Whether the held value is the result of an unhandled exception."""
+
+    @exception.setter
+    def exception(self, value: bool):
+        """Set or clear the exception flag."""
+
+    @property
     def acquired(self) -> bool:
         """Whether the cown is currently acquired."""
 
     def __lt__(self, other: "Cown") -> bool:
-        """Order by the underying capsule for deterministic ordering."""
+        """Order by the underlying capsule for deterministic ordering."""
 
     def __eq__(self, other: "Cown") -> bool:
         """Equality based on the wrapped capsule."""
@@ -379,14 +390,196 @@ class Cown(Generic[T]):
         """Debug representation."""
 
 
+def notice_write(key: str, value: Any) -> None:
+    """Write a value to the noticeboard.
+
+    The write is fire-and-forget: the value is serialized immediately and
+    handed to a dedicated noticeboard thread, which applies it under
+    mutex.
+
+    **No ordering guarantee.** A subsequent behavior — even one that
+    chains directly off the writer through a shared cown — is *not*
+    guaranteed to observe this write. Treat the noticeboard as
+    eventually consistent shared state, never as a synchronization
+    channel between behaviors.
+
+    The noticeboard supports up to 64 distinct keys.  Writes beyond the
+    limit are not applied; the noticeboard thread catches the resulting
+    error and logs a warning.  No exception propagates to the caller.
+
+    :param key: The noticeboard key (max 63 UTF-8 bytes).
+    :type key: str
+    :param value: The value to store.
+    :type value: Any
+    """
+
+
+def notice_update(key: str, fn: Callable[[Any], Any], default: Any = None) -> None:
+    """Atomically update a noticeboard entry.
+
+    Reads the current value for *key* (or *default* if absent), applies
+    *fn* to it, and writes the result back.  The read-modify-write is
+    atomic because the single-threaded noticeboard mutator performs all
+    three steps without interleaving. Like :func:`notice_write`, the
+    call is fire-and-forget and carries **no ordering guarantee** with
+    respect to other behaviors.
+
+    Both *fn* and *default* must be picklable.  Lambdas and closures
+    are **not** picklable; use ``functools.partial`` with a module-level
+    function or an ``operator`` function instead.
+
+    If *fn* returns the ``REMOVED`` sentinel, the entry is deleted from
+    the noticeboard instead of being updated.
+
+    .. warning::
+
+       *fn* and *default* are pickled and sent to the noticeboard
+       thread for execution. Anyone who can call :func:`notice_update`
+       can therefore execute arbitrary Python on that thread. bocpy
+       treats all runtime code as equally trusted; audit callers if
+       that assumption does not hold.
+
+    .. warning::
+
+       More generally: bocpy worker sub-interpreters share the C-level
+       runtime (terminator, MCS request queues, message queues,
+       noticeboard) with the primary interpreter via ungated entry
+       points such as :py:func:`bocpy._core.terminator_inc`,
+       :py:func:`bocpy._core.terminator_dec`, and
+       :py:meth:`bocpy._core.BehaviorCapsule.release_all`. These are
+       intentionally callable from sub-interpreters because behavior
+       bodies legitimately schedule nested ``@when`` calls. Any
+       sub-interpreter running untrusted Python is therefore part of
+       the trusted computing base: it can drive the terminator
+       negative, schedule unbounded behaviors, or unlink an arbitrary
+       behavior from the MCS queue. Only run code you trust inside
+       behavior bodies.
+
+    :param key: The noticeboard key (max 63 UTF-8 bytes).
+    :type key: str
+    :param fn: A picklable callable taking the current value, returning the new.
+    :type fn: Callable[[Any], Any]
+    :param default: Value used when *key* does not yet exist.
+    :type default: Any
+    """
+
+
+def notice_delete(key: str) -> None:
+    """Delete a single noticeboard entry.
+
+    The deletion is fire-and-forget: the request is sent to the
+    noticeboard thread, which removes the entry under mutex.  If the
+    key does not exist, the operation is a no-op. Like
+    :func:`notice_write`, this carries **no ordering guarantee** with
+    respect to other behaviors.
+
+    :param key: The noticeboard key to delete (max 63 UTF-8 bytes).
+    :type key: str
+    """
+
+
+def noticeboard() -> Mapping[str, Any]:
+    """Return a cached snapshot of the noticeboard.
+
+    Must be called from within a ``@when`` behavior. The first call within a
+    behavior captures all entries under mutex and caches the data.
+    Subsequent calls in the same behavior return a view of the same
+    cached data.
+
+    The returned mapping is read-only.
+
+    Calling from outside a behavior (e.g. the main thread) will return a
+    snapshot that is never refreshed for that thread.
+
+    :return: A read-only mapping of keys to their stored values.
+    :rtype: Mapping[str, Any]
+    """
+
+
+def notice_read(key: str, default: Any = None) -> Any:
+    """Read a single key from the noticeboard.
+
+    Must be called from within a ``@when`` behavior. Convenience wrapper
+    that takes a snapshot and returns one value.
+
+    Calling from outside a behavior (e.g. the main thread) will return a
+    snapshot that is never refreshed for that thread.
+
+    :param key: The noticeboard key to read.
+    :type key: str
+    :param default: Value returned when key is absent.
+    :type default: Any
+    :return: The stored value, or *default* if the key does not exist.
+    :rtype: Any
+    """
+
+
+def noticeboard_version() -> int:
+    """Return the current noticeboard version counter.
+
+    The counter is incremented every time the noticeboard is
+    successfully written, updated, or cleared. Two reads returning the
+    same value mean no commit happened between them; a strictly larger
+    value means at least one commit happened.
+
+    The counter is global (across all threads and interpreters) and
+    monotonic. Useful as a *hint* for detecting noticeboard changes
+    without taking a full snapshot.
+
+    .. note::
+
+       This is *not* a synchronization primitive. Because
+       :func:`notice_write`, :func:`notice_update`, and
+       :func:`notice_delete` are fire-and-forget, the version may not
+       have advanced yet when a behavior that depends on a write
+       observes the noticeboard. For strict read-your-writes ordering,
+       use :func:`notice_sync`.
+
+    :return: The current noticeboard version.
+    :rtype: int
+    """
+
+
+def notice_sync(timeout: Optional[float] = 30.0) -> int:
+    """Block until the caller's prior noticeboard mutations are committed.
+
+    Because :func:`notice_write`, :func:`notice_update`, and
+    :func:`notice_delete` are fire-and-forget, a behavior that wants
+    read-your-writes ordering against a *subsequent* behavior must call
+    ``notice_sync()`` after its writes. By the time this returns, every
+    write/update/delete posted from the calling thread before the call
+    has been applied to the noticeboard.
+
+    The barrier carries **no ordering guarantee** with respect to
+    writes posted from other threads or behaviors interleaved with the
+    caller's; it only flushes the caller's own queued mutations.
+
+    :param timeout: Maximum seconds to wait. ``None`` waits forever.
+        Defaults to 30 seconds.
+    :type timeout: Optional[float]
+    :raises TimeoutError: If the barrier does not complete within
+        *timeout* seconds.
+    :raises RuntimeError: If the runtime is not started.
+    :return: The :func:`noticeboard_version` after the flush.
+    :rtype: int
+    """
+
+
 def wait(timeout: Optional[float] = None):
     """Block until all behaviors complete, with optional timeout.
+
+    On a successful return the runtime is **stopped**: workers are
+    joined, the noticeboard thread exits, the export tempdir is removed,
+    and the terminator is closed. The next ``@when`` call (or explicit
+    :func:`start`) will spin up a fresh runtime.
 
     Note that holding on to references to Cown objects such that they
     are deallocated after wait() is called results in undefined behavior.
 
     :param timeout: Maximum number of seconds to wait, or ``None`` to
-        wait indefinitely.
+        wait indefinitely. The timeout bounds only the quiescence and
+        noticeboard-drain phases; worker shutdown and tempdir cleanup
+        run to completion regardless.
     :type timeout: Optional[float]
     """
 
@@ -415,7 +608,11 @@ def when(*cowns):
 
 
 def start(**kwargs):
-    """Start the behavior scheduler and worker pool.
+    """Start the bocpy runtime and worker pool.
+
+    Spawns the worker sub-interpreters and the dedicated noticeboard
+    thread. Scheduling and release run on the caller and worker
+    threads themselves — there is no central scheduler thread.
 
     :param worker_count: The number of worker interpreters to start.  If
         ``None``, defaults to the number of available cores minus one.

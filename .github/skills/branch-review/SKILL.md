@@ -1,6 +1,6 @@
 ---
 name: branch-review
-description: "Multi-perspective code review for a branch before merging. Use when: reviewing a branch, preparing a PR, pre-merge review, auditing a feature branch, or when /branch-review is invoked. Spawns four reviewer subagents with competing priorities (correctness, security, maintainability, adversarial) then synthesizes their findings into a unified review report."
+description: "Multi-perspective code review for a branch before merging. Use when: reviewing a branch, preparing a PR, pre-merge review, auditing a feature branch, or when /branch-review is invoked. Spawns three constructive reviewer subagents (correctness, security, usability), then runs an adversarial gap analysis to find what they missed, and synthesizes all findings into a unified review report."
 argument-hint: "Branch name or merge target (e.g. 'main' or 'feature/foo -> main')"
 ---
 
@@ -62,23 +62,22 @@ Assemble a context block that every reviewer will receive. It must include:
 Keep the context block identical across all four reviewers to ensure a fair
 comparison.
 
-### 3. Spawn Four Reviewer Subagents
+### 3. Spawn Three Constructive Reviewer Lens Subagents
 
-Launch four subagents **in parallel**. Each receives the context block plus a
-persona directive. Each must return findings in the severity-tagged format
-defined above.
+Launch three subagents **in parallel**, each using a named lens agent operating
+in **review mode**. Each receives the context block and must return findings in
+the severity-tagged format defined above.
 
-| # | Persona | Directive |
-|---|---------|-----------|
-| 1 | **Correctness** | Focus exclusively on functional correctness. Look for logic errors, off-by-one mistakes, incorrect state transitions, broken invariants, missing error handling at system boundaries, and test gaps. Ignore style. |
-| 2 | **Security** | Focus exclusively on security. Look for injection flaws, buffer overflows, race conditions exploitable by an attacker, unsafe deserialization, credential leaks, missing input validation at trust boundaries, and OWASP Top 10 issues. Ignore style. |
-| 3 | **Maintainability** | Focus on code quality and long-term health. Look for unclear naming, excessive complexity, duplicated logic, missing or misleading comments, poor abstractions, and violations of project conventions (flake8 rules, comment style, etc.). Ignore performance unless it causes a correctness issue. |
-| 4 | **Adversarial** | Assume the code is wrong and try to break it. Construct pathological inputs, race windows, resource exhaustion scenarios, and edge cases. Challenge every assumption. Only clear findings that survive scrutiny. |
+| # | Agent | Focus |
+|---|-------|-------|
+| 1 | `correctness-lens` | Logic errors, broken invariants, test gaps |
+| 2 | `security-lens` | Injection, overflows, trust boundary violations |
+| 3 | `usability-lens` | Naming, complexity, conventions, maintainability |
 
 Each subagent prompt must include:
 
 - The shared context block
-- The persona directive (from the table above)
+- An instruction to operate in **review mode**
 - These instructions:
 
   > Review the diff and changed files from the perspective described above.
@@ -95,9 +94,48 @@ Each subagent prompt must include:
   > Do NOT fabricate issues. Only report genuine problems.
   > Order findings by severity (critical first).
 
-### 4. Deduplicate and Synthesize
+### 4. Adversarial Gap Analysis
 
-After all four reviewers return:
+After the three constructive reviewers return, spawn a fresh `adversarial-lens`
+subagent operating in **review mode**. This step runs **sequentially** — the
+adversarial reviewer receives the existing findings so it can focus on what the
+others missed.
+
+The adversarial subagent prompt must include:
+
+- The shared context block
+- The full list of findings from the three constructive reviewers
+- These instructions:
+
+  > You are the adversarial reviewer. The findings below were produced by three
+  > constructive reviewers (correctness, security, usability). Your job is to
+  > find what they missed.
+  >
+  > Focus on:
+  > - Code sections covered by NO existing finding (overlooked areas)
+  > - Issue categories not represented in the existing findings
+  > - Cross-component interactions no single lens would catch
+  > - Unchecked assumptions and untested preconditions
+  > - Silent divergences with no test coverage
+  > - Fragile coupling where changing one thing silently breaks another
+  >
+  > For each issue found, report it in this exact format:
+  >
+  >   **[SEVERITY] Short title**
+  >   - **Location:** file path and line number(s)
+  >   - **Problem:** what is wrong and why it matters
+  >   - **Suggestion:** concrete fix or remediation
+  >
+  >   where SEVERITY is one of: critical, high, medium, low.
+  >
+  > If the existing findings are comprehensive and you find no gaps, state
+  > explicitly: "No additional issues found."
+  > Do NOT duplicate issues already reported. Only report NEW problems.
+  > Order findings by severity (critical first).
+
+### 5. Deduplicate and Synthesize
+
+After all four reviewers (three constructive + adversarial) have returned:
 
 1. **Merge duplicates.** If multiple reviewers flag the same issue, keep the
    most detailed version and note which perspectives flagged it (higher
@@ -110,27 +148,42 @@ After all four reviewers return:
    or construct a minimal reproduction. Mark any finding you cannot verify as
    **[unverified]**.
 
-### 5. Present the Report
+### 6. Present the Report
 
-Present a single unified review report to the user:
+Present a single unified review report to the user with these sections, in
+order:
 
 1. **Summary** — one-paragraph overview: number of findings by severity, overall
    assessment (e.g., "ready to merge with minor fixes" or "has blocking issues").
-2. **Findings** — listed by severity (critical first). Each finding includes:
-   - The severity tag and title
-   - Location (as a file link with line numbers)
-   - Problem description
-   - Suggested fix
-   - Which reviewer perspectives flagged it
-3. **Trade-offs** — any unresolved disagreements between reviewers, with both
+
+2. **Positive observations** — bullet list of things the reviewers agreed were
+   done well (design choices, test quality, documentation, etc.). Keep it brief
+   but genuine — this provides signal about what to preserve during remediation.
+
+3. **Findings — Critical / High** — a Markdown table with columns:
+   `#`, `Severity`, `Title`, `Location`, `Flagged by`, `Status`.
+   Below the table, expand each row with the full problem description and
+   suggested fix.
+
+4. **Findings — Medium** — same table + expansion format.
+
+5. **Findings — Low** — same table + expansion format.
+
+6. **Trade-offs** — any unresolved disagreements between reviewers, with both
    sides stated.
-4. **Action prompt** — ask the user which findings to address. Options:
-   - Fix all
+
+7. **Remediation plan** — a numbered, ordered list of concrete steps to address
+   the findings. Group related fixes into a single step where sensible. Each
+   step should name the finding(s) it addresses and briefly describe what to
+   do. Order by priority: blocking issues first, then medium, then low.
+
+8. **Action prompt** — ask the user which findings to address. Options:
+   - Fix all (follow the remediation plan)
    - Select specific findings by number
    - Dismiss specific findings
    - Ask for clarification
 
-### 6. Apply Fixes
+### 7. Apply Fixes
 
 For each approved finding:
 
@@ -140,7 +193,7 @@ For each approved finding:
 
 If a fix is ambiguous or touches architecture, ask the user for guidance.
 
-### 7. Check Exit or Re-review
+### 8. Check Exit or Re-review
 
 After all approved fixes are applied:
 

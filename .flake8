@@ -9,4 +9,4 @@ extend-ignore = E203, N812, N817
 
 #============================ Repo-specific config ===========================
 per-file-ignores =
-    test/*:D103,D403
+    test/*:D102,D103,D403

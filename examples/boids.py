@@ -6,7 +6,7 @@ import colorsys
 import math
 from typing import Mapping, NamedTuple
 
-from bocpy import Cown, Matrix, receive, send, wait, when
+from bocpy import Cown, Matrix, receive, send, start, wait, when
 
 
 class BoundingBox(NamedTuple("BoundingBox", [("left", int), ("top", int), ("right", int), ("bottom", int)])):
@@ -351,12 +351,15 @@ def main():
     class Boids(pyglet.window.Window):
         """Pyglet window that renders a boids simulation."""
 
-        def __init__(self, width: int, height: int, num_boids: int):
+        def __init__(self, width: int, height: int, num_boids: int,
+                     show_overlay: bool = True):
             """Initialize the window and create boids.
 
             :param width: Window width in pixels.
             :param height: Window height in pixels.
             :param num_boids: The number of boids to simulate.
+            :param show_overlay: Whether to render the boid count and
+                behavior-rate overlay in the bottom-left corner.
             """
             pyglet.window.Window.__init__(self, width, height, "Boids")
             pyglet.gl.glClearColor(1, 1, 1, 1)
@@ -365,14 +368,21 @@ def main():
             self.simulation = Simulation(num_boids, width, height)
             self.num_behaviors = 0
             self.samples = deque()
+            self.show_overlay = show_overlay
 
-            self.num_boids_label = pyglet.text.Label(f"#boids: {num_boids}",
-                                                     font_size=24, x=5, y=5,
-                                                     color=(100, 100, 100, 255))
+            if show_overlay:
+                self.num_boids_label = pyglet.text.Label(
+                    f"#boids: {num_boids}",
+                    font_size=24, x=5, y=5,
+                    color=(100, 100, 100, 255))
 
-            self.behaviors_label = pyglet.text.Label("behavior/s: ",
-                                                     font_size=24, x=5, y=50,
-                                                     color=(100, 100, 100, 255))
+                self.behaviors_label = pyglet.text.Label(
+                    "behavior/s: ",
+                    font_size=24, x=5, y=50,
+                    color=(100, 100, 100, 255))
+            else:
+                self.num_boids_label = None
+                self.behaviors_label = None
 
             self.triangles: pyglet.shapes.Triangle = []
             for _ in range(num_boids):
@@ -386,8 +396,9 @@ def main():
             """Clear the window and draw all boid triangles."""
             self.clear()
             self.batch.draw()
-            self.num_boids_label.draw()
-            self.behaviors_label.draw()
+            if self.show_overlay:
+                self.num_boids_label.draw()
+                self.behaviors_label.draw()
 
         def on_close(self):
             wait()
@@ -409,7 +420,7 @@ def main():
                 if len(self.samples) > 10:
                     self.samples.popleft()
 
-            if len(self.samples) > 3:
+            if len(self.samples) > 3 and self.behaviors_label is not None:
                 behavior_rate = sum(self.samples) / len(self.samples)
                 self.behaviors_label.text = f"behavior/s: {behavior_rate:.0f}"
 
@@ -431,10 +442,200 @@ def main():
     parser.add_argument("--boids", "-b", type=int, default=300)
     parser.add_argument("--width", type=int, default=1200)
     parser.add_argument("--height", type=int, default=800)
+    parser.add_argument("--mode", choices=("window", "video"),
+                        default="window",
+                        help="window: interactive (default); "
+                             "video: render and pipe frames to ffmpeg.")
+    parser.add_argument("--duration", type=float, default=30.0,
+                        help="Seconds to simulate in video mode.")
+    parser.add_argument("--output", "-o", default="boids.mp4",
+                        help="Output path for video mode.")
+    parser.add_argument("--fps", type=int, default=30,
+                        help="Simulation/render rate. In video mode this is "
+                             "the encoded frame rate; in window mode this is "
+                             "the scheduled tick rate. The simulation "
+                             "integrates one step per tick, so this value "
+                             "controls on-screen speed in both modes.")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="Number of BOC worker sub-interpreters. "
+                             "Defaults to bocpy's default (CPU count - 1).")
     args = parser.parse_args()
 
+    # Validate at the boundary; downstream code (Matrix sizing, hash modulo,
+    # 1.0/fps) assumes positive values and would crash or silently misbehave.
+    if args.boids <= 0:
+        parser.error("--boids must be positive")
+    if args.width <= 0 or args.height <= 0:
+        parser.error("--width and --height must be positive")
+    if args.duration <= 0:
+        parser.error("--duration must be positive")
+    if args.fps <= 0:
+        parser.error("--fps must be positive")
+    if args.workers is not None and args.workers <= 0:
+        parser.error("--workers must be positive")
+
+    # Start the BOC runtime explicitly so --workers takes effect for every
+    # mode.
+    start(worker_count=args.workers)
+
+    if args.mode == "video":
+        import subprocess
+
+        # Create the window first so we can query the actual framebuffer
+        # dimensions (which may differ from logical size on HiDPI displays).
+        # The overlay (boid count / behavior rate) is suppressed in video
+        # mode so the rendered output stays clean.
+        boids = Boids(args.width, args.height, args.boids,
+                      show_overlay=False)
+
+        # Allow graceful close: override on_close to set a flag and return
+        # True so pyglet does not destroy the window mid-frame. The loop
+        # below honors the flag; the finally block tears the window down.
+        # Use a bocpy-prefixed attribute name to avoid colliding with any
+        # underscore-prefixed pyglet internals.
+        boids.bocpy_video_closing = False
+
+        def _on_close():
+            boids.bocpy_video_closing = True
+            return True
+
+        boids.on_close = _on_close
+
+        # Determine the real framebuffer size (HiDPI-correct).
+        boids.switch_to()
+        boids.dispatch_events()
+        boids.clear()
+        boids.batch.draw()
+        first_buf = pyglet.image.get_buffer_manager().get_color_buffer()
+        fb_width = first_buf.width
+        fb_height = first_buf.height
+        if (fb_width, fb_height) != (args.width, args.height):
+            print(f"note: framebuffer is {fb_width}x{fb_height} "
+                  f"(window requested {args.width}x{args.height}); "
+                  f"encoding at framebuffer resolution.")
+
+        # Validate frame count BEFORE spawning ffmpeg so we don't leak the
+        # subprocess if the duration/fps combination produces no frames.
+        num_frames = int(args.duration * args.fps)
+        if num_frames == 0:
+            print(f"error: --duration {args.duration} is too short for "
+                  f"--fps {args.fps} (no frames would be written).")
+            boids.close()
+            wait()
+            return
+
+        try:
+            ff = subprocess.Popen(
+                [
+                    "ffmpeg", "-y", "-loglevel", "warning",
+                    "-f", "rawvideo", "-pix_fmt", "rgba",
+                    "-s", f"{fb_width}x{fb_height}",
+                    "-r", str(args.fps),
+                    "-i", "-",
+                    "-vf", "vflip",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                    args.output,
+                ],
+                stdin=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            print("error: ffmpeg not found on PATH; install ffmpeg or use "
+                  "--mode headless.")
+            boids.close()
+            wait()
+            return
+        except OSError as exc:
+            # Other startup failures (read-only output dir, ENOMEM, etc.)
+            # also need cleanup to avoid leaking the window/runtime.
+            print(f"error: failed to start ffmpeg: {exc}")
+            boids.close()
+            wait()
+            return
+
+        dt = 1.0 / args.fps
+        frames_written = 0
+        ff_stderr: bytes | None = b""
+        try:
+            for _ in range(num_frames):
+                if boids.bocpy_video_closing:
+                    break
+
+                boids.switch_to()
+                boids.dispatch_events()
+                if boids.bocpy_video_closing:
+                    break
+
+                boids.update(dt)
+                boids.clear()
+                boids.batch.draw()
+                if boids.show_overlay:
+                    boids.num_boids_label.draw()
+                    boids.behaviors_label.draw()
+
+                buf = pyglet.image.get_buffer_manager().get_color_buffer()
+                # Defensive: framebuffer size must remain stable for the
+                # encoder. If it changes (window manager fiddling, monitor
+                # move) we abort rather than emit garbled frames.
+                if (buf.width, buf.height) != (fb_width, fb_height):
+                    print(f"error: framebuffer size changed mid-record "
+                          f"({fb_width}x{fb_height} -> "
+                          f"{buf.width}x{buf.height}); stopping.")
+                    break
+
+                data = buf.get_image_data().get_data("RGBA", buf.width * 4)
+                try:
+                    ff.stdin.write(data)
+                except BrokenPipeError:
+                    print("error: ffmpeg pipe closed unexpectedly.")
+                    break
+                frames_written += 1
+                boids.flip()
+        except KeyboardInterrupt:
+            print("(interrupted)")
+        finally:
+            try:
+                try:
+                    if ff.stdin is not None:
+                        ff.stdin.close()
+                except OSError:
+                    pass
+                try:
+                    _, ff_stderr = ff.communicate(timeout=30)
+                except subprocess.TimeoutExpired:
+                    print("warning: ffmpeg did not exit within 30s; killing.")
+                    ff.kill()
+                    try:
+                        _, ff_stderr = ff.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+            finally:
+                # Always release the pyglet window and BOC runtime, even if
+                # ffmpeg cleanup raised something unexpected.
+                try:
+                    boids.close()
+                finally:
+                    wait()
+
+        if ff.returncode != 0:
+            if ff.returncode is None:
+                # We tried to kill ffmpeg but it never reaped within 5s after
+                # SIGKILL. The output file (if any) is almost certainly
+                # truncated and missing the libx264 moov atom.
+                print("error: ffmpeg was killed and did not exit; "
+                      "output file is likely truncated.")
+            else:
+                print(f"error: ffmpeg exited with status {ff.returncode}.")
+            if ff_stderr:
+                print(ff_stderr.decode("utf-8", errors="replace"), end="")
+            return
+
+        print(f"Wrote {args.output} ({frames_written} frames)"
+              f"{' (interrupted)' if boids.bocpy_video_closing else ''}")
+        return
+
     boids = Boids(args.width, args.height, args.boids)
-    pyglet.clock.schedule_interval(boids.update, 1/30)
+    pyglet.clock.schedule_interval(boids.update, 1 / args.fps)
     pyglet.app.run()
 
 
