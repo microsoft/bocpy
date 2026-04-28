@@ -2,12 +2,13 @@
 
 from functools import partial
 
+import pytest
+
 from bocpy import (Cown, drain, notice_delete, notice_read, notice_sync,
                    notice_update, notice_write, noticeboard,
                    noticeboard_version, receive,
                    REMOVED, send, start, TIMEOUT, wait, when)
 import bocpy._core as _core
-import pytest
 
 
 RECEIVE_TIMEOUT = 10

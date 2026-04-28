@@ -5,6 +5,14 @@ on:
     branches: ["main"]
   workflow_dispatch:
 
+# Build the private `bocpy._internal_test` C extension across all CI test
+# jobs. It is gated off by default in setup.py so it never ships in
+# distributed wheels; CI opts in here so the corresponding pytest modules
+# (test_internal_*, test_compat_atomics) actually run instead of being
+# skipped.
+env:
+  BOCPY_BUILD_INTERNAL_TESTS: "1"
+
 jobs:
   linting:
     runs-on: ubuntu-latest

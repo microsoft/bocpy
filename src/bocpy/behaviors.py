@@ -14,9 +14,7 @@ to block on a mutex.
 import inspect
 import logging
 import os
-import shutil
 import sys
-import tempfile
 from textwrap import dedent
 import threading
 import time
@@ -71,7 +69,7 @@ class Cown(Generic[T]):
 
     def __init__(self, value: T):
         """Create a cown."""
-        logging.debug(f"initialising Cown with value: {value}")
+        logging.debug("initialising Cown with value: %r", value)
         if isinstance(value, _core.CownCapsule):
             self.impl = value
         else:
@@ -153,20 +151,14 @@ WORKER_MAIN_END = "# END boc_export"
 class Behaviors:
     """Coordinator that starts workers and schedules behaviors."""
 
-    def __init__(self, num_workers: Optional[int], export_dir: Optional[str]):
+    def __init__(self, num_workers: Optional[int]):
         """Creates a new Behaviors runtime.
 
         :param num_workers: The number of worker interpreters to start.  If
             None, defaults to the number of available cores minus one.
         :type num_workers: Optional[int]
-        :param export_dir: The directory to which the target module will be
-            exported for worker import.  If None, a temporary directory will
-            be created and removed on shutdown.
-        :type export_dir: Optional[str]
         """
         self.num_workers = WORKER_COUNT if num_workers is None else num_workers
-        self.export_dir = export_dir
-        self.export_tmp = export_dir is None
         self.worker_script = None
         self.classes = set()
         self.worker_threads = []
@@ -179,14 +171,35 @@ class Behaviors:
         self.noticeboard = None
         self._noticeboard_start_error: Optional[BaseException] = None
         # Set to True by stop() once worker shutdown, noticeboard
-        # tear-down, and tempdir cleanup have all completed. The
-        # warned-stop / drain-error raise from stop() happens *after*
-        # this flips, so wait()/__exit__ can use the flag to
-        # distinguish "stop() raised but the runtime is dead -- clear
-        # the global handle" from "stop() raised mid-teardown and the
-        # runtime is still alive -- retain the handle so the caller
-        # can retry stop()".
+        # tear-down, and the C-level noticeboard slot release have
+        # all completed. The warned-stop / drain-error raise from
+        # stop() happens *after* this flips, so wait()/__exit__ can
+        # use the flag to distinguish "stop() raised but the runtime
+        # is dead -- clear the global handle" from "stop() raised
+        # mid-teardown and the runtime is still alive -- retain the
+        # handle so the caller can retry stop()".
         self._teardown_complete = False
+        # Populated by stop_workers() with any release_all() failures
+        # observed during the per-task-queue orphan drain. stop()
+        # consumes the list and clears it; on a clean stop this stays
+        # empty.
+        self._stop_drain_errors: list[BaseException] = []
+        # Set True when stop_workers() has run to completion (whether
+        # from the clean path or the noticeboard-timeout branch). A
+        # subsequent stop() retry must NOT re-invoke stop_workers --
+        # the worker pool is gone and `_core.scheduler_request_stop_all`
+        # would block forever waiting for shutdown replies that never
+        # come. The retry path skips straight to the noticeboard
+        # cleanup that the prior attempt could not complete.
+        self._workers_stopped = False
+        # Per-worker scheduler_stats() snapshot captured at the moment
+        # workers have replied "shutdown" but BEFORE
+        # `_core.scheduler_runtime_stop()` frees the per-worker array.
+        # Surfaced to the caller via `wait(stats=True)`. ``None`` means
+        # no snapshot was captured (e.g. start_workers failed before any
+        # worker registered, or stop_workers raised before reaching the
+        # capture point).
+        self._final_stats: Optional[list[dict]] = None
         self.final_cowns: tuple[Cown, ...] = ()
         self.bid = 0
 
@@ -250,13 +263,13 @@ class Behaviors:
             for name in list(frame.f_globals):
                 val = frame.f_globals[name]
                 if isinstance(val, Cown) or isinstance(val, _core.CownCapsule):
-                    self.logger.debug(f"acquiring {name}")
+                    self.logger.debug("acquiring %s", name)
                     val.acquire()
 
             for name in list(frame.f_locals):
                 val = frame.f_locals[name]
                 if isinstance(val, Cown) or isinstance(val, _core.CownCapsule):
-                    self.logger.debug(f"acquiring {name}")
+                    self.logger.debug("acquiring %s", name)
                     val.acquire()
 
             frame = frame.f_back
@@ -265,17 +278,78 @@ class Behaviors:
             cown.acquire()
 
         self.logger.debug("stopping workers")
-        for _ in range(self.num_workers):
-            _core.send("boc_worker", "shutdown")
+        # Single C-level fan-out: flips stop_requested on every
+        # worker and signals each cv. Each worker observes the
+        # flag inside scheduler_worker_pop, exits its do_work loop,
+        # and sends "shutdown" back on boc_behavior.
+        #
+        # Once `scheduler_request_stop_all()` has been called the
+        # worker pool is committed to shutting down: re-entering this
+        # function on a retry would issue a second fan-out and then
+        # block forever in `receive("boc_behavior")` waiting for
+        # shutdown replies from workers that have already replied (or
+        # exited). Wrap everything past the fan-out in try/finally
+        # that pins `_workers_stopped = True` so any exception from
+        # the handshake, teardown, drain, or runtime_stop still
+        # routes a subsequent stop() down the retry-only branch.
+        #
+        # The retry-only branch in `stop()` does NOT itself call
+        # `scheduler_runtime_stop`, so we must guarantee it runs here
+        # even when the handshake / teardown / drain above raised --
+        # otherwise the per-worker `WORKERS` array leaks until the
+        # next `start()`. The C-side stop is idempotent (covered by
+        # `test_scheduler_runtime_stop_is_idempotent`), so running it
+        # unconditionally inside `finally` is safe.
+        _core.scheduler_request_stop_all()
+        try:
+            for _ in range(self.num_workers):
+                _, contents = _core.receive("boc_behavior")
+                assert contents == "shutdown"
 
-        for _ in range(self.num_workers):
-            _, contents = _core.receive("boc_behavior")
-            assert contents == "shutdown"
+            for _ in range(self.num_workers):
+                _core.send("boc_cleanup", True)
 
-        for _ in range(self.num_workers):
-            _core.send("boc_cleanup", True)
-
-        self.teardown_workers()
+            self.teardown_workers()
+            # Drain any behaviours that were dispatched but never
+            # consumed (warned path of stop(), or any race where a
+            # late behaviour landed in a per-task queue between
+            # request_stop_all and the worker's pop_slow returning
+            # NULL). MUST run BEFORE scheduler_runtime_stop, which
+            # frees the worker array and the per-task queues with it.
+            # release_all on a drained behaviour may dispatch its
+            # successor; loop until the queues stay empty.
+            self._stop_drain_errors = self._drain_orphan_behaviors()
+        finally:
+            try:
+                # Snapshot the per-worker scheduler counters before
+                # the per-worker array is freed. Workers have already
+                # replied "shutdown" and exited their do_work loops,
+                # so their counters are stable. Surfaced to the
+                # caller via `wait(stats=True)`. Best-effort: any
+                # failure here must not block teardown.
+                try:
+                    self._final_stats = _core.scheduler_stats()
+                except Exception as snap_ex:
+                    self.logger.warning(
+                        "stop_workers(): failed to snapshot scheduler_stats: %r",
+                        snap_ex,
+                    )
+                    self._final_stats = None
+                # Free the per-worker scheduler array now that no
+                # worker thread can observe it. Paired with the
+                # `scheduler_runtime_start` call in `start()`. Run
+                # inside the outer `finally` so the WORKERS array is
+                # reclaimed even when an earlier step raised --
+                # without this the retry-only branch in `stop()`
+                # would never reach this call site.
+                _core.scheduler_runtime_stop()
+            finally:
+                # Mark workers as stopped so a retried stop() (after
+                # the noticeboard-timeout branch raises, or after a
+                # failure anywhere in the handshake/teardown/drain
+                # above) does not try to shut down a worker pool that
+                # is already gone.
+                self._workers_stopped = True
         self.logger.debug("workers stopped")
 
     def start_noticeboard(self):
@@ -416,97 +490,171 @@ class Behaviors:
             export = export_module_from_file(module[1])
             module_name = f"{module[0]}"
 
-        if self.export_dir is None:
-            self.export_dir = tempfile.mkdtemp()
-            self.export_tmp = True
+        # Defence in depth: the transpiler emits identifier-shaped
+        # names, but `module_name` is interpolated into worker
+        # bootstrap source -- reject anything that is not a valid
+        # dotted Python module path at the boundary so a hostile or
+        # malformed name cannot reach the `repr()`-protected
+        # interpolation below. Dotted names (``pkg.sub.mod``) are
+        # accepted because users may invoke bocpy from a
+        # package-qualified module; each dotted component must
+        # itself be a valid identifier. ``__main__`` falls through
+        # naturally because ``"__main__".isidentifier()`` is True
+        # and ``"__main__".split(".") == ["__main__"]``.
+        if not all(part.isidentifier() for part in module_name.split(".")):
+            raise ValueError(
+                f"module_name must be a dotted Python module path; "
+                f"got {module_name!r}"
+            )
 
         self.behavior_lookup = export.behaviors
-        path = os.path.join(self.export_dir, f"{module_name}.py")
-        with open(path, "w", encoding="utf-8") as file:
-            file.write(export.code)
+
+        # Embed the transpiled source as a Python string literal
+        # (via ``repr()``) into the worker bootstrap. Each worker
+        # compiles and exec's the literal into a fresh
+        # ``types.ModuleType``; no file is written to disk. The
+        # synthetic filename ``<bocpy:NAME>`` is registered with
+        # ``linecache`` so tracebacks still surface the transpiled
+        # source line. Every interpolated occurrence of the module
+        # name uses ``repr(module_name)`` so quote / backslash /
+        # non-ASCII content cannot break out of the string literal
+        # (the prior path interpolated ``module_name`` raw via
+        # f-string into ``r"..."``).
+        src_literal = repr(export.code)
+        bocmain_alias = "__bocmain__" if module_name == "__main__" else module_name
+        sysmod_key = repr(bocmain_alias)
+        linecache_key = repr(f"<bocpy:{bocmain_alias}>")
 
         main_start = worker_script.find(WORKER_MAIN_END)
 
+        bootstrap = [
+            "import linecache",
+            "import types",
+            f"_bocpy_src = {src_literal}",
+            f"_bocpy_mod = types.ModuleType({sysmod_key})",
+            f"_bocpy_mod.__file__ = {linecache_key}",
+            (
+                "linecache.cache["
+                f"{linecache_key}"
+                "] = (len(_bocpy_src), None, "
+                "_bocpy_src.splitlines(keepends=True), "
+                f"{linecache_key})"
+            ),
+            (
+                "exec(compile(_bocpy_src, "
+                f"{linecache_key}, 'exec'), _bocpy_mod.__dict__)"
+            ),
+            f"sys.modules[{sysmod_key}] = _bocpy_mod",
+            "boc_export = _bocpy_mod",
+        ]
+
         if module_name == "__main__":
-            lines = [f'load_boc_module("__bocmain__", r"{path}")', 'boc_export = sys.modules["__bocmain__"]']
             sys.modules["__bocmain__"] = sys.modules["__main__"]
             for cls in export.classes:
-                lines.append(f'\n\nclass {cls}(sys.modules["__bocmain__"].{cls}):')
-                lines.append("    pass")
-        else:
-            lines = [f'load_boc_module("{module_name}", r"{path}")', f'boc_export = sys.modules["{module_name}"]']
+                bootstrap.append(f'\n\nclass {cls}(sys.modules["__bocmain__"].{cls}):')
+                bootstrap.append("    pass")
 
-        lines.append("")
+        bootstrap.append("")
 
-        self.worker_script = worker_script[:main_start] + "\n".join(lines) + worker_script[main_start:]
+        self.worker_script = (
+            worker_script[:main_start]
+            + "\n".join(bootstrap)
+            + worker_script[main_start:]
+        )
 
-        set_tags(["boc_behavior", "boc_worker", "boc_cleanup", "boc_noticeboard"])
-        # Bring up workers and the noticeboard thread first. We seed
-        # the C-level terminator only after both succeed so a failure
-        # in start_noticeboard (or anywhere between here and the
-        # terminator_reset below) leaves the terminator in its
-        # post-stop() quiescent state (count=0, seeded=0) and the
-        # next start() can proceed cleanly without a drift diagnostic
-        # firing. On a partial-startup failure we also tear the
-        # workers back down so the subsequent start() is not blocked
-        # by stale shutdown handshakes or dangling sub-interpreters.
-        self.start_workers()
+        set_tags(["boc_behavior", "boc_cleanup", "boc_noticeboard"])
+        # Allocate the per-worker scheduler array before spawning any
+        # workers so each worker's first action (registering its slot)
+        # has a non-empty WORKERS array to claim from. Mirrored by
+        # `_core.scheduler_runtime_stop()` in `stop_workers()` after
+        # the workers are joined, and by every abort path below so
+        # the C-side WORKERS array is reclaimed and the next
+        # `start()` does not observe stale per-task queues.
+        _core.scheduler_runtime_start(self.num_workers)
         try:
-            self.start_noticeboard()
-        except BaseException:
-            # Close the terminator first so any sibling thread that
-            # somehow races a whencall during the abort window is
-            # refused at terminator_inc rather than slipping a real
-            # behavior into boc_worker between our shutdown sentinels.
-            # TERMINATOR_CLOSED is 0 on the very first start() of the
-            # process and 1 after any prior stop()/abort; either way,
-            # set it to 1 explicitly. terminator_close() is idempotent.
-            _core.terminator_close()
-            self._abort_workers()
-            raise
+            # Bring up workers and the noticeboard thread first. We seed
+            # the C-level terminator only after both succeed so a failure
+            # in start_noticeboard (or anywhere between here and the
+            # terminator_reset below) leaves the terminator in its
+            # post-stop() quiescent state (count=0, seeded=0) and the
+            # next start() can proceed cleanly without a drift diagnostic
+            # firing. On a partial-startup failure we also tear the
+            # workers back down so the subsequent start() is not blocked
+            # by stale shutdown handshakes or dangling sub-interpreters.
+            self.start_workers()
+            try:
+                self.start_noticeboard()
+            except BaseException:
+                # Close the terminator first so any sibling thread that
+                # somehow races a whencall during the abort window is
+                # refused at terminator_inc rather than slipping a real
+                # behavior into a per-task queue between our scheduler
+                # stop request and the worker shutdown handshake.
+                # TERMINATOR_CLOSED is 0 on the very first start() of
+                # the process and 1 after any prior stop()/abort;
+                # either way, set it to 1 explicitly. terminator_close()
+                # is idempotent.
+                _core.terminator_close()
+                self._abort_workers()
+                raise
 
-        # Arm the C-level terminator (count=1 seed, closed=0, seeded=1).
-        # reset() returns the prior (count, seeded) so we can detect a
-        # previous run that died without reaching its reconciliation
-        # point (KeyboardInterrupt, stop() that raised, etc.). We refuse
-        # to start on drift rather than silently clobbering whatever
-        # state was left behind -- the previous run is still leaking
-        # behaviors or cowns and starting fresh would mask the bug.
-        prior_count, prior_seeded = _core.terminator_reset()
-        if prior_count != 0 or prior_seeded != 0:
-            # We just armed the terminator (count=1, seeded=1, closed=0).
-            # Close it FIRST so any sibling thread that races a
-            # whencall during the abort window is refused before
-            # touching the half-shut-down pool. Then drop our own
-            # seed via terminator_seed_dec so the next start() sees
-            # (count=0, seeded=0) instead of re-firing the same
-            # drift diagnostic forever. Finally tear down workers
-            # and the noticeboard so the next start() can re-spawn
-            # without colliding with the orphans.
-            _core.terminator_close()
-            _core.terminator_seed_dec()
-            self._abort_noticeboard()
-            self._abort_workers()
-            raise RuntimeError(
-                "terminator drift carried over from a previous run "
-                f"(prior_count={prior_count}, prior_seeded={prior_seeded}). "
-                "This indicates a leaked whencall, a stop() that raised "
-                "before reconciliation, or an interrupted teardown. "
-                "Resolve the earlier failure before starting again."
-            )
+            # Arm the C-level terminator (count=1 seed, closed=0, seeded=1).
+            # reset() returns the prior (count, seeded) so we can detect a
+            # previous run that died without reaching its reconciliation
+            # point (KeyboardInterrupt, stop() that raised, etc.). We refuse
+            # to start on drift rather than silently clobbering whatever
+            # state was left behind -- the previous run is still leaking
+            # behaviors or cowns and starting fresh would mask the bug.
+            prior_count, prior_seeded = _core.terminator_reset()
+            if prior_count != 0 or prior_seeded != 0:
+                # We just armed the terminator (count=1, seeded=1, closed=0).
+                # Close it FIRST so any sibling thread that races a
+                # whencall during the abort window is refused before
+                # touching the half-shut-down pool. Then drop our own
+                # seed via terminator_seed_dec so the next start() sees
+                # (count=0, seeded=0) instead of re-firing the same
+                # drift diagnostic forever. Finally tear down workers
+                # and the noticeboard so the next start() can re-spawn
+                # without colliding with the orphans.
+                _core.terminator_close()
+                _core.terminator_seed_dec()
+                self._abort_noticeboard()
+                self._abort_workers()
+                raise RuntimeError(
+                    "terminator drift carried over from a previous run "
+                    f"(prior_count={prior_count}, prior_seeded={prior_seeded}). "
+                    "This indicates a leaked whencall, a stop() that raised "
+                    "before reconciliation, or an interrupted teardown. "
+                    "Resolve the earlier failure before starting again."
+                )
+        except BaseException:
+            # Defence in depth: if any abort path above failed to call
+            # `_core.scheduler_runtime_stop` (or if `start_workers`
+            # raised before reaching the inner try), free the C-side
+            # WORKERS array here. `scheduler_runtime_stop` is
+            # idempotent — calling it twice on a successful abort is
+            # a no-op on the second call.
+            try:
+                _core.scheduler_runtime_stop()
+            except Exception as ex:
+                self.logger.exception(ex)
+            # Drop the __bocmain__ alias if we installed one, so a
+            # follow-up start() observes a clean sys.modules. Same
+            # rationale as in the successful stop() path.
+            sys.modules.pop("__bocmain__", None)
+            raise
 
     def _abort_workers(self):
         """Tear down the worker pool after a partial-startup failure.
 
-        Sends the same ``("boc_worker", "shutdown")`` / cleanup
+        Issues the same ``scheduler_request_stop_all`` + cleanup
         handshake as :py:meth:`stop_workers` but without the cown
         round-up, which is unsafe before the runtime is fully alive.
         Used only on the error path of :py:meth:`start`; on the normal
         path :py:meth:`stop_workers` performs the equivalent work.
         """
         self.logger.debug("aborting workers after failed startup")
-        for _ in range(self.num_workers):
-            _core.send("boc_worker", "shutdown")
+        _core.scheduler_request_stop_all()
         for _ in range(self.num_workers):
             try:
                 _, contents = _core.receive("boc_behavior")
@@ -544,12 +692,26 @@ class Behaviors:
         """Quiesce all behaviors and tear the runtime down.
 
         :param timeout: Upper bound on the **quiescence** and
-            **noticeboard-drain** phases (steps 1, 2, and 4 below). The
-            worker shutdown handshake (step 5), orphan-behavior drain,
-            and tempdir cleanup that follow run to completion regardless;
-            ``timeout`` does not bound total ``stop()`` runtime. ``None``
-            means wait forever for quiescence.
+            **noticeboard-drain** phases (steps 1, 2, and 4 below).
+            The worker shutdown handshake (step 5) and orphan-behavior
+            drain that follow run to completion regardless;
+            ``timeout`` does not bound total ``stop()`` runtime.
+            ``None`` means wait forever for quiescence. Values above
+            ``1e9`` seconds (~31.7 years) are clamped to wait-forever
+            to avoid platform ``time_t`` / ``DWORD`` overflow inside
+            the underlying condition-variable wait.
         :type timeout: Optional[float]
+        :raises RuntimeError: If the noticeboard thread does not exit
+            before the timeout (or, on a retry call, is still alive).
+            The first failure carries the message prefix
+            ``"noticeboard thread did not shut down within timeout=..."``;
+            subsequent retry failures carry
+            ``"noticeboard thread still pinned on retry ..."``.
+            Workers and the orphan-behavior drain have already
+            completed by the time either is raised, so the runtime
+            is intentionally left re-drivable: callers may retry
+            ``stop()`` / ``wait()`` once the in-flight noticeboard
+            mutation finishes.
 
         With no central scheduler thread, ``stop()`` drives
         the C terminator directly. The sequence is:
@@ -564,12 +726,17 @@ class Behaviors:
         4. Tear down the noticeboard thread (it must have drained any
            in-flight messages from the last behaviors before the
            single-writer slot is released).
-        5. Stop workers and clean up the export tempdir.
+        5. Stop workers and release the C-level noticeboard slot.
 
         After ``terminator_wait`` returns we assert ``terminator_count
         == 0 and terminator_seeded == 0``; any non-zero value indicates
         a bookkeeping bug (a missed decrement, or a scheduling-after-
         wait that slipped past ``terminator_close``).
+
+        The retry path is internally gated on ``_workers_stopped`` so
+        the worker pool is not torn down twice; a second ``stop()``
+        after a noticeboard-timeout abort retries only the
+        noticeboard drain.
         """
         # Take down the seed and wait for quiescence. Both
         # are idempotent so a second stop() / wait() is a no-op.
@@ -588,70 +755,123 @@ class Behaviors:
                 return None
             return max(0.0, deadline - time.monotonic())
 
-        _core.terminator_seed_dec()
-        _core.terminator_wait(_remaining())
+        # Idempotent retry: if a prior stop() reached the
+        # noticeboard-timeout branch, it already drove the
+        # terminator to quiescence and shut the workers down.
+        # Re-running ``stop_workers`` would block forever in
+        # ``scheduler_request_stop_all`` waiting for shutdown
+        # replies from a worker pool that is gone. Skip straight
+        # to the noticeboard cleanup the prior attempt could not
+        # complete.
+        if not self._workers_stopped:
+            _core.terminator_seed_dec()
+            _core.terminator_wait(_remaining())
 
-        # Post-wait reconciliation. If wait() timed out the count is
-        # still > 0 -- skip the assertion in that case so a partial
-        # teardown does not mask the underlying timeout.
-        c_count = _core.terminator_count()
-        c_seeded = _core.terminator_seeded()
-        quiesced = (c_count == 0 and c_seeded == 0)
-        # Close the terminator unconditionally before any further drain
-        # work. On the clean path this is the documented refusal point;
-        # on the warned path it MUST happen before _drain_orphan_behaviors
-        # so a late whencall caller cannot slip a fresh BehaviorCapsule
-        # into boc_worker between the drain's last receive() and the
-        # cleanup that follows. terminator_close() is idempotent.
-        _core.terminator_close()
-        if not quiesced:
-            self.logger.warning(
-                "stop(): terminator did not reach quiescence "
-                f"(count={c_count}, seeded={c_seeded}). "
-                "This typically means stop() was invoked with a timeout "
-                "that elapsed while behaviors were still in flight."
-            )
+            # Post-wait reconciliation. If wait() timed out the count is
+            # still > 0 -- skip the assertion in that case so a partial
+            # teardown does not mask the underlying timeout.
+            c_count = _core.terminator_count()
+            c_seeded = _core.terminator_seeded()
+            quiesced = (c_count == 0 and c_seeded == 0)
+            # Close the terminator unconditionally before any further drain
+            # work. On the clean path this is the documented refusal point;
+            # on the warned path it MUST happen before stop_workers's
+            # orphan drain so a late whencall caller cannot slip a fresh
+            # behavior into a per-task queue between the drain pass and
+            # scheduler_runtime_stop. terminator_close() is idempotent.
+            _core.terminator_close()
+            if not quiesced:
+                self.logger.warning(
+                    "stop(): terminator did not reach quiescence "
+                    f"(count={c_count}, seeded={c_seeded}). "
+                    "This typically means stop() was invoked with a timeout "
+                    "that elapsed while behaviors were still in flight."
+                )
 
-        # Drain the noticeboard thread.
-        _core.send("boc_noticeboard", "shutdown")
-        self.noticeboard.join(_remaining())
-        if self.noticeboard.is_alive():
-            # join() timed out. Do not proceed to stop_workers / cleanup:
-            # the noticeboard thread still owns the single-writer slot
-            # and may be holding NB_MUTEX while processing an in-flight
-            # mutation. Tearing workers down under it would be racy.
-            raise RuntimeError(
-                "stop(): noticeboard thread did not shut down within "
-                f"timeout={timeout!r}. The runtime is left running so "
-                "the leak can be diagnosed; a later stop() call may "
-                "succeed once the in-flight mutation completes."
-            )
-        # Shut workers down and reset noticeboard ownership.
-        self.stop_workers()
-        # Defensive drain: if stop() entered the "terminator did not
-        # quiesce" branch above (or any late whencall slipped in
-        # between terminator_close and the worker shutdown messages),
-        # behaviors may still sit in boc_worker with their MCS links
-        # pinned. Release them inline so we do not leak cowns on a
-        # warned-only stop, and drop the terminator holds the whencall
-        # callers took. With a clean stop this is a no-op.
-        drain_errors = self._drain_orphan_behaviors()
+            # Drain the noticeboard thread.
+            _core.send("boc_noticeboard", "shutdown")
+            self.noticeboard.join(_remaining())
+            if self.noticeboard.is_alive():
+                # join() timed out. The noticeboard thread still owns the
+                # single-writer slot and may be holding NB_MUTEX while
+                # processing an in-flight mutation. We do not call
+                # `clear_noticeboard_thread` / `noticeboard_clear` (those
+                # would race with the live thread), but we MUST still drain
+                # orphan behaviors so the C-side terminator_count returns
+                # to 0 — otherwise a caller-supplied finite timeout that
+                # fires here permanently strands every behavior currently
+                # parked in a per-task queue. Worker shutdown itself does
+                # not touch NB_MUTEX, so it is safe under a wedged
+                # noticeboard thread.
+                try:
+                    self.stop_workers()
+                except Exception as drain_ex:
+                    # Surface drain failures via logging; the outer
+                    # RuntimeError below remains the primary failure
+                    # signal because the noticeboard timeout is what got
+                    # us into this branch.
+                    self.logger.exception(drain_ex)
+                # Reset the drain errors list so a subsequent stop() does
+                # not double-report; the drain has already happened.
+                self._stop_drain_errors = []
+                raise RuntimeError(
+                    "stop(): noticeboard thread did not shut down within "
+                    f"timeout={timeout!r}. Workers were shut down and "
+                    "orphan behaviors drained, but the noticeboard slot "
+                    "is still pinned; a later stop() call may complete "
+                    "the cleanup once the in-flight mutation finishes."
+                )
+            # Shut workers down and reset noticeboard ownership.
+            # stop_workers() now owns the orphan-drain (must happen before
+            # the per-task queues are freed); it stashes any release_all
+            # exceptions on `self._stop_drain_errors` for stop() to re-raise.
+            self.stop_workers()
+            drain_errors = self._stop_drain_errors
+            self._stop_drain_errors = []
+        else:
+            # Retry path: workers are already gone. Re-attempt the
+            # noticeboard drain that timed out previously. ``join()``
+            # without a timeout waits forever -- by this point the
+            # in-flight noticeboard fn must have finished or the
+            # caller is no closer to making progress than they were
+            # before. We surface the join via a remaining-budget
+            # join so a caller-supplied timeout still bounds the
+            # retry. The ``is_alive()`` check below is best-effort:
+            # if the thread has already exited it skips the
+            # redundant sentinel send. There is a residual TOCTOU
+            # window (alive at check, exits before the send lands)
+            # in which a stale sentinel can linger in the
+            # ``boc_noticeboard`` queue, but correctness rests on
+            # ``Behaviors.start_runtime`` calling ``set_tags(["...",
+            # "boc_noticeboard"])`` on the next ``start()``, which
+            # clears the queue per the public ``set_tags`` contract.
+            # The guard reduces the frequency of the stale-sentinel
+            # case but is not itself the correctness fence.
+            if self.noticeboard.is_alive():
+                _core.send("boc_noticeboard", "shutdown")
+            self.noticeboard.join(_remaining())
+            if self.noticeboard.is_alive():
+                # Still pinned. Re-raise the same diagnostic so the
+                # caller can keep retrying. ``_workers_stopped`` is
+                # unchanged so a subsequent retry stays on this path.
+                raise RuntimeError(
+                    "stop(): noticeboard thread still pinned on retry "
+                    f"(timeout={timeout!r}). The in-flight mutation "
+                    "has not finished; retry once it has."
+                )
+            drain_errors = []
         _core.clear_noticeboard_thread()
         _core.noticeboard_clear()
         # Teardown is complete: workers are joined, the noticeboard
-        # thread has exited, and the C-level slot is released. The
-        # tempdir cleanup that follows is bookkeeping; if it raises
-        # the runtime is still gone and wait()/__exit__ should null
-        # the global BEHAVIORS handle so the next @when starts fresh
-        # rather than retrying stop() on a dead instance.
+        # thread has exited, and the C-level slot is released.
+        # The transpiled module is exec'd in-memory in each worker,
+        # so there is no on-disk artifact to clean up.
         self._teardown_complete = True
-        if os.path.exists(self.export_dir) and self.export_tmp:
-            try:
-                shutil.rmtree(self.export_dir)
-            except Exception as ex:
-                # An orphan tempdir is annoying but not fatal: log and
-                # continue so the caller observes a normal stop().
-                self.logger.exception(ex)
+        # Drop the __bocmain__ alias we installed in start() so a
+        # subsequent bocpy.start() observes a clean sys.modules
+        # (and so the main module isn't pinned in sys.modules under
+        # an alias after the runtime has shut down).
+        sys.modules.pop("__bocmain__", None)
         if drain_errors:
             # Surface the first failure so the caller sees the leak at
             # the failure site rather than later as a mysterious
@@ -664,18 +884,31 @@ class Behaviors:
             ) from drain_errors[0]
 
     def _drain_orphan_behaviors(self):
-        """Release any BehaviorCapsules left on ``boc_worker`` post-shutdown.
+        """Release any BehaviorCapsules left in per-worker queues post-shutdown.
 
-        Called after :py:meth:`stop_workers`. Each orphan has had its
-        cowns scheduled (MCS links established) but never acquired by
-        a worker. ``release_all`` walks the MCS queues, hands off to any
-        waiting successors, and frees the request array; ``terminator_dec``
-        drops the hold the ``whencall`` caller took before
-        ``behavior_schedule``. The result Cown of each dropped behavior
-        is *not* mutated here: it has already been released (owner
-        ``NO_OWNER``, ``value`` is ``NULL``, ``xidata`` is set), and
-        writing into ``value`` would put it in a state ``cown_acquire``
-        cannot recover from on a subsequent runtime restart.
+        Called from :py:meth:`stop_workers` after the worker threads
+        have joined but BEFORE :py:func:`_core.scheduler_runtime_stop`
+        frees the per-worker queues. Each orphan has had its cowns
+        scheduled (MCS links established) but never acquired by a
+        worker. ``release_all`` walks the MCS queues, hands off to any
+        waiting successors, and frees the request array;
+        ``terminator_dec`` drops the hold the ``whencall`` caller took
+        before ``behavior_schedule``.
+
+        Before ``release_all`` runs, ``set_drop_exception`` marks the
+        result Cown with a :class:`RuntimeError` so a caller awaiting
+        ``cown.value`` / ``cown.exception`` after :py:meth:`stop` sees
+        a diagnostic instead of a permanent ``None``. Mirrors the
+        worker exception path (:py:func:`worker.run_behavior`):
+        ``acquire`` → ``set_exception`` → ``release``, condensed into
+        one C call (`_core.c::BehaviorCapsule_set_drop_exception`).
+
+        ``release_all`` may dispatch a successor into the per-task
+        queues (the off-worker arm of ``boc_sched_dispatch`` runs
+        because the calling thread is the main thread, not a worker).
+        That successor will not be consumed -- workers are gone --
+        so the loop drains again until
+        ``scheduler_drain_all_queues`` returns an empty list.
 
         :returns: A list of exceptions captured from
             ``release_all`` failures, or ``[]`` on a clean
@@ -684,29 +917,59 @@ class Behaviors:
             mysterious deadlock on the affected cowns.
         """
         errors = []
+        # KeyboardInterrupt / SystemExit raised mid-drain must not
+        # abort the drain partway -- the orphaned behaviors would
+        # leak their MCS chains and terminator holds, so the next
+        # start() would diagnose terminator drift forever. Capture
+        # them, finish the drain, and re-raise the first after the
+        # loop returns clean.
+        deferred_base_exc = None
         while True:
-            msg = _core.receive("boc_worker", timeout=0)
-            if msg[0] == _core.TIMEOUT:
+            capsules = _core.scheduler_drain_all_queues()
+            if not capsules:
+                if deferred_base_exc is not None:
+                    raise deferred_base_exc
                 return errors
-            payload = msg[1]
-            if isinstance(payload, _core.BehaviorCapsule):
+            for payload in capsules:
                 self.logger.warning(
                     "behavior dropped during stop(); the runtime was "
                     "torn down before this behavior could acquire its cowns"
                 )
+                # Surface the drop to anyone awaiting the result Cown.
+                # Best-effort: failures here only degrade UX (the user
+                # sees None instead of a diagnostic), so log and
+                # continue with release_all so MCS chains still
+                # unwind.
+                try:
+                    payload.set_drop_exception(RuntimeError(
+                        "behavior dropped during stop(); the runtime "
+                        "was torn down before this behavior could "
+                        "acquire its cowns"
+                    ))
+                except Exception as ex:
+                    self.logger.exception(ex)
+                except (KeyboardInterrupt, SystemExit) as ex:
+                    self.logger.exception(ex)
+                    if deferred_base_exc is None:
+                        deferred_base_exc = ex
                 try:
                     payload.release_all()
                 except Exception as ex:
                     self.logger.exception(ex)
                     errors.append(ex)
+                except (KeyboardInterrupt, SystemExit) as ex:
+                    self.logger.exception(ex)
+                    errors.append(ex)
+                    if deferred_base_exc is None:
+                        deferred_base_exc = ex
                 try:
                     _core.terminator_dec()
                 except Exception as ex:
                     self.logger.exception(ex)
-            # Non-capsule payloads (e.g. a stray "shutdown") are silently
-            # ignored. Worker shutdowns balance 1:1 with workers, so a
-            # stray sentinel here would already indicate a bug elsewhere;
-            # the loop body just falls through to the next receive().
+                except (KeyboardInterrupt, SystemExit) as ex:
+                    self.logger.exception(ex)
+                    if deferred_base_exc is None:
+                        deferred_base_exc = ex
 
     def __exit__(self, exc_type, exc_value, traceback):
         """Ensure stop is called on context exit."""
@@ -737,7 +1000,10 @@ def whencall(thunk: str, args: list[Union[Cown, list[Cown]]], captures: list[Any
         group_id += 1
 
     behavior = _core.BehaviorCapsule(thunk, result.impl, cowns, captures)
-    logging.debug(f"whencall:behavior=Behavior(thunk={thunk}, result={result}, args={args}, captures={captures})")
+    logging.debug(
+        "whencall:behavior=Behavior(thunk=%s, result=%r, args=%r, captures=%r)",
+        thunk, result, args, captures,
+    )
     # Caller threads run the entire 2PL inline. Register with the
     # C terminator first so a concurrent stop()/terminator_close() will
     # refuse the schedule rather than racing teardown. Once the
@@ -764,7 +1030,6 @@ def get_caller_module():
 
 
 def start(worker_count: Optional[int] = None,
-          export_dir: Optional[str] = None,
           module: Optional[tuple[str, str]] = None):
     """Start the behavior runtime: worker pool plus noticeboard thread.
 
@@ -774,10 +1039,6 @@ def start(worker_count: Optional[int] = None,
     :param worker_count: The number of worker interpreters to start.  If
         None, defaults to the number of available cores minus one.
     :type worker_count: Optional[int]
-    :param export_dir: The directory to which the target module will be
-        exported for worker import.  If None, a temporary directory will
-        be created and removed on shutdown.
-    :type export_dir: Optional[str]
     :param module: A tuple of the target module name and file path to export
         for worker import.  If None, the caller's module will be used.
     :type module: Optional[tuple[str, str]]
@@ -794,7 +1055,7 @@ def start(worker_count: Optional[int] = None,
 
     if module is None:
         module = get_caller_module()
-    BEHAVIORS = Behaviors(worker_count, export_dir)
+    BEHAVIORS = Behaviors(worker_count)
     try:
         BEHAVIORS.start(module)
     except BaseException:
@@ -834,7 +1095,7 @@ def when(*cowns):
             print(BEHAVIORS.behavior_lookup)
             return None
 
-        logging.debug(f"when:behavior={binfo}")
+        logging.debug("when:behavior=%s", binfo)
         captures = []
         for name in binfo.captures:
             frame = when_frame
@@ -866,24 +1127,43 @@ def when(*cowns):
     return when_factory
 
 
-def wait(timeout: Optional[float] = None):
-    """Block until all behaviors complete, with optional timeout."""
+def wait(timeout: Optional[float] = None, *, stats: bool = False):
+    """Block until all behaviors complete, with optional timeout.
+
+    When ``stats=True``, returns the per-worker
+    :func:`_core.scheduler_stats` snapshot captured at shutdown
+    (after all behaviors have run, before the per-worker array is
+    freed). When ``stats=False`` (the default), returns ``None``.
+    Returns ``[]`` if the runtime was never started or the snapshot
+    could not be captured.
+    """
     global BEHAVIORS
     if BEHAVIORS:
         # Clear BEHAVIORS only if stop() drove the runtime all the
         # way through teardown (workers joined, noticeboard exited,
-        # tempdir removed). On stop()'s noticeboard-join-timeout path
-        # the runtime is intentionally left running so the caller can
-        # diagnose the leak and retry; nulling the global handle
-        # there would strand the live workers / noticeboard thread
-        # with no Python-side reference.
+        # C-level noticeboard slot released). On stop()'s
+        # noticeboard-join-timeout path the runtime is intentionally
+        # left running so the caller can diagnose the leak and
+        # retry; nulling the global handle there would strand the
+        # live workers / noticeboard thread with no Python-side
+        # reference.
         try:
             BEHAVIORS.stop(timeout)
         except BaseException:
             if BEHAVIORS._teardown_complete:
+                snapshot = BEHAVIORS._final_stats
                 BEHAVIORS = None
+                if stats:
+                    return snapshot if snapshot is not None else []
             raise
+        snapshot = BEHAVIORS._final_stats
         BEHAVIORS = None
+        if stats:
+            return snapshot if snapshot is not None else []
+        return None
+    if stats:
+        return []
+    return None
 
 
 def _validate_noticeboard_key(key: str) -> None:

@@ -1,3 +1,99 @@
+## 2026-04-29 - Version 0.5.0
+Verona-RT-style work-stealing scheduler, C source split into per-subsystem
+translation units, and a portable atomics / threading layer.
+
+**New Features**
+
+- **Work-stealing scheduler** — the single behavior queue has been
+  replaced with a Verona-RT-inspired distributed scheduler. Each
+  worker owns a Multi-Producer Multi-Consumer behavior queue
+  (`boc_bq_*`, ported from `verona-rt/src/rt/sched/mpmcq.h`), pops
+  work from its own queue first, and steals from peers when empty.
+  Idle workers park on a per-worker condition variable and are
+  signalled directly by the producer / victim, eliminating the
+  central wakeup broadcast. Per-worker statistics (steals, parks,
+  fast/slow pops, dispatches) are exposed for benchmarking.
+- **Per-worker fairness tokens** — each worker advances a token node
+  through its own queue so that long-running behaviors cannot
+  monopolise dispatch slots. The token is also used to drive the
+  cooperative shutdown handshake.
+- **`compat.h` / `compat.c` portability layer** — a single header now
+  exposes uniform `BOCMutex`, `BOCCond`, `boc_atomic_*_explicit`,
+  monotonic-time, and sleep primitives across MSVC, pthreads, and
+  C11 `<threads.h>`. The work-stealing scheduler depends on the
+  typed-atomics API for ARM64-correct memory ordering on Windows.
+- **`xidata.h` cross-interpreter shim** — the `#if PY_VERSION_HEX`
+  ladders for the `_PyXIData_*` / `_PyCrossInterpreterData_*` APIs
+  that previously lived in both `_core.c` and `_math.c` have been
+  centralised in one header covering CPython 3.12 through 3.15
+  (including free-threaded builds).
+- **`fanout_benchmark` example** — a fan-out / fan-in benchmark
+  harness exercising scheduler throughput under heavy producer
+  load.
+
+**Improvements**
+
+- **In-memory transpiled-module loading** — workers no longer write
+  the transpiled module to a temporary directory and import it
+  through `importlib.util.spec_from_file_location`. Instead, the
+  transpiled source is embedded as a string literal in the worker
+  bootstrap and `exec`'d into a fresh `types.ModuleType` registered
+  in `sys.modules`. The source is also published to `linecache` so
+  tracebacks still point at the transpiled lines. This removes the
+  `export_dir` argument from `start()` (and the matching tempdir
+  cleanup in `wait()`/`stop()`), eliminates a filesystem round-trip
+  on every worker startup, and avoids leaving `.py` files behind on
+  abnormal exit. Module names are validated as dotted Python
+  identifiers at the boundary, and `__main__` is re-aliased to
+  `__bocmain__` inside workers so a follow-up `start()` observes a
+  clean `sys.modules`.
+- **Nested `@when` capture** — the transpiler now recurses into
+  `@when`-decorated nested functions when computing the outer
+  behavior's captures, so a behavior body can schedule child
+  behaviors that close over the outer frame's free names without
+  raising `NameError` at dispatch time.
+- **C extension split into subsystem TUs** — `_core.c` has been
+  reduced from ~5,000 lines to ~3,500 by extracting `sched.{c,h}`
+  (work-stealing scheduler), `noticeboard.{c,h}`, `terminator.{c,h}`,
+  `tags.{c,h}` (message-queue tag table), `cown.h` (cown refcount
+  helpers), and `compat.{c,h}` / `xidata.h` into separate
+  translation units. Every public function now has a header
+  declaration with Doxygen-style documentation.
+- **Direct dispatch on cown release** — `behavior_release_all` now
+  hands a resolved successor directly to a worker via the
+  work-stealing dispatch path (`boc_sched_dispatch`) instead of
+  re-entering the central scheduler, removing one queue hop per
+  cown handoff.
+- **Cooperative worker shutdown** — `boc_sched_worker_request_stop_all`
+  and `boc_sched_unpause_all` provide a clean stop/drain protocol
+  that interacts correctly with parked workers and the terminator.
+
+**Internal Test Modules**
+
+- **`_internal_test_atomics`** — pytest-driven correctness tests for
+  the `compat.h` typed-atomics API on every supported platform.
+- **`_internal_test_bq`** — torture tests for the MPMC behavior
+  queue (`boc_bq_*`), covering segmented dequeue, FIFO fairness,
+  and concurrent producer / consumer races.
+- **`_internal_test_wsq`** — tests for the work-stealing primitives
+  (fast pop, slow pop, steal, park / unpark handshake).
+
+**Test Suite**
+
+- New scheduler test files — `test_scheduler_integration.py`,
+  `test_scheduler_mpmcq.py`, `test_scheduler_pertask_queue.py`,
+  `test_scheduler_stats.py`, `test_scheduler_steal.py`,
+  `test_scheduler_wsq.py` — exercise the distributed scheduler end
+  to end and per primitive.
+- `test_compat_atomics.py` — Python-level smoke tests for the
+  portable atomics layer.
+- `test_stop_retry_composition.py` — covers `stop()` / `start()` /
+  `wait()` retry composition across multiple runtime cycles.
+- `test_scheduling_stress.py` substantially expanded with new
+  fan-out, work-stealing, and shutdown stress scenarios.
+- `test_boc.py` and `test_transpiler.py` extended with regression
+  cases discovered during the scheduler rewrite.
+
 ## 2026-04-17 - Version 0.4.0
 Noticeboard, distributed scheduler, and a relocated examples package.
 

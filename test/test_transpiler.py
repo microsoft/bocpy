@@ -99,6 +99,79 @@ class TestCapturedFreeVars:
                 return known
         """, known_vars={"known"}) == set()
 
+
+class TestCapturedNestedWhen:
+    """Names referenced only inside a nested @when must propagate outward.
+
+    A nested @when is rewritten by ``WhenTransformer`` into a ``whencall(...)``
+    in the outer behavior's frame, so its captures and cown arguments must be
+    available there. Plain nested ``def``s keep the existing opaque
+    treatment because Python's own closure handles them.
+    """
+
+    @staticmethod
+    def _captures(source, known_vars=frozenset()):
+        tree = ast.parse(textwrap.dedent(source))
+        finder = CapturedVariableFinder(set(known_vars))
+        finder.visit(tree.body[0])
+        return finder.captured_vars
+
+    def test_inner_when_capture_propagates(self):
+        # `marker` is referenced only inside the nested @when body, but must
+        # be captured by the outer behavior so the inner whencall can see it.
+        caps = self._captures("""\
+            def outer(c):
+                @when(c)
+                def _(c):
+                    use(marker)
+        """, known_vars={"when", "use"})
+        assert "marker" in caps
+
+    def test_inner_when_decorator_arg_propagates(self):
+        # The cown argument to the nested @when is evaluated in the outer
+        # frame, so it must also be captured.
+        caps = self._captures("""\
+            def outer():
+                @when(other_cown)
+                def _(x):
+                    pass
+        """, known_vars={"when"})
+        assert "other_cown" in caps
+
+    def test_inner_when_locals_not_captured(self):
+        # Names that are local/params of the inner @when should NOT leak out.
+        caps = self._captures("""\
+            def outer():
+                @when(c)
+                def _(c):
+                    x = 1
+                    use(x, c)
+        """, known_vars={"when", "use"})
+        assert caps == {"c"}
+
+    def test_plain_nested_def_unchanged(self):
+        # A plain (non-@when) nested def keeps its opaque treatment: names
+        # used only inside its body do not surface in the outer's captures.
+        caps = self._captures("""\
+            def outer():
+                def helper():
+                    return inner_only
+        """)
+        assert caps == set()
+
+    def test_deeply_nested_when_propagates(self):
+        # A name referenced in a doubly-nested @when must propagate all the
+        # way out to the top-level behavior.
+        caps = self._captures("""\
+            def outer(c):
+                @when(c)
+                def _(c):
+                    @when(c)
+                    def _(c):
+                        use(deep_marker)
+        """, known_vars={"when", "use"})
+        assert "deep_marker" in caps
+
     def test_mixed_locals_and_captures(self):
         caps = self._captures("""\
             def f(a):

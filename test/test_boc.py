@@ -3,11 +3,13 @@
 import functools
 import sys
 import threading
+import traceback
 from typing import NamedTuple
+
+import pytest
 
 from bocpy import Cown, drain, receive, send, start, TIMEOUT, wait, when
 from bocpy._core import CownCapsule
-import pytest
 
 RECEIVE_TIMEOUT = 10
 
@@ -97,6 +99,22 @@ def exception(x: Cown) -> Cown:
         x.value /= 0
 
     return do_div0
+
+
+class RaiseOnUnpickle:
+    """Pickles cleanly but raises ZeroDivisionError when unpickled.
+
+    Used to drive the deserialisation-failure path inside
+    ``cown_acquire``. The ``__reduce__`` protocol stores
+    ``(eval, ("1/0",))``; ``eval`` is a builtin so the bytestream is
+    portable across sub-interpreters, and ``eval("1/0")`` raises
+    ``ZeroDivisionError`` when ``pickle.loads`` is called inside the
+    worker's ``cown_acquire``.
+    """
+
+    def __reduce__(self):
+        """Return a reduce tuple whose loader raises on unpickle."""
+        return (eval, ("1/0",))
 
 
 class Fork:
@@ -602,6 +620,125 @@ class TestGlobalCapture:
         receive_asserts()
 
 
+class TestCownAcquireDeserialiseFailure:
+    """``cown_acquire`` rolls back owner on unpickle failure.
+
+    When ``xidata_to_object`` (which calls ``_PyPickle_Loads``) raises,
+    ``cown_acquire`` previously returned -1 with the cown left in a
+    half-acquired ``(owner=worker, value=NULL, xidata!=NULL)`` state.
+    The worker-side recovery arm in ``run_behavior`` then called
+    ``behavior.release()``, whose ``cown_release`` aborts on
+    ``assert(cown->value != NULL)`` (debug build) or NULL-derefs in
+    ``object_to_xidata`` (release build).
+
+    The fix stores ``NO_OWNER`` back into ``cown->owner`` before
+    returning -1, so the recovery arm's ``cown_release`` short-circuits
+    cleanly via the ``owner == NO_OWNER`` branch and the result Cown
+    surfaces the exception to downstream behaviors.
+    """
+
+    @classmethod
+    def teardown_class(cls):
+        """Ensure runtime is drained after suite."""
+        wait()
+
+    def test_acquire_rollback_surfaces_exception(self):
+        """Acquire failure produces a result Cown with .exception True.
+
+        The first behavior ``use_bad`` is scheduled against a Cown wrapping
+        an instance of :class:`RaiseOnUnpickle`. When the worker dequeues
+        the behavior and calls ``cown_acquire``, ``_PyPickle_Loads`` raises
+        ``ZeroDivisionError``. The worker's recovery arm marks ``use_bad``'s
+        result Cown with the exception. The downstream behavior ``check``
+        observes ``b.exception is True``.
+
+        Without this rollback, ``cown_release`` aborts before
+        ``check`` is ever scheduled, the assert messages never
+        arrive, and the test either segfaults or times out.
+        """
+        bad = Cown(RaiseOnUnpickle())
+
+        @when(bad)
+        def use_bad(b):
+            # This body never runs — acquire fails first.
+            send("assert", (b.value, "unreachable"))
+
+        @when(use_bad)
+        def check(b):
+            send("assert", (b.exception, True))
+            send("assert", (isinstance(b.value, ZeroDivisionError), True))
+
+        receive_asserts(2)
+
+
+class TestBehaviorCapsuleArgsSize:
+    """``BehaviorCapsule`` ``group_ids`` allocation corner cases.
+
+    ``BehaviorCapsule_init`` allocates ``behavior->group_ids`` via
+    ``PyMem_RawCalloc(args_size, sizeof(int))``. Two corner cases must
+    work:
+
+    * ``args_size == 0`` -- ``PyMem_RawCalloc`` may legally return NULL
+      for a zero-element request, so the NULL check must be guarded
+      ``args_size > 0``.
+    * ``args_size > 0`` with a successful allocation -- the standard
+      path; verifies the gating logic does not regress normal use.
+
+    OOM injection for the failure path requires allocator hooks that
+    do not exist in the test infrastructure today.
+    """
+
+    @classmethod
+    def teardown_class(cls):
+        """Ensure runtime is drained after suite."""
+        wait()
+
+    def test_zero_args_behavior_capsule(self):
+        """BehaviorCapsule with empty args list must construct cleanly."""
+        from bocpy import start as _start_runtime
+        from bocpy._core import BehaviorCapsule
+        try:
+            _start_runtime()
+        except RuntimeError:
+            pass  # Runtime already started by a prior test.
+
+        result = Cown(None)
+        # Empty args list — args_size == 0. The
+        # ``args_size > 0 && group_ids == NULL`` guard avoids a
+        # spurious failure if PyMem_RawCalloc(0, ...) returns NULL.
+        capsule = BehaviorCapsule(
+            "__behavior_zero_args__",
+            result.impl,
+            [],
+            [],
+        )
+        assert capsule is not None
+
+    def test_large_args_behavior_capsule(self):
+        """BehaviorCapsule with many args constructs and group_ids works."""
+        from bocpy import start as _start_runtime
+        from bocpy._core import BehaviorCapsule
+        try:
+            _start_runtime()
+        except RuntimeError:
+            pass  # Runtime already started by a prior test.
+
+        result = Cown(None)
+        # 32 distinct cowns with distinct group_ids. Exercises the
+        # group_ids[i] = group_id loop that NULL-derefs without
+        # the alloc check on OOM.
+        cowns = [Cown(i) for i in range(32)]
+        args = [(i, c.impl) for i, c in enumerate(cowns)]
+
+        capsule = BehaviorCapsule(
+            "__behavior_large_args__",
+            result.impl,
+            args,
+            [],
+        )
+        assert capsule is not None
+
+
 class TestExceptionFlag:
     """Tests for the Cown.exception flag distinguishing thrown vs returned."""
 
@@ -861,3 +998,308 @@ class TestCrossWorker:
             assert isinstance(observed, CownCapsule), (
                 f"slot {idx} returned {type(observed).__name__}, "
                 "expected CownCapsule")
+
+
+class TestInMemoryExport:
+    """Regression tests for the in-memory transpiler export path.
+
+    Prior to the in-memory export path the transpiled module was
+    written to a temporary directory under ``tempfile.mkdtemp()``
+    and re-read by every worker via
+    ``importlib.util.spec_from_file_location``. That path had three problems: a world-traversable on-disk artifact, a
+    small TOCTOU window between write and per-worker read, and an
+    f-string interpolation of ``module_name`` into ``r"..."`` that
+    re-opened a code-injection vector if a hostile name reached
+    ``start()``.
+
+    The replacement embeds the transpiled source as a Python string
+    literal (via ``repr()``) inside the per-worker bootstrap, exec's
+    it into a fresh ``types.ModuleType``, and registers a
+    ``linecache`` entry under a synthetic filename
+    ``<bocpy:NAME>`` so tracebacks still point at the transpiled
+    source line. These tests exercise the surfaces that change.
+    """
+
+    @classmethod
+    def teardown_class(cls):
+        """Ensure the runtime is drained between this and the next class."""
+        wait()
+
+    def test_traceback_resolves_via_linecache(self):
+        """A raising body's traceback shows the transpiled source line.
+
+        The ``linecache`` registration in the worker bootstrap is the
+        only thing keeping tracebacks debuggable now that the source
+        is no longer on disk. We capture a worker-side traceback
+        string via ``traceback.format_exc()`` and assert it references
+        the synthetic ``<bocpy:NAME>`` filename — proof the bootstrap
+        registered the cache entry under that name.
+        """
+        c = Cown(0)
+        start(worker_count=2)
+        try:
+            @when(c)
+            def _b(c):  # noqa: B023
+                try:
+                    raise RuntimeError("synthetic-from-test-traceback")
+                except RuntimeError:
+                    send("tb_done", traceback.format_exc())
+            tag, tb_str = receive(["tb_done"], RECEIVE_TIMEOUT)
+            assert tag != TIMEOUT, "traceback probe timed out"
+        finally:
+            drain("tb_done")
+            wait()
+
+        # The traceback must reference the synthetic bootstrap
+        # filename ``<bocpy:__bocmain__>`` (the test module is the
+        # worker's __main__ alias).
+        assert "<bocpy:" in tb_str, (
+            f"traceback did not reference synthetic filename; got:\n{tb_str}"
+        )
+
+    def test_tricky_source_round_trips(self):
+        """Tricky literals (Unicode, backslashes, triple-quotes) survive.
+
+        ``repr()`` is the source-of-truth for embedding the transpiled
+        text into the worker bootstrap. This test puts every embedding
+        hazard we can think of into a single behavior body and
+        confirms it executes correctly.
+        """
+        c = Cown(0)
+        start(worker_count=2)
+        try:
+            @when(c)
+            def _(c):  # noqa: B023
+                # 1. Non-ASCII identifier-class literal
+                # 2. Embedded quotes of every flavour
+                # 3. Triple-quoted string literal
+                # 4. Backslash and raw-string-style content
+                # 5. Surrogate-free Unicode (U+1F600 grinning face)
+                # 6. NUL byte in a literal — repr() must escape it
+                payload = (
+                    "héllo",
+                    'mix "single" and \'double\' quotes',
+                    """triple-quoted with embedded "quote" and 'apostrophe'""",
+                    r"raw \n not a newline",
+                    'back\\slash and "escaped quote"',
+                    "emoji \U0001F600 in literal",
+                    "with\x00nul",
+                )
+                send("tricky_done", payload)
+            tag, payload = receive(["tricky_done"], RECEIVE_TIMEOUT)
+            assert tag != TIMEOUT, "tricky-source probe timed out"
+            assert payload == (
+                "héllo",
+                'mix "single" and \'double\' quotes',
+                """triple-quoted with embedded "quote" and 'apostrophe'""",
+                r"raw \n not a newline",
+                'back\\slash and "escaped quote"',
+                "emoji \U0001F600 in literal",
+                "with\x00nul",
+            ), f"payload round-trip mismatch: {payload!r}"
+        finally:
+            drain("tricky_done")
+            wait()
+
+    def test_module_name_with_quote_rejected(self):
+        """``module_name`` containing a double-quote is rejected at start().
+
+        Defence in depth: even though every interpolation now uses
+        ``repr()``, ``Behaviors.start`` validates ``module_name`` is
+        a dotted Python module path before building the bootstrap
+        snippet. A name with a quote would ``repr()`` cleanly but
+        is still nonsensical and the boundary check refuses it with
+        a ``ValueError``.
+        """
+        # Reach Behaviors.start directly so we can pass an arbitrary
+        # module name. We cannot use the public ``bocpy.start()``
+        # entry point because it overrides ``module`` from the
+        # caller's frame.
+        from bocpy import behaviors as _behaviors
+
+        wait()  # ensure no live runtime
+        b = _behaviors.Behaviors(2)
+        # Provide a path that exists so export_module_from_file does not
+        # raise on FileNotFoundError before reaching the validation.
+        # The transpiler will parse this test file itself; the body
+        # never runs because the validation fires first.
+        with pytest.raises(ValueError, match="dotted Python module path"):
+            b.start(module=('a"b', __file__))
+
+
+# ---------------------------------------------------------------------------
+# NaN/Inf timeout helper
+# ---------------------------------------------------------------------------
+
+
+class TestTimeoutValidation:
+    """Boundary validation for wait/notice_sync_wait timeouts.
+
+    The C-level ``boc_validate_finite_timeout`` helper rejects NaN with
+    ``ValueError``, treats ``+Inf`` as "wait forever", and clamps
+    negatives to 0 (return immediately). Without it NaN would compute a
+    nonsensical ``ms`` argument to the OS timed-wait primitive (UB on
+    Windows, wedge-forever on POSIX).
+    """
+
+    @classmethod
+    def teardown_class(cls):
+        wait()
+
+    def test_terminator_wait_nan_timeout_raises_value_error(self):
+        """NaN timeout to ``_core.terminator_wait`` raises ``ValueError``."""
+        from bocpy import _core
+        with pytest.raises(ValueError, match="NaN"):
+            _core.terminator_wait(float("nan"))
+
+    def test_notice_sync_wait_nan_timeout_raises_value_error(self):
+        """NaN timeout to ``_core.notice_sync_wait`` raises ``ValueError``."""
+        from bocpy import _core
+        with pytest.raises(ValueError, match="NaN"):
+            _core.notice_sync_wait(0, float("nan"))
+
+    def test_wait_inf_timeout_blocks_until_done(self):
+        """``+Inf`` timeout treats wait as "wait forever" and returns once done.
+
+        With no live behaviors the terminator count is already 0, so
+        ``terminator_wait(+Inf)`` returns ``True`` immediately rather
+        than blocking. The point is that it does *not* raise.
+        """
+        from bocpy import _core
+        # No runtime has incremented the terminator, so this returns at
+        # once. The test exists to assert +Inf is accepted (not ValueError).
+        assert _core.terminator_wait(float("inf")) is True
+
+    def test_terminator_wait_negative_timeout_returns_immediately(self):
+        """Negative timeout to ``_core.terminator_wait`` is mapped to wait_forever.
+
+        bocpy's existing convention treats negatives as "wait forever"
+        (matching the historical Python-side semantics). The new
+        validator preserves that behaviour for negatives — only NaN is
+        upgraded to a hard error. With no live runtime the terminator
+        is already at 0, so this returns immediately either way.
+        """
+        from bocpy import _core
+        # Returns True immediately because count is already 0.
+        assert _core.terminator_wait(-1.0) is True
+
+
+# ---------------------------------------------------------------------------
+# BaseException discipline
+# ---------------------------------------------------------------------------
+
+
+class TestBaseExceptionDiscipline:
+    """KeyboardInterrupt in a @when body releases the cown.
+
+    Without ``finally``-based cleanup, ``except Exception`` arms in
+    ``worker.py`` and the orphan-drain loop in ``behaviors.py``
+    silently let ``KeyboardInterrupt`` / ``SystemExit`` escape past
+    the per-iteration cleanup. The MCS chain would stay linked, the
+    cown would stay owned, and every successor on it would strand.
+    """
+
+    @classmethod
+    def teardown_class(cls):
+        wait()
+        drain("ki_done")
+
+    def test_keyboard_interrupt_during_worker_releases_cown(self):
+        """A ``KeyboardInterrupt`` from a @when body releases the cown.
+
+        Schedules a behavior that raises ``KeyboardInterrupt``, then
+        a follow-on behavior on the same cown. If the
+        ``finally``-based release / release_all chain is wired
+        correctly, the follow-on runs and the test sees its message.
+        Otherwise the cown is stranded and ``receive`` times out.
+        """
+        wait()
+        start(worker_count=2)
+        try:
+            c = Cown(0)
+
+            @when(c)
+            def _raise(c):
+                raise KeyboardInterrupt("intentional KI")
+
+            @when(c)
+            def _follow(c):
+                send("ki_done", "ok")
+
+            tag, payload = receive("ki_done", RECEIVE_TIMEOUT)
+            assert tag != TIMEOUT, (
+                "follow-on never ran -- cown was not released after KI"
+            )
+            assert payload == "ok"
+        finally:
+            drain("ki_done")
+            wait()
+
+    def test_keyboard_interrupt_during_orphan_drain_completes_drain(self):
+        """KI mid-drain still drains the remaining orphans.
+
+        Patches ``BehaviorCapsule.set_drop_exception`` so the first
+        orphan raises ``KeyboardInterrupt`` (mimicking a Ctrl-C landing
+        inside the drain loop). The drain must finish the remaining
+        orphans before the deferred KI is re-raised, so no MCS chain or
+        terminator hold leaks.
+        """
+        from unittest import mock
+
+        from bocpy import behaviors as _behaviors
+
+        wait()
+        # Build a Behaviors directly so we can drive _drain_orphan_behaviors
+        # against synthetic capsules without standing up the full runtime.
+        b = _behaviors.Behaviors(2)
+
+        # Synthetic capsule that records its release_all call. We do
+        # NOT actually inject these into the C scheduler queue; instead
+        # we monkey-patch `_core.scheduler_drain_all_queues` to return
+        # them, and patch `_core.terminator_dec` to be a no-op so the
+        # test does not touch global C state.
+        class FakeCapsule:
+            def __init__(self):
+                self.set_drop_called = False
+                self.released = False
+
+            def set_drop_exception(self, exc):
+                self.set_drop_called = True
+
+            def release_all(self):
+                self.released = True
+
+        cap_ki = FakeCapsule()
+        cap_ok = FakeCapsule()
+
+        # First call returns both capsules; second call returns [] so
+        # the drain loop terminates cleanly.
+        drain_returns = [[cap_ki, cap_ok], []]
+
+        def fake_drain():
+            return drain_returns.pop(0) if drain_returns else []
+
+        # Make set_drop_exception on cap_ki raise KI; cap_ok works normally.
+        original_set_drop = FakeCapsule.set_drop_exception
+
+        def patched_set_drop(self, exc):
+            if self is cap_ki:
+                raise KeyboardInterrupt("orphan-drain KI")
+            return original_set_drop(self, exc)
+
+        with mock.patch.object(FakeCapsule, "set_drop_exception",
+                               patched_set_drop), \
+             mock.patch("bocpy._core.scheduler_drain_all_queues",
+                        side_effect=fake_drain), \
+             mock.patch("bocpy._core.terminator_dec", return_value=0):
+            with pytest.raises(KeyboardInterrupt, match="orphan-drain KI"):
+                b._drain_orphan_behaviors()
+
+        # cap_ok must still have had its release_all called -- the KI on
+        # cap_ki did not abort the drain partway.
+        assert cap_ok.released, (
+            "second orphan was not drained -- KI aborted the loop"
+        )
+        # cap_ki's release_all was attempted too (the KI was raised
+        # from set_drop_exception, which runs *before* release_all).
+        assert cap_ki.released

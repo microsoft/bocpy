@@ -162,6 +162,20 @@ pip install -e .[linting]    # linting deps
 flake8 src/ test/            # lint check
 ```
 
+The private `bocpy._internal_test` C extension (used by
+`test_internal_mpmcq.py`, `test_internal_wsq.py`, and
+`test_compat_atomics.py`) is **not** built by default — it is gated off
+in [setup.py](../setup.py) so it never ships in distributed wheels. To
+run those test files locally, opt in at install time:
+
+```bash
+BOCPY_BUILD_INTERNAL_TESTS=1 pip install -e .[test]
+```
+
+Without the env var, the affected tests skip cleanly via
+`pytest.importorskip`. CI sets the variable at the workflow level in
+`.github/workflows/pr_gate.yml`.
+
 Never run `pip`, `pytest`, `python`, or any project command outside the
 activated venv. If you need to validate a fix against more than one Python
 version, re-install and re-run the suite in each relevant venv.

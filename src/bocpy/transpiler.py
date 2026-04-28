@@ -7,6 +7,15 @@ import sys
 from typing import Mapping, NamedTuple, Set
 
 
+def _has_when_decorator(node: ast.FunctionDef) -> bool:
+    """Return True if the function carries an ``@when(...)`` decorator."""
+    for dec in node.decorator_list:
+        if (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Name)
+                and dec.func.id == "when"):
+            return True
+    return False
+
+
 class CapturedVariableFinder(ast.NodeVisitor):
     """Finds captured variables in a FunctionDef."""
 
@@ -41,6 +50,21 @@ class CapturedVariableFinder(ast.NodeVisitor):
         for stmt in node.body:
             if isinstance(stmt, ast.FunctionDef):
                 self.local_vars.add(stmt.name)
+                # A nested @when is rewritten by WhenTransformer into a
+                # whencall(...) at this position. The cown arguments and the
+                # capture tuple are evaluated in *this* (outer) frame, so any
+                # free names they reference must appear in the outer
+                # behavior's captures. Plain nested def's keep their normal
+                # opaque treatment because Python's own closure handles them.
+                if _has_when_decorator(stmt):
+                    inner = CapturedVariableFinder(self.known_vars)
+                    inner.visit(stmt)
+                    self.used_vars |= inner.captured_vars
+                    for dec in stmt.decorator_list:
+                        if (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Name)
+                                and dec.func.id == "when"):
+                            for arg in dec.args:
+                                self.visit(arg)
                 continue
 
             self.generic_visit(stmt)

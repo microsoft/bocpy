@@ -4,6 +4,7 @@ inline-quotes = double
 import-order-style = google
 docstring-convention = google
 max-line-length = 120
+application-import-names = bocpy,examples
 
 extend-ignore = E203, N812, N817
 

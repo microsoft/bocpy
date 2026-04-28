@@ -170,6 +170,12 @@ class RepeatResult:
     elapsed_s: float
     throughput: float
     wall_clock_ns_start: int
+    scheduler_stats: Optional[list] = None
+    queue_stats: Optional[list] = None
+    # ``derived`` holds the post-processed metrics computed from the
+    # per-window scheduler-stats delta (see
+    # ``compute_derived_metrics``).
+    derived: Optional[dict] = None
 
 
 @dataclass
@@ -331,7 +337,13 @@ def emit_chain_snapshot(state_cown: Cown, tag: str) -> None:
 
 
 def run_single_point_body(cfg: BenchConfig, repeat_index: int) -> RepeatResult:
-    """Run one measurement in a fresh BOC runtime; return plain data.
+    """Run one chain-ring measurement in a fresh BOC runtime.
+
+    Snapshots ``_core.scheduler_stats()`` after warmup, then captures
+    the post-session snapshot via ``wait(stats=True)``. The **delta**
+    of the two is stored in ``RepeatResult.scheduler_stats`` so warmup
+    pushes do not pollute the per-window counters consumed by
+    ``compute_derived_metrics``.
 
     :param cfg: The fully-derived config.
     :param repeat_index: Index of this repeat for reporting.
@@ -349,7 +361,7 @@ def run_single_point_body(cfg: BenchConfig, repeat_index: int) -> RepeatResult:
     notice_write("cr_null", cfg.null_payload)
     payload_bytes = cfg.payload_rows * cfg.payload_cols * 8
     total_bytes = cfg.rings * cfg.ring_size * payload_bytes
-    print(f"workload: rings={cfg.rings} ring_size={cfg.ring_size} "
+    print(f"workload: chain rings={cfg.rings} ring_size={cfg.ring_size} "
           f"chains={cfg.rings * cfg.chains_per_ring} "
           f"payload={cfg.payload_rows}x{cfg.payload_cols} "
           f"(~{total_bytes / 1024:.1f} KiB matrix data)",
@@ -372,6 +384,8 @@ def run_single_point_body(cfg: BenchConfig, repeat_index: int) -> RepeatResult:
                 chain_idx += 1
 
         time.sleep(cfg.warmup)
+        from bocpy import _core
+        sched_stats_warm = _core.scheduler_stats()
         wall_clock_ns_start = time.time_ns()
         t_measure_start = time.perf_counter()
         time.sleep(cfg.duration)
@@ -383,18 +397,135 @@ def run_single_point_body(cfg: BenchConfig, repeat_index: int) -> RepeatResult:
             raise RuntimeError("snap behavior did not publish in time")
         _, total = msg
         elapsed_s = t_snap_received - t_measure_start
+
+        # Snapshot tagged-queue counters BEFORE wait() tears the
+        # runtime down. Per-tag assignments are rebound on the next
+        # start(), so capture here while they still reflect this run.
+        queue_stats_snap = (
+            _core.queue_stats() if hasattr(_core, "queue_stats") else None
+        )
     finally:
         # Drop bare-Cown locals before wait().
         del rings
         del state_cowns
-        wait()
+        # ``wait(stats=True)`` returns the per-worker scheduler_stats
+        # snapshot captured AFTER all behaviors completed but BEFORE
+        # the per-worker array is freed -- the only correct moment
+        # for a session-final snapshot.
+        sched_stats_end = wait(stats=True)
 
+    sched_stats_delta = _delta_scheduler_stats(sched_stats_warm,
+                                               sched_stats_end)
     throughput = total / elapsed_s if elapsed_s > 0 else 0.0
     return RepeatResult(repeat_index=repeat_index,
                         completed_behaviors=int(total),
                         elapsed_s=elapsed_s,
                         throughput=throughput,
-                        wall_clock_ns_start=wall_clock_ns_start)
+                        wall_clock_ns_start=wall_clock_ns_start,
+                        scheduler_stats=sched_stats_delta,
+                        queue_stats=queue_stats_snap,
+                        derived=compute_derived_metrics(sched_stats_delta,
+                                                        int(total)))
+
+
+# ---------------------------------------------------------------------------
+# Stats-delta + derived metrics
+# ---------------------------------------------------------------------------
+
+
+# Counter fields in ``_core.scheduler_stats()`` that are monotonically
+# increasing per-worker counters and therefore subtractable across two
+# snapshots.  Non-counter fields (``last_steal_attempt_ns``,
+# ``parked``) are carried over from the end-of-window snapshot
+# unchanged because subtracting them is meaningless.
+_COUNTER_FIELDS = (
+    "pushed_local",
+    "dispatched_to_pending",
+    "pushed_remote",
+    "popped_local",
+    "popped_via_steal",
+    "enqueue_cas_retries",
+    "dequeue_cas_retries",
+    "batch_resets",
+    "steal_attempts",
+    "steal_failures",
+    "fairness_arm_fires",
+)
+
+
+def _delta_scheduler_stats(warm: Optional[list],
+                           end: Optional[list]) -> Optional[list]:
+    """Return per-worker ``end - warm`` for the monotonic counter fields.
+
+    Non-counter fields (``parked``, ``last_steal_attempt_ns``) are
+    copied from ``end`` unchanged.  If either snapshot is missing or
+    the worker counts disagree (for example because the runtime tore
+    down between snapshots), returns the end snapshot unchanged.
+
+    :param warm: End-of-warmup snapshot (per-worker dicts).
+    :param end: End-of-measurement-window snapshot.
+    :return: Per-worker delta dicts.
+    """
+    if not end:
+        return end
+    if not warm or len(warm) != len(end):
+        return end
+    out = []
+    for w, e in zip(warm, end):
+        d = dict(e)
+        for k in _COUNTER_FIELDS:
+            if k in e and k in w:
+                d[k] = int(e[k]) - int(w[k])
+        out.append(d)
+    return out
+
+
+def compute_derived_metrics(stats: Optional[list],
+                            completed_behaviors: int) -> dict:
+    """Compute the dispatch-contention metrics from a stats delta.
+
+    :param stats: Per-worker delta stats from ``_delta_scheduler_stats``.
+    :param completed_behaviors: Total completed behaviors over the
+        measurement window (matches the throughput numerator).
+    :return: A dict with ``producer_worker_index``,
+        ``enq_retry_ratio``, ``steal_yield``, ``idle_ratio``, and
+        ``producer_pushed_local`` so callers can reconstruct the
+        ratio's numerator / denominator without re-walking ``stats``.
+    """
+    out = {
+        "producer_worker_index": None,
+        "producer_pushed_local": 0,
+        "producer_enqueue_cas_retries": 0,
+        "enq_retry_ratio": None,
+        "steal_yield": None,
+        "idle_ratio": None,
+    }
+    if not stats:
+        return out
+    # Producer worker = the worker with the most local pushes over
+    # the measurement window. For chain that is whichever worker's
+    # queue saw the most ``schedule_fifo`` evicts of ``pending`` to
+    # ``q``.
+    pushed_local = [int(w.get("pushed_local", 0)) for w in stats]
+    if not pushed_local or max(pushed_local) == 0:
+        return out
+    p_idx = max(range(len(pushed_local)), key=lambda i: pushed_local[i])
+    p_pushed = pushed_local[p_idx]
+    p_enq_r = int(stats[p_idx].get("enqueue_cas_retries", 0))
+    out["producer_worker_index"] = p_idx
+    out["producer_pushed_local"] = p_pushed
+    out["producer_enqueue_cas_retries"] = p_enq_r
+    out["enq_retry_ratio"] = (p_enq_r / p_pushed) if p_pushed > 0 else None
+
+    total_steal = sum(int(w.get("popped_via_steal", 0)) for w in stats)
+    if completed_behaviors > 0:
+        out["steal_yield"] = total_steal / completed_behaviors
+
+    total_attempts = sum(int(w.get("steal_attempts", 0)) for w in stats)
+    total_failures = sum(int(w.get("steal_failures", 0)) for w in stats)
+    if total_attempts > 0:
+        out["idle_ratio"] = total_failures / total_attempts
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +561,12 @@ def cfg_to_argv(cfg: BenchConfig) -> list:
     return args
 
 
+# Sidechannel: the parent passes its --emit-scheduler-stats flag down
+# to the child via an env var so cfg_to_argv stays a pure function of
+# BenchConfig (the flag is a reporting concern, not a workload knob).
+BOCPY_BENCH_EMIT_SCHED_STATS_ENV = "BOCPY_BENCH_EMIT_SCHED_STATS"
+
+
 def run_in_subprocess(cfg: BenchConfig, repeat_index: int,
                       git_sha: Optional[str]) -> RepeatResult:
     """Run one repeat in a fresh subprocess and return its result.
@@ -446,8 +583,12 @@ def run_in_subprocess(cfg: BenchConfig, repeat_index: int,
     if git_sha is not None:
         env["BOCPY_BENCH_GIT_SHA"] = git_sha
 
+    extra = []
+    if env.get(BOCPY_BENCH_EMIT_SCHED_STATS_ENV) == "1":
+        extra.append("--emit-scheduler-stats")
+
     cmd = [sys.executable, "-m", "bocpy.examples.benchmark",
-           "--json-stdout"] + cfg_to_argv(cfg)
+           "--json-stdout"] + cfg_to_argv(cfg) + extra
     timeout = max(cfg.duration * 3 + 30, cfg.duration + cfg.warmup + 60)
     try:
         proc = subprocess.run(cmd, env=env, capture_output=True,
@@ -473,7 +614,10 @@ def run_in_subprocess(cfg: BenchConfig, repeat_index: int,
         completed_behaviors=int(payload["completed_behaviors"]),
         elapsed_s=float(payload["elapsed_s"]),
         throughput=float(payload["throughput"]),
-        wall_clock_ns_start=int(payload["wall_clock_ns_start"]))
+        wall_clock_ns_start=int(payload["wall_clock_ns_start"]),
+        scheduler_stats=payload.get("scheduler_stats"),
+        queue_stats=payload.get("queue_stats"),
+        derived=payload.get("derived"))
 
 
 def _extract_sentinel_payload(stdout: str) -> Optional[dict]:
@@ -959,6 +1103,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--table", dest="table", action="store_true", default=None)
     p.add_argument("--no-table", dest="table", action="store_false")
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--emit-scheduler-stats", dest="emit_scheduler_stats",
+                   action="store_true", default=False,
+                   help="Capture _core.scheduler_stats() and "
+                        "_core.queue_stats() snapshots after each "
+                        "repeat and embed them in the result JSON.")
     p.add_argument("--json-stdout", action="store_true",
                    help="Run a single point and print sentinel-framed "
                         "JSON to stdout (subprocess internal).")
@@ -1018,6 +1167,15 @@ def child_main(args) -> int:
         "throughput": rep.throughput,
         "wall_clock_ns_start": rep.wall_clock_ns_start,
     }
+    if args.emit_scheduler_stats:
+        # Read from the snapshot taken INSIDE run_single_point_body,
+        # before wait() freed the per-worker array. Querying _core
+        # here would return empty lists.
+        payload["scheduler_stats"] = rep.scheduler_stats or []
+        payload["queue_stats"] = rep.queue_stats or []
+    # Always forward derived metrics (small dict; harmless when None).
+    if rep.derived is not None:
+        payload["derived"] = rep.derived
     sys.stdout.write("\n" + SENTINEL_BEGIN + "\n")
     sys.stdout.write(json.dumps(payload, default=_json_default))
     sys.stdout.write("\n" + SENTINEL_END + "\n")
@@ -1052,6 +1210,12 @@ def parent_main(args) -> int:
         derived_points.append(cfg)
 
     git_sha = _git_sha()
+
+    # Sidechannel: forward the emit-scheduler-stats flag to children
+    # via an env var. cfg_to_argv stays a pure function of BenchConfig
+    # because the flag is a reporting concern, not a workload knob.
+    if args.emit_scheduler_stats:
+        os.environ[BOCPY_BENCH_EMIT_SCHED_STATS_ENV] = "1"
 
     # Wall-clock estimate for sweep duration.
     startup_slack = 5.0

@@ -565,22 +565,65 @@ def notice_sync(timeout: Optional[float] = 30.0) -> int:
     """
 
 
-def wait(timeout: Optional[float] = None):
+def wait(timeout: Optional[float] = None, *, stats: bool = False):
     """Block until all behaviors complete, with optional timeout.
 
     On a successful return the runtime is **stopped**: workers are
-    joined, the noticeboard thread exits, the export tempdir is removed,
-    and the terminator is closed. The next ``@when`` call (or explicit
-    :func:`start`) will spin up a fresh runtime.
+    joined, the noticeboard thread exits, the C-level noticeboard
+    slot is released, and the terminator is closed. The next
+    ``@when`` call (or explicit :func:`start`) will spin up a fresh
+    runtime.
 
     Note that holding on to references to Cown objects such that they
     are deallocated after wait() is called results in undefined behavior.
 
     :param timeout: Maximum number of seconds to wait, or ``None`` to
         wait indefinitely. The timeout bounds only the quiescence and
-        noticeboard-drain phases; worker shutdown and tempdir cleanup
-        run to completion regardless.
+        noticeboard-drain phases; worker shutdown runs to completion
+        regardless. Values above ``1e9`` seconds (~31.7 years) are
+        clamped to wait-forever to avoid platform ``time_t`` /
+        ``DWORD`` overflow inside the underlying condition-variable
+        wait.
     :type timeout: Optional[float]
+    :param stats: If ``True``, return the per-worker
+        :func:`_core.scheduler_stats` snapshot captured at shutdown
+        (after every behavior has run, before the per-worker array
+        is freed). This is the only reliable way to read the
+        scheduler counters for the session that just ended --
+        calling :func:`_core.scheduler_stats` after :func:`wait`
+        returns ``[]`` because the per-worker array has already been
+        reclaimed. Returns ``[]`` if the runtime was never started
+        or the snapshot could not be captured. Each dict has the
+        keys documented on :func:`_core.scheduler_stats`
+        (``worker_index``, ``pushed_local``,
+        ``dispatched_to_pending``, ``pushed_remote``,
+        ``popped_local``, ``popped_via_steal``,
+        ``enqueue_cas_retries``, ``dequeue_cas_retries``,
+        ``batch_resets``, ``steal_attempts``, ``steal_failures``,
+        ``parked``, ``last_steal_attempt_ns``,
+        ``fairness_arm_fires``, plus the per-sub-queue
+        ``boc_bq_t`` counters).
+    :type stats: bool
+    :return: ``None`` when ``stats=False``; otherwise the per-worker
+        stats list (same shape as :func:`_core.scheduler_stats`).
+    :rtype: Optional[list[dict]]
+    :raises RuntimeError: If the noticeboard thread does not exit
+        before the timeout (or, on a retry call, is still alive).
+        The first failure carries the message prefix
+        ``"noticeboard thread did not shut down within timeout=..."``;
+        subsequent retry failures carry
+        ``"noticeboard thread still pinned on retry ..."``. Workers
+        and the orphan-behavior drain have already completed by the
+        time either is raised, so the runtime is intentionally left
+        re-drivable: callers may retry ``wait()`` / ``stop()`` once
+        the in-flight noticeboard mutation finishes. **Note:** when
+        ``stats=True`` and ``stop()`` raises *after* runtime
+        teardown has already completed (i.e. workers joined and the
+        noticeboard closed), the exception is suppressed and the
+        captured snapshot is returned instead — callers who require
+        the exception to propagate should call :func:`wait` (without
+        ``stats``) and read :func:`_core.scheduler_stats` from a
+        prior in-session call.
     """
 
 
@@ -617,10 +660,6 @@ def start(**kwargs):
     :param worker_count: The number of worker interpreters to start.  If
         ``None``, defaults to the number of available cores minus one.
     :type worker_count: Optional[int]
-    :param export_dir: The directory to which the target module will be
-        exported for worker import.  If ``None``, a temporary directory
-        will be created and removed on shutdown.
-    :type export_dir: Optional[str]
     :param module: A tuple of the target module name and file path to
         export for worker import.  If ``None``, the caller's module will
         be used.

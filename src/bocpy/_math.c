@@ -7,108 +7,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if PY_VERSION_HEX >= 0x030D0000
-#define Py_BUILD_CORE
-#include <internal/pycore_crossinterp.h>
-#endif
+#include "compat.h"
+#include "xidata.h"
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-typedef volatile int_least64_t atomic_int_least64_t;
-
-int_least64_t atomic_fetch_add(atomic_int_least64_t *ptr, int_least64_t value) {
-  return InterlockedExchangeAdd64(ptr, value);
-}
-
-bool atomic_compare_exchange_strong(atomic_int_least64_t *ptr,
-                                    atomic_int_least64_t *expected,
-                                    int_least64_t desired) {
-  int_least64_t prev;
-  prev = InterlockedCompareExchange64(ptr, desired, *expected);
-  if (prev == *expected) {
-    return true;
-  }
-
-  *expected = prev;
-  return false;
-}
-
-int_least64_t atomic_load(atomic_int_least64_t *ptr) { return *ptr; }
-
-int_least64_t atomic_exchange(atomic_int_least64_t *ptr, int_least64_t value) {
-  return InterlockedExchange64(ptr, value);
-}
-
-void atomic_store(atomic_int_least64_t *ptr, int_least64_t value) {
-  *ptr = value;
-}
-
-#define thread_local __declspec(thread)
-
-#else
+#ifndef _WIN32
 #include <math.h>
-#include <stdatomic.h>
-#endif
-
-#if defined __APPLE__
-#define thrd_sleep nanosleep
-#define thread_local _Thread_local
-#elif defined _WIN32
-#else
-#include <threads.h>
-#endif
-
-#if PY_VERSION_HEX >= 0x030E0000 // 3.14
-
-#define XIDATA_INIT _PyXIData_Init
-#define XIDATA_REGISTERCLASS(type, cb)                                         \
-  _PyXIData_RegisterClass(PyThreadState_GET(), (type),                         \
-                          (_PyXIData_getdata_t){.basic = (cb)})
-#define XIDATA_T _PyXIData_t
-
-#elif PY_VERSION_HEX >= 0x030D0000 // 3.13
-
-#define XIDATA_INIT _PyCrossInterpreterData_Init
-#define XIDATA_REGISTERCLASS(type, cb)                                         \
-  _PyCrossInterpreterData_RegisterClass((type), (crossinterpdatafunc)(cb))
-#define XIDATA_T _PyCrossInterpreterData
-
-#elif PY_VERSION_HEX >= 0x030C0000 // 3.12
-
-#define XIDATA_INIT _PyCrossInterpreterData_Init
-#define XIDATA_REGISTERCLASS(type, cb)                                         \
-  _PyCrossInterpreterData_RegisterClass((type), (crossinterpdatafunc)(cb))
-#define XIDATA_T _PyCrossInterpreterData
-
-#else
-
-#define BOC_NO_MULTIGIL
-
-#define XIDATA_REGISTERCLASS(type, cb)                                         \
-  _PyCrossInterpreterData_RegisterClass((type), (crossinterpdatafunc)(cb))
-#define XIDATA_T _PyCrossInterpreterData
-
-static void xidata_init(XIDATA_T *data, PyInterpreterState *interp,
-                        void *shared, PyObject *obj,
-                        PyObject *(*new_object)(_PyCrossInterpreterData *)) {
-  assert(data->data == NULL);
-  assert(data->obj == NULL);
-  *data = (_PyCrossInterpreterData){0};
-  data->interp = -1;
-
-  assert(data != NULL);
-  assert(new_object != NULL);
-  data->data = shared;
-  if (obj != NULL) {
-    assert(interp != NULL);
-    data->obj = Py_NewRef(obj);
-  }
-  data->interp = (interp != NULL) ? PyInterpreterState_GetID(interp) : -1;
-  data->new_object = new_object;
-}
-#define XIDATA_INIT xidata_init
-
 #endif
 
 /// @brief Convenience method to obtain the interpreter ID

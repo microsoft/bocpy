@@ -3,8 +3,9 @@
 import math
 import random
 
-from bocpy import Cown, Matrix
 import pytest
+
+from bocpy import Cown, Matrix
 
 
 # ---------------------------------------------------------------------------

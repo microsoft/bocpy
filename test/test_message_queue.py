@@ -20,8 +20,9 @@ import random
 import threading
 import time
 
-from bocpy import drain, receive, send, set_tags, TIMEOUT
 import pytest
+
+from bocpy import drain, receive, send, set_tags, TIMEOUT
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +269,44 @@ class TestErrors:
         """receive() with non-string elements in tag list raises TypeError."""
         with pytest.raises(TypeError):
             receive([123], 0)
+
+    def test_send_unpaired_surrogate_tag_no_leak(self):
+        """send() with a tag containing an unpaired surrogate fails cleanly.
+
+        Regression test: ``tag_from_PyUnicode`` previously leaked
+        the @c BOCTag struct when @c PyUnicode_AsUTF8AndSize
+        raised on surrogate input. After the fix the partial
+        allocation is freed before the function returns NULL, and
+        the caller (``boc_message_new`` / ``get_queue_for_tag``)
+        propagates the @c UnicodeEncodeError without wedging the
+        slot in @c ASSIGNED-with-NULL-tag state. We then prove the
+        slot is still usable by sending a normal tag through the
+        queue afterwards.
+        """
+        bad_tag = "\ud800"  # lone high surrogate
+        with pytest.raises(UnicodeEncodeError):
+            send(bad_tag, "payload")
+        # Sanity: the queue subsystem is still functional after the
+        # failed attempt.
+        send("post_surrogate_ok", "ok")
+        _, val = receive("post_surrogate_ok", 1)
+        assert val == "ok"
+
+    def test_set_tags_unpaired_surrogate_no_leak(self):
+        """set_tags() with a surrogate tag fails cleanly mid-loop.
+
+        Companion to ``test_send_unpaired_surrogate_tag_no_leak``:
+        exercises the @c _core_set_tags caller of
+        @c tag_from_PyUnicode, which is the second path that the
+        leak fix has to cover. We only assert that the
+        @c UnicodeEncodeError propagates without crashing /
+        deadlocking — set_tags' partial-failure recovery
+        semantics are tracked separately.
+        """
+        with pytest.raises(UnicodeEncodeError):
+            set_tags(["ok_tag", "\ud800"])
+        # Restore queues to a usable state for the rest of the suite.
+        set_tags([])
 
 
 # ===================================================================
