@@ -2192,7 +2192,7 @@ static BOCQueue *get_queue_for_tag(PyObject *tag) {
     // to win the slot against a racing peer; on CAS loss we tag-
     // release and fall through to the discovery branch below
     // exactly as the prior code did.
-    int_least64_t observed = atomic_load_intptr(&qptr->state);
+    int_least64_t observed = atomic_load(&qptr->state);
     if (observed == BOC_QUEUE_UNASSIGNED) {
       // Allocate the tag *before* the CAS so that an allocation failure
       // (UTF-8 error / OOM in tag_from_PyUnicode) leaves the slot in
@@ -3567,6 +3567,15 @@ static PyObject *BehaviorCapsule_schedule(PyObject *op,
   BehaviorCapsuleObject *capsule = (BehaviorCapsuleObject *)op;
   BOCBehavior *behavior = capsule->behavior;
 
+  // Drain the caller's recycle queue opportunistically. The main
+  // interpreter ordinarily drains via its own receive() loop; a worker
+  // that calls @when from inside a behavior body (i.e. is the caller
+  // here) would otherwise have to wait until it returns to
+  // _core_scheduler_worker_pop before reclaiming any xidata pushed onto
+  // its queue by other interpreters. Non-blocking; the recycle queue is
+  // single-consumer (this interpreter), so the drain is safe.
+  BOCRecycleQueue_empty(BOC_STATE->recycle_queue, false);
+
   // Build the request array if it has not already been built (e.g. by an
   // external caller having invoked create_requests first). create_requests
   // is idempotent only via its own guard; here we just skip if populated.
@@ -4171,6 +4180,18 @@ static PyObject *_core_recycle(PyObject *module, PyObject *Py_UNUSED(dummy)) {
   Py_RETURN_NONE;
 }
 
+/// @brief Return the best-effort physical CPU count for the process.
+/// @details Thin wrapper around @ref boc_physical_cpu_count. Returns 0
+/// if the platform-specific detection failed; the Python caller falls
+/// back to the logical CPU count in that case.
+/// @param module The _core module (unused)
+/// @param Py_UNUSED unused arg
+/// @return PyLong of the physical core count, or 0 on detection failure.
+static PyObject *_core_physical_cpu_count(PyObject *Py_UNUSED(module),
+                                          PyObject *Py_UNUSED(dummy)) {
+  return PyLong_FromLong((long)boc_physical_cpu_count());
+}
+
 /// @brief Returns any cowns for which this module has a weak reference.
 /// @details These are cowns which were sent by this module to another module
 /// and have not yet been recycled. As such, those cowns contain XIData which
@@ -4502,8 +4523,7 @@ static PyObject *_core_queue_stats(PyObject *Py_UNUSED(module),
     if (state != BOC_QUEUE_ASSIGNED) {
       continue;
     }
-    BOCTag *tag =
-        (BOCTag *)atomic_load_explicit(&qptr->tag, memory_order_relaxed);
+    BOCTag *tag = (BOCTag *)atomic_load_intptr(&qptr->tag);
     PyObject *tag_obj;
     if (tag != NULL && tag->str != NULL) {
       tag_obj = PyUnicode_FromString(tag->str);
@@ -4747,6 +4767,18 @@ static PyObject *_core_scheduler_worker_pop(PyObject *Py_UNUSED(module),
   // Verona closure at `core.h:28-32`.
   BOCBehavior *behavior;
   for (;;) {
+    // Drain this worker interpreter's recycle queue. Cross-interpreter
+    // cown_acquire pushes the previous owner's xidata onto THAT owner's
+    // queue; only the owning interpreter is allowed to consume it (the
+    // recycle queue is single-consumer). Without this drain the worker
+    // never reclaims xidata that other workers/the main interpreter
+    // pushed onto its queue, and the corresponding BOCCown weak refs
+    // (taken by BOCRecycleQueue_register on every cown_release) are
+    // never released -- a steady leak of one BOCCown per cross-worker
+    // hop. The legacy receive("boc_behavior") loop drained on every
+    // spin (see receive_single_tag); the distributed-scheduler worker
+    // bypasses receive entirely, so the drain has to live here.
+    BOCRecycleQueue_empty(BOC_STATE->recycle_queue, false);
     boc_bq_node_t *n = boc_sched_worker_pop_fast(self);
     if (n == NULL) {
       n = boc_sched_worker_pop_slow(self);
@@ -4871,6 +4903,11 @@ static PyMethodDef _core_module_methods[] = {
     {"is_primary", _core_is_primary, METH_NOARGS, NULL},
     {"index", _core_index, METH_NOARGS, NULL},
     {"recycle", _core_recycle, METH_NOARGS, NULL},
+    {"physical_cpu_count", _core_physical_cpu_count, METH_NOARGS,
+     "physical_cpu_count($module, /)\n--\n\n"
+     "Best-effort count of physical CPU cores available to this process. "
+     "Returns 0 if detection failed; callers should fall back to the logical "
+     "CPU count in that case."},
     {"cowns", _core_cowns, METH_NOARGS, NULL},
     {"set_tags", _core_set_tags, METH_VARARGS,
      "set_tags($module, tags, /)\n--\n\nAssigns tags to message queues."},

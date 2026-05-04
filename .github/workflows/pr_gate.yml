@@ -96,6 +96,31 @@ jobs:
       - name: Python test
         run: pytest -vv -s
 
+  windows-x86:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python_version: ["3.12"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Use Python ${{matrix.python_version}} (x86)
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{matrix.python_version}}
+          architecture: x86
+
+      - name: Get dependencies
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Python build
+        run: pip install -e .[test] --verbose
+
+      - name: Python test
+        run: pytest -vv -s
+
   macos-arm64:
     runs-on: macos-latest
     strategy:

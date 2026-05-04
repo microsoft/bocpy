@@ -10,7 +10,7 @@ from bocpy import Cown, wait, when
 
 def all_known_cheeses() -> list[str]:
     """Load the cheese inventory from disk."""
-    path = os.path.join(os.path.dirname(__file__), "assets", "cheese.txt")
+    path = os.path.join(os.path.dirname(__file__), "cheese.txt")
     with open(path) as file:
         return [line.strip() for line in file]
 
@@ -26,7 +26,7 @@ def is_available(logger, name: str) -> bool:
 
 def menu() -> list[str]:
     """Load the menu and shuffle it."""
-    path = os.path.join(os.path.dirname(__file__), "assets", "menu.txt")
+    path = os.path.join(os.path.dirname(__file__), "menu.txt")
     with open(path) as file:
         menu = [line.strip() for line in file]
         random.shuffle(menu)

@@ -83,6 +83,46 @@ the free-threaded build and the relevant CPython APIs stabilise.
 [pep703]: https://peps.python.org/pep-0703/
 [issue5]: https://github.com/microsoft/bocpy/issues/5
 
+### Scaling with cores
+
+The chart below shows BOC runtime throughput as the worker count grows from
+1 to 8, plotted as **speedup relative to a single worker**. Numbers come
+from [examples/benchmark.py](examples/benchmark.py) — a chain-ring workload
+that exercises the scheduler, two-phase locking, sub-interpreter crossings
+and the message queue together — run on CPython 3.14 (mean of 3 repeats,
+8 s each).
+
+<!-- pypi-skip-start -->
+```mermaid
+---
+config:
+    xyChart:
+        width: 700
+        height: 360
+---
+xychart-beta
+    title "bocpy speedup vs. worker count (chain-ring benchmark, CPython 3.14)"
+    x-axis "Workers" [1, 2, 3, 4, 5, 6, 7, 8]
+    y-axis "Speedup vs. 1 worker" 0 --> 9
+    bar [1.00, 1.97, 2.94, 3.90, 4.87, 5.82, 6.75, 7.54]
+    line [1, 2, 3, 4, 5, 6, 7, 8]
+```
+<!-- pypi-skip-end -->
+
+The line is the ideal `y = x` reference; the bars are measured speedup. Up
+to 8 workers, BOC delivers roughly linear scaling on this microbenchmark
+(≈7.5× at 8 workers). Real applications carry serial costs that this
+benchmark deliberately strips out — see the docstring at the top of
+[examples/benchmark.py](examples/benchmark.py) for the load-bearing
+caveats. To reproduce:
+
+```bash
+python examples/benchmark.py \
+    --sweep-axis workers --sweep-values 1,2,3,4,5,6,7,8 \
+    --duration 8 --warmup 2 --repeats 3 \
+    --output scaling.json
+```
+
 A behavior can be thought of as a function which depends on zero or more
 concurrently-owned data objects (which we call **cowns**). As a programmer, you
 indicate that you want the function to be called once all of those resources are

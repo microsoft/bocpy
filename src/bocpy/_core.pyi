@@ -64,3 +64,34 @@ def queue_stats() -> list[dict[str, Any]]:
     :return: A list of per-queue stats dicts.
     :rtype: list[dict[str, Any]]
     """
+
+
+def physical_cpu_count() -> int:
+    """Return the best-effort count of physical CPU cores available to
+    this process.
+
+    Unlike ``os.cpu_count()`` and ``len(os.sched_getaffinity(0))``,
+    excludes hyperthread / SMT siblings so it reflects the count of
+    independent execution units. Used to size the default worker
+    pool (see :data:`bocpy.WORKER_COUNT`): oversubscribing CPU-bound
+    Python workloads on hyperthread siblings often *reduces*
+    throughput because two siblings on the same physical core fight
+    for the same execution resources.
+
+    Per-platform sourcing:
+
+    * **Linux**: walks ``/sys/devices/system/cpu/cpu*/topology/thread_siblings_list``
+      and intersects with ``sched_getaffinity(0)`` so cgroup /
+      container CPU restrictions are honoured.
+    * **macOS**: ``sysctlbyname("hw.physicalcpu_max", ...)`` with
+      ``"hw.physicalcpu"`` as fallback.
+    * **Windows**: ``GetLogicalProcessorInformationEx`` with
+      ``RelationProcessorCore``.
+
+    Returns ``0`` on any detection failure (sysfs unreadable,
+    sysctl / API failure, etc.); callers should fall back to the
+    logical CPU count in that case.
+
+    :return: Physical core count, or 0 on failure.
+    :rtype: int
+    """

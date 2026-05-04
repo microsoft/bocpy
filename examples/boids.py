@@ -352,7 +352,7 @@ def main():
         """Pyglet window that renders a boids simulation."""
 
         def __init__(self, width: int, height: int, num_boids: int,
-                     show_overlay: bool = True):
+                     show_overlay: bool = True, scale: float = 1.0):
             """Initialize the window and create boids.
 
             :param width: Window width in pixels.
@@ -360,6 +360,8 @@ def main():
             :param num_boids: The number of boids to simulate.
             :param show_overlay: Whether to render the boid count and
                 behavior-rate overlay in the bottom-left corner.
+            :param scale: Multiplier applied to the drawn boid triangle
+                size. ``1.0`` keeps the original 20x14 pixel triangle.
             """
             pyglet.window.Window.__init__(self, width, height, "Boids")
             pyglet.gl.glClearColor(1, 1, 1, 1)
@@ -367,7 +369,11 @@ def main():
             self.elapsed = 0
             self.simulation = Simulation(num_boids, width, height)
             self.num_behaviors = 0
+            self.num_frames = 0
+            self.total_behaviors = 0
+            self.total_elapsed = 0.0
             self.samples = deque()
+            self.fps_samples = deque()
             self.show_overlay = show_overlay
 
             if show_overlay:
@@ -380,13 +386,24 @@ def main():
                     "behavior/s: ",
                     font_size=24, x=5, y=50,
                     color=(100, 100, 100, 255))
+
+                self.fps_label = pyglet.text.Label(
+                    "fps: ",
+                    font_size=24, x=5, y=95,
+                    color=(100, 100, 100, 255))
             else:
                 self.num_boids_label = None
                 self.behaviors_label = None
+                self.fps_label = None
 
             self.triangles: pyglet.shapes.Triangle = []
+            tip_x = 0.0
+            base_x = -20.0 * scale
+            base_y = 7.0 * scale
             for _ in range(num_boids):
-                tri = pyglet.shapes.Triangle(0, 0, -20, +7, -20, -7,
+                tri = pyglet.shapes.Triangle(tip_x, 0,
+                                             base_x, +base_y,
+                                             base_x, -base_y,
                                              color=(55, 255, 255, 255),
                                              batch=self.batch)
                 tri.anchor_position = 0, 0
@@ -399,6 +416,7 @@ def main():
             if self.show_overlay:
                 self.num_boids_label.draw()
                 self.behaviors_label.draw()
+                self.fps_label.draw()
 
         def on_close(self):
             wait()
@@ -412,17 +430,26 @@ def main():
             self.elapsed += delta_time
             self.simulation.step(self.width, self.height)
             self.num_behaviors += self.simulation.num_behaviors
+            self.num_frames += 1
+            self.total_behaviors += self.simulation.num_behaviors
+            self.total_elapsed += delta_time
 
             if self.elapsed > 1:
                 self.samples.append(self.num_behaviors / self.elapsed)
+                self.fps_samples.append(self.num_frames / self.elapsed)
                 self.num_behaviors = 0
+                self.num_frames = 0
                 self.elapsed = 0
                 if len(self.samples) > 10:
                     self.samples.popleft()
+                if len(self.fps_samples) > 10:
+                    self.fps_samples.popleft()
 
             if len(self.samples) > 3 and self.behaviors_label is not None:
                 behavior_rate = sum(self.samples) / len(self.samples)
                 self.behaviors_label.text = f"behavior/s: {behavior_rate:.0f}"
+                fps = sum(self.fps_samples) / len(self.fps_samples)
+                self.fps_label.text = f"fps: {fps:.1f}"
 
             positions = self.simulation.positions
             velocities = self.simulation.velocities
@@ -459,6 +486,9 @@ def main():
     parser.add_argument("--workers", type=int, default=None,
                         help="Number of BOC worker sub-interpreters. "
                              "Defaults to bocpy's default (CPU count - 1).")
+    parser.add_argument("--scale", type=float, default=1.0,
+                        help="Multiplier applied to the drawn boid "
+                             "triangle size (default: 1.0).")
     args = parser.parse_args()
 
     # Validate at the boundary; downstream code (Matrix sizing, hash modulo,
@@ -473,6 +503,8 @@ def main():
         parser.error("--fps must be positive")
     if args.workers is not None and args.workers <= 0:
         parser.error("--workers must be positive")
+    if args.scale <= 0:
+        parser.error("--scale must be positive")
 
     # Start the BOC runtime explicitly so --workers takes effect for every
     # mode.
@@ -486,7 +518,7 @@ def main():
         # The overlay (boid count / behavior rate) is suppressed in video
         # mode so the rendered output stays clean.
         boids = Boids(args.width, args.height, args.boids,
-                      show_overlay=False)
+                      show_overlay=False, scale=args.scale)
 
         # Allow graceful close: override on_close to set a flag and return
         # True so pyglet does not destroy the window mid-frame. The loop
@@ -630,11 +662,20 @@ def main():
                 print(ff_stderr.decode("utf-8", errors="replace"), end="")
             return
 
+        # Successful render: report the average behavior rate over the
+        # entire run, computed from cumulative counters (not the rolling
+        # 1s window used for the on-screen overlay).
+        if boids.total_elapsed > 0:
+            avg_rate = boids.total_behaviors / boids.total_elapsed
+            print(f"behavior/s (avg over {boids.total_elapsed:.1f}s of "
+                  f"simulated time): {avg_rate:.0f} "
+                  f"({boids.total_behaviors} behaviors)")
+
         print(f"Wrote {args.output} ({frames_written} frames)"
               f"{' (interrupted)' if boids.bocpy_video_closing else ''}")
         return
 
-    boids = Boids(args.width, args.height, args.boids)
+    boids = Boids(args.width, args.height, args.boids, scale=args.scale)
     pyglet.clock.schedule_interval(boids.update, 1 / args.fps)
     pyglet.app.run()
 

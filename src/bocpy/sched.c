@@ -30,7 +30,7 @@ void boc_bq_init(boc_bq_t *q) {
   // Use relaxed stores during init: callers must publish the queue
   // through their own release edge before any thread observes it.
   boc_atomic_store_ptr_explicit(&q->front, NULL, BOC_MO_RELAXED);
-  boc_atomic_store_ptr_explicit(&q->back, &q->front, BOC_MO_RELAXED);
+  boc_atomic_store_ptr_explicit(&q->back, (void *)&q->front, BOC_MO_RELAXED);
 }
 
 void boc_bq_destroy_assert_empty(boc_bq_t *q) {
@@ -69,7 +69,7 @@ void boc_bq_enqueue_segment(boc_bq_t *q, boc_bq_segment_t s) {
   BOC_SCHED_YIELD();
 
   boc_atomic_ptr_t *b = (boc_atomic_ptr_t *)boc_atomic_exchange_ptr_explicit(
-      &q->back, s.end, BOC_MO_ACQ_REL);
+      &q->back, (void *)s.end, BOC_MO_ACQ_REL);
 
   BOC_SCHED_YIELD();
 
@@ -129,9 +129,10 @@ boc_bq_node_t *boc_bq_dequeue(boc_bq_t *q) {
   // (mpmcq.h:165-176). The expected `back` value is the address of the
   // singleton node's `next_in_queue` slot; the desired value is the
   // address of `q->front`, restoring the empty representation.
-  void *expected = &old_front->next_in_queue;
+  void *expected = (void *)&old_front->next_in_queue;
   if (boc_atomic_compare_exchange_strong_ptr_explicit(
-          &q->back, &expected, &q->front, BOC_MO_ACQ_REL, BOC_MO_RELAXED)) {
+          &q->back, &expected, (void *)&q->front, BOC_MO_ACQ_REL,
+          BOC_MO_RELAXED)) {
     return old_front;
   }
 
@@ -156,8 +157,8 @@ boc_bq_segment_t boc_bq_dequeue_all(boc_bq_t *q) {
   BOC_SCHED_YIELD();
 
   boc_atomic_ptr_t *old_back =
-      (boc_atomic_ptr_t *)boc_atomic_exchange_ptr_explicit(&q->back, &q->front,
-                                                           BOC_MO_ACQ_REL);
+      (boc_atomic_ptr_t *)boc_atomic_exchange_ptr_explicit(
+          &q->back, (void *)&q->front, BOC_MO_ACQ_REL);
 
   BOC_SCHED_YIELD();
 

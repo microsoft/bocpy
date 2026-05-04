@@ -34,12 +34,28 @@ from typing import Optional
 
 from bocpy import (Cown, Matrix, noticeboard, notice_write, receive, send,
                    start, wait, when)
+from bocpy import _core
 
 # Sentinels for the parent/child JSON protocol.  Uppercase so the
 # transpiler keeps them as module-level constants in the worker export.
 SENTINEL_BEGIN = "---BOCPY-BENCH-BEGIN---"
 SENTINEL_END = "---BOCPY-BENCH-END---"
 SCHEMA_VERSION = 1
+
+
+def _physical_cpu_count() -> int:
+    """Return physical core count, falling back to logical or 1.
+
+    Used as the oversubscription threshold so warnings fire when the
+    requested worker count starts using SMT siblings rather than
+    waiting until logical cores are exhausted.
+
+    :return: A positive integer.
+    """
+    n = _core.physical_cpu_count()
+    if n > 0:
+        return n
+    return os.cpu_count() or 1
 
 
 # ---------------------------------------------------------------------------
@@ -203,11 +219,22 @@ def derive_sizes(cfg: BenchConfig) -> BenchConfig:
     :return: The same config with ``rings`` / ``chains_per_ring`` set.
     """
     if cfg.chains_per_ring is None:
+        # Use a small per-ring chain count (4) so chains never collide
+        # on adjacent slots as they advance. Independent rings carry
+        # the load instead.
         cfg.chains_per_ring = max(
-            1, cfg.ring_size // (cfg.group_size * cfg.stride * 2))
+            1, cfg.ring_size // (cfg.group_size * cfg.stride * 8))
     if cfg.rings is None:
-        cfg.rings = max(cfg.workers * 4 // cfg.chains_per_ring,
-                        cfg.workers * 2)
+        # Bias toward more *rings* rather than more chains-per-ring:
+        # chains on the same ring contend for adjacent slots as they
+        # advance, so per-ring concurrency is bounded well below
+        # ``chains_per_ring``. Independent rings, by contrast, never
+        # collide. Provision at least ``workers * 4`` rings so every
+        # worker sees a deep, independent supply of ready chains and
+        # the measured throughput reflects scheduler scaling rather
+        # than workload starvation.
+        cfg.rings = max(cfg.workers * 16 // cfg.chains_per_ring,
+                        cfg.workers * 4)
     return cfg
 
 
@@ -244,8 +271,9 @@ def emit_soft_warnings(cfg: BenchConfig, cpu_count: int) -> None:
         print(f"warning: duration={cfg.duration}s is short; results will "
               "be noisy", file=sys.stderr)
     if cfg.workers > cpu_count:
-        print(f"warning: workers={cfg.workers} exceeds cpu_count="
-              f"{cpu_count}; oversubscribed", file=sys.stderr)
+        print(f"warning: workers={cfg.workers} exceeds physical core "
+              f"count={cpu_count}; oversubscribed (SMT siblings or "
+              f"hyperthreads will be used)", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -862,6 +890,7 @@ def collect_metadata(argv: list, git_sha: Optional[str]) -> dict:
         "hostname": socket.gethostname(),
         "platform": sys.platform,
         "cpu_count": os.cpu_count() or 0,
+        "physical_cpu_count": _physical_cpu_count(),
         "python_version": sys.version.split()[0],
         "python_implementation": sys.implementation.name,
         "free_threaded": free_threaded,
@@ -1054,7 +1083,7 @@ def _default_sweep_values(axis: str) -> list:
     :param axis: The sweep axis name.
     :return: A list of default values.
     """
-    cpu = os.cpu_count() or 1
+    cpu = _physical_cpu_count()
     if axis == "workers":
         return sorted(set([1, 2, 4, 8, min(16, cpu)]))
     if axis == "iters":
@@ -1158,7 +1187,7 @@ def child_main(args) -> int:
     if err is not None:
         print(f"benchmark: invalid config: {err}", file=sys.stderr)
         return 2
-    emit_soft_warnings(cfg, os.cpu_count() or 1)
+    emit_soft_warnings(cfg, _physical_cpu_count())
     rep = run_single_point_body(cfg, repeat_index=0)
     payload = {
         "inputs": asdict(cfg),
@@ -1197,7 +1226,7 @@ def parent_main(args) -> int:
         return 2
 
     # Pre-spawn validation across every sweep point.
-    cpu = os.cpu_count() or 1
+    cpu = _physical_cpu_count()
     derived_points = []
     for value in sweep_values:
         cfg = cfg_for_axis(base, args.sweep_axis, value)

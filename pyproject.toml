@@ -53,4 +53,4 @@ packages = ["bocpy", "bocpy.examples"]
 "bocpy.examples" = "examples"
 
 [tool.setuptools.package-data]
-"bocpy.examples" = ["assets/*.txt"]
+"bocpy.examples" = ["*.txt"]

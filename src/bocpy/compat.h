@@ -161,14 +161,26 @@ static inline bool atomic_compare_exchange_strong_intptr(atomic_intptr_t *ptr,
 
 // All Interlocked* intrinsics on x86/x64 are full barriers, so the
 // memory_order argument is accepted but ignored.
-// Note: atomic_load_explicit is a plain volatile read. On x86/x64 this
-// provides acquire semantics due to TSO. Correctness of the parking
-// protocol relies on the mutex-protected re-check, not on seq_cst ordering.
+// Note: atomic_load_explicit uses a plain volatile read on x64 (TSO
+// provides acquire semantics). On x86 (32-bit), 64-bit volatile reads
+// are not atomic, but the legacy atomic_int_least64_t polyfill here is
+// only used for waiter counts and state fields where torn reads are
+// benign (protected by mutex re-checks). The typed boc_atomic_*_u64
+// API above uses _InterlockedCompareExchange64 for true atomicity.
+#if defined(_M_IX86)
+#define atomic_load_explicit(ptr, order)                                       \
+  ((int_least64_t)InterlockedCompareExchange64((ptr), 0, 0))
+#define atomic_fetch_add_explicit(ptr, val, order)                             \
+  atomic_fetch_add((ptr), (val))
+#define atomic_fetch_sub_explicit(ptr, val, order)                             \
+  atomic_fetch_sub((ptr), (val))
+#else
 #define atomic_load_explicit(ptr, order) (*(ptr))
 #define atomic_fetch_add_explicit(ptr, val, order)                             \
   InterlockedExchangeAdd64((ptr), (val))
 #define atomic_fetch_sub_explicit(ptr, val, order)                             \
   InterlockedExchangeAdd64((ptr), -(val))
+#endif
 #define memory_order_seq_cst 0
 
 // ---------------------------------------------------------------------------
@@ -271,6 +283,13 @@ static inline uint64_t boc_atomic_load_u64_explicit(boc_atomic_u64_t *p,
   default:
     return BOC_IL_LOAD64_ACQ(p);
   }
+#elif defined(_M_IX86)
+  // On x86, a 64-bit volatile read is not atomic (two 32-bit loads).
+  // Use _InterlockedCompareExchange64(p, 0, 0) which atomically reads
+  // the value without modifying it (CAS that "replaces" 0 with 0 if
+  // matched; either way returns the current value).
+  (void)order;
+  return (uint64_t)_InterlockedCompareExchange64((volatile __int64 *)p, 0, 0);
 #else
   (void)order;
   return *p;
@@ -291,6 +310,18 @@ static inline void boc_atomic_store_u64_explicit(boc_atomic_u64_t *p,
   default:
     (void)_InterlockedExchange64((volatile __int64 *)p, (__int64)v);
     return;
+  }
+#elif defined(_M_IX86)
+  // On x86, a 64-bit volatile write is not atomic. Use an exchange
+  // via CAS loop to atomically store the value.
+  (void)order;
+  __int64 old = *((volatile __int64 *)p);
+  for (;;) {
+    __int64 prev =
+        _InterlockedCompareExchange64((volatile __int64 *)p, (__int64)v, old);
+    if (prev == old)
+      return;
+    old = prev;
   }
 #else
   (void)order;
@@ -314,6 +345,18 @@ boc_atomic_exchange_u64_explicit(boc_atomic_u64_t *p, uint64_t v,
                                                 (__int64)v);
   default:
     return (uint64_t)_InterlockedExchange64((volatile __int64 *)p, (__int64)v);
+  }
+#elif defined(_M_IX86)
+  // x86 lacks _InterlockedExchange64; emulate with a CAS loop using
+  // _InterlockedCompareExchange64 (which is available on x86).
+  (void)order;
+  __int64 old = *((volatile __int64 *)p);
+  for (;;) {
+    __int64 prev =
+        _InterlockedCompareExchange64((volatile __int64 *)p, (__int64)v, old);
+    if (prev == old)
+      return (uint64_t)old;
+    old = prev;
   }
 #else
   (void)order;
@@ -374,6 +417,18 @@ boc_atomic_fetch_add_u64_explicit(boc_atomic_u64_t *p, uint64_t v,
   default:
     return (uint64_t)_InterlockedExchangeAdd64((volatile __int64 *)p,
                                                (__int64)v);
+  }
+#elif defined(_M_IX86)
+  // x86 lacks _InterlockedExchangeAdd64; emulate with a CAS loop.
+  (void)order;
+  __int64 old = *((volatile __int64 *)p);
+  for (;;) {
+    __int64 desired = old + (__int64)v;
+    __int64 prev =
+        _InterlockedCompareExchange64((volatile __int64 *)p, desired, old);
+    if (prev == old)
+      return (uint64_t)old;
+    old = prev;
   }
 #else
   (void)order;
@@ -855,6 +910,33 @@ static inline void boc_atomic_thread_fence_explicit(boc_memory_order_t o) {
 /// @brief Returns the current time as double-precision seconds.
 /// @return the current time
 double boc_now_s(void);
+
+/// @brief Best-effort count of physical CPU cores available to this process.
+/// @details Unlike @c sysconf(_SC_NPROCESSORS_ONLN) /
+/// @c os.cpu_count(), this excludes hyperthread / SMT siblings so it
+/// matches the count of independent execution units. Used to size the
+/// default worker pool: oversubscribing CPU-bound Python workloads on
+/// HT siblings causes the two siblings on a physical core to fight for
+/// the same execution resources, often halving throughput vs. one
+/// worker per physical core.
+///
+/// **Per-platform behaviour.**
+/// - **Linux**: walks @c
+/// /sys/devices/system/cpu/cpu*/topology/thread_siblings_list,
+///   counts distinct sibling sets, and intersects with
+///   @c sched_getaffinity(0) so cgroup / container CPU restrictions
+///   are honoured.
+/// - **macOS**: @c sysctlbyname("hw.physicalcpu_max", ...) (falling
+///   back to @c "hw.physicalcpu").
+/// - **Windows**: @c GetLogicalProcessorInformationEx with
+///   @c RelationProcessorCore.
+///
+/// On any platform where detection fails (sysfs unreadable, sysctl /
+/// API failure), returns 0; callers should fall back to the logical
+/// CPU count in that case.
+/// @return Number of physical cores available to the process, or 0
+///         on failure.
+int boc_physical_cpu_count(void);
 
 /// @brief Returns a monotonic timestamp in nanoseconds.
 /// @details Uses @c CLOCK_MONOTONIC on POSIX and

@@ -31,12 +31,49 @@ except ModuleNotFoundError:
 
 
 BEHAVIORS = None
-WORKER_COUNT: int = 1
-try:
-    WORKER_COUNT = len(os.sched_getaffinity(0)) - 1
-except AttributeError:
-    from multiprocessing import cpu_count
-    WORKER_COUNT = cpu_count() - 1
+
+
+def _default_worker_count() -> int:
+    """Pick a sensible default worker count for this process.
+
+    Resolution order:
+
+    1. ``BOCPY_WORKERS`` environment variable (must parse as a positive
+       integer; ignored otherwise).
+    2. ``_core.physical_cpu_count() - 1`` -- one worker per physical
+       core, leaving one for the main interpreter. Avoids HT
+       oversubscription, which on CPU-bound Python workloads commonly
+       *reduces* throughput because hyperthread siblings on the same
+       physical core fight for the same execution units.
+    3. ``len(os.sched_getaffinity(0)) - 1`` (logical cores minus the
+       main interpreter) when physical detection is unavailable
+       (returns 0).
+    4. ``multiprocessing.cpu_count() - 1`` as a final portable fallback.
+
+    Always returns at least 1 so a single-core / 2-logical-core
+    machine still produces a usable runtime.
+    """
+    env = os.environ.get("BOCPY_WORKERS")
+    if env is not None:
+        try:
+            value = int(env)
+        except ValueError:
+            value = 0
+        if value >= 1:
+            return value
+
+    physical = _core.physical_cpu_count()
+    if physical >= 1:
+        return max(1, physical - 1)
+
+    try:
+        return max(1, len(os.sched_getaffinity(0)) - 1)
+    except AttributeError:
+        from multiprocessing import cpu_count
+        return max(1, cpu_count() - 1)
+
+
+WORKER_COUNT: int = _default_worker_count()
 
 T = TypeVar("T")
 

@@ -16,10 +16,6 @@ What the tests assert:
 - **Empty-queue race** — starting the runtime with W workers and no
   work must converge to every worker parked and the process CPU/wall
   ratio must stay well below 1 (no busy-spinning thieves).
-- **Spurious-failure stress** — placeholder; activated when bocpy is
-  built with ``-DBOC_SCHED_SYSTEMATIC`` (Verona-style fault-injection
-  in the queue links). The flag is off in default builds, so the
-  test is skipped here.
 
 Tests that asserted timing-dependent outcomes (``popped_via_steal >
 0`` after a pinned fan-out, ``fairness_arm_fires >= N`` on a busy
@@ -225,28 +221,3 @@ class TestStealEmptyQueueNoSpin:
                 f"worker {s['worker_index']} never reached cnd_wait "
                 f"in an idle runtime: {s}"
             )
-
-
-# ---------------------------------------------------------------------------
-# Spurious-failure stress (gated on the systematic-test build flag)
-# ---------------------------------------------------------------------------
-
-
-class TestStealSpuriousFailureStress:
-    """Reserved for ``-DBOC_SCHED_SYSTEMATIC`` builds.
-
-    Verona's stealing path has three documented spurious-failure
-    modes (fully empty victim, single-element victim, first link not
-    yet visible). Verifying convergence under fault-injection
-    requires building bocpy with the ``BOC_SCHED_SYSTEMATIC`` macro,
-    which is off in the default editable install. When that build
-    flavour exists the body of this test should run 100 fan-out
-    iterations and assert each completes within ``RECEIVE_TIMEOUT``.
-    """
-
-    @pytest.mark.skip(
-        reason="needs -DBOC_SCHED_SYSTEMATIC build flag",
-    )
-    def test_spurious_failure_stress(self):  # pragma: no cover
-        """Placeholder; see class docstring."""
-        pass
