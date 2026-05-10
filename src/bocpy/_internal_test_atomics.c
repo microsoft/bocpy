@@ -1,7 +1,7 @@
 /// @file _internal_test_atomics.c
 /// @brief Atomics-domain tests for the `bocpy._internal_test` extension.
 ///
-/// Exposes the typed `boc_atomic_*_explicit` API from `compat.h` to
+/// Exposes the typed `boc_atomic_*_explicit` API from `boc_compat.h` to
 /// Python so `test/test_compat_atomics.py` can drive the inline
 /// atomic primitives from real Python threads (which give us true
 /// parallelism either via free-threaded CPython or via
@@ -18,7 +18,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "compat.h"
+#include "boc_compat.h"
 
 // Single shared block of atomic slots, accessed by every test entry
 // point through a PyCapsule handle. Cacheline-sized (64B) to avoid

@@ -1,4 +1,4 @@
-"""Tests for the typed `boc_atomic_*_explicit` API in `compat.h`.
+"""Tests for the typed `boc_atomic_*_explicit` API in `boc_compat.h`.
 
 These tests drive the C extension `bocpy._internal_test` (atomics
 domain, `atomics_*` methods) from real Python threads. On
@@ -10,7 +10,7 @@ producer/consumer handshake and CAS contention loops still race.
 On x86/x64 these tests are smoke tests (every Interlocked* on those
 architectures is a full barrier). On ARM64 they are the canonical
 weak-memory correctness tests for the `__ldar*`/`__stlr*` and
-`Interlocked*_{nf,acq,rel}` dispatch in `compat.h`.
+`Interlocked*_{nf,acq,rel}` dispatch in `boc_compat.h`.
 """
 
 import threading

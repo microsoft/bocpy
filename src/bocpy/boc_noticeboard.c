@@ -1,7 +1,7 @@
-/// @file noticeboard.c
+/// @file boc_noticeboard.c
 /// @brief Implementation of the global noticeboard subsystem.
 ///
-/// See @ref noticeboard.h for the public API and the thread/PyErr
+/// See @ref boc_noticeboard.h for the public API and the thread/PyErr
 /// discipline. This TU owns:
 ///
 ///   - The fixed-capacity entry table @c NB plus its mutex.
@@ -12,7 +12,7 @@
 ///   - The notice_sync barrier primitives (@c NB_SYNC_REQUESTED,
 ///     @c NB_SYNC_PROCESSED, @c NB_SYNC_MUTEX, @c NB_SYNC_COND).
 
-#include "noticeboard.h"
+#include "boc_noticeboard.h"
 
 #include <string.h>
 
@@ -133,7 +133,7 @@ void noticeboard_destroy(void) {
   mtx_destroy(&NB.mutex);
   // NB_SYNC_MUTEX / NB_SYNC_COND are SRWLOCK / CONDITION_VARIABLE on
   // Windows (no destroy needed) and pthread / mtx_t on POSIX (handled
-  // by mtx_destroy / cnd_destroy in compat.h shims). The original
+  // by mtx_destroy / cnd_destroy in boc_compat.h shims). The original
   // _core.c module-free path never destroyed these; preserve that
   // behaviour to keep the symbol-additions-only invariant.
 }
@@ -189,8 +189,6 @@ void noticeboard_drop_local_cache(void) {
 }
 
 void noticeboard_cache_clear_for_behavior(void) { NB_VERSION_CHECKED = false; }
-
-int_least64_t noticeboard_version(void) { return atomic_load(&NB_VERSION); }
 
 // ---------------------------------------------------------------------------
 // Pin helper.

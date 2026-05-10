@@ -21,6 +21,8 @@ A few load-bearing caveats baked into the design:
 """
 
 import argparse
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
 import json
 import os
 import socket
@@ -28,13 +30,11 @@ import statistics
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass, field
-from datetime import datetime
 from typing import Optional
 
-from bocpy import (Cown, Matrix, noticeboard, notice_write, receive, send,
-                   start, wait, when)
 from bocpy import _core
+from bocpy import (Cown, Matrix, notice_write, noticeboard, receive, send,
+                   start, wait, when)
 
 # Sentinels for the parent/child JSON protocol.  Uppercase so the
 # transpiler keeps them as module-level constants in the worker export.

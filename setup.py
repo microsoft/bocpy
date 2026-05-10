@@ -36,15 +36,40 @@ _build_internal_tests = (
     and not _building_distribution
 )
 
+_headers = [
+    "src/bocpy/include/bocpy/bocpy.h",
+    "src/bocpy/include/bocpy/xidata.h",
+    "src/bocpy/boc_compat.h",
+    "src/bocpy/boc_cown.h",
+    "src/bocpy/boc_noticeboard.h",
+    "src/bocpy/boc_sched.h",
+    "src/bocpy/boc_tags.h",
+    "src/bocpy/boc_terminator.h",
+]
+
+# Both directories are on the include path:
+#   - ``src/bocpy/include`` is the public root, so internal C files
+#     refer to public headers as ``<bocpy/bocpy.h>`` and downstream
+#     consumers resolved via ``bocpy.get_include()`` see exactly the
+#     same surface.
+#   - ``src/bocpy`` is the private root, scoped by the ``boc_`` prefix
+#     to avoid colliding with system headers (``sched.h``, ``tags.h``,
+#     etc.) when this directory ends up on a downstream ``-I`` path.
+_include_dirs = ["src/bocpy/include", "src/bocpy"]
+
 _ext_modules = [
     Extension(
         name="bocpy._core",
-        sources=["src/bocpy/_core.c", "src/bocpy/compat.c", "src/bocpy/noticeboard.c",
-                 "src/bocpy/sched.c", "src/bocpy/tags.c", "src/bocpy/terminator.c"],
+        sources=["src/bocpy/_core.c", "src/bocpy/boc_compat.c", "src/bocpy/boc_noticeboard.c",
+                 "src/bocpy/boc_sched.c", "src/bocpy/boc_tags.c", "src/bocpy/boc_terminator.c"],
+        depends=_headers,
+        include_dirs=_include_dirs,
     ),
     Extension(
         name="bocpy._math",
-        sources=["src/bocpy/_math.c", "src/bocpy/compat.c"],
+        sources=["src/bocpy/_math.c", "src/bocpy/boc_compat.c"],
+        depends=_headers,
+        include_dirs=_include_dirs,
     ),
 ]
 
@@ -57,9 +82,11 @@ if _build_internal_tests:
                 "src/bocpy/_internal_test_atomics.c",
                 "src/bocpy/_internal_test_bq.c",
                 "src/bocpy/_internal_test_wsq.c",
-                "src/bocpy/compat.c",
-                "src/bocpy/sched.c",
+                "src/bocpy/boc_compat.c",
+                "src/bocpy/boc_sched.c",
             ],
+            depends=_headers,
+            include_dirs=_include_dirs,
         )
     )
 

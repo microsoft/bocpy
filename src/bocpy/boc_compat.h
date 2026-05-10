@@ -1,14 +1,14 @@
-/// @file compat.h
+/// @file boc_compat.h
 /// @brief Cross-platform portability shims for bocpy C extensions.
 ///
 /// Centralises the platform-specific atomic, mutex, condition-variable,
 /// thread-local, sleep, and monotonic-time primitives used by `_core.c`,
-/// `_math.c`, and `sched.c`.
+/// `_math.c`, and `boc_sched.c`.
 ///
 /// **Linkage:** all heavy-weight platform primitives are exposed as
 /// `static inline` wrappers around the platform's native API, except for
 /// the MSVC `atomic_*` functions on `int_least64_t` (kept as out-of-line
-/// definitions in `compat.c` to preserve their original symbol shape).
+/// definitions in `boc_compat.c` to preserve their original symbol shape).
 ///
 /// Also exposes the `boc_atomic_*_explicit` typed atomics API that the
 /// work-stealing scheduler depends on for ARM64-correct memory ordering

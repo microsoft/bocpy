@@ -29,7 +29,104 @@ jobs:
         run: pip install -e .[linting]
 
       - name: Run flake8
-        run: flake8 src/bocpy test
+        run: flake8 src/bocpy test examples
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Use Python 3.14
+        uses: actions/setup-python@v6
+        with:
+          python-version: 3.14
+
+      - name: Install docs deps
+        run: pip install -e .[docs]
+
+      - name: Build Sphinx docs (warnings as errors)
+        run: sphinx-build -W -b html sphinx/source sphinx/build/html
+
+  c-abi-consumer:
+    # Build a standalone downstream extension against the bocpy public
+    # C ABI (templates/c_abi_consumer/) and run its pytest suite. This
+    # exercises ``bocpy.get_include()`` / ``bocpy.get_sources()`` and
+    # the ``<bocpy/bocpy.h>`` umbrella from a fresh process that does
+    # not share build flags with bocpy itself. The Windows leg also
+    # compiles ``bocpy_msvc.c`` (returned by ``get_sources()`` on
+    # win32) end-to-end.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Use Python ${{matrix.python_version}}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{matrix.python_version}}
+
+      - name: Install bocpy
+        # Scrub the workflow-level BOCPY_BUILD_INTERNAL_TESTS=1 here:
+        # this job never invokes the internal-test extension, so
+        # building it is pure overhead.
+        env:
+          BOCPY_BUILD_INTERNAL_TESTS: ""
+        run: pip install -e .[test] --verbose
+
+      - name: Build downstream consumer extension
+        run: pip install --no-build-isolation ./templates/c_abi_consumer
+
+      - name: Run consumer tests
+        run: pytest -vv templates/c_abi_consumer/test
+
+  sdist:
+    runs-on: ubuntu-latest
+    # The new sdist must build cleanly without the internal-test
+    # opt-in; setuptools excludes those sources from the tarball, so
+    # leaving the workflow-level env in scope would attempt to build
+    # missing files via PEP 517.
+    env:
+      BOCPY_BUILD_INTERNAL_TESTS: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Use Python 3.14
+        uses: actions/setup-python@v6
+        with:
+          python-version: 3.14
+
+      - name: Install build tool
+        run: pip install build
+
+      - name: Build sdist
+        run: python -m build --sdist
+
+      - name: Install from sdist
+        run: pip install dist/*.tar.gz --verbose
+
+      - name: Smoke-test import
+        run: python -c "import bocpy; print(bocpy.__name__)"
+
+      - name: Smoke-test example with data file
+        run: |
+          python -c "import importlib, importlib.resources as r; \
+          m = importlib.import_module('bocpy.examples'); \
+          assert (r.files(m) / 'cheese.txt').is_file(), 'cheese.txt missing'; \
+          assert (r.files(m) / 'menu.txt').is_file(), 'menu.txt missing'"
+
+      - name: Wheel allow-list (no internal C/H ships)
+        env:
+          BOCPY_TEST_WHEEL: "1"
+        run: |
+          pip install pytest
+          pytest -vv test/test_public_c_abi.py
 
   cpp-format:
     runs-on: ubuntu-latest
@@ -37,6 +134,7 @@ jobs:
       matrix:
         path: 
           - check: src/bocpy
+          - check: templates/c_abi_consumer/src
     steps:
       - name: Checkout
         uses: actions/checkout@v6

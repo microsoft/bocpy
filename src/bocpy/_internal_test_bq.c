@@ -2,7 +2,7 @@
 /// @brief BQ-domain (Verona MPMC behaviour queue) tests for
 ///        `bocpy._internal_test`.
 ///
-/// Exposes the `boc_bq_*` API from `sched.h` to Python so
+/// Exposes the `boc_bq_*` API from `boc_sched.h` to Python so
 /// `test/test_internal_mpmcq.py` can stress the queue from multiple
 /// real threads. Methods are registered on the `bocpy._internal_test`
 /// module under the `bq_*` prefix.
@@ -21,8 +21,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#include "compat.h"
-#include "sched.h"
+#include "boc_compat.h"
+#include "boc_sched.h"
 
 // ---------------------------------------------------------------------------
 // Node and queue capsule helpers
@@ -213,7 +213,7 @@ static PyObject *bq_dequeue_all(PyObject *Py_UNUSED(self), PyObject *args) {
   }
   // Walk the segment via segment_take_one. take_one returns NULL for
   // three reasons (mpmcq.h:67-89, also documented at
-  // sched.c::boc_sched_steal):
+  // boc_sched.c::boc_sched_steal):
   //   1. fully empty (impossible here — guarded above),
   //   2. singleton segment (end == &start->next_in_queue) — append
   //      start as the tail and return,

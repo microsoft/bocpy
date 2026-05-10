@@ -422,15 +422,15 @@ class TestExportCaptures:
         assert info.captures == []
 
 
-class TestExportDecoratorStripping:
-    """Generated behavior functions must not carry any decorators."""
+class TestExportDecoratorComposition:
+    """Decorator handling: @when is stripped, others are preserved."""
 
     @staticmethod
     def _export(source, path="/tmp/test.py"):
         tree = ast.parse(textwrap.dedent(source))
         return export_module(tree, path)
 
-    def test_no_decorator_on_behavior(self):
+    def test_when_stripped_from_behavior(self):
         result = self._export("""\
             from bocpy import when, whencall, Cown
 
@@ -443,9 +443,293 @@ class TestExportDecoratorStripping:
         gen_tree = ast.parse(result.code)
         for node in ast.walk(gen_tree):
             if isinstance(node, ast.FunctionDef) and node.name.startswith("__behavior__"):
-                assert node.decorator_list == [], (
-                    f"{node.name} still has decorators"
+                for dec in node.decorator_list:
+                    dec_src = ast.unparse(dec)
+                    assert "when" not in dec_src, (
+                        f"{node.name} still has @when decorator"
+                    )
+
+    def test_below_decorator_preserved(self):
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+            import functools
+
+            x = Cown(1)
+
+            def identity(fn):
+                return fn
+
+            @when(x)
+            @identity
+            def f(x):
+                return x.value
+        """)
+        gen_tree = ast.parse(result.code)
+        found = False
+        for node in ast.walk(gen_tree):
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("__behavior__"):
+                assert len(node.decorator_list) == 1, (
+                    f"expected 1 decorator, got {len(node.decorator_list)}"
                 )
+                assert ast.unparse(node.decorator_list[0]) == "identity"
+                found = True
+        assert found, "no __behavior__ function found"
+
+    def test_above_decorator_raises(self):
+        import pytest
+        with pytest.raises(SyntaxError, match="above @when"):
+            self._export("""\
+                from bocpy import when, whencall, Cown
+
+                x = Cown(1)
+
+                def log_calls(fn):
+                    return fn
+
+                @log_calls
+                @when(x)
+                def f(x):
+                    return x.value
+            """)
+
+    def test_unresolvable_decorator_name_raises(self):
+        import pytest
+        with pytest.raises(SyntaxError, match="not_importable"):
+            self._export("""\
+                from bocpy import when, whencall, Cown
+
+                x = Cown(1)
+
+                @when(x)
+                @not_importable
+                def f(x):
+                    return x.value
+            """)
+
+    def test_decorator_with_module_level_constant_arg(self):
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            MAX_RETRIES = 3
+
+            def retry(n):
+                def decorator(fn):
+                    return fn
+                return decorator
+
+            x = Cown(1)
+
+            @when(x)
+            @retry(MAX_RETRIES)
+            def f(x):
+                return x.value
+        """)
+        gen_tree = ast.parse(result.code)
+        for node in ast.walk(gen_tree):
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("__behavior__"):
+                assert len(node.decorator_list) == 1
+                assert "retry" in ast.unparse(node.decorator_list[0])
+
+    def test_async_def_with_when_raises(self):
+        import pytest
+        with pytest.raises(SyntaxError, match="async"):
+            self._export("""\
+                from bocpy import when, whencall, Cown
+
+                x = Cown(1)
+
+                @when(x)
+                async def f(x):
+                    return x.value
+            """)
+
+    def test_lambda_in_decorator_does_not_false_positive(self):
+        """Names bound by a Lambda inside a decorator must not be flagged."""
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            x = Cown(1)
+
+            def retry(fn):
+                def deco(target):
+                    return target
+                return deco
+
+            @when(x)
+            @retry(lambda x: x * 2)
+            def f(x):
+                return x.value
+        """)
+        assert "__behavior__" in result.code
+
+    def test_comprehension_in_decorator_does_not_false_positive(self):
+        """Comprehension targets are local to the comprehension scope."""
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            x = Cown(1)
+            REGISTRY = [1, 2, 3]
+
+            def register(items):
+                def deco(fn):
+                    return fn
+                return deco
+
+            @when(x)
+            @register([item for item in REGISTRY])
+            def f(x):
+                return x.value
+        """)
+        assert "__behavior__" in result.code
+
+    def test_genexp_in_decorator_does_not_false_positive(self):
+        """Generator-expression bound names are local to the genexp."""
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            x = Cown(1)
+            REGISTRY = [1, 2, 3]
+
+            def use(items):
+                def deco(fn):
+                    return fn
+                return deco
+
+            @when(x)
+            @use(sum(item for item in REGISTRY))
+            def f(x):
+                return x.value
+        """)
+        assert "__behavior__" in result.code
+
+    def test_dictcomp_in_decorator_does_not_false_positive(self):
+        """DictComp key/value names are local to the DictComp scope."""
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            x = Cown(1)
+            REGISTRY = [1, 2, 3]
+
+            def use(d):
+                def deco(fn):
+                    return fn
+                return deco
+
+            @when(x)
+            @use({k: k * 2 for k in REGISTRY})
+            def f(x):
+                return x.value
+        """)
+        assert "__behavior__" in result.code
+
+    def test_staticmethod_below_when_raises(self):
+        import pytest
+        with pytest.raises(SyntaxError, match="staticmethod"):
+            self._export("""\
+                from bocpy import when, whencall, Cown
+
+                x = Cown(1)
+
+                @when(x)
+                @staticmethod
+                def f(x):
+                    return x.value
+            """)
+
+    def test_classmethod_below_when_raises(self):
+        import pytest
+        with pytest.raises(SyntaxError, match="classmethod"):
+            self._export("""\
+                from bocpy import when, whencall, Cown
+
+                x = Cown(1)
+
+                @when(x)
+                @classmethod
+                def f(x):
+                    return x.value
+            """)
+
+    def test_property_below_when_raises(self):
+        import pytest
+        with pytest.raises(SyntaxError, match="property"):
+            self._export("""\
+                from bocpy import when, whencall, Cown
+
+                x = Cown(1)
+
+                @when(x)
+                @property
+                def f(x):
+                    return x.value
+            """)
+
+    def test_stacked_below_decorators_preserved_in_order(self):
+        """Multiple below-decorators are preserved with their source order."""
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            x = Cown(1)
+
+            def deco_a(fn):
+                return fn
+
+            def deco_b(fn):
+                return fn
+
+            @when(x)
+            @deco_a
+            @deco_b
+            def f(x):
+                return x.value
+        """)
+        gen_tree = ast.parse(result.code)
+        for node in ast.walk(gen_tree):
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("__behavior__"):
+                names = [ast.unparse(d) for d in node.decorator_list]
+                assert names == ["deco_a", "deco_b"], names
+
+    def test_annassign_constant_resolves_in_decorator(self):
+        """``X: int = 3`` makes ``X`` resolvable to a decorator argument."""
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            MAX_RETRIES: int = 3
+
+            def retry(n):
+                def deco(fn):
+                    return fn
+                return deco
+
+            x = Cown(1)
+
+            @when(x)
+            @retry(MAX_RETRIES)
+            def f(x):
+                return x.value
+        """)
+        assert "__behavior__" in result.code
+
+    def test_tuple_constant_target_resolves_in_decorator(self):
+        """Tuple-target uppercase assignment makes targets resolvable."""
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            A, B = 1, 2
+
+            def use(x):
+                def deco(fn):
+                    return fn
+                return deco
+
+            x = Cown(1)
+
+            @when(x)
+            @use(A + B)
+            def f(x):
+                return x.value
+        """)
+        assert "__behavior__" in result.code
 
 
 class TestExportFileRewrite:

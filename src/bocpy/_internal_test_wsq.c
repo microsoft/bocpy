@@ -2,7 +2,7 @@
 /// @brief WSQ-domain (work-stealing queue cursor + spread) tests for
 ///        `bocpy._internal_test`.
 ///
-/// Exposes the inline `boc_wsq_*` helpers from `sched.h` so
+/// Exposes the inline `boc_wsq_*` helpers from `boc_sched.h` so
 /// `test/test_internal_wsq.py` can verify the cursor-wrap arithmetic
 /// and the `enqueue_spread` distribution invariant directly, without
 /// going through the full scheduler runtime.
@@ -28,8 +28,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "compat.h"
-#include "sched.h"
+#include "boc_compat.h"
+#include "boc_sched.h"
 
 // ---------------------------------------------------------------------------
 // Worker fixture capsule

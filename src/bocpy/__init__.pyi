@@ -7,6 +7,10 @@ TIMEOUT: str
 REMOVED: object
 """Sentinel returned by a ``notice_update`` fn to delete the entry."""
 
+WORKER_COUNT: int
+"""Default worker-pool size used when :func:`start` is called without an
+explicit ``workers`` argument (CPU count - 1, minimum 1)."""
+
 
 def drain(tags: Union[str, Sequence[str]]) -> None:
     """Drain all messages associated with one or more tags.
@@ -514,33 +518,7 @@ def notice_read(key: str, default: Any = None) -> Any:
     """
 
 
-def noticeboard_version() -> int:
-    """Return the current noticeboard version counter.
-
-    The counter is incremented every time the noticeboard is
-    successfully written, updated, or cleared. Two reads returning the
-    same value mean no commit happened between them; a strictly larger
-    value means at least one commit happened.
-
-    The counter is global (across all threads and interpreters) and
-    monotonic. Useful as a *hint* for detecting noticeboard changes
-    without taking a full snapshot.
-
-    .. note::
-
-       This is *not* a synchronization primitive. Because
-       :func:`notice_write`, :func:`notice_update`, and
-       :func:`notice_delete` are fire-and-forget, the version may not
-       have advanced yet when a behavior that depends on a write
-       observes the noticeboard. For strict read-your-writes ordering,
-       use :func:`notice_sync`.
-
-    :return: The current noticeboard version.
-    :rtype: int
-    """
-
-
-def notice_sync(timeout: Optional[float] = 30.0) -> int:
+def notice_sync(timeout: Optional[float] = 30.0) -> None:
     """Block until the caller's prior noticeboard mutations are committed.
 
     Because :func:`notice_write`, :func:`notice_update`, and
@@ -560,8 +538,6 @@ def notice_sync(timeout: Optional[float] = 30.0) -> int:
     :raises TimeoutError: If the barrier does not complete within
         *timeout* seconds.
     :raises RuntimeError: If the runtime is not started.
-    :return: The :func:`noticeboard_version` after the flush.
-    :rtype: int
     """
 
 
@@ -640,6 +616,21 @@ def when(*cowns):
     the result of executing the behavior.  This :class:`Cown` can be used for
     further coordination.
 
+    Decorators **below** ``@when`` compose with the behavior body and run
+    on the worker (e.g. ``@when(x) @my_decorator def f(x): ...``).
+    Decorators **above** ``@when`` are not supported and will raise a
+    ``SyntaxError`` at transpile time.  ``async def`` functions are also
+    rejected — there is no event loop on workers to drive coroutines.
+    ``@staticmethod`` / ``@classmethod`` / ``@property`` below ``@when``
+    are also rejected because the generated behavior runs as a
+    module-level function, where these descriptors are not callable.
+
+    .. note::
+
+       The transpiler matches ``@when`` by literal name. Aliasing the
+       import (``from bocpy import when as boc_when``) is not
+       supported — the rewrite will not fire and the worker will fail.
+
     :param cowns: Zero or more :class:`Cown` objects or ``list[Cown]`` groups
         to acquire before running the decorated function.  Each argument
         becomes one parameter of the decorated function: a single
@@ -678,4 +669,35 @@ def whencall(thunk: str, args: list[Union[Cown, list[Cown]]], captures: list[Any
     :type captures: list[Any]
     :return: A :class:`Cown` that will hold the behavior's return value.
     :rtype: Cown
+    """
+
+
+def get_include() -> str:
+    """Return the absolute path to the bocpy public C header root.
+
+    Use the returned path as an additional ``include_dirs`` entry on a
+    downstream :class:`setuptools.Extension` so its translation units
+    can ``#include <bocpy/bocpy.h>``. The directory contains a single
+    ``bocpy/`` subdirectory holding the public ABI surface; bocpy's
+    private headers are not exposed.
+
+    :return: Absolute filesystem path to the include root (the parent
+        of the ``bocpy/`` subdirectory containing ``bocpy.h`` and
+        ``xidata.h``).
+    :rtype: str
+    """
+
+
+def get_sources() -> list[str]:
+    """Return platform-specific extra C sources for downstream extensions.
+
+    On Windows the returned list contains the absolute path to
+    ``bocpy_msvc.c``, which provides MSVC out-of-line bodies for the
+    atomic ops declared in ``<bocpy/bocpy.h>``. On non-Windows
+    platforms the list is empty (``<stdatomic.h>`` provides
+    everything).
+
+    :return: A list of absolute paths to add to a downstream
+        :class:`setuptools.Extension`'s ``sources=`` list.
+    :rtype: list[str]
     """

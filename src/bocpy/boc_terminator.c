@@ -1,13 +1,13 @@
-/// @file terminator.c
+/// @file boc_terminator.c
 /// @brief Implementation of the process-global rundown counter.
 ///
 /// All state lives in file-scope statics so that every sub-interpreter
 /// in the same process shares one counter, mutex, and condvar. See
-/// `terminator.h` for the public API and lifecycle contract.
+/// `boc_terminator.h` for the public API and lifecycle contract.
 
-#include "terminator.h"
+#include "boc_terminator.h"
 
-#include "compat.h"
+#include "boc_compat.h"
 
 /// @brief Active behavior count + the Pyrona seed.
 static atomic_int_least64_t TERMINATOR_COUNT = 0;

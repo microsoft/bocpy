@@ -85,11 +85,17 @@ behavior once its cowns are free.  The two transfers serialise on the
 ``Alice``/``Bob`` cowns, so their effects are interleaved in a deadlock-free,
 data-race-free order chosen by the runtime.
 
+For cross-behavior shared state see :ref:`noticeboard`. For lower-level
+Erlang-style ``send`` / ``receive`` channels see :ref:`messaging`.
+
 .. toctree::
    :maxdepth: 2
    :caption: Contents:
 
    api
+   noticeboard
+   messaging
+   c_abi
 
 Indices and Tables
 ==================

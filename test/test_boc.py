@@ -1303,3 +1303,81 @@ class TestBaseExceptionDiscipline:
         # cap_ki's release_all was attempted too (the KI was raised
         # from set_drop_exception, which runs *before* release_all).
         assert cap_ki.released
+
+
+def add_one(fn):
+    """Module-level decorator that adds 1 to the return value."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs) + 1
+    return wrapper
+
+
+def times_two(fn):
+    """Module-level decorator that multiplies the return value by 2."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        return fn(*args, **kwargs) * 2
+    return wrapper
+
+
+class TestDecoratorComposition:
+    """Decorators below @when should compose with the behavior body."""
+
+    @classmethod
+    def teardown_class(cls):
+        """Ensure runtime is drained after suite."""
+        wait()
+
+    def test_decorator_modifies_return_value(self):
+        x = Cown(10)
+
+        @when(x)
+        @add_one
+        def doubled_plus_one(x):
+            return x.value * 2
+
+        @when(doubled_plus_one)
+        def _(result):
+            send("assert", (result.value, 21))
+
+        receive_asserts()
+
+    def test_stacked_below_decorators_apply_in_order(self):
+        """Stacked below-decorators compose innermost-first on the worker.
+
+        ``@times_two @add_one def f(x): return x.value`` should compute
+        ``(x + 1) * 2`` because ``add_one`` wraps the body first, then
+        ``times_two`` wraps the result.
+        """
+        x = Cown(10)
+
+        @when(x)
+        @times_two
+        @add_one
+        def composed(x):
+            return x.value
+
+        @when(composed)
+        def _(result):
+            send("assert", (result.value, 22))
+
+        receive_asserts()
+
+    def test_below_decorator_inside_nested_when(self):
+        """A nested ``@when`` body may itself carry a below-decorator."""
+        x = Cown(10)
+        y = Cown(7)
+
+        @when(x)
+        def outer(x):
+            @when(y)
+            @add_one
+            def inner(y):
+                return y.value
+
+            @when(inner)
+            def _(result):
+                send("assert", (result.value, 8))
+
+        receive_asserts()

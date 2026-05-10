@@ -1,8 +1,8 @@
-/// @file cown.h
+/// @file boc_cown.h
 /// @brief Minimal cross-TU surface for the cown refcount API.
 ///
 /// This header exists so that translation units other than `_core.c`
-/// (for now: `noticeboard.c`) can hold strong references to a
+/// (for now: `boc_noticeboard.c`) can hold strong references to a
 /// `BOCCown` without needing to know its layout. The full struct
 /// definition and the implementation of @ref cown_incref / @ref
 /// cown_decref live in `_core.c`. The per-call cost of the indirect

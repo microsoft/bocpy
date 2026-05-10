@@ -104,13 +104,11 @@ xychart-beta
     title "bocpy speedup vs. worker count (chain-ring benchmark, CPython 3.14)"
     x-axis "Workers" [1, 2, 3, 4, 5, 6, 7, 8]
     y-axis "Speedup vs. 1 worker" 0 --> 9
-    bar [1.00, 1.97, 2.94, 3.90, 4.87, 5.82, 6.75, 7.54]
-    line [1, 2, 3, 4, 5, 6, 7, 8]
+    line [1.00, 1.97, 2.94, 3.90, 4.87, 5.82, 6.75, 7.54]
 ```
 <!-- pypi-skip-end -->
 
-The line is the ideal `y = x` reference; the bars are measured speedup. Up
-to 8 workers, BOC delivers roughly linear scaling on this microbenchmark
+Up to 8 workers, BOC delivers roughly linear scaling on this microbenchmark
 (≈7.5× at 8 workers). Real applications carry serial costs that this
 benchmark deliberately strips out — see the docstring at the top of
 [examples/benchmark.py](examples/benchmark.py) for the load-bearing
@@ -280,27 +278,32 @@ We provide a few examples to show different ways of using BOC in a program:
 
 
 ## Why BOC for Python?
-For many Python programmers, the GIL has established a programming model in which
-they do not have to think about the many potential issues that are introduced by
-concurrency, in particular data races. One of the best features of BOC is that, due
-to the way behaviors interact with concurrently owned data (*cowns*), each behavior
-can operate over its data without a need to change this familiar programming model.
-Even in a free-threading context, BOC will reduce contention on locks and provide
-programs which are data-race free by construction. Our initial research and experiments
-with BOC have shown near linear scaling over cores, with up to 32 concurrent worker
-sub-interpreters.
+Python has always had data races — compound operations like `x += 1` are not
+atomic, even under the GIL — and with the arrival of free-threaded builds
+(Python 3.13t+) the surface area for concurrency bugs is only growing. BOC
+eliminates these problems by construction: because behaviors interact with
+shared data exclusively through *cowns*, each behavior operates over its data
+as if it were single-threaded. There is no lock ordering to get right, no
+forgotten `acquire()`/`release()`, and no possibility of deadlock. This holds
+whether your program runs under the GIL, on per-interpreter GIL (3.12+), or
+on a free-threaded interpreter.
 
 ### This library
 Our implementation is built on top of the sub-interpreters mechanism and the
 Cross-Interpreter Data (`XIData`) API. As of Python 3.12 each sub-interpreter
 has its own GIL, so behaviors scheduled by `bocpy` run truly in parallel.
 
-In addition to the `when` function decorator, the library also exposes
-low-level Erlang-style `send` and selective `receive` functions which enable
-lock-free communication across threads and sub-interpreters. See the
-[`bocpy-primes`](https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/primes.py) and
-[`bocpy-calculator`](https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/calculator.py)
-examples for the usage of these lower-level functions.
+The core scheduling engine is written in C — it is **not** a wrapper around
+locks, message queues, or `asyncio`. Each `Cown` is backed by a C-level
+capsule that embeds an MCS-style queue of pending behaviors. When you call
+`@when(a, b)`, the runtime performs **two-phase locking** (2PL) over the
+sorted cown IDs entirely in C (releasing the GIL across the lock-free link
+loops). Once all cowns in a behavior's request set are acquired, the behavior
+is dispatched directly to a worker — there is no central scheduler thread and
+no OS-level lock acquisition on the fast path. Releasing a cown unlinks the
+MCS node and hands ownership to the next waiting behavior in O(1), which is
+then dispatched without touching any shared queue. This gives bocpy the same
+deadlock-freedom-by-construction guarantee as the original Verona runtime.
 
 For cross-behavior data sharing that does not warrant a `Cown`, the library
 also provides a small **noticeboard** — a global key-value store of up to 64
@@ -309,6 +312,23 @@ read-modify-write) and `notice_delete` keys without acquiring any cowns, and
 read a frozen snapshot via `noticeboard()` / `notice_read()`. The
 [`bocpy-prime-factor`](https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/prime_factor.py)
 example uses it to coordinate early termination across worker behaviors.
+
+The library also includes lower-level Erlang-style messaging primitives
+(`send` / `receive`) for channel-based communication patterns; see the
+[API documentation](https://microsoft.github.io/bocpy/messaging.html) for
+details.
+
+### Waiting for completion
+
+Call `wait()` after scheduling all your behaviors. It blocks the calling
+thread until every scheduled behavior has finished, then tears down the
+runtime (joins workers, closes the noticeboard). The next `@when` call will
+spin up a fresh runtime automatically.
+
+```python
+wait()          # block indefinitely
+wait(timeout=5) # raise TimeoutError if not done in 5 s
+```
 
 ### Additional Info
 BOC is built on a solid foundation of serious scholarship and engineering. For further reading, please see:

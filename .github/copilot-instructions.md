@@ -159,7 +159,7 @@ source .env314/bin/activate  # or whichever venv the user picked
 pip install -e .[test]       # editable install with test deps
 pytest -vv                   # run full suite
 pip install -e .[linting]    # linting deps
-flake8 src/ test/            # lint check
+flake8 src/ test/ examples/  # lint check
 ```
 
 The private `bocpy._internal_test` C extension (used by

@@ -1,4 +1,4 @@
-/// @file noticeboard.h
+/// @file boc_noticeboard.h
 /// @brief Public API for the global cross-behavior key-value noticeboard.
 ///
 /// The noticeboard is a fixed-capacity table (max @ref NB_MAX_ENTRIES
@@ -14,13 +14,13 @@
 /// Python-level read-modify-write helpers (e.g. @c notice_update).
 /// Snapshot reads (@ref noticeboard_snapshot) are unrestricted —
 /// readers cache the result thread-locally and revalidate against
-/// @ref noticeboard_version once per behavior boundary.
+/// the version counter once per behavior boundary.
 ///
 /// **PyErr discipline.** Functions that interact with the Python C
 /// API (@ref noticeboard_snapshot, @ref nb_pin_cowns,
 /// @ref noticeboard_write, @ref noticeboard_delete) set a Python
 /// exception and return -1 / NULL on failure. Functions that are
-/// pure C (@ref noticeboard_clear, @ref noticeboard_version,
+/// pure C (@ref noticeboard_clear,
 /// @ref notice_sync_*) cannot fail.
 
 #ifndef BOCPY_NOTICEBOARD_H
@@ -32,9 +32,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "compat.h"
-#include "cown.h"
-#include "xidata.h"
+#include "boc_compat.h"
+#include "boc_cown.h"
+#include <bocpy/xidata.h>
 
 /// @brief Maximum number of entries the noticeboard can hold.
 #define NB_MAX_ENTRIES 64
@@ -75,12 +75,9 @@ void noticeboard_drop_local_cache(void);
 /// @brief Mark the calling thread's cache as needing one version check.
 /// @details Called by the worker loop at every behavior boundary so
 /// the next @ref noticeboard_snapshot in this thread does exactly one
-/// atomic load against @ref noticeboard_version before reusing the
+/// atomic load against the version counter before reusing the
 /// cached proxy. Cheaper than dropping the cache outright.
 void noticeboard_cache_clear_for_behavior(void);
-
-/// @brief Read the noticeboard's monotonic version counter.
-int_least64_t noticeboard_version(void);
 
 /// @brief Walk a Python sequence of integer cown pointers, returning the
 ///        underlying @ref BOCCown array.
@@ -125,7 +122,7 @@ int noticeboard_write(const char *key, Py_ssize_t key_len, XIDATA_T *xidata,
 int noticeboard_delete(const char *key, Py_ssize_t key_len);
 
 /// @brief Drop every entry, freeing XIData and pins.
-/// @details Bumps @ref noticeboard_version. Cannot fail.
+/// @details Bumps the version counter. Cannot fail.
 void noticeboard_clear(void);
 
 /// @brief Build (or reuse) the calling thread's read-only snapshot proxy.

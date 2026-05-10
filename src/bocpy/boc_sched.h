@@ -1,4 +1,4 @@
-/// @file sched.h
+/// @file boc_sched.h
 /// @brief Work-stealing scheduler: per-worker MPMC queues, parking, stats.
 ///
 /// This translation unit owns:
@@ -22,7 +22,7 @@
 
 #include <Python.h>
 
-#include "compat.h"
+#include "boc_compat.h"
 
 // ---------------------------------------------------------------------------
 // Verona MPMC behaviour queue (`boc_bq_*`)
@@ -47,7 +47,7 @@
 typedef struct boc_bq_node {
   /// @brief Intrusive forward link, payload type
   /// `struct boc_bq_node *` stored in a `boc_atomic_ptr_t` slot for
-  /// MSVC compatibility (see `compat.h`).
+  /// MSVC compatibility (see `boc_compat.h`).
   /// @details Reads use @c BOC_MO_ACQUIRE (mpmcq.h:78,145); writes
   /// use @c BOC_MO_RELEASE (mpmcq.h:113,174) or @c BOC_MO_RELAXED
   /// (mpmcq.h:103,131) per Verona.
@@ -388,10 +388,10 @@ typedef struct boc_sched_stats_atomic {
 //
 // Holds the per-worker MPMC queue, the fairness-token slot
 // (`token_work` / `should_steal_for_fairness`), the parking-protocol
-// `cv_mu` / `cv` pair (`compat.h` `BOCMutex` / `BOCCond`, pthread on
+// `cv_mu` / `cv` pair (`boc_compat.h` `BOCMutex` / `BOCCond`, pthread on
 // POSIX, SRWLock on MSVC), the ring-link `next_in_ring` pointer, the
 // per-worker counter block, and a reserved terminator-delta slot.
-// Atomics use the typed `compat.h` shim (`boc_atomic_*_t` +
+// Atomics use the typed `boc_compat.h` shim (`boc_atomic_*_t` +
 // `boc_atomic_*_explicit`) so the layout compiles identically on POSIX
 // and MSVC ARM64.
 //
@@ -468,7 +468,7 @@ struct boc_sched_worker_payload_ {
 ///   - @c owner_interp_id: sub-interpreter id of the worker that
 ///     called `boc_sched_worker_register` for this slot. Used for
 ///     wrong-thread asserts in `pop`.
-///   - @c cv_mu / @c cv: parking-protocol mutex/condvar (compat.h
+///   - @c cv_mu / @c cv: parking-protocol mutex/condvar (boc_compat.h
 ///     wrappers).
 ///   - @c next_in_ring: forms a circular singly-linked ring over
 ///     @ref boc_sched_worker_count workers; immutable after
@@ -657,7 +657,7 @@ Py_ssize_t boc_sched_worker_count(void);
 /// @details Returns a non-owning pointer into the @c WORKERS array
 /// for use with the @c boc_bq_* primitives (e.g. orphan-drain on
 /// shutdown calls @c boc_bq_dequeue(&boc_sched_worker_at(i)->q)
-/// to walk each per-task queue from outside @c sched.c). The
+/// to walk each per-task queue from outside @c boc_sched.c). The
 /// returned pointer is invalidated by @ref boc_sched_shutdown.
 /// @param worker_index Zero-based worker slot.
 /// @return Borrowed worker pointer, or NULL if @p worker_index is
@@ -741,7 +741,7 @@ Py_ssize_t boc_sched_worker_register(void);
 /// owning behaviour via the standard `container_of` arithmetic
 /// (see @c BEHAVIOR_FROM_BQ_NODE in @c _core.c). Keeping the
 /// scheduler decoupled from the @c BOCBehavior layout avoids a
-/// circular header dependency between @c sched.h and
+/// circular header dependency between @c boc_sched.h and
 /// @c _core.c's behaviour struct.
 boc_bq_node_t *boc_sched_worker_pop_slow(boc_sched_worker_t *self);
 

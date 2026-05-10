@@ -1,4 +1,4 @@
-/// @file terminator.h
+/// @file boc_terminator.h
 /// @brief Process-global rundown counter API shared between TUs.
 ///
 /// The terminator is the C-level barrier that gates `Behaviors.wait()` /
@@ -8,7 +8,7 @@
 /// the count positive between the runtime starting and `stop()` taking
 /// it down via @ref terminator_seed_dec.
 ///
-/// State is process-global (file-scope statics in `terminator.c`, NOT
+/// State is process-global (file-scope statics in `boc_terminator.c`, NOT
 /// per-interpreter) so every sub-interpreter sees the same counter,
 /// mutex, and condvar.
 ///

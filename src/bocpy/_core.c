@@ -1,12 +1,12 @@
 #define PY_SSIZE_T_CLEAN
 
-#include "compat.h"
-#include "cown.h"
-#include "noticeboard.h"
-#include "sched.h"
-#include "tags.h"
-#include "terminator.h"
-#include "xidata.h"
+#include "boc_compat.h"
+#include "boc_cown.h"
+#include "boc_noticeboard.h"
+#include "boc_sched.h"
+#include "boc_tags.h"
+#include "boc_terminator.h"
+#include <bocpy/bocpy.h>
 
 // Forward declaration — BOCQueue is defined below.
 typedef struct boc_queue BOCQueue;
@@ -46,7 +46,6 @@ static inline void boc_park_wait(BOCQueue *q);
 const struct timespec SLEEP_TS = {0, 1000};
 const char *BOC_TIMEOUT = "__timeout__";
 const int BOC_CAPACITY = 1024 * 16;
-const PY_INT64_T NO_OWNER = -2;
 atomic_int_least64_t BOC_COUNT = 0;
 atomic_int_least64_t BOC_COWN_COUNT = 0;
 
@@ -125,7 +124,7 @@ typedef struct boc_queue {
   // boc_enqueue / boc_dequeue. Read by `_core.queue_stats()`. Grouped
   // and padded so they sit on their own cacheline and do not
   // false-share with the hot head/tail/state above. Typed via
-  // `compat.h` so the build works on MSVC (which has no `_Atomic`).
+  // `boc_compat.h` so the build works on MSVC (which has no `_Atomic`).
   /// @brief CAS retries observed by enqueuers contending on @c tail.
   boc_atomic_u64_t enqueue_cas_retries;
   /// @brief CAS retries observed by dequeuers contending on @c head.
@@ -286,14 +285,6 @@ static void boc_ref_tracking(bool is_cown, int_least64_t delta) {
 #define BOC_REF_TRACKING_REMOVE_BEHAVIOR(...)
 #define BOC_REF_TRACKING_REPORT(...)
 #endif
-
-/// @brief Convenience method to obtain the interpreter ID
-/// @return the ID of the currently running interpreter
-static inline PY_INT64_T get_interpid() {
-  PyThreadState *ts = PyThreadState_GET();
-  PyInterpreterState *is = PyThreadState_GetInterpreter(ts);
-  return PyInterpreterState_GetID(is);
-}
 
 /// @brief Allocates a new MPSC RecycleQueue.
 /// @details This will add it to the queue list and then return the reference.
@@ -612,23 +603,6 @@ static PyObject *_core_noticeboard_cache_clear(PyObject *self,
   BOC_STATE_SET(self);
   noticeboard_cache_clear_for_behavior();
   Py_RETURN_NONE;
-}
-
-/// @brief Return the current noticeboard version counter
-/// @details The counter is incremented under @ref Noticeboard::mutex on
-/// every successful @c notice_write, @c notice_delete, or
-/// @c noticeboard_clear. Read with sequentially-consistent semantics.
-/// Two reads returning the same value mean no commit happened between
-/// them; a strictly larger value means at least one commit happened.
-/// Useful for detecting noticeboard changes without taking a full
-/// snapshot.
-/// @param self The module (unused)
-/// @param args Unused
-/// @return A Python int with the current noticeboard version
-static PyObject *_core_noticeboard_version(PyObject *self,
-                                           PyObject *Py_UNUSED(args)) {
-  BOC_STATE_SET(self);
-  return PyLong_FromLongLong((long long)noticeboard_version());
 }
 
 /// @brief Register the calling thread as the noticeboard mutator thread
@@ -1001,11 +975,11 @@ static void BOCRecycleQueue_enqueue(BOCRecycleQueue *queue, XIDATA_T *xidata);
 // release hot path costs measurable throughput. Mirror CPython's
 // Py_INCREF (inline header macro) vs _Py_IncRef (out-of-line ABI export)
 // pattern: keep `static inline` bodies as the in-TU implementation,
-// expose extern wrappers under the names declared in `cown.h` for
-// noticeboard.c, and override the macros from cown.h to bind locally to
+// expose extern wrappers under the names declared in `boc_cown.h` for
+// boc_noticeboard.c, and override the macros from boc_cown.h to bind locally to
 // the inline versions. The one earlier callsite (the write_direct error
 // rollback above this point) is on an error path and stays bound to the
-// extern wrapper from cown.h — not hot.
+// extern wrapper from boc_cown.h — not hot.
 
 static inline int_least64_t cown_decref_inline(BOCCown *cown) {
   int_least64_t rc = atomic_fetch_add(&cown->rc, -1) - 1;
@@ -1023,7 +997,7 @@ static inline int_least64_t cown_decref_inline(BOCCown *cown) {
 
   // we can clear the object and recycle the xidata
   if (cown->value != NULL) {
-    assert(cown->owner == get_interpid());
+    assert(cown->owner == bocpy_interpid());
     Py_CLEAR(cown->value);
   }
 
@@ -1036,7 +1010,7 @@ static inline int_least64_t cown_decref_inline(BOCCown *cown) {
   return 0;
 }
 
-/// @brief Out-of-line export consumed by other TUs (see @ref cown.h).
+/// @brief Out-of-line export consumed by other TUs (see @ref boc_cown.h).
 int_least64_t cown_decref(BOCCown *cown) { return cown_decref_inline(cown); }
 
 #define COWN_WEAK_DECREF(c) cown_weak_decref(c)
@@ -1051,7 +1025,7 @@ static inline int_least64_t cown_incref_inline(BOCCown *cown) {
   return rc;
 }
 
-/// @brief Out-of-line export consumed by other TUs (see @ref cown.h).
+/// @brief Out-of-line export consumed by other TUs (see @ref boc_cown.h).
 int_least64_t cown_incref(BOCCown *cown) { return cown_incref_inline(cown); }
 
 // Rebind COWN_INCREF / COWN_DECREF to the inline forms so every
@@ -1126,7 +1100,7 @@ static BOCCown *BOCCown_new(PyObject *value) {
   atomic_store(&cown->weak_rc, 1);
   cown_set_value(cown, value);
   assert(cown->value != NULL);
-  atomic_store(&cown->owner, get_interpid());
+  atomic_store(&cown->owner, bocpy_interpid());
   PRINTDBG("BOCCown_new(cid=%" PRIdLEAST64 ", value=", cown->id);
   PRINTOBJDBG(value);
   PRINTFDBG(")\n");
@@ -1383,7 +1357,7 @@ static int CownCapsule_init(PyObject *op, PyObject *args,
 /// @param set_error Whether to set an error message
 /// @return whether the currently running interpreter has acquired the cown
 static bool cown_check_acquired(BOCCown *cown, bool set_error) {
-  PY_INT64_T current_id = get_interpid();
+  PY_INT64_T current_id = bocpy_interpid();
   if (current_id != atomic_load(&cown->owner)) {
     if (set_error) {
       PyErr_SetString(PyExc_RuntimeError,
@@ -1474,17 +1448,17 @@ static PyObject *CownCapsule_acquired(PyObject *op,
 
 /// @brief Attempts to acquire the cown
 /// @note On failure, the cown's owner is restored to its prior value: either
-/// NO_OWNER (if deserialisation failed after the CAS succeeded) or the actual
-/// owning interpreter (if the CAS itself failed). Callers can therefore rely
-/// on the invariant that a -1 return never leaves the cown in a half-acquired
-/// (owner=me, value=NULL, xidata non-NULL) state. This is required by the
-/// worker-side recovery arm in `worker.run_behavior`, which calls
-/// `behavior.release()` after an acquire failure.
+/// BOCPY_NO_OWNER (if deserialisation failed after the CAS succeeded) or the
+/// actual owning interpreter (if the CAS itself failed). Callers can therefore
+/// rely on the invariant that a -1 return never leaves the cown in a
+/// half-acquired (owner=me, value=NULL, xidata non-NULL) state. This is
+/// required by the worker-side recovery arm in `worker.run_behavior`, which
+/// calls `behavior.release()` after an acquire failure.
 /// @param cown The cown to acquire
 /// @return -1 if failure, 0 if success
 static int cown_acquire(BOCCown *cown) {
-  int_least64_t expected = NO_OWNER;
-  int_least64_t desired = get_interpid();
+  int_least64_t expected = BOCPY_NO_OWNER;
+  int_least64_t desired = bocpy_interpid();
   if (!atomic_compare_exchange_strong(&cown->owner, &expected, desired)) {
     if (expected == desired) {
       // already acquired by this interpreter
@@ -1503,13 +1477,13 @@ static int cown_acquire(BOCCown *cown) {
   cown->value = xidata_to_object(cown->xidata, cown->pickled);
 
   if (cown->value == NULL) {
-    // Deserialisation failed. We CAS'd owner from NO_OWNER to desired above,
-    // so we must roll it back; otherwise the cown is permanently stuck in a
-    // (owner=me, value=NULL, xidata non-NULL) half-acquired state and any
+    // Deserialisation failed. We CAS'd owner from BOCPY_NO_OWNER to desired
+    // above, so we must roll it back; otherwise the cown is permanently stuck
+    // in a (owner=me, value=NULL, xidata non-NULL) half-acquired state and any
     // future acquire from any interpreter (including the worker-side
     // recovery arm) sees "already acquired by N" instead of being able to
     // retry. xidata stays in place for a future retry.
-    atomic_store(&cown->owner, (int_least64_t)NO_OWNER);
+    atomic_store(&cown->owner, (int_least64_t)BOCPY_NO_OWNER);
     return -1;
   }
 
@@ -1541,10 +1515,10 @@ static PyObject *CownCapsule_acquire(PyObject *op, PyObject *Py_UNUSED(dummy)) {
 /// @param cown The cown to release
 /// @return -1 if error, 0 otherwise
 static int cown_release(BOCCown *cown) {
-  int_least64_t expected = get_interpid();
+  int_least64_t expected = bocpy_interpid();
   int_least64_t owner = atomic_load(&cown->owner);
   if (owner != expected) {
-    if (owner == NO_OWNER) {
+    if (owner == BOCPY_NO_OWNER) {
       // already released
       return 0;
     }
@@ -1572,7 +1546,7 @@ static int cown_release(BOCCown *cown) {
   cown->pickled = Py_IsTrue(pickled);
   Py_CLEAR(cown->value);
 
-  int_least64_t desired = NO_OWNER;
+  int_least64_t desired = BOCPY_NO_OWNER;
   if (!atomic_compare_exchange_strong(&cown->owner, &expected, desired)) {
     // this should never happen
     PyErr_SetString(PyExc_RuntimeError,
@@ -1602,13 +1576,13 @@ static PyObject *CownCapsule_release(PyObject *op, PyObject *Py_UNUSED(dummy)) {
 }
 
 /// @brief Abandons the cown value without serializing it
-/// @details Clears the value and resets ownership to NO_OWNER. This is used
-/// during worker cleanup to safely discard orphan cowns before the owning
+/// @details Clears the value and resets ownership to BOCPY_NO_OWNER. This is
+/// used during worker cleanup to safely discard orphan cowns before the owning
 /// interpreter is destroyed.
 /// @param cown The cown to disown
 /// @return -1 if error, 0 otherwise
 static int cown_disown(BOCCown *cown) {
-  int_least64_t expected = get_interpid();
+  int_least64_t expected = bocpy_interpid();
   int_least64_t owner = atomic_load(&cown->owner);
   if (owner != expected) {
     PyErr_Format(PyExc_RuntimeError,
@@ -1623,7 +1597,7 @@ static int cown_disown(BOCCown *cown) {
 
   Py_CLEAR(cown->value);
 
-  int_least64_t desired = NO_OWNER;
+  int_least64_t desired = BOCPY_NO_OWNER;
   if (!atomic_compare_exchange_strong(&cown->owner, &expected, desired)) {
     PyErr_SetString(PyExc_RuntimeError,
                     "Panic: contention on cown during disown");
@@ -1940,18 +1914,9 @@ static PyObject *_new_cown_object(XIDATA_T *xidata) {
 /// @brief Initialises an xidata that shares a cown.
 /// @param tstate the state of the current thread
 /// @param obj the CownCapsule object
-/// @param fallback a fallback xidata method
 /// @param xidata the xidata object
 /// @return 0 if successful
-static int _cown_shared(
-#ifndef BOC_NO_MULTIGIL
-    PyThreadState *tstate,
-#endif
-    PyObject *obj, XIDATA_T *xidata) {
-#ifdef BOC_NO_MULTIGIL
-  PyThreadState *tstate = PyThreadState_GET();
-#endif
-
+XIDATA_GETDATA_FUNC(_cown_shared) {
   CownCapsuleObject *capsule = (CownCapsuleObject *)obj;
   BOCCown *cown = capsule->cown;
 
@@ -2362,7 +2327,7 @@ static BOCMessage *boc_message_new(PyObject *tag, PyObject *contents) {
 /// consumer draining -- in practice this only happens for a tag
 /// where producers vastly outpace consumers. Behaviour dispatch
 /// does not go through a tag at all (it routes through per-worker
-/// queues in @c sched.c).
+/// queues in @c boc_sched.c).
 ///
 /// On overflow this returns -1 without setting a Python exception; the
 /// caller (typically @c behavior_resolve_one) reports the error. Once
@@ -3347,7 +3312,7 @@ static int BehaviorCapsule_init(PyObject *op, PyObject *args,
 ///
 /// **Cown-side residue on dispatch failure.** When the count==0
 /// transition fires here AND @c boc_sched_dispatch returns -1
-/// (runtime-down sentinel; see @c boc_sched_dispatch in @c sched.c),
+/// (runtime-down sentinel; see @c boc_sched_dispatch in @c boc_sched.c),
 /// the behavior's BOCRequest array has already been linked onto every
 /// target cown's MCS chain by the link/finish 2PL phases. The
 /// rollback below DECREFs only the queue-owned BEHAVIOR_INCREF; it
@@ -3670,11 +3635,11 @@ static PyObject *BehaviorCapsule_set_exception(PyObject *op, PyObject *args) {
 /// @brief Mark a never-executed behavior's result Cown with a drop exception.
 /// @details For behaviors drained during stop() that never had a chance to
 /// run. The result Cown is in the published-and-released state
-/// (owner=NO_OWNER, xidata=set, value=NULL) that ``Cown(None)``'s
+/// (owner=BOCPY_NO_OWNER, xidata=set, value=NULL) that ``Cown(None)``'s
 /// constructor leaves it in. Mirrors the worker exception path
 /// (``worker.py``: acquire → set_exception → release) but condensed into
 /// one C call: cown_acquire takes ownership on the main thread, the
-/// exception is stored, then cown_release pickles back to NO_OWNER so a
+/// exception is stored, then cown_release pickles back to BOCPY_NO_OWNER so a
 /// caller awaiting ``cown.value`` / ``cown.exception`` after stop()
 /// observes a clear diagnostic instead of a permanent ``None``.
 /// @param op The BehaviorCapsule object
@@ -3951,15 +3916,7 @@ static PyObject *_new_behavior_object(XIDATA_T *xidata) {
   return (PyObject *)capsule;
 }
 
-static int _behavior_shared(
-#ifndef BOC_NO_MULTIGIL
-    PyThreadState *tstate,
-#endif
-    PyObject *obj, XIDATA_T *xidata) {
-#ifdef BOC_NO_MULTIGIL
-  PyThreadState *tstate = PyThreadState_GET();
-#endif
-
+XIDATA_GETDATA_FUNC(_behavior_shared) {
   BehaviorCapsuleObject *capsule = (BehaviorCapsuleObject *)obj;
   BOCBehavior *behavior = capsule->behavior;
 
@@ -4592,7 +4549,7 @@ static PyObject *_core_scheduler_runtime_start(PyObject *Py_UNUSED(module),
   // are zero-initialised so every refcount / cown-array field is the
   // safe NULL state, and `is_token = 1` discriminates them at the
   // worker-pop site. Allocation lives here (and not in
-  // `boc_sched_init`) because `sched.c` deliberately treats
+  // `boc_sched_init`) because `boc_sched.c` deliberately treats
   // `BOCBehavior` as opaque.
   for (Py_ssize_t i = 0; i < (Py_ssize_t)n; ++i) {
     BOCBehavior *token = (BOCBehavior *)PyMem_RawCalloc(1, sizeof(BOCBehavior));
@@ -4959,9 +4916,6 @@ static PyMethodDef _core_module_methods[] = {
     {"noticeboard_cache_clear", _core_noticeboard_cache_clear, METH_NOARGS,
      "noticeboard_cache_clear($module, /)"
      "\n--\n\nClears the thread-local snapshot cache."},
-    {"noticeboard_version", _core_noticeboard_version, METH_NOARGS,
-     "noticeboard_version($module, /)"
-     "\n--\n\nReturns the global noticeboard version counter."},
     {"set_noticeboard_thread", _core_set_noticeboard_thread, METH_NOARGS,
      "set_noticeboard_thread($module, /)"
      "\n--\n\nRegisters the calling thread as the noticeboard mutator "
