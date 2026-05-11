@@ -1,4 +1,4 @@
-"""Unit tests for the inline ``boc_wsq_*`` helpers in ``sched.h``.
+"""Unit tests for the inline ``boc_wsq_*`` helpers in ``boc_sched.h``.
 
 These tests exercise the work-stealing-queue cursor arithmetic and
 ``enqueue_spread`` distribution invariant directly via the

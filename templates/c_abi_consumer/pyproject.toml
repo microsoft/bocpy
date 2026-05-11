@@ -1,0 +1,14 @@
+[build-system]
+# `bocpy` is listed here so an isolated PEP 517 build can satisfy the
+# `import bocpy` in setup.py. Always install with --no-build-isolation
+# so the build resolves headers against the bocpy install actually
+# being tested. See README.md.
+requires = ["setuptools", "wheel", "bocpy"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bocpy-c-abi-consumer"
+version = "0.0.0"
+description = "Smoke test and canonical downstream template for the bocpy public C ABI."
+requires-python = ">=3.10"
+dependencies = ["bocpy"]

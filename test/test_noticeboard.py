@@ -6,7 +6,7 @@ import pytest
 
 from bocpy import (Cown, drain, notice_delete, notice_read, notice_sync,
                    notice_update, notice_write, noticeboard,
-                   noticeboard_version, receive,
+                   receive,
                    REMOVED, send, start, TIMEOUT, wait, when)
 import bocpy._core as _core
 
@@ -1400,81 +1400,6 @@ class TestNoticeboardVersioning:
 
         receive_asserts(3)
 
-    def test_snapshot_reused_when_no_writes_intervene(self):
-        """Version is unchanged across read-only behaviors.
-
-        With no writes in flight, the version counter must stay constant
-        no matter how many read-only behaviors run.
-        """
-        from bocpy import noticeboard_version
-
-        x = Cown(0)
-
-        @when(x)
-        def seed(x):
-            notice_write("k", 1)
-            notice_sync()
-
-        # Drain the seed behavior by chaining a subsequent read; this
-        # ensures the write has landed before we sample the version.
-        @when(x, seed)
-        def warm(x, _):
-            send("assert", (notice_read("k"), 1))
-
-        receive_asserts()
-
-        # Now run N read-only behaviors and watch the version.
-        before = noticeboard_version()
-        n = 20
-
-        for _ in range(n):
-            @when(x)
-            def reader(x):
-                send("assert", (notice_read("k"), 1))
-
-        receive_asserts(n)
-
-        after = noticeboard_version()
-        assert after == before, (
-            f"version moved from {before} to {after} across {n} "
-            f"read-only behaviors; no writes were issued")
-
-    def test_writes_advance_version(self):
-        """Each notice_write strictly increases the version counter."""
-        x = Cown(0)
-
-        @when(x)
-        def seed(x):
-            notice_write("vk", 0)
-            notice_sync()
-            # Reading noticeboard_version() from the test thread would
-            # race the noticeboard mutator thread; the result-cown of
-            # this behavior carries the sample safely into `check`.
-            return noticeboard_version()
-
-        n = 5
-        for _ in range(n):
-            @when(x)
-            def writer(x):
-                notice_write("vk", 1)
-                notice_sync()
-
-        @when(x)
-        def sample(x):
-            # Runs after every writer because all share `x`. Every
-            # writer's notice_sync() committed before its behavior
-            # released x, so the version we read here reflects all of
-            # them.
-            return noticeboard_version()
-
-        @when(seed, sample)
-        def check(before, after):
-            # `before` and `after` are the result-cowns of the upstream
-            # behaviors; their values are the noticeboard_version() ints.
-            send("assert", (after.value - before.value, n))
-
-        receive_asserts()
-
     def test_cross_behavior_visibility_preserved(self):
         """Sanity: write in A is visible in B (no regression vs baseline)."""
         x = Cown(0)
@@ -1491,19 +1416,21 @@ class TestNoticeboardVersioning:
         receive_asserts()
 
 
-class TestNoticeboardVersionAPI:
-    """Public-API surface tests for ``noticeboard_version``."""
+class TestNoticeSyncReturnType:
+    """Pin the documented return type of ``notice_sync()`` (None)."""
 
-    def test_returns_int(self):
-        """The version is an int."""
-        from bocpy import noticeboard_version
-        v = noticeboard_version()
-        assert isinstance(v, int)
-        assert v >= 0
+    @classmethod
+    def teardown_class(cls):
+        """Drain the runtime after the suite."""
+        wait()
 
-    def test_monotonic(self):
-        """The version never decreases between consecutive reads."""
-        from bocpy import noticeboard_version
-        a = noticeboard_version()
-        b = noticeboard_version()
-        assert b >= a
+    def test_returns_none_inside_behavior(self):
+        x = Cown(0)
+
+        @when(x)
+        def _(x):
+            notice_write("rk", 1)
+            result = notice_sync()
+            send("assert", (result, None))
+
+        receive_asserts()

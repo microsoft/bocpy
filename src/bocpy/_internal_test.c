@@ -14,7 +14,7 @@
 ///                   (`_internal_test_bq.c`).
 ///
 /// The module deliberately does NOT link against `_core` or `_math`.
-/// It links only the units it tests (`compat.c`, `sched.c`) so the
+/// It links only the units it tests (`boc_compat.c`, `boc_sched.c`) so the
 /// test surface stays minimal and there is no sub-interpreter
 /// machinery in the way of the test threads.
 

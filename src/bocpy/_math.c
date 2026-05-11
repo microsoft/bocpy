@@ -7,20 +7,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "compat.h"
-#include "xidata.h"
+#include <bocpy/bocpy.h>
 
 #ifndef _WIN32
 #include <math.h>
 #endif
-
-/// @brief Convenience method to obtain the interpreter ID
-/// @return the ID of the currently running interpreter
-static inline PY_INT64_T get_interpid() {
-  PyThreadState *ts = PyThreadState_GET();
-  PyInterpreterState *is = PyThreadState_GetInterpreter(ts);
-  return PyInterpreterState_GetID(is);
-}
 
 /// @brief Underlying C-based matrix implementation
 typedef struct boc_matrix_impl {
@@ -119,7 +110,7 @@ static matrix_impl *impl_new(size_t rows, size_t columns) {
 
   matrix->rows = rows;
   matrix->columns = columns;
-  atomic_store(&matrix->owner, get_interpid());
+  atomic_store(&matrix->owner, bocpy_interpid());
   atomic_store(&matrix->rc, 0);
 
   if (update_row_ptrs(matrix) < 0) {
@@ -669,7 +660,7 @@ static matrix_impl *impl_new_from_sequence(PyObject *sequence, bool as_column) {
 }
 
 static bool impl_check_acquired(matrix_impl *matrix, bool set_error) {
-  PY_INT64_T current_id = get_interpid();
+  PY_INT64_T current_id = bocpy_interpid();
   if (current_id != atomic_load(&matrix->owner)) {
     if (set_error) {
       PyErr_SetString(PyExc_RuntimeError,
@@ -2386,8 +2377,6 @@ static PyType_Spec Matrix_Spec = {.name = "bocpy._math.Matrix",
                                            Py_TPFLAGS_IMMUTABLETYPE,
                                   .slots = Matrix_slots};
 
-const PY_INT64_T NO_OWNER = -2;
-
 /// @brief Wraps a matrix sent from another interpreter.
 /// @details The underlying C matrix, when it arrives at another interpreter, is
 /// wrapped by this method in a MatrixObject so that it can be used from that
@@ -2398,8 +2387,8 @@ static PyObject *_new_matrix_object(XIDATA_T *xidata) {
   matrix_impl *impl = (matrix_impl *)xidata->data;
 
   // take ownership of the C matrix
-  int_least64_t expected = NO_OWNER;
-  int_least64_t desired = get_interpid();
+  int_least64_t expected = BOCPY_NO_OWNER;
+  int_least64_t desired = bocpy_interpid();
   if (!atomic_compare_exchange_strong(&impl->owner, &expected, desired)) {
     PyErr_Format(PyExc_RuntimeError,
                  "%" PRIdLEAST64
@@ -2415,7 +2404,7 @@ static PyObject *_new_matrix_object(XIDATA_T *xidata) {
   if (matrix == NULL) {
     // attempt to roll back the ownership change
     int_least64_t rollback_expected = desired;
-    desired = NO_OWNER;
+    desired = BOCPY_NO_OWNER;
     atomic_compare_exchange_strong(&impl->owner, &rollback_expected, desired);
     return NULL;
   }
@@ -2428,30 +2417,22 @@ static PyObject *_new_matrix_object(XIDATA_T *xidata) {
 }
 
 /// @brief Prepare the underlying C matrix for sharing with another interpreter.
-/// @param tstate The thread state of the current interpreter (> 3.11)
+/// @param tstate The thread state of the current interpreter
 /// @param obj The MatrixObject instance
 /// @param xidata An empty xidata package
-/// @return 0 if successful, < o on error
-static int _matrix_shared(
-#ifndef BOC_NO_MULTIGIL
-    PyThreadState *tstate,
-#endif
-    PyObject *obj, XIDATA_T *xidata) {
-#ifdef BOC_NO_MULTIGIL
-  PyThreadState *tstate = PyThreadState_GET();
-#endif
-
+/// @return 0 if successful, < 0 on error
+XIDATA_GETDATA_FUNC(_matrix_shared) {
   MatrixObject *matrix = (MatrixObject *)obj;
   matrix_impl *impl = matrix->impl;
 
   // put the underlying C matrix in an ownerless state during transport
-  int_least64_t expected = get_interpid();
-  int_least64_t desired = NO_OWNER;
+  int_least64_t expected = bocpy_interpid();
+  int_least64_t desired = BOCPY_NO_OWNER;
   if (!atomic_compare_exchange_strong(&impl->owner, &expected, desired)) {
     PyErr_Format(PyExc_RuntimeError,
                  "%" PRIdLEAST64
                  " cannot release matrix (acquired by %" PRIdLEAST64 ")",
-                 get_interpid(), expected);
+                 bocpy_interpid(), expected);
     return -1;
   }
 

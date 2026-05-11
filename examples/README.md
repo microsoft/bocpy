@@ -53,22 +53,3 @@ for a result before doing a batch of trial divisions. When any lane finds a
 factor it writes to the noticeboard, and the remaining lanes see the result on
 their next check and stop early. Demonstrates the "behavior loop" pattern and
 cross-behavior coordination via the noticeboard.
-
-## Send/Receive
-In addition to exposing the higher-level behavior primitives (*i.e.*,
-`when`, `Cown`, `wait`), the library also exposes the lower-level functions
-[`send`](http://microsoft.github.io/bocpy/sphinx/api.html#bocpy.send) and
-[`receive`](http://microsoft.github.io/bocpy/sphinx/api.html#bocpy.receive), which provide
-lock-free Erlang-style send and selective receive. As this paradigm may be
-unfamiliar, we provide a few examples for this lower-level API as well.
-
-### Calculator
-In this example, several clients send arithmetic commands concurrently in
-parallel to a calculator server, which performs the operations and prints the
-result. Shows basic `send`/`receive` functionality and how to provide timeout
-information.
-
-### Primes
-In this example, you have a coordination thread producing work (in this case,
-batches of integers) and worker threads doing work (here, counting primes).
-Shows how to use `send`/`receive` to share work across multiple worker threads.

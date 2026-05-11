@@ -36,7 +36,7 @@ class CapturedVariableFinder(ast.NodeVisitor):
         self.used_vars.clear()
         self.captured_vars.clear()
 
-    def visit_FunctionDef(self, node: ast.FunctionDef):  # noqa: N802
+    def visit_FunctionDef(self, node):  # noqa: N802
         """Collect locals and recurse to find captured variables."""
         for arg in node.args.args:
             self.local_vars.add(arg.arg)
@@ -48,7 +48,7 @@ class CapturedVariableFinder(ast.NodeVisitor):
             self.local_vars.add(node.args.kwarg.arg)
 
         for stmt in node.body:
-            if isinstance(stmt, ast.FunctionDef):
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 self.local_vars.add(stmt.name)
                 # A nested @when is rewritten by WhenTransformer into a
                 # whencall(...) at this position. The cown arguments and the
@@ -70,6 +70,8 @@ class CapturedVariableFinder(ast.NodeVisitor):
             self.generic_visit(stmt)
 
         self.captured_vars = self.used_vars - self.local_vars - self.known_vars
+
+    visit_AsyncFunctionDef = visit_FunctionDef  # noqa: N815
 
     def visit_Name(self, node: ast.Name):  # noqa: N802
         """Track variable usage to determine captures."""
@@ -93,10 +95,21 @@ class BOCModuleTransformer(ast.NodeTransformer):
         self.classes = set()
         self.functions = set()
         self.imports = set()
+        self.constants = set()
 
     def known_vars(self):
         """Return identifiers known at module scope for capture exclusion."""
         return self.classes | self.functions | self.imports
+
+    def module_scope_names(self):
+        """Return all names available at module scope in the exported module.
+
+        This is a superset of ``known_vars`` that also includes
+        UPPERCASE constants and literal assignments kept by
+        ``visit_Assign``. It is used for decorator name-resolution
+        validation only — NOT for capture exclusion.
+        """
+        return self.classes | self.functions | self.imports | self.constants
 
     def visit_Import(self, node: ast.Import):  # noqa: N802
         """Record imported names and keep the node."""
@@ -136,9 +149,26 @@ class BOCModuleTransformer(ast.NodeTransformer):
 
         return node
 
+    visit_AsyncFunctionDef = visit_FunctionDef  # noqa: N815
+
+    def _record_constant_targets(self, targets):
+        """Record every ``Name`` (including nested in tuple targets) as a constant."""
+        for tgt in targets:
+            if isinstance(tgt, ast.Name):
+                self.constants.add(tgt.id)
+            elif isinstance(tgt, (ast.Tuple, ast.List)):
+                for elt in tgt.elts:
+                    if isinstance(elt, ast.Name):
+                        self.constants.add(elt.id)
+
     def visit_Assign(self, node: ast.Assign):  # noqa: N802
         """Add module-level constants."""
         if isinstance(node.value, ast.Constant):
+            # Constant assignments survive in the export. Record every
+            # target name (including chained ``A = B = 1`` and tuple
+            # ``A, B = 1, 2``) so the decorator validator can resolve
+            # them.
+            self._record_constant_targets(node.targets)
             return node
 
         if len(node.targets) > 1:
@@ -149,8 +179,25 @@ class BOCModuleTransformer(ast.NodeTransformer):
         if isinstance(name, ast.Name):
             # use naming convention to allow some non-constant values as well
             if name.id.isupper():
+                self.constants.add(name.id)
                 return node
 
+        if isinstance(name, (ast.Tuple, ast.List)) and all(
+                isinstance(e, ast.Name) and e.id.isupper() for e in name.elts):
+            for elt in name.elts:
+                self.constants.add(elt.id)
+            return node
+
+        return None
+
+    def visit_AnnAssign(self, node: ast.AnnAssign):  # noqa: N802
+        """Keep annotated module-level constants and uppercase names."""
+        if isinstance(node.target, ast.Name):
+            is_constant = isinstance(node.value, ast.Constant)
+            is_upper = node.target.id.isupper()
+            if is_constant or is_upper:
+                self.constants.add(node.target.id)
+                return node
         return None
 
     def generic_visit(self, node):
@@ -181,13 +228,122 @@ class WhenTransformer(ast.NodeTransformer):
     the function with a call to `whencall` for that behavior.
     """
 
-    def __init__(self, known_vars: set, path: str):
+    # Best-effort early warning for stdlib decorators that produce
+    # non-callable descriptors at module scope (``staticmethod``,
+    # ``classmethod``, ``property``). Applied below ``@when``, these
+    # would silently break worker dispatch — the generated
+    # ``__behavior__N`` is invoked as a plain function on the worker,
+    # but the descriptor is not callable that way; ``property`` even
+    # raises ``TypeError`` at import time.
+    #
+    # This is **not** a correctness guarantee. The transpiler can only
+    # see decorator *syntax*, not what the expression evaluates to at
+    # import time on the worker, so any third-party decorator with the
+    # same shape (e.g., ``functools.cached_property``, custom
+    # descriptor factories) will slip through. Treat the set below as a
+    # convenience: a precise, actionable error for the few stdlib names
+    # we can recognise from the AST. Users applying exotic decorators
+    # below ``@when`` are on their own.
+    _BANNED_BELOW_DECORATORS = frozenset({"staticmethod", "classmethod", "property"})
+
+    def __init__(self, known_vars: set, path: str, module_scope_names: set):
         """Prepare behavior extraction with known identifiers and file path."""
         self.known_vars = known_vars
+        self.module_scope_names = module_scope_names
         self.cap_finder = CapturedVariableFinder(known_vars)
         self.nodes = []
         self.behaviors = {}
         self.path = path
+
+    def _validate_decorator_names(self, dec: ast.AST):
+        """Reject free names in ``dec`` that the worker cannot resolve.
+
+        Walks the decorator subtree honoring lexical scope: parameters
+        of ``Lambda`` and target names of comprehensions / generator
+        expressions are *local* to those forms and must not be flagged.
+        Free ``Name(Load)`` references must appear in
+        ``module_scope_names`` (imports, classes, functions, constants,
+        builtins) so they resolve when the exported module is imported
+        on a worker.
+        """
+        bound_stack: list[set] = []
+
+        def is_bound(name: str) -> bool:
+            return any(name in s for s in bound_stack)
+
+        def lambda_locals(args: ast.arguments) -> set:
+            local = set()
+            for grp in (args.posonlyargs, args.args, args.kwonlyargs):
+                for a in grp:
+                    local.add(a.arg)
+            if args.vararg:
+                local.add(args.vararg.arg)
+            if args.kwarg:
+                local.add(args.kwarg.arg)
+            return local
+
+        def collect_targets(target: ast.AST, into: set) -> None:
+            if isinstance(target, ast.Name):
+                into.add(target.id)
+            elif isinstance(target, (ast.Tuple, ast.List)):
+                for elt in target.elts:
+                    collect_targets(elt, into)
+            elif isinstance(target, ast.Starred):
+                collect_targets(target.value, into)
+
+        def visit(node: ast.AST) -> None:
+            if isinstance(node, ast.Lambda):
+                # Defaults are evaluated in the *outer* scope.
+                for d in node.args.defaults:
+                    visit(d)
+                for d in node.args.kw_defaults:
+                    if d is not None:
+                        visit(d)
+                bound_stack.append(lambda_locals(node.args))
+                visit(node.body)
+                bound_stack.pop()
+                return
+
+            if isinstance(node, (ast.ListComp, ast.SetComp,
+                                 ast.GeneratorExp, ast.DictComp)):
+                local: set = set()
+                for i, gen in enumerate(node.generators):
+                    # The *first* iter is evaluated in the enclosing
+                    # scope; later iters see prior targets.
+                    if i == 0:
+                        visit(gen.iter)
+                    else:
+                        bound_stack.append(local)
+                        visit(gen.iter)
+                        bound_stack.pop()
+                    collect_targets(gen.target, local)
+                    bound_stack.append(local)
+                    for if_ in gen.ifs:
+                        visit(if_)
+                    bound_stack.pop()
+                bound_stack.append(local)
+                if isinstance(node, ast.DictComp):
+                    visit(node.key)
+                    visit(node.value)
+                else:
+                    visit(node.elt)
+                bound_stack.pop()
+                return
+
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                if not is_bound(node.id) and node.id not in self.module_scope_names:
+                    raise SyntaxError(
+                        f"Decorator references '{node.id}' which is "
+                        f"not defined as an import, class, function, or "
+                        f"constant at module level. Ensure it is "
+                        f"importable in the worker.",
+                        (self.path, node.lineno, node.col_offset, None),
+                    )
+
+            for child in ast.iter_child_nodes(node):
+                visit(child)
+
+        visit(dec)
 
     def visit_Module(self, node: ast.Module):  # noqa: N802
         """Remove when-call expressions and append generated behaviors."""
@@ -222,6 +378,26 @@ class WhenTransformer(ast.NodeTransformer):
         if when_dec is None:
             return self.generic_visit(node)
 
+        # Reject async functions — there is no event loop on workers.
+        if isinstance(node, ast.AsyncFunctionDef):
+            raise SyntaxError(
+                "@when does not support async functions",
+                (self.path, node.lineno, node.col_offset, None),
+            )
+
+        # Reject decorators above @when — they would wrap the
+        # scheduling call (a Cown), not the behavior body.
+        when_idx = node.decorator_list.index(when_dec)
+        if when_idx > 0:
+            bad = node.decorator_list[0]
+            above = [ast.unparse(d) for d in node.decorator_list[:when_idx]]
+            raise SyntaxError(
+                "Decorators above @when are not supported — move them "
+                "below @when to apply them to the behavior body: "
+                + ", ".join(above),
+                (self.path, bad.lineno, bad.col_offset, None),
+            )
+
         # first create a deep copy of the function
         behavior_node = copy.deepcopy(node)
         ast.copy_location(behavior_node, node)
@@ -239,9 +415,40 @@ class WhenTransformer(ast.NodeTransformer):
         for name in captures:
             behavior_node.args.args.append(ast.Name(id=name))
 
-        # strip the @when decorator (and any other decorators, they are
-        # not supported)
-        behavior_node.decorator_list.clear()
+        # Remove only @when decorators; other decorators compose with
+        # the behavior body and are preserved in the exported module.
+        behavior_node.decorator_list = [
+            d for d in behavior_node.decorator_list
+            if not (isinstance(d, ast.Call)
+                    and isinstance(d.func, ast.Name)
+                    and d.func.id == "when")
+        ]
+
+        # Reject descriptor-producing decorators that would silently
+        # break worker dispatch when applied to a module-level
+        # ``__behavior__N`` (the worker calls it as a plain function).
+        for dec in behavior_node.decorator_list:
+            banned = None
+            if isinstance(dec, ast.Name) and dec.id in self._BANNED_BELOW_DECORATORS:
+                banned = dec.id
+            elif (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Name)
+                    and dec.func.id in self._BANNED_BELOW_DECORATORS):
+                banned = dec.func.id
+            if banned is not None:
+                raise SyntaxError(
+                    f"@{banned} is not supported below @when — the generated "
+                    f"behavior runs as a module-level function on the worker, "
+                    f"where {banned} produces a non-callable descriptor.",
+                    (self.path, dec.lineno, dec.col_offset, None),
+                )
+
+        # Validate that remaining decorator expressions only reference
+        # names available at module scope in the worker. Walk only
+        # *free* variables — names bound by ``Lambda`` /
+        # comprehension / generator-expression scopes inside the
+        # decorator are local and must not be flagged.
+        for dec in behavior_node.decorator_list:
+            self._validate_decorator_names(dec)
 
         # deal with any recursive behaviors within this behavior
         behavior_node = self.visit(behavior_node)
@@ -267,6 +474,8 @@ class WhenTransformer(ast.NodeTransformer):
         ast.copy_location(when_call, node)
         ast.fix_missing_locations(when_call)
         return ast.Expr(ast.Assign([ast.Name(id=node.name)], when_call))
+
+    visit_AsyncFunctionDef = visit_FunctionDef  # noqa: N815
 
 
 ExportResult = NamedTuple("ExportResult", [("code", str), ("classes", Set[str]),
@@ -297,7 +506,11 @@ def export_module(tree: ast.Module, path: str = None) -> ExportResult:
     boc_export = BOCModuleTransformer()
     boc_export.visit(tree)
 
-    when_transformer = WhenTransformer(boc_export.known_vars() | builtins, path)
+    when_transformer = WhenTransformer(
+        boc_export.known_vars() | builtins,
+        path,
+        module_scope_names=boc_export.module_scope_names() | builtins,
+    )
     when_transformer.visit(tree)
 
     tree.body.extend(when_transformer.nodes)

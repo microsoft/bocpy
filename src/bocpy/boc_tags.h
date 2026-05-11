@@ -1,4 +1,4 @@
-/// @file tags.h
+/// @file boc_tags.h
 /// @brief Message-tag table API shared between TUs.
 ///
 /// A `BOCTag` names a message stream and pins one of the 16 fixed
@@ -19,7 +19,7 @@
 
 #include <Python.h>
 
-#include "compat.h"
+#include "boc_compat.h"
 
 /// @brief Forward declaration. Body defined in `_core.c` (later
 /// `message_queue.h`); tags only carry a pointer.

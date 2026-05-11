@@ -1,16 +1,21 @@
-/// @file compat.c
+/// @file boc_compat.c
 /// @brief Out-of-line definitions for the cross-platform shims declared in
-///        `compat.h`.
+///        `boc_compat.h`.
 ///
 /// On POSIX the C11 `<stdatomic.h>` machinery is fully header-only, so this
 /// translation unit is essentially empty there. On MSVC the `atomic_*`
 /// functions on `int_least64_t` are kept as out-of-line definitions
 /// (linked into `_core.o` and `_math.o` from `compat.o`).
 
-#include "compat.h"
+#include "boc_compat.h"
 
 #ifdef _WIN32
 
+/* The bytes between @atomic-bodies-begin and @atomic-bodies-end must
+ * be byte-identical to the marker region in
+ * src/bocpy/include/bocpy/bocpy_msvc.c (enforced by
+ * test_msvc_bodies_in_lockstep). */
+/* @atomic-bodies-begin */
 int_least64_t atomic_fetch_add(atomic_int_least64_t *ptr, int_least64_t value) {
 #if defined(_M_IX86)
   int_least64_t old = *ptr;
@@ -22,14 +27,6 @@ int_least64_t atomic_fetch_add(atomic_int_least64_t *ptr, int_least64_t value) {
   }
 #else
   return InterlockedExchangeAdd64(ptr, value);
-#endif
-}
-
-int_least64_t atomic_fetch_sub(atomic_int_least64_t *ptr, int_least64_t value) {
-#if defined(_M_IX86)
-  return atomic_fetch_add(ptr, -value);
-#else
-  return InterlockedExchangeAdd64(ptr, -value);
 #endif
 }
 
@@ -50,7 +47,35 @@ int_least64_t atomic_load(atomic_int_least64_t *ptr) {
 #if defined(_M_IX86)
   return InterlockedCompareExchange64(ptr, 0, 0);
 #else
-  return *ptr;
+  /* Seq-cst load. Plain `*ptr` is acquire/release at best on x64
+   * and gives no ordering on ARM64; InterlockedOr64(ptr, 0) is a
+   * full barrier on every supported MSVC target. */
+  return InterlockedOr64(ptr, 0);
+#endif
+}
+
+void atomic_store(atomic_int_least64_t *ptr, int_least64_t value) {
+#if defined(_M_IX86)
+  int_least64_t old = *ptr;
+  for (;;) {
+    int_least64_t prev = InterlockedCompareExchange64(ptr, value, old);
+    if (prev == old)
+      return;
+    old = prev;
+  }
+#else
+  /* Seq-cst store. Plain `*ptr = value` does not forbid StoreLoad
+   * reordering on x64/ARM64; InterlockedExchange64 is a full barrier. */
+  (void)InterlockedExchange64(ptr, value);
+#endif
+}
+/* @atomic-bodies-end */
+
+int_least64_t atomic_fetch_sub(atomic_int_least64_t *ptr, int_least64_t value) {
+#if defined(_M_IX86)
+  return atomic_fetch_add(ptr, -value);
+#else
+  return InterlockedExchangeAdd64(ptr, -value);
 #endif
 }
 
@@ -68,20 +93,6 @@ int_least64_t atomic_exchange(atomic_int_least64_t *ptr, int_least64_t value) {
 #endif
 }
 
-void atomic_store(atomic_int_least64_t *ptr, int_least64_t value) {
-#if defined(_M_IX86)
-  int_least64_t old = *ptr;
-  for (;;) {
-    int_least64_t prev = InterlockedCompareExchange64(ptr, value, old);
-    if (prev == old)
-      return;
-    old = prev;
-  }
-#else
-  *ptr = value;
-#endif
-}
-
 void thrd_sleep(const struct timespec *duration, struct timespec *remaining) {
   const DWORD MS_PER_NS = 1000000;
   DWORD ms = (DWORD)duration->tv_sec * 1000;
@@ -90,7 +101,7 @@ void thrd_sleep(const struct timespec *duration, struct timespec *remaining) {
 }
 
 // ---------------------------------------------------------------------------
-// Physical CPU detection (Windows arm). See compat.h for contract.
+// Physical CPU detection (Windows arm). See boc_compat.h for contract.
 // ---------------------------------------------------------------------------
 
 int boc_physical_cpu_count(void) {
@@ -128,7 +139,7 @@ int boc_physical_cpu_count(void) {
 #elif defined(__APPLE__)
 
 // ---------------------------------------------------------------------------
-// Physical CPU detection (macOS arm). See compat.h for contract.
+// Physical CPU detection (macOS arm). See boc_compat.h for contract.
 // ---------------------------------------------------------------------------
 
 #include <sys/sysctl.h>
@@ -152,7 +163,7 @@ int boc_physical_cpu_count(void) {
 #else // assume Linux / glibc-compatible
 
 // ---------------------------------------------------------------------------
-// Physical CPU detection (Linux arm). See compat.h for contract.
+// Physical CPU detection (Linux arm). See boc_compat.h for contract.
 // ---------------------------------------------------------------------------
 
 #include <ctype.h>

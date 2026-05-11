@@ -240,14 +240,39 @@ class Behaviors:
         self.final_cowns: tuple[Cown, ...] = ()
         self.bid = 0
 
-    def lookup_behavior(self, line_number: int) -> BehaviorInfo:
-        """Resolve behavior info from a source line number."""
+    def lookup_behavior(self, line_number: int,  max_decorator_stack=32) -> BehaviorInfo:
+        """Resolve behavior info from a source line number.
+
+        ``behavior_lookup`` is keyed by the line of the ``@when(...)``
+        decorator as it appears in the AST. The runtime frame line we
+        get from ``inspect.currentframe().f_back.f_lineno`` depends on
+        the CPython version:
+
+        - Python >= 3.11 attributes each decorator's application to
+          that decorator's own source line, so the frame line equals
+          the lookup key.
+        - Python <= 3.10 attributes all decorator applications on a
+          ``def`` to the ``def`` line itself, so the frame line is
+          ``def_line``, which is ``len(decorators)`` greater than the
+          ``@when`` decorator's line.
+
+        Walking from ``line_number`` downward to the largest key
+        ``<= line_number`` covers both cases for any decorator stack
+        height. We bound the walk so a stale frame deep in unrelated
+        code cannot silently mis-resolve to a distant earlier
+        behavior.
+        """
         if line_number in self.behavior_lookup:
             return self.behavior_lookup[line_number]
 
-        # 3.10: Might be off by one
-        if line_number - 1 in self.behavior_lookup:
-            return self.behavior_lookup[line_number - 1]
+        # Bound the backward search: a decorator stack of depth N
+        # leaves the @when line N below the def line in 3.10, but
+        # realistic stacks are tiny. 32 is plenty and still small
+        # enough to catch a stale-frame mis-resolution before it
+        # silently returns the wrong behavior.
+        for offset in range(1, max_decorator_stack + 1):
+            if line_number - offset in self.behavior_lookup:
+                return self.behavior_lookup[line_number - offset]
 
         return None
 
@@ -1117,6 +1142,10 @@ def when(*cowns):
     The function itself will be replaced by a Cown which will hold the
     result of executing the behavior. This Cown can be used for further
     coordination.
+
+    Note: the transpiler matches ``@when`` by literal name. Aliasing
+    the import (``from bocpy import when as boc_when``) is not
+    supported -- the rewrite will not fire and the worker will fail.
     """
 
     def when_factory(func):
@@ -1464,35 +1493,7 @@ def notice_read(key: str, default: Any = None) -> Any:
     return _core.noticeboard_snapshot().get(key, default)
 
 
-def noticeboard_version() -> int:
-    """Return the current noticeboard version counter.
-
-    The counter is incremented every time the noticeboard is
-    successfully written, updated, or cleared. Two reads returning the
-    same value mean no commit happened between them; a strictly larger
-    value means at least one commit happened.
-
-    The counter is global (across all threads and interpreters) and
-    monotonic. Useful as a *hint* for detecting noticeboard changes
-    without taking a full snapshot — for example, polling for any
-    change before deciding whether to refresh a derived view.
-
-    .. note::
-
-       This is *not* a synchronization primitive. Because
-       :func:`notice_write`, :func:`notice_update`, and
-       :func:`notice_delete` are fire-and-forget, the version may not
-       have advanced yet when a behavior that depends on a write
-       observes the noticeboard. For strict read-your-writes ordering,
-       use :func:`notice_sync`.
-
-    :return: The current noticeboard version.
-    :rtype: int
-    """
-    return _core.noticeboard_version()
-
-
-def notice_sync(timeout: Optional[float] = 30.0) -> int:
+def notice_sync(timeout: Optional[float] = 30.0) -> None:
     """Block until the caller's prior noticeboard mutations are committed.
 
     Because :func:`notice_write`, :func:`notice_update`, and
@@ -1514,8 +1515,6 @@ def notice_sync(timeout: Optional[float] = 30.0) -> int:
     :raises TimeoutError: If the noticeboard thread does not drain the
         caller's sentinel within *timeout* seconds.
     :raises RuntimeError: If the runtime is not started.
-    :return: The :func:`noticeboard_version` after the flush.
-    :rtype: int
     """
     if _core.is_primary() and BEHAVIORS is None:
         raise RuntimeError("cannot notice_sync before the runtime is started")
@@ -1523,4 +1522,3 @@ def notice_sync(timeout: Optional[float] = 30.0) -> int:
     _core.send("boc_noticeboard", ("sync", seq))
     if not _core.notice_sync_wait(seq, timeout):
         raise TimeoutError(f"notice_sync({timeout}s) timed out waiting for seq={seq}")
-    return _core.noticeboard_version()

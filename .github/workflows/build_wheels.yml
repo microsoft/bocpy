@@ -22,6 +22,9 @@ jobs:
         uses: pypa/cibuildwheel@v3.4.0
         env:
           CIBW_BUILD: ${{ matrix.python }}-win*
+          CIBW_TEST_REQUIRES: "pytest setuptools wheel"
+          CIBW_ENVIRONMENT: "BOCPY_TEST_WHEEL=1"
+          CIBW_TEST_COMMAND: "pytest {project}/test/test_public_c_abi.py -v"
         with:
           package-dir: ${{github.workspace}}
 
@@ -58,6 +61,9 @@ jobs:
         env:
           CIBW_BUILD: ${{ matrix.python }}-macosx*
           CIBW_ARCHS_MACOS: arm64
+          CIBW_TEST_REQUIRES: "pytest setuptools wheel"
+          CIBW_ENVIRONMENT: "BOCPY_TEST_WHEEL=1"
+          CIBW_TEST_COMMAND: "pytest {project}/test/test_public_c_abi.py -v"
         with:
           package-dir: ${{github.workspace}}
 
@@ -95,6 +101,9 @@ jobs:
           CIBW_BUILD: ${{ matrix.python }}-macosx*
           CIBW_ARCHS_MACOS: x86_64
           MACOSX_DEPLOYMENT_TARGET: 14.8.1
+          CIBW_TEST_REQUIRES: "pytest setuptools wheel"
+          CIBW_ENVIRONMENT: "BOCPY_TEST_WHEEL=1"
+          CIBW_TEST_COMMAND: "pytest {project}/test/test_public_c_abi.py -v"
         with:
           package-dir: ${{github.workspace}}
 
@@ -121,6 +130,9 @@ jobs:
         env:
           CIBW_BUILD: ${{ matrix.python }}-manylinux*
           CIBW_BEFORE_ALL: yum makecache
+          CIBW_TEST_REQUIRES: "pytest setuptools wheel"
+          CIBW_ENVIRONMENT: "BOCPY_TEST_WHEEL=1"
+          CIBW_TEST_COMMAND: "pytest {project}/test/test_public_c_abi.py -v"
         with:
           package-dir: ${{github.workspace}}
 
@@ -147,6 +159,9 @@ jobs:
         uses: pypa/cibuildwheel@v3.4.0
         env:
           CIBW_BUILD: ${{ matrix.python }}-musllinux*
+          CIBW_TEST_REQUIRES: "pytest setuptools wheel"
+          CIBW_ENVIRONMENT: "BOCPY_TEST_WHEEL=1"
+          CIBW_TEST_COMMAND: "pytest {project}/test/test_public_c_abi.py -v"
         with:
           package-dir: ${{github.workspace}}
 

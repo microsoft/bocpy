@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bocpy"
-version = "0.5.0"
+version = "0.6.0"
 authors = [
     {name = "bocpy Team", email="bocpy@microsoft.com"}
 ]
@@ -27,7 +27,7 @@ documentation = "https://microsoft.github.io/bocpy/sphinx/index.html"
 issues = "https://github.com/microsoft/bocpy/issues"
 
 [project.optional-dependencies]
-test = ["pytest-md", "pytest-emoji", "pytest-cov", "pytest"]
+test = ["pytest-md", "pytest-emoji", "pytest-cov", "pytest", "setuptools", "wheel"]
 linting = ["flake8", "flake8-bugbear", "flake8-builtins", "flake8-docstrings", "flake8-import-order", "flake8-quotes", "pep8-naming"]
 docs = ["sphinx", "sphinx-autodoc-typehints", "enum-tools[sphinx]"]
 boids = ["pyglet"]
@@ -47,10 +47,24 @@ bocpy-sketches = "bocpy.examples.sketches:main"
 
 [tool.setuptools]
 packages = ["bocpy", "bocpy.examples"]
+include-package-data = false
 
 [tool.setuptools.package-dir]
 "" = "src"
 "bocpy.examples" = "examples"
 
 [tool.setuptools.package-data]
+"bocpy" = [
+  "py.typed",
+  "*.pyi",
+  "include/bocpy/bocpy.h",
+  "include/bocpy/xidata.h",
+  "include/bocpy/bocpy_msvc.c",
+]
 "bocpy.examples" = ["*.txt"]
+
+[tool.pytest.ini_options]
+# Confine pytest collection to the in-tree test suite. The downstream
+# template at templates/c_abi_consumer/ has its own pytest suite that
+# the dedicated `c-abi-consumer` PR-gate job invokes explicitly.
+testpaths = ["test"]

@@ -25,6 +25,8 @@ runtimes microbenchmarks today; refactoring is premature).
 """
 
 import argparse
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
 import json
 import os
 import socket
@@ -32,8 +34,6 @@ import statistics
 import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass, field
-from datetime import datetime
 from typing import Optional
 
 from bocpy import Cown, Matrix, receive, send, start, wait, when

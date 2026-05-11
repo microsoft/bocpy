@@ -1,0 +1,7 @@
+include src/bocpy/*.h
+include src/bocpy/*.c
+include src/bocpy/include/bocpy/*.h
+include src/bocpy/include/bocpy/*.c
+include src/bocpy/py.typed
+include src/bocpy/*.pyi
+recursive-include examples *.txt

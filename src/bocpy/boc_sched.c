@@ -1,4 +1,4 @@
-// sched.c — Work-stealing scheduler.
+// boc_sched.c — Work-stealing scheduler.
 //
 // Owns the per-worker MPMC queues, parking protocol, work-stealing,
 // and per-worker fairness tokens.
@@ -9,7 +9,7 @@
 // `incarnation` counter; pause/unpause epoch protocol), and
 // `core.h` (fairness token).
 
-#include "sched.h"
+#include "boc_sched.h"
 
 #include <assert.h>
 #include <stdbool.h>
@@ -195,7 +195,7 @@ bool boc_bq_is_empty(boc_bq_t *q) {
 // Per-worker scheduler state
 // ===========================================================================
 
-// The per-worker struct (`boc_sched_worker_t`) is defined in `sched.h`
+// The per-worker struct (`boc_sched_worker_t`) is defined in `boc_sched.h`
 // so dispatch and pop call sites can refer to its fields without an
 // extra indirection. Cacheline padding and `static_assert`s live with
 // the type definition.
@@ -239,12 +239,12 @@ static boc_atomic_u64_t INCARNATION = 0;
 // Each scheduler-aware thread (worker sub-interpreter, or any other
 // thread that calls boc_sched_dispatch from a worker context) keeps
 // its dispatch state in TLS slots rather than in `boc_sched_worker_t`
-// fields. The bocpy precedent: this matches `noticeboard.c`'s
+// fields. The bocpy precedent: this matches `boc_noticeboard.c`'s
 // `nb_cache_*` thread-locals. Verona equivalent: the same fields
 // are members of `SchedulerThread`, which is itself one-per-OS-thread
 // — TLS is the same effect with one fewer indirection.
 //
-// All slots use the `compat.h` `thread_local` macro (`_Thread_local`
+// All slots use the `boc_compat.h` `thread_local` macro (`_Thread_local`
 // on POSIX, `__declspec(thread)` on MSVC) with the **default** TLS
 // model.
 
@@ -360,7 +360,7 @@ int boc_sched_init(Py_ssize_t worker_count) {
     // per-interpreter, so an allocation made in interpreter A would
     // be invalid (and unfreeable) from interpreter B. The raw
     // allocator is process-wide and GIL-independent. Zero-init gives
-    // every counter, every typed atomic slot (compat.h
+    // every counter, every typed atomic slot (boc_compat.h
     // `boc_atomic_*_t` are layout-compatible with the underlying
     // scalar; zero is the well-defined "false" / NULL / 0 state on
     // every supported platform), and every reserved slot the correct
@@ -374,7 +374,7 @@ int boc_sched_init(Py_ssize_t worker_count) {
 
     // Per-worker non-trivial initialisation: bq queue, mutex,
     // condvar, owner-interp placeholder, and the ring-link.
-    // Mutex and condvar wrappers come from `compat.h` (pthread on
+    // Mutex and condvar wrappers come from `boc_compat.h` (pthread on
     // POSIX, SRWLock / CONDITION_VARIABLE on MSVC).
     for (Py_ssize_t i = 0; i < worker_count; ++i) {
       boc_sched_worker_t *w = &WORKERS[i];
@@ -1300,7 +1300,7 @@ static boc_bq_node_t *boc_sched_steal(boc_sched_worker_t *self) {
     }
 
     // Brief sleep so two concurrently-failing thieves do not pin
-    // their cores. Using `boc_sleep_ns` (compat.h) rather than
+    // their cores. Using `boc_sleep_ns` (boc_compat.h) rather than
     // `sched_yield` because we want a hard backoff: a yield is
     // ineffective when there is no other runnable thread (the
     // case during quiescence).

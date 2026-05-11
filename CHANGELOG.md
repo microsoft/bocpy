@@ -1,3 +1,52 @@
+## 2026-05-10 - Version 0.6.0
+Public C ABI for downstream extensions, enabling C-level participation
+in behavior-oriented concurrency across worker sub-interpreters.
+
+**New Features**
+
+- **Decorator composition with ``@when``** — decorators stacked below
+  ``@when`` are now preserved on the generated behavior function and
+  compose with the behavior body on the worker.  Decorators placed
+  above ``@when`` raise a ``SyntaxError`` at transpile time with
+  actionable guidance.  ``async def`` functions with ``@when`` are
+  also explicitly rejected.
+- **Public C ABI (`<bocpy/bocpy.h>`)** — downstream C extensions can
+  now link against bocpy to register custom Python types as
+  cross-interpreter shareable so :class:`Cown` can carry instances of
+  them across worker interpreters. The header is C-only, version-gated
+  via the ``BOCPY_ABI`` macro, and bumped on any incompatible change
+  to ``bocpy.h`` or ``xidata.h``. Wheels remain CPython-version-tagged
+  so a runtime ABI mismatch cannot occur.
+- **`bocpy.get_include()` / `bocpy.get_sources()`** — Python-level
+  helpers that downstream ``setup.py`` files use to locate the bocpy
+  headers and the small set of C sources that must be compiled into
+  the consuming extension.
+- **`templates/c_abi_consumer/`** — a ready-to-copy template for
+  building a C extension against the bocpy ABI, including a
+  ``setup.py``, a probe extension exercising the public surface, and
+  a pytest suite (``test_public_c_abi.py``) that validates the ABI
+  end-to-end.
+- **C source reorganisation** — the per-subsystem translation units
+  introduced in 0.5.0 have been renamed with a ``boc_`` prefix
+  (``boc_compat.[ch]``, ``boc_sched.[ch]``, ``boc_tags.[ch]``,
+  ``boc_terminator.[ch]``, ``boc_noticeboard.[ch]``, ``boc_cown.h``)
+  to give the public ABI a stable, namespaced identity. ``xidata.h``
+  has moved under ``include/bocpy/`` alongside ``bocpy.h``.
+
+**Documentation**
+
+- New :doc:`c_abi`, :doc:`messaging`, and :doc:`noticeboard` pages
+  in the Sphinx site; the API reference has been expanded to cover
+  the public ABI surface.
+
+**Breaking Changes**
+
+- **`noticeboard_version` removed** — the global monotonic version
+  counter introduced in 0.4.0 has been removed. It exposed an
+  implementation detail of the snapshot cache that did not survive
+  the C ABI review and had no use case that was not better served
+  by ``notice_sync`` plus an explicit ``noticeboard()`` read.
+
 ## 2026-04-29 - Version 0.5.0
 Verona-RT-style work-stealing scheduler, C source split into per-subsystem
 translation units, and a portable atomics / threading layer.

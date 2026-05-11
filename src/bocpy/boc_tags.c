@@ -1,8 +1,8 @@
-/// @file tags.c
+/// @file boc_tags.c
 /// @brief Out-of-line implementations for the message-tag API.
 ///
 /// Hot-path operations (incref / decref / disable check) are
-/// `static inline` in `tags.h`; this TU houses the cold helpers
+/// `static inline` in `boc_tags.h`; this TU houses the cold helpers
 /// (alloc / free / unicode bridges / comparisons).
 
 #define PY_SSIZE_T_CLEAN
@@ -10,7 +10,7 @@
 #include <Python.h>
 #include <string.h>
 
-#include "tags.h"
+#include "boc_tags.h"
 
 BOCTag *tag_from_PyUnicode(PyObject *unicode, BOCQueue *queue) {
   if (!PyUnicode_CheckExact(unicode)) {
