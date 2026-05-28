@@ -1,0 +1,48 @@
+name: Nightly Supply-Chain Audit
+
+# Runs pip-audit on ``main`` against the hashed CI constraint files
+# every night so newly-published advisories surface within ~24h even
+# when no PR is open. Failures fall through to the GitHub Actions
+# notification settings of the repository (an issue can be opened
+# manually from the failed run page).
+#
+# This complements the per-PR ``audit`` job in ``pr_gate.yml``:
+# that job protects against landing a vulnerable dependency,
+# this job catches advisories that come out after a PR has already
+# merged.
+
+"on":
+  schedule:
+    # 03:17 UTC daily — odd minute to avoid GH's top-of-hour rush.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Use Python 3.14
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: 3.14
+
+      - name: Install pinned pip-audit
+        run: pip install -r ci/constraints-audit.txt --require-hashes
+
+      - name: Audit test constraints
+        run: pip-audit --strict --requirement ci/constraints-test.txt
+
+      - name: Audit linting constraints
+        run: pip-audit --strict --requirement ci/constraints-linting.txt
+
+      - name: Audit docs constraints
+        run: pip-audit --strict --requirement ci/constraints-docs.txt
+
+      - name: Audit audit constraints (self-check)
+        run: pip-audit --strict --requirement ci/constraints-audit.txt

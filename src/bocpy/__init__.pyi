@@ -1,4 +1,22 @@
-from typing import Any, Callable, Generic, Iterator, Mapping, Optional, Sequence, TypeVar, Union
+"""Type stubs for the bocpy public API.
+
+These stubs document the runtime surface exported by :mod:`bocpy` and
+are consumed by static type checkers (mypy, pyright, pylance). Keep
+entries in sync with the implementations in :mod:`bocpy.behaviors`,
+:mod:`bocpy._core`, and :mod:`bocpy._math`.
+"""
+
+from typing import (Any, Callable, Generic, Iterator, Literal, Mapping,
+                    NamedTuple, Optional, overload, Sequence, TypeVar, Union)
+
+
+__version__: str
+"""The installed bocpy distribution's version string.
+
+Resolved at import time via :func:`importlib.metadata.version` so the
+value tracks ``pyproject.toml`` without a second source-of-truth. Falls
+back to ``"0.0.0+unknown"`` when running from an uninstalled source
+checkout."""
 
 
 TIMEOUT: str
@@ -344,6 +362,16 @@ class Cown(Generic[T]):
         """Create a cown.
 
         :param value: The initial value to wrap.
+
+        .. note::
+           Calling :func:`pickle.dumps` on a cown produces bytes that
+           carry one strong reference per embedded cown. If those
+           bytes are never unpickled in the producing process — for
+           example, if they are saved to disk or sent to an external
+           store — each embedded cown leaks one strong reference per
+           orphan byte string. The bocpy runtime never produces orphan
+           bytes; the leak surface only applies to third-party code
+           that calls ``pickle.dumps(cown)`` directly.
         """
 
     def __enter__(self):
@@ -411,6 +439,10 @@ def notice_write(key: str, value: Any) -> None:
     limit are not applied; the noticeboard thread catches the resulting
     error and logs a warning.  No exception propagates to the caller.
 
+    Values may embed :class:`Cown` references; the noticeboard keeps
+    each embedded cown alive for as long as the entry remains in the
+    noticeboard.
+
     :param key: The noticeboard key (max 63 UTF-8 bytes).
     :type key: str
     :param value: The value to store.
@@ -434,6 +466,10 @@ def notice_update(key: str, fn: Callable[[Any], Any], default: Any = None) -> No
 
     If *fn* returns the ``REMOVED`` sentinel, the entry is deleted from
     the noticeboard instead of being updated.
+
+    The value returned by *fn* may embed :class:`Cown` references; the
+    noticeboard retains them until the entry is overwritten or deleted,
+    identical to :func:`notice_write`.
 
     .. warning::
 
@@ -541,7 +577,34 @@ def notice_sync(timeout: Optional[float] = 30.0) -> None:
     """
 
 
-def wait(timeout: Optional[float] = None, *, stats: bool = False):
+@overload
+def wait(timeout: Optional[float] = None, *,
+         stats: Literal[False] = False,
+         noticeboard: Literal[False] = False) -> None: ...
+
+
+@overload
+def wait(timeout: Optional[float] = None, *,
+         stats: Literal[True],
+         noticeboard: Literal[False] = False) -> list[dict]: ...
+
+
+@overload
+def wait(timeout: Optional[float] = None, *,
+         stats: Literal[False] = False,
+         noticeboard: Literal[True]) -> dict[str, Any]: ...
+
+
+@overload
+def wait(timeout: Optional[float] = None, *,
+         stats: Literal[True],
+         noticeboard: Literal[True]) -> "WaitResult": ...
+
+
+def wait(timeout: Optional[float] = None, *,
+         stats: bool = False,
+         noticeboard: bool = False
+         ) -> Union[None, list[dict], dict[str, Any], "WaitResult"]:
     """Block until all behaviors complete, with optional timeout.
 
     On a successful return the runtime is **stopped**: workers are
@@ -561,16 +624,16 @@ def wait(timeout: Optional[float] = None, *, stats: bool = False):
         ``DWORD`` overflow inside the underlying condition-variable
         wait.
     :type timeout: Optional[float]
-    :param stats: If ``True``, return the per-worker
-        :func:`_core.scheduler_stats` snapshot captured at shutdown
+    :param stats: If ``True``, capture the per-worker
+        :func:`_core.scheduler_stats` snapshot at shutdown
         (after every behavior has run, before the per-worker array
         is freed). This is the only reliable way to read the
         scheduler counters for the session that just ended --
         calling :func:`_core.scheduler_stats` after :func:`wait`
         returns ``[]`` because the per-worker array has already been
-        reclaimed. Returns ``[]`` if the runtime was never started
-        or the snapshot could not be captured. Each dict has the
-        keys documented on :func:`_core.scheduler_stats`
+        reclaimed. Falls back to ``[]`` if the runtime was never
+        started or the snapshot could not be captured. Each dict has
+        the keys documented on :func:`_core.scheduler_stats`
         (``worker_index``, ``pushed_local``,
         ``dispatched_to_pending``, ``pushed_remote``,
         ``popped_local``, ``popped_via_steal``,
@@ -580,9 +643,19 @@ def wait(timeout: Optional[float] = None, *, stats: bool = False):
         ``fairness_arm_fires``, plus the per-sub-queue
         ``boc_bq_t`` counters).
     :type stats: bool
-    :return: ``None`` when ``stats=False``; otherwise the per-worker
-        stats list (same shape as :func:`_core.scheduler_stats`).
-    :rtype: Optional[list[dict]]
+    :param noticeboard: If ``True``, capture the final noticeboard
+        contents as a plain ``dict`` at shutdown (after the
+        noticeboard thread exits, before :func:`noticeboard`
+        entries are freed). Useful for lifting a final result an
+        early-stopping behavior wrote to the noticeboard before
+        the runtime quiesced. Falls back to ``{}`` if the runtime
+        was never started or the snapshot could not be captured.
+    :type noticeboard: bool
+    :return: ``None`` when neither flag is set; the per-worker stats
+        list when only ``stats=True``; the noticeboard dict when only
+        ``noticeboard=True``; and a :class:`WaitResult` ``NamedTuple``
+        carrying both when both flags are set.
+    :rtype: Union[None, list[dict], dict[str, Any], WaitResult]
     :raises RuntimeError: If the noticeboard thread does not exit
         before the timeout (or, on a retry call, is still alive).
         The first failure carries the message prefix
@@ -593,14 +666,27 @@ def wait(timeout: Optional[float] = None, *, stats: bool = False):
         time either is raised, so the runtime is intentionally left
         re-drivable: callers may retry ``wait()`` / ``stop()`` once
         the in-flight noticeboard mutation finishes. **Note:** when
-        ``stats=True`` and ``stop()`` raises *after* runtime
-        teardown has already completed (i.e. workers joined and the
-        noticeboard closed), the exception is suppressed and the
-        captured snapshot is returned instead — callers who require
-        the exception to propagate should call :func:`wait` (without
-        ``stats``) and read :func:`_core.scheduler_stats` from a
-        prior in-session call.
+        either ``stats=True`` or ``noticeboard=True`` is set and
+        ``stop()`` raises *after* runtime teardown has already
+        completed (i.e. workers joined and the noticeboard closed),
+        the exception is suppressed and the captured snapshot(s) are
+        returned instead -- callers who require the exception to
+        propagate should call :func:`wait` without either flag.
     """
+
+
+class WaitResult(NamedTuple):
+    """Result bundle returned by :func:`wait`.
+
+    Produced only when both ``stats=True`` and ``noticeboard=True``
+    are set.
+
+    :ivar stats: Per-worker scheduler-stats snapshot.
+    :ivar noticeboard: Final noticeboard contents as a plain ``dict``.
+    """
+
+    stats: list[dict]
+    noticeboard: dict[str, Any]
 
 
 def when(*cowns):

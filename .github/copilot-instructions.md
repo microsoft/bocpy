@@ -257,6 +257,12 @@ For non-trivial design work (multi-subsystem changes, architecture decisions),
 use **multi-perspective-plan** to draft and stress-test the plan with competing
 lens subagents before any code is written.
 
+When a branch is ready to merge, use the **finalize-pr** skill to bump the
+version across all required files, add a CHANGELOG entry, update the Sphinx
+and README docs, scrub comment debt with the **editor-lens** agent, and run
+the local mirror of the PR-gate lint and test jobs. This skill replaces the
+older `version-bump` skill.
+
 Other skills available in `.github/skills/`:
 
 - **commenting-c-and-python** — the C and Python doc/comment conventions used
@@ -267,8 +273,18 @@ Other skills available in `.github/skills/`:
   pattern.
 - **testing-message-queue** — how to write tests for the lock-free MPSC queue
   (`send`/`receive`/`set_tags`/`drain`).
-- **version-bump** — the files to update in lock-step when releasing a new
-  version.
+- **c-extensions-with-bocpy** — how to write a downstream C extension whose
+  custom types can live inside a `Cown` and travel between worker
+  sub-interpreters via the public C ABI. Use when touching `_math.c`,
+  `templates/c_abi_consumer/`, or any code that goes through
+  `XIDATA_REGISTERCLASS` / `XIDATA_GETDATA_FUNC` / the proto-Region
+  ownership pattern.
+
+The **editor-lens** agent (`.github/agents/editor-lens.agent.md`) is the
+counterweight to `usability-lens`: it ruthlessly cuts review-process
+scaffolding, archaeology, and stale comments from the source tree. It is
+normally invoked as a step of `finalize-pr`, but you can run it standalone
+via `review-loop` whenever comment debt has built up between PRs.
 
 I am still your collaborator. If you are unsure how to address a reviewer's
 comment, ask me rather than guessing.

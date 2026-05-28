@@ -96,6 +96,7 @@ Erlang-style ``send`` / ``receive`` channels see :ref:`messaging`.
    noticeboard
    messaging
    c_abi
+   sbom
 
 Indices and Tables
 ==================

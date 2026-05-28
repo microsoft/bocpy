@@ -11,3 +11,8 @@ extend-ignore = E203, N812, N817
 #============================ Repo-specific config ===========================
 per-file-ignores =
     test/*:D102,D103,D403
+    # .pyi stubs intentionally:
+    #   A003: methods shadowing Python builtins (Matrix.sum/min/max/abs/round)
+    #   D402: Sphinx-style docstrings start with the function signature
+    #   N802: NumPy-style ``Matrix.T`` transpose property is upper-case
+    *.pyi:A003,D402,N802

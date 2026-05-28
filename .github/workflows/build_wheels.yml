@@ -3,6 +3,14 @@ name: Build Python Wheels for Release
 on:
   workflow_dispatch:
 
+# Default least-privilege token scope for every job. Override at job
+# scope only when a job legitimately needs more (none currently do —
+# all wheel jobs read source and upload artifacts via the workflow-
+# scoped implicit ``actions`` token, which is independent of
+# ``contents``).
+permissions:
+  contents: read
+
 jobs:
   build_windows_wheels:
     name: Build wheels on windows
@@ -12,23 +20,33 @@ jobs:
         python: [cp310, cp311, cp312, cp313, cp314]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Git config for fetching pull requests
         run: |
           git config --global --add remote.origin.fetch +refs/pull/*/merge:refs/remotes/pull/*
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v3.4.0
+        uses: pypa/cibuildwheel@54a71d3375df80d84b6d4537d04614fec04e637f  # v3.4.0
         env:
           CIBW_BUILD: ${{ matrix.python }}-win*
           CIBW_TEST_REQUIRES: "pytest setuptools wheel"
           CIBW_ENVIRONMENT: "BOCPY_TEST_WHEEL=1"
           CIBW_TEST_COMMAND: "pytest {project}/test/test_public_c_abi.py -v"
+          # build_sbom.py uses stdlib tomllib on 3.11+ and falls back to
+          # tomli on 3.10. Hash-pin tomli via the bootstrap constraint
+          # file so cibuildwheel cannot pull a tampered wheel; the
+          # ``python_version < '3.11'`` marker makes the install a no-op
+          # on 3.11+ where the stdlib already provides tomllib.
+          CIBW_BEFORE_BUILD: "pip install -r {project}/ci/constraints-cibw-bootstrap.txt --require-hashes"
+          # Windows has no default wheel-repair tool, so build_sbom.py is
+          # responsible for both copying the wheel into {dest_dir} and
+          # injecting the PEP 770 SBOM into the copy.
+          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: 'python {project}/scripts/build_sbom.py inject {wheel} --copy-to {dest_dir}'
         with:
           package-dir: ${{github.workspace}}
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: wheels-${{ matrix.python }}-windows
           path: ./wheelhouse/*.whl
@@ -40,9 +58,9 @@ jobs:
         python: [cp310, cp311, cp312, cp313, cp314]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         id: python
         with:
           python-version: "3.10 - 3.14"
@@ -57,17 +75,26 @@ jobs:
           export PATH=$(python3 -m site --user-base)/bin:$PATH
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v3.4.0
+        uses: pypa/cibuildwheel@54a71d3375df80d84b6d4537d04614fec04e637f  # v3.4.0
         env:
           CIBW_BUILD: ${{ matrix.python }}-macosx*
           CIBW_ARCHS_MACOS: arm64
           CIBW_TEST_REQUIRES: "pytest setuptools wheel"
           CIBW_ENVIRONMENT: "BOCPY_TEST_WHEEL=1"
           CIBW_TEST_COMMAND: "pytest {project}/test/test_public_c_abi.py -v"
+          # build_sbom.py uses stdlib tomllib on 3.11+ and falls back to
+          # tomli on 3.10. Hash-pin tomli via the bootstrap constraint
+          # file so cibuildwheel cannot pull a tampered wheel; the
+          # ``python_version < '3.11'`` marker makes the install a no-op
+          # on 3.11+ where the stdlib already provides tomllib.
+          CIBW_BEFORE_BUILD: "pip install -r {project}/ci/constraints-cibw-bootstrap.txt --require-hashes"
+          # Run delocate (the macOS default) then inject the PEP 770 SBOM into
+          # the single wheel left in {dest_dir}.
+          CIBW_REPAIR_WHEEL_COMMAND_MACOS: 'delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel} && python {project}/scripts/build_sbom.py inject {dest_dir}'
         with:
           package-dir: ${{github.workspace}}
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: wheels-${{ matrix.python }}-mac-arm64
           path: ./wheelhouse/*.whl
@@ -79,9 +106,9 @@ jobs:
         python: [cp310, cp311, cp312, cp313, cp314]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         id: python
         with:
           python-version: "3.10 - 3.14"
@@ -96,7 +123,7 @@ jobs:
           export PATH=$(python3 -m site --user-base)/bin:$PATH
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v3.4.0
+        uses: pypa/cibuildwheel@54a71d3375df80d84b6d4537d04614fec04e637f  # v3.4.0
         env:
           CIBW_BUILD: ${{ matrix.python }}-macosx*
           CIBW_ARCHS_MACOS: x86_64
@@ -104,10 +131,19 @@ jobs:
           CIBW_TEST_REQUIRES: "pytest setuptools wheel"
           CIBW_ENVIRONMENT: "BOCPY_TEST_WHEEL=1"
           CIBW_TEST_COMMAND: "pytest {project}/test/test_public_c_abi.py -v"
+          # build_sbom.py uses stdlib tomllib on 3.11+ and falls back to
+          # tomli on 3.10. Hash-pin tomli via the bootstrap constraint
+          # file so cibuildwheel cannot pull a tampered wheel; the
+          # ``python_version < '3.11'`` marker makes the install a no-op
+          # on 3.11+ where the stdlib already provides tomllib.
+          CIBW_BEFORE_BUILD: "pip install -r {project}/ci/constraints-cibw-bootstrap.txt --require-hashes"
+          # Run delocate (the macOS default) then inject the PEP 770 SBOM into
+          # the single wheel left in {dest_dir}.
+          CIBW_REPAIR_WHEEL_COMMAND_MACOS: 'delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel} && python {project}/scripts/build_sbom.py inject {dest_dir}'
         with:
           package-dir: ${{github.workspace}}
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: wheels-${{ matrix.python }}-mac-x86_64
           path: ./wheelhouse/*.whl
@@ -119,24 +155,33 @@ jobs:
         python: [cp310, cp311, cp312, cp313, cp314]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Git config for fetching pull requests
         run: |
           git config --global --add remote.origin.fetch +refs/pull/*/merge:refs/remotes/pull/*
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v3.4.0
+        uses: pypa/cibuildwheel@54a71d3375df80d84b6d4537d04614fec04e637f  # v3.4.0
         env:
           CIBW_BUILD: ${{ matrix.python }}-manylinux*
           CIBW_BEFORE_ALL: yum makecache
           CIBW_TEST_REQUIRES: "pytest setuptools wheel"
           CIBW_ENVIRONMENT: "BOCPY_TEST_WHEEL=1"
           CIBW_TEST_COMMAND: "pytest {project}/test/test_public_c_abi.py -v"
+          # build_sbom.py uses stdlib tomllib on 3.11+ and falls back to
+          # tomli on 3.10. Hash-pin tomli via the bootstrap constraint
+          # file so cibuildwheel cannot pull a tampered wheel; the
+          # ``python_version < '3.11'`` marker makes the install a no-op
+          # on 3.11+ where the stdlib already provides tomllib.
+          CIBW_BEFORE_BUILD: "pip install -r {project}/ci/constraints-cibw-bootstrap.txt --require-hashes"
+          # Run auditwheel (the Linux default) then inject the PEP 770 SBOM
+          # into the single wheel left in {dest_dir}.
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: 'auditwheel repair -w {dest_dir} {wheel} && python {project}/scripts/build_sbom.py inject {dest_dir}'
         with:
           package-dir: ${{github.workspace}}
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: wheels-${{ matrix.python }}-manylinux
           path: ./wheelhouse/*.whl
@@ -149,23 +194,32 @@ jobs:
         python: [cp310, cp311, cp312, cp313, cp314]
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Git config for fetching pull requests
         run: |
           git config --global --add remote.origin.fetch +refs/pull/*/merge:refs/remotes/pull/*
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v3.4.0
+        uses: pypa/cibuildwheel@54a71d3375df80d84b6d4537d04614fec04e637f  # v3.4.0
         env:
           CIBW_BUILD: ${{ matrix.python }}-musllinux*
           CIBW_TEST_REQUIRES: "pytest setuptools wheel"
           CIBW_ENVIRONMENT: "BOCPY_TEST_WHEEL=1"
           CIBW_TEST_COMMAND: "pytest {project}/test/test_public_c_abi.py -v"
+          # build_sbom.py uses stdlib tomllib on 3.11+ and falls back to
+          # tomli on 3.10. Hash-pin tomli via the bootstrap constraint
+          # file so cibuildwheel cannot pull a tampered wheel; the
+          # ``python_version < '3.11'`` marker makes the install a no-op
+          # on 3.11+ where the stdlib already provides tomllib.
+          CIBW_BEFORE_BUILD: "pip install -r {project}/ci/constraints-cibw-bootstrap.txt --require-hashes"
+          # Run auditwheel (the Linux default) then inject the PEP 770 SBOM
+          # into the single wheel left in {dest_dir}.
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: 'auditwheel repair -w {dest_dir} {wheel} && python {project}/scripts/build_sbom.py inject {dest_dir}'
         with:
           package-dir: ${{github.workspace}}
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: wheels-${{ matrix.python }}-musllinux
           path: ./wheelhouse/*.whl
@@ -180,13 +234,141 @@ jobs:
       runs-on: ubuntu-latest
       steps:
       - name: Download Wheels
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           path: wheelhouse
           pattern: wheels-*
           merge-multiple: true
       - run: ls -R wheelhouse
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: wheels
           path: ./wheelhouse/*
+
+      # Extract every embedded PEP 770 SBOM into a flat directory so that
+      # downstream consumers (security scanners, supply-chain dashboards,
+      # auditors) can grab the SBOMs without having to unzip every wheel.
+      # The SBOMs remain embedded in the wheels too — this is purely an
+      # ergonomic convenience.
+      - name: Extract embedded SBOMs
+        run: |
+          mkdir -p sboms
+          python <<'PY'
+          import pathlib
+          import sys
+          import zipfile
+
+          wheelhouse = pathlib.Path("wheelhouse")
+          sboms = pathlib.Path("sboms")
+          sboms.mkdir(exist_ok=True)
+
+          for wheel in sorted(wheelhouse.glob("*.whl")):
+              with zipfile.ZipFile(wheel) as wf:
+                  matches = [n for n in wf.namelist() if n.endswith("/sboms/bocpy.cdx.json")]
+                  if len(matches) != 1:
+                      print(f"error: {wheel.name} has {len(matches)} embedded SBOMs", file=sys.stderr)
+                      sys.exit(1)
+                  data = wf.read(matches[0])
+              out = sboms / f"{wheel.stem}.cdx.json"
+              out.write_bytes(data)
+              print(f"  {wheel.name} -> {out.name}")
+          PY
+          ls -l sboms
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: sboms
+          path: ./sboms/*.cdx.json
+
+  # PEP 770 SBOM verification. Two complementary checks against the
+  # SBOMs the `merge` job extracts from the released wheels:
+  #
+  #   1. ``scripts/validate_sbom.py`` — stdlib-only structural validator
+  #      that pins bocpy's wire format (CycloneDX 1.6, urn:uuid:<v4>
+  #      serial, root component is ``pkg:pypi/bocpy@<version>``, etc.).
+  #      Catches accidental drift in ``build_sbom.py``.
+  #   2. ``grype`` via ``anchore/scan-action`` — third-party scanner
+  #      consumability proof. Confirms every SBOM parses through a real
+  #      ecosystem tool and reports no known vulnerabilities. bocpy has
+  #      zero third-party runtime Python deps, so a CRITICAL finding
+  #      here would mean either (a) someone accidentally introduced a
+  #      runtime dep, or (b) the SBOM is malformed in a way grype mis-
+  #      interprets — either way, worth failing on.
+  verify_sboms:
+    name: Verify embedded SBOMs
+    needs: merge
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Use Python 3.14
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Download SBOMs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: sboms
+          path: sboms
+
+      - name: List SBOMs
+        run: ls -l sboms
+
+      - name: Structural validation (stdlib-only)
+        # Pins the wire format bocpy commits to. Stdlib-only on purpose
+        # so this check has zero supply-chain surface of its own.
+        run: python scripts/validate_sbom.py sboms
+
+      # Download a pinned grype binary via the official sub-action, then
+      # scan every SBOM in a shell loop. anchore/scan-action's ``sbom:``
+      # input takes a single file, but our merge job produces one SBOM
+      # per wheel; looping with the bare ``grype`` CLI is the cleanest
+      # way to scan all of them. ``--fail-on high`` makes the job fail
+      # on any HIGH or CRITICAL finding — bocpy ships zero third-party
+      # runtime Python deps, so the expected count is 0.
+      - name: Download grype
+        id: grype
+        uses: anchore/scan-action/download-grype@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2  # v7.4.0
+
+      - name: Scan every SBOM with grype
+        # Route the grype binary path through ``env:`` rather than
+        # interpolating ``${{ steps.grype.outputs.cmd }}`` directly into
+        # the shell script. Direct ``${{ }}`` interpolation inside a
+        # ``run:`` block is the classic GitHub Actions script-injection
+        # sink: the value is substituted before the shell sees it, so
+        # any shell metacharacters in the value would execute. Sourcing
+        # via ``env:`` makes the runner treat the value as data, which
+        # the shell then sees as a normal string variable.
+        env:
+          GRYPE_CMD: ${{ steps.grype.outputs.cmd }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          failures=0
+          scanned=0
+          for sbom in sboms/*.cdx.json; do
+            scanned=$((scanned + 1))
+            echo "::group::grype $sbom"
+            if ! "$GRYPE_CMD" "sbom:$sbom" \
+                --fail-on high --output table; then
+              failures=$((failures + 1))
+            fi
+            echo "::endgroup::"
+          done
+          # Defense in depth: ``validate_sbom.py`` already fails on an
+          # empty ``sboms/`` directory, but ``shopt -s nullglob`` makes
+          # the loop above a silent no-op on an empty glob. Assert the
+          # loop actually executed so a future reordering of steps (or
+          # a regression in validate_sbom.py) cannot let the verify job
+          # pass without scanning anything.
+          if [ "$scanned" -eq 0 ]; then
+            echo "grype scan loop saw zero SBOMs in sboms/ — refusing to pass" >&2
+            exit 1
+          fi
+          if [ "$failures" -gt 0 ]; then
+            echo "grype reported HIGH/CRITICAL findings in $failures SBOM(s)" >&2
+            exit 1
+          fi

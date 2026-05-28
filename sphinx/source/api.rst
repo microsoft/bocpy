@@ -7,6 +7,8 @@ API
 
 This part of the documentation covers all the interfaces of `bocpy`.
 
+.. autodata:: __version__
+
 Behaviors
 ---------
 
@@ -16,6 +18,8 @@ Behaviors
 
 .. autodecorator:: when
 .. autofunction:: wait
+.. autoclass:: WaitResult
+    :members:
 .. autofunction:: start
 
 Cown Groups

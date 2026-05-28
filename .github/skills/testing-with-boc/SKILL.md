@@ -579,6 +579,7 @@ def test_object_in_cown(self):
 | Using default arguments to capture loop variables | Default args add parameters, breaking the arg-count rule. Use a closure variable instead: `val = i` on a separate line before `@when`. |
 | Mismatched `receive_asserts` count | The count must match the exact number of `send("assert", ...)` calls expected. |
 | Non-XIData-compatible objects in cowns across interpreters | Stick to built-in types or objects that support cross-interpreter data. |
+| Importing `unittest.mock` in a BOC test | The transpiler exports the whole test module for import in every worker sub-interpreter. `unittest.mock` transitively imports `asyncio`, which can deadlock during PEP 684 per-interpreter init (observed on macOS arm64 + Python 3.12/3.13). Use the in-house `mockreplacement.patch_attr` / `Recorder` helpers (see `test/mockreplacement.py`), and import them **inside the test method** — never at module scope, because workers also fail to find `mockreplacement` on their `sys.path` during bootstrap. |
 | Test function names with uppercase letters (N802) | Test names must be lowercase. E.g., `test_t_equals_transpose`, **not** `test_T_equals_transpose`, even when testing a property like `.T`. |
 | Assigning `Cown(m)` to an unused variable (F841) | When the return value isn't needed (e.g., releasing a resource), use bare `Cown(m)` without assignment. |
 | Using single quotes (Q000) | The project enforces `inline-quotes = double`. Use `"nan"` not `'nan'`. |

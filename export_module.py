@@ -19,7 +19,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     export = export_module_from_file(args.path)
-    with open(args.output, "w") as file:
+    with open(args.output, "w", encoding="utf-8") as file:
         file.write(export.code)
 
     print(export.classes)

@@ -10,6 +10,14 @@ logging.basicConfig(level=logging.NOTSET)
 index = _core.index()
 logger = logging.getLogger(f"worker{index}")
 
+# Generous deadline (seconds) for the boc_cleanup handshake. The main
+# thread normally sends `True` immediately after collecting every
+# worker's "shutdown" reply, so this only fires if `stop_workers`
+# itself wedged. Proceeding with cleanup on timeout prevents this
+# sub-interpreter from outliving the runtime, which would otherwise
+# block `interpreters.destroy()` -> `t.join()` in `teardown_workers`.
+_CLEANUP_RECEIVE_TIMEOUT = 120.0
+
 
 boc_export = None
 
@@ -163,7 +171,18 @@ def do_work():
 def cleanup():
     """Recycle remaining cowns and wait for cleanup signal."""
     try:
-        receive("boc_cleanup")
+        tag, _ = receive("boc_cleanup", _CLEANUP_RECEIVE_TIMEOUT)
+        if tag == _core.TIMEOUT:
+            # The main thread never sent the boc_cleanup signal --
+            # `stop_workers` is wedged. Log and proceed with the
+            # local cown drain anyway so this sub-interpreter can
+            # be destroyed and its thread joined.
+            logger.warning(
+                "cleanup: boc_cleanup signal not received within %.1fs; "
+                "proceeding with cown recycle so the sub-interpreter "
+                "can be torn down.",
+                _CLEANUP_RECEIVE_TIMEOUT,
+            )
 
         orphan_cowns = _core.cowns()
         if len(orphan_cowns) != 0:

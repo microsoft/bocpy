@@ -189,12 +189,63 @@ typedef struct boc_state {
   PyObject *loads;
   PyTypeObject *cown_capsule_type;
   PyTypeObject *behavior_capsule_type;
+  /// @brief Cached reference to _cown_capsule_from_pointer_inheriting.
+  /// @details The pickle reconstructor used by every CownCapsule.__reduce__
+  /// call except those issued by the noticeboard's write-direct path.
+  /// Inheriting reconstructor takes the COWN_INCREF that @ref
+  /// CownCapsule_reduce took before pickling; the two refs balance.
+  PyObject *cown_reconstructor_inheriting;
+  /// @brief Cached reference to _cown_capsule_from_pointer_borrowing.
+  /// @details Used only when @ref BOC_NB_CTX is non-NULL (currently
+  /// only on the noticeboard write-direct thread). Borrowing reconstructor
+  /// takes its own fresh COWN_INCREF; the writer did NOT take one.
+  PyObject *cown_reconstructor_borrowing;
   /// @brief PyUnicode objects indicating the string associated with each of the
   /// queues.
   BOCTag *queue_tags[BOC_QUEUE_COUNT];
 } _core_module_state;
 
 static thread_local _core_module_state *BOC_STATE;
+
+/// @brief Per-thread borrowing context for the noticeboard write path.
+/// @details Default NULL — every @ref CownCapsule_reduce embeds the
+/// inheriting reconstructor symbol and takes a paired @c COWN_INCREF.
+/// The noticeboard's write-direct path stack-allocates a
+/// @ref NoticeboardPickleCtx, points this thread-local at it for the
+/// duration of the @c object_to_xidata call, and clears it on the way
+/// out. While the pointer is non-NULL, every reduce embeds the
+/// borrowing reconstructor, takes NO @c COWN_INCREF, and audits its
+/// inner @ref BOCCown against the caller's pin set (see
+/// @ref NoticeboardPickleCtx::pins). Any cown the pickler reduces that
+/// is not a member of the pin set increments
+/// @ref NoticeboardPickleCtx::unpinned_count; the writer fails the
+/// whole notice_write rather than letting an unpinned borrowing token
+/// reach a reader.
+/// @note Thread-local because today no worker interpreter ever sets it
+/// — the noticeboard runs on a single dedicated thread inside the
+/// primary interpreter, and @ref noticeboard_check_thread enforces
+/// that. If that ever changes, migration to a module-state cell is
+/// mechanical.
+typedef struct noticeboard_pickle_ctx {
+  /// @brief Caller-owned, exactly-sized array of pre-pinned @c BOCCown*.
+  /// @details Borrowed (not owned) for the duration of one
+  /// @c object_to_xidata call. The caller
+  /// (@ref _core_noticeboard_write_direct) freed any prior pin array
+  /// before installing this one and is responsible for releasing this
+  /// one too.
+  BOCCown **pins;
+  /// @brief Number of valid entries in @ref pins.
+  int pin_count;
+  /// @brief Number of @c CownCapsule reductions seen during pickling
+  /// whose inner @c BOCCown was NOT a member of @ref pins.
+  /// @details Sticky: only ever increments. The writer treats any
+  /// non-zero value as a fail-close trigger after @c object_to_xidata
+  /// returns. See @ref CownCapsule_reduce for the audit point and
+  /// @ref _core_noticeboard_write_direct for the post-pickle check.
+  int unpinned_count;
+} NoticeboardPickleCtx;
+
+static thread_local NoticeboardPickleCtx *BOC_NB_CTX = NULL;
 
 #define BOC_STATE_SET(m)                                                       \
   do {                                                                         \
@@ -466,8 +517,50 @@ static PyObject *_core_noticeboard_write_direct(PyObject *self,
   }
 
   // Serialize the value to XIData in the main interpreter.
+  //
+  // *** DO NOT REMOVE the BOC_NB_CTX toggle below. ***
+  //
+  // The noticeboard is the ONE site that owns its own pin set
+  // (new_pins, populated above by nb_pin_cowns). Any CownCapsule we
+  // pickle as part of this value must therefore use the *borrowing*
+  // reconstructor: the noticeboard entry keeps the inner BOCCown
+  // alive across all readers, and each reader's snapshot takes its
+  // own fresh COWN_INCREF in _cown_capsule_from_pointer_borrowing.
+  //
+  // Without this toggle, CownCapsule_reduce would take a single
+  // COWN_INCREF (inheriting form) per pickle, but the inheriting
+  // reconstructor would *also* be invoked on every reader on every
+  // worker, leading to one consumed INCREF per unpickle and an
+  // eventual COWN_DECREF underflow → UAF.
+  //
+  // The context also carries the pin set so that every CownCapsule the
+  // pickler reduces can be audited against it: any cown the value
+  // reaches via a custom __reduce__ / __getstate__ / copyreg dispatch
+  // but that _gather_pins missed is flagged on ctx.unpinned_count and
+  // the whole write is failed below. This closes the CWE-416 path
+  // where a hidden cown would otherwise produce a borrowing token
+  // whose underlying BOCCown is not held alive by the noticeboard
+  // entry, causing the first reader after the writer's wrapper drops
+  // to resurrect a freed pointer.
+  //
+  // BOC_NB_CTX is thread-local and the noticeboard write thread is
+  // single-threaded by construction (see noticeboard_check_thread
+  // above), so it must be NULL on entry. A non-NULL value would mean
+  // a prior write left a dangling stack pointer behind — a memory-
+  // safety precondition violation, not a recoverable error. The
+  // Py_FatalError fence enforces the invariant in release wheels too.
+  if (BOC_NB_CTX != NULL) {
+    Py_FatalError("noticeboard borrowing context leaked across writes");
+  }
+  NoticeboardPickleCtx nb_ctx = {
+      .pins = new_pins,
+      .pin_count = new_pin_count,
+      .unpinned_count = 0,
+  };
+  BOC_NB_CTX = &nb_ctx;
   XIDATA_T *xidata = NULL;
   PyObject *pickled = object_to_xidata(value, &xidata);
+  BOC_NB_CTX = NULL;
   if (pickled == NULL) {
     if (xidata != NULL) {
       XIDATA_FREE(xidata);
@@ -482,6 +575,35 @@ static PyObject *_core_noticeboard_write_direct(PyObject *self,
 
   bool is_pickled = (pickled == Py_True);
   Py_DECREF(pickled);
+
+  // Pin-set audit. If the pickler reduced any CownCapsule whose inner
+  // BOCCown was NOT in our pre-pinned set, the serialized bytes
+  // contain a borrowing token to a cown that nothing in the
+  // noticeboard entry keeps alive. The first reader to resurrect that
+  // pointer after the writer's local Cown wrappers drop would call
+  // COWN_INCREF on freed memory (the cown will have been returned to
+  // the recycler) → CWE-416. Fail closed: discard the bytes, roll
+  // back the pins, raise. The error propagates to the noticeboard
+  // thread's outer try/except in Behaviors.noticeboard(), which logs
+  // a warning and drops the message; the entry is never installed,
+  // so readers cannot observe a partially-pinned snapshot.
+  if (nb_ctx.unpinned_count > 0) {
+    int unpinned = nb_ctx.unpinned_count;
+    XIDATA_FREE(xidata);
+    for (int i = 0; i < new_pin_count; i++) {
+      COWN_DECREF(new_pins[i]);
+    }
+    PyMem_RawFree(new_pins);
+    PyErr_Format(PyExc_RuntimeError,
+                 "noticeboard value pickle reduced %d cown(s) the pin "
+                 "walker did not see (custom __reduce__ / __getstate__ / "
+                 "copyreg dispatch can expose cowns hidden from "
+                 "__dict__ / __slots__ / supported containers). Expose "
+                 "every cown via a normal attribute or container so the "
+                 "walker can pin it before the write commits.",
+                 unpinned);
+    return NULL;
+  }
 
   // noticeboard_write takes ownership of xidata + pins on success and
   // frees them on failure.
@@ -937,10 +1059,28 @@ static inline int_least64_t cown_weak_decref(BOCCown *cown) {
   return weak_rc;
 }
 
+/// @brief Print an unhandled exception stored on a cown to stderr.
+/// @details Called from @c cown_decref_inline when the final strong ref
+/// is dropped on a cown whose @c exception flag is set. The exception
+/// payload may be live (the owning interpreter never released the
+/// cown after @c set_exception) or pickled into @c xidata (the
+/// interpreter that set the exception has since released the cown).
+///
+/// In the pickled case this function temporarily deserializes the
+/// exception so we can print it, then clears the borrowed value before
+/// returning. The borrow does NOT count as taking ownership of the
+/// cown -- @c cown->owner is left untouched -- because we never
+/// performed the @c BOCPY_NO_OWNER -> @c bocpy_interpid() CAS that a
+/// real @c cown_acquire would. Leaving the borrowed value in place
+/// after the print would violate the invariant that @c value != NULL
+/// implies the current interpreter owns the cown, which @ref
+/// cown_decref_inline asserts before clearing the value.
 static inline void report_unhandled_exception(BOCCown *cown) {
   fprintf(stderr, "Cown(%p) contains an unhandled exception: ", cown);
 
   if (cown->value != NULL) {
+    // Owning-interpreter path: the value is real and will be Py_CLEAR'd
+    // by cown_decref_inline below as part of normal teardown.
     PyObject_Print(cown->value, stderr, 0);
     fprintf(stderr, "\n");
     return;
@@ -952,16 +1092,18 @@ static inline void report_unhandled_exception(BOCCown *cown) {
     return;
   }
 
-  cown->value = xidata_to_object(cown->xidata, cown->pickled);
+  // Pickled path: borrow the value just long enough to print it.
+  PyObject *borrowed = xidata_to_object(cown->xidata, cown->pickled);
 
-  if (cown->value == NULL) {
+  if (borrowed == NULL) {
     PyErr_Clear();
     fprintf(stderr, "<fatal error: unable to deserialize exception>\n");
     return;
   }
 
-  PyObject_Print(cown->value, stderr, 0);
+  PyObject_Print(borrowed, stderr, 0);
   fprintf(stderr, "\n");
+  Py_DECREF(borrowed);
   return;
 }
 
@@ -1454,6 +1596,18 @@ static PyObject *CownCapsule_acquired(PyObject *op,
 /// half-acquired (owner=me, value=NULL, xidata non-NULL) state. This is
 /// required by the worker-side recovery arm in `worker.run_behavior`, which
 /// calls `behavior.release()` after an acquire failure.
+/// @note A cown whose previous acquire failed inside @c xidata_to_object is
+/// marked as **permanently unavailable**: its @c xidata is discarded (because
+/// @c pickle.loads may have partially consumed inherited refcount
+/// contributions, leaving the bytes unsafe to retry) and every subsequent
+/// acquire fails fast with @c RuntimeError("...permanently unavailable...")
+/// via the @c xidata == NULL guard at the head of this function. The first
+/// waiter sees the original deserialisation exception preserved verbatim via
+/// @c PyErr_Fetch / @c PyErr_Restore; only second-and-later waiters see the
+/// terminal RuntimeError. The worker recovery arm in
+/// @c worker.run_behavior records that original deserialisation exception
+/// on the failing behavior's result cown so downstream behaviors observe
+/// it through @c Cown.exception.
 /// @param cown The cown to acquire
 /// @return -1 if failure, 0 if success
 static int cown_acquire(BOCCown *cown) {
@@ -1472,17 +1626,60 @@ static int cown_acquire(BOCCown *cown) {
     return -1;
   }
 
+  // Poisoned-state guard. If a previous acquire of this
+  // cown failed inside xidata_to_object, we discarded the bytes
+  // (their embedded inherited refcount contributions had already
+  // been partially consumed by pickle's error path) and rolled
+  // owner back to NO_OWNER. Re-running pickle.loads against those
+  // bytes would risk dereferencing freed BOCCown* pointers. Refuse
+  // cleanly so the worker recovery arm marks the result cown with
+  // .exception = True and propagates a deterministic error.
+  if (cown->xidata == NULL) {
+    atomic_store(&cown->owner, (int_least64_t)BOCPY_NO_OWNER);
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "cown is permanently unavailable: a previous acquire failed "
+        "to deserialise its value");
+    return -1;
+  }
+
   assert(cown->value == NULL);
   assert(cown->xidata != NULL);
   cown->value = xidata_to_object(cown->xidata, cown->pickled);
 
   if (cown->value == NULL) {
-    // Deserialisation failed. We CAS'd owner from BOCPY_NO_OWNER to desired
-    // above, so we must roll it back; otherwise the cown is permanently stuck
-    // in a (owner=me, value=NULL, xidata non-NULL) half-acquired state and any
-    // future acquire from any interpreter (including the worker-side
-    // recovery arm) sees "already acquired by N" instead of being able to
-    // retry. xidata stays in place for a future retry.
+    // pickle.loads may have partially constructed inner
+    // CownCapsules before failing, consuming inherited refcount
+    // contributions from the encoded BOCCown* pointers. The bytes
+    // are now "poisoned" — a retry could dereference freed memory.
+    // Discard the xidata so any future acquire fails fast via the
+    // cown->xidata == NULL guard above, and surface the original
+    // deserialisation exception unchanged so the worker recovery arm
+    // records it on the failing behavior's result cown.
+    PyObject *exc_type, *exc_value, *exc_tb;
+    PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
+    PyErr_NormalizeException(&exc_type, &exc_value, &exc_tb);
+
+    BOCRecycleQueue_enqueue(cown->recycle_queue, cown->xidata);
+    cown->recycle_queue = NULL;
+    cown->xidata = NULL;
+
+    /* Defense in depth: if the recycle-queue
+     * enqueue itself raised (Py_CLEAR running a __del__ side effect,
+     * MemoryError from PyMem_RawMalloc-adjacent paths), suppress that
+     * secondary error so PyErr_Restore reinstates the original
+     * deserialisation exception unchanged. Surface a one-line stderr
+     * note so the suppressed error is at least observable.
+     */
+    if (PyErr_Occurred()) {
+      PySys_WriteStderr(
+          "cown_acquire: enqueue/recycle raised while poisoning cown %p; "
+          "suppressing to preserve original deserialisation error\n",
+          (void *)cown);
+      PyErr_Clear();
+    }
+    PyErr_Restore(exc_type, exc_value, exc_tb);
+
     atomic_store(&cown->owner, (int_least64_t)BOCPY_NO_OWNER);
     return -1;
   }
@@ -1631,18 +1828,38 @@ static PyObject *CownCapsule_get_impl(PyObject *op, void *Py_UNUSED(dummy)) {
 }
 
 /// @brief Pickle support for CownCapsule
-/// @details Returns a (reconstructor, (pointer, pid)) tuple. Does NOT take a
-/// COWN_INCREF on the inner BOCCown: the bytes produced by pickling are
-/// dead data, not a reference. The caller is responsible for ensuring the
-/// underlying BOCCown is kept alive between pickling and unpickling. For
-/// transient pickles (send/receive on the message queue), the original
-/// CownCapsule held by the sender provides that liveness; for long-lived
-/// pickles (the noticeboard), the noticeboard layer pins the BOCCown
-/// independently via @ref nb_collect_cowns at write time.
-/// @note An earlier design did COWN_INCREF here as a "pin" and had the
-/// reconstructor inherit it. That assumed a 1-pickle / 1-unpickle pairing
-/// and was broken by the noticeboard, where one write is unpickled by
-/// every reader on every worker.
+/// @details Returns a (reconstructor, (pointer, pid)) tuple. The reconstructor
+/// symbol embedded in the pickle encodes the lifetime contract chosen at
+/// pickle time:
+///   - **Inheriting (default)**: When @ref BOC_NB_CTX is NULL
+///     (every call site except the noticeboard's write-direct thread),
+///     this function takes a @c COWN_INCREF on the inner BOCCown and
+///     embeds @ref _cown_capsule_from_pointer_inheriting. The reconstructor
+///     consumes that INCREF when it builds the receiving CownCapsule, so
+///     the BOCCown is kept alive from pickle to unpickle without
+///     depending on the original sender to hold a reference. This fixes
+///     the message-queue UAF where a sender could drop its local
+///     CownCapsule before the receiver decoded the message (e.g. an
+///     inner cown created inside a behavior that releases before the
+///     downstream behavior runs).
+///   - **Borrowing**: When @ref BOC_NB_CTX is non-NULL (only on the
+///     noticeboard write-direct path), this function takes NO INCREF and
+///     embeds @ref _cown_capsule_from_pointer_borrowing. The noticeboard
+///     entry's pin set (populated by @ref nb_pin_cowns at write time)
+///     keeps the BOCCown alive for every reader; each reader's
+///     reconstructor takes its own fresh INCREF for its CownCapsule.
+///     This is required because a single noticeboard write may be
+///     unpickled by every reader on every worker — a 1-pickle /
+///     N-unpickles pattern that the inheriting form cannot support.
+///     The borrowing path also audits its inner BOCCown against
+///     @ref NoticeboardPickleCtx::pins; a miss increments
+///     @ref NoticeboardPickleCtx::unpinned_count so the writer fails
+///     the whole notice_write rather than leaving a dangling borrowing
+///     token in the snapshot.
+/// @note The choice of contract is baked into the pickle bytes via the
+/// reconstructor symbol; readers cannot misinterpret a borrowing pickle
+/// as inheriting (or vice versa) because they call the symbol the writer
+/// chose.
 /// @param op The CownCapsule object
 /// @param Py_UNUSED (ignored)
 /// @return A tuple (reconstructor, (pointer, pid)) for pickle, or NULL on error
@@ -1666,33 +1883,72 @@ static PyObject *CownCapsule_reduce(PyObject *op, PyObject *Py_UNUSED(dummy)) {
     return NULL;
   }
 
-  PyObject *module = PyImport_ImportModule("bocpy._core");
-  if (module == NULL) {
+  // Resolve the cached reconstructor on the module state. The cown
+  // capsule type is registered via PyType_FromModuleAndSpec so
+  // PyType_GetModuleState returns the same struct as BOC_STATE without
+  // an import lookup.
+  _core_module_state *state =
+      (_core_module_state *)PyType_GetModuleState(Py_TYPE(op));
+  if (state == NULL) {
     Py_DECREF(pid_obj);
     Py_DECREF(ptr);
     return NULL;
   }
 
-  PyObject *reconstructor =
-      PyObject_GetAttrString(module, "_cown_capsule_from_pointer");
-  Py_DECREF(module);
-  if (reconstructor == NULL) {
-    Py_DECREF(pid_obj);
-    Py_DECREF(ptr);
-    return NULL;
+  // Select reconstructor and INCREF the inner BOCCown when inheriting.
+  // The INCREF must be taken BEFORE we hand the pointer to PyTuple_Pack
+  // so that the resulting pickle bytes always carry a live reference;
+  // failure of PyTuple_Pack below rolls it back.
+  //
+  // When BOC_NB_CTX is non-NULL we are inside a noticeboard write and
+  // must (a) use the borrowing reconstructor and (b) verify that this
+  // cown is a member of the caller's pre-pinned set. A miss flags the
+  // ctx so the writer can fail-close after object_to_xidata returns;
+  // we still emit the borrowing token here because the pickler is
+  // already streaming opcodes and the writer will discard the
+  // resulting xidata wholesale (see the pin-set audit in
+  // _core_noticeboard_write_direct).
+  //
+  // The membership check is a linear scan over the pin array. Expected
+  // N is small (typical noticeboard values hold 0–3 cowns); the array
+  // already lives in one cache line up to N=8. If a profile ever shows
+  // this matters, sort new_pins[] in nb_pin_cowns and bsearch here.
+  NoticeboardPickleCtx *nb_ctx = BOC_NB_CTX;
+  bool borrowing = (nb_ctx != NULL);
+  PyObject *reconstructor = borrowing ? state->cown_reconstructor_borrowing
+                                      : state->cown_reconstructor_inheriting;
+  if (borrowing) {
+    bool found = false;
+    for (int i = 0; i < nb_ctx->pin_count; i++) {
+      if (nb_ctx->pins[i] == cown) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      nb_ctx->unpinned_count++;
+    }
+  } else {
+    COWN_INCREF(cown);
   }
+  /* Cached pointer owned by the module; PyTuple_Pack INCREFs its
+   * argument so we do not borrow into the result tuple. */
 
   PyObject *args = PyTuple_Pack(2, ptr, pid_obj);
   Py_DECREF(ptr);
   Py_DECREF(pid_obj);
   if (args == NULL) {
-    Py_DECREF(reconstructor);
+    if (!borrowing) {
+      COWN_DECREF(cown);
+    }
     return NULL;
   }
 
   PyObject *result = PyTuple_Pack(2, reconstructor, args);
-  Py_DECREF(reconstructor);
   Py_DECREF(args);
+  if (result == NULL && !borrowing) {
+    COWN_DECREF(cown);
+  }
   return result;
 }
 
@@ -3837,7 +4093,9 @@ static PyObject *BehaviorCapsule_execute(PyObject *op, PyObject *args) {
     return NULL;
   }
 
-  PRINTDBG("Executing thunk...\n");
+  PRINTFDBG("Executing thunk ");
+  PRINTOBJDBG(thunk);
+  PRINTDBG("...\n");
 
   PyObject *result = PyObject_Call(thunk, thunk_args, NULL);
 
@@ -4284,14 +4542,103 @@ static PyObject *_core_set_tags(PyObject *module, PyObject *args) {
   Py_RETURN_NONE;
 }
 
-/// @brief Reconstructs a CownCapsule from a pickled pointer
+/// @brief Reconstructs a CownCapsule from a pickled pointer (inheriting form).
 /// @details Used by CownCapsule.__reduce__ to unpickle. Inherits the
 /// COWN_INCREF pin from __reduce__ (no additional INCREF). Must not use
 /// cown_capsule_wrap which would double-INCREF.
 /// @param module The _core module (unused)
 /// @param args Tuple of (pointer_as_int, process_id)
 /// @return A new CownCapsule, or NULL on error
-static PyObject *_cown_capsule_from_pointer(PyObject *module, PyObject *args) {
+static PyObject *_cown_capsule_from_pointer_inheriting(PyObject *module,
+                                                       PyObject *args) {
+  PyObject *ptr_obj, *pid_obj;
+  if (!PyArg_ParseTuple(args, "OO", &ptr_obj, &pid_obj)) {
+    return NULL;
+  }
+
+  long pickled_pid = PyLong_AsLong(pid_obj);
+  if (pickled_pid == -1 && PyErr_Occurred()) {
+    return NULL;
+  }
+
+#ifdef _WIN32
+  long current_pid = (long)_getpid();
+#else
+  long current_pid = (long)getpid();
+#endif
+  if (pickled_pid != current_pid) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "CownCapsule cannot be unpickled in a different process");
+    return NULL;
+  }
+
+  BOCCown *cown = (BOCCown *)PyLong_AsVoidPtr(ptr_obj);
+  if (cown == NULL) {
+    if (!PyErr_Occurred()) {
+      PyErr_SetString(PyExc_ValueError, "Invalid cown pointer");
+    }
+    return NULL;
+  }
+
+  // Inherit the COWN_INCREF that CownCapsule_reduce took on the writer
+  // side; the pickle bytes carried a live reference and we are
+  // consuming it into this CownCapsule. The dealloc path issues the
+  // matching COWN_DECREF, balancing the original INCREF. No additional
+  // INCREF here — calling COWN_INCREF would double-pin and leak.
+  //
+  // Allocate the capsule BEFORE consuming the inherited pin so an
+  // OOM-failed ``tp_alloc`` does not strand the writer-side INCREF.
+  // The borrowing variant has the same ordering (alloc → INCREF →
+  // assign); keeping the two reconstructors structurally identical
+  // makes the contract easier to audit.
+  PyTypeObject *type = BOC_STATE->cown_capsule_type;
+  CownCapsuleObject *capsule = (CownCapsuleObject *)type->tp_alloc(type, 0);
+  if (capsule == NULL) {
+    // ``tp_alloc`` failed; release the inherited pin so the writer
+    // side's COWN_INCREF in ``CownCapsule_reduce`` is balanced. Without
+    // this, every unpickle-time OOM leaks one strong reference to a
+    // BOCCown that the caller has already let go of.
+    COWN_DECREF(cown);
+    return NULL;
+  }
+
+  capsule->cown = cown;
+  return (PyObject *)capsule;
+}
+
+/// @brief Reconstructs a CownCapsule from a pickled pointer (borrowing form).
+/// @details Sister of @ref _cown_capsule_from_pointer_inheriting. Used
+/// when the pickle bytes were produced by a writer that did NOT take a
+/// COWN_INCREF in @ref CownCapsule_reduce — currently only the
+/// noticeboard write-direct path. The borrowing reconstructor takes
+/// its own fresh COWN_INCREF and relies on the writer to hold an
+/// independent strong reference (the noticeboard entry's pin set,
+/// populated by @ref nb_pin_cowns) for the lifetime of the encoded
+/// BOCCown* pointer.
+/// @note Calling this reconstructor on bytes whose writer DID take a
+/// COWN_INCREF leaks one strong reference per call. Calling the
+/// inheriting sister on bytes whose writer did NOT take one
+/// underflows the refcount → UAF. The writer side is responsible
+/// for choosing the correct symbol; the choice is encoded in the
+/// pickle bytes so readers cannot get it wrong.
+///
+/// **Trust model.** This is pickle's reconstructor: it is reachable
+/// from any @c pickle.loads call by qualified name and has the same
+/// trust boundary as @c pickle.loads itself. Anyone who can feed
+/// bytes to @c pickle.loads in this process can already execute
+/// arbitrary code via @c __reduce__, so guarding the reconstructor
+/// against forged or replayed input would not raise the bar. The
+/// only liveness contract we *can* enforce in-process is the
+/// writer-side H1 audit in @ref _core_noticeboard_write_direct,
+/// which fails the whole @c notice_write whenever the value pickler
+/// reduces a cown the pin walker did not see — that closes the
+/// honest-mistake path where a custom @c __reduce__ pickles an
+/// unpinned cown.
+/// @param module The _core module (unused)
+/// @param args Tuple of (pointer_as_int, process_id)
+/// @return A new CownCapsule, or NULL on error
+static PyObject *_cown_capsule_from_pointer_borrowing(PyObject *module,
+                                                      PyObject *args) {
   PyObject *ptr_obj, *pid_obj;
   if (!PyArg_ParseTuple(args, "OO", &ptr_obj, &pid_obj)) {
     return NULL;
@@ -4896,8 +5243,10 @@ static PyMethodDef _core_module_methods[] = {
      METH_NOARGS,
      "scheduler_drain_all_queues($module, /)\n--\n\n"
      "Drain every per-worker queue. Returns list[BehaviorCapsule]."},
-    {"_cown_capsule_from_pointer", _cown_capsule_from_pointer, METH_VARARGS,
-     NULL},
+    {"_cown_capsule_from_pointer_inheriting",
+     _cown_capsule_from_pointer_inheriting, METH_VARARGS, NULL},
+    {"_cown_capsule_from_pointer_borrowing",
+     _cown_capsule_from_pointer_borrowing, METH_VARARGS, NULL},
     {"cown_pin_pointers", _core_cown_pin_pointers, METH_VARARGS,
      "cown_pin_pointers($module, pins, /)\n--\n\n"
      "INCREF each CownCapsule and return raw pointer ints (transfers refs)."},
@@ -5073,14 +5422,21 @@ static int _core_module_exec(PyObject *module) {
 
   state->dumps = PyObject_GetAttrString(state->pickle, "dumps");
   if (state->dumps == NULL) {
-    Py_DECREF(state->pickle);
+    // Use Py_CLEAR rather than bare Py_DECREF: ``_core_module_clear``
+    // runs on a module that failed its exec slot (multi-phase init
+    // tears the partial module down via the normal collect path), so
+    // a bare DECREF would leave ``state->pickle`` dangling and the
+    // subsequent ``Py_CLEAR(state->pickle)`` in clear would
+    // double-free. Same rationale applies to ``loads`` below and to
+    // the reconstructor block further down.
+    Py_CLEAR(state->pickle);
     return -1;
   }
 
   state->loads = PyObject_GetAttrString(state->pickle, "loads");
   if (state->loads == NULL) {
-    Py_DECREF(state->pickle);
-    Py_DECREF(state->dumps);
+    Py_CLEAR(state->pickle);
+    Py_CLEAR(state->dumps);
     return -1;
   }
 
@@ -5120,6 +5476,24 @@ static int _core_module_exec(PyObject *module) {
     return -1;
   }
 
+  // Cache the reconstructor symbols on the module state so
+  // CownCapsule_reduce does not have to PyImport_ImportModule on every
+  // pickle. Both must be bound on the module by m_methods before this
+  // exec slot runs.
+  state->cown_reconstructor_inheriting =
+      PyObject_GetAttrString(module, "_cown_capsule_from_pointer_inheriting");
+  if (state->cown_reconstructor_inheriting == NULL) {
+    return -1;
+  }
+  state->cown_reconstructor_borrowing =
+      PyObject_GetAttrString(module, "_cown_capsule_from_pointer_borrowing");
+  if (state->cown_reconstructor_borrowing == NULL) {
+    // Mirror the existing dumps/loads cleanup pattern: drop the
+    // previously acquired strong ref before propagating the error.
+    Py_CLEAR(state->cown_reconstructor_inheriting);
+    return -1;
+  }
+
   assert(BOC_STATE == NULL);
   BOC_STATE = state;
 
@@ -5138,6 +5512,8 @@ static int _core_module_clear(PyObject *module) {
   Py_CLEAR(state->pickle);
   Py_CLEAR(state->cown_capsule_type);
   Py_CLEAR(state->behavior_capsule_type);
+  Py_CLEAR(state->cown_reconstructor_inheriting);
+  Py_CLEAR(state->cown_reconstructor_borrowing);
   // The recycle_queue is allocated late in module_exec; it may be NULL if
   // module_exec returned -1 before reaching BOCRecycleQueue_new(). The
   // worker recycle queue's xidata_to_cowns dict is owned by this
@@ -5224,6 +5600,8 @@ static int _core_module_traverse(PyObject *module, visitproc visit, void *arg) {
   Py_VISIT(state->pickle);
   Py_VISIT(state->cown_capsule_type);
   Py_VISIT(state->behavior_capsule_type);
+  Py_VISIT(state->cown_reconstructor_inheriting);
+  Py_VISIT(state->cown_reconstructor_borrowing);
   // recycle_queue is allocated late in module_exec; if exec failed before
   // reaching BOCRecycleQueue_new() the field is still NULL.
   if (state->recycle_queue != NULL) {

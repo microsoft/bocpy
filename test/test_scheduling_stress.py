@@ -10,7 +10,6 @@ synchronize with completion.
 """
 
 import os
-from unittest import mock
 
 import pytest
 
@@ -18,6 +17,12 @@ import bocpy
 from bocpy import _core
 from bocpy import Cown, drain, receive, send, TIMEOUT, wait, when
 import bocpy.behaviors as _behaviors
+
+# NOTE: do NOT import ``mockreplacement`` (or ``unittest.mock``) at
+# module scope. The transpiler exports this whole module into every
+# worker sub-interpreter; module-level imports therefore run inside
+# every worker, and ``mockreplacement`` is not on the worker
+# ``sys.path``. The handful of tests that need it import it locally.
 
 
 RECEIVE_TIMEOUT = 30
@@ -338,12 +343,17 @@ class TestWhencallRollback:
         # bring count back to exactly the pre-call value.
         before = _core.terminator_count()
 
+        from mockreplacement import patch_attr, Recorder
+
         sentinel = RuntimeError("synthetic schedule failure")
-        fake_capsule = mock.MagicMock()
+        fake_capsule = Recorder("FakeBehaviorCapsule")
         fake_capsule.schedule.side_effect = sentinel
-        with mock.patch.object(
-            _behaviors._core, "BehaviorCapsule",
-            return_value=fake_capsule,
+
+        def _fake_capsule_ctor(*args, **kwargs):
+            return fake_capsule
+
+        with patch_attr(
+            _behaviors._core, "BehaviorCapsule", _fake_capsule_ctor,
         ):
             c = Cown(Counter())
             with pytest.raises(RuntimeError) as info:
@@ -429,9 +439,13 @@ class TestStopVsScheduleRace:
 
         _collect_done(1)
 
-        with mock.patch.object(
-            _behaviors._core, "terminator_inc",
-            return_value=-1,
+        from mockreplacement import patch_attr
+
+        def _refuse_inc(*args, **kwargs):
+            return -1
+
+        with patch_attr(
+            _behaviors._core, "terminator_inc", _refuse_inc,
         ):
             c = Cown(Counter())
             with pytest.raises(RuntimeError, match="shutting down"):
@@ -561,10 +575,15 @@ class TestNoticeboardStartupHandshake:
         # Quiesce any prior runtime so the next @when triggers a fresh start.
         wait()
 
+        from mockreplacement import patch_attr
+
         sentinel = RuntimeError("synthetic claim failure")
-        with mock.patch.object(
-            _behaviors._core, "set_noticeboard_thread",
-            side_effect=sentinel,
+
+        def _raise_sentinel(*args, **kwargs):
+            raise sentinel
+
+        with patch_attr(
+            _behaviors._core, "set_noticeboard_thread", _raise_sentinel,
         ):
             c = Cown(Counter())
             with pytest.raises(RuntimeError, match="noticeboard thread"):
@@ -679,7 +698,9 @@ class TestChainRingPerWorkerCount:
         # Every behaviour that completes was popped exactly once, so
         # `total_pops` must reach the dispatched count. We don't need
         # an exact equality (last-mile read-back behaviours and the
-        # warm-up handshake also count), only a sanity floor.
+        # warm-up handshake also count, and the fairness token's
+        # pop-side accounting biases the totals; see
+        # `boc_sched_stats_t` in `boc_sched.h`), only a sanity floor.
         assert total_pops >= ring_length, (
             f"W={worker_count}: only {total_pops} pops recorded "
             f"for {ring_length} dispatched behaviours"
@@ -769,19 +790,26 @@ class TestOrphanDropException:
         from bocpy import start as _start_runtime
         _start_runtime()
 
-        # Build a real BehaviorCapsule wrapped in a MagicMock so the
-        # orphan-drain path can call the documented methods on it
-        # (``set_drop_exception``, ``release_all``).
-        fake_capsule = mock.MagicMock()
+        from mockreplacement import patch_attr, Recorder
+
+        # Build a recorder so the orphan-drain path can call the
+        # documented methods on it (``set_drop_exception``,
+        # ``release_all``) and we can assert on the recorded calls.
+        fake_capsule = Recorder("orphan_capsule")
         # Single-shot drain: first call returns one fake orphan, the
         # second call returns [] so the drain loop terminates.
         drain_results = [[fake_capsule], []]
-        with mock.patch.object(
-            _behaviors._core, "scheduler_drain_all_queues",
-            side_effect=lambda: drain_results.pop(0),
-        ), mock.patch.object(
-            _behaviors._core, "terminator_dec",
-            return_value=0,
+
+        def _fake_drain():
+            return drain_results.pop(0)
+
+        def _fake_terminator_dec(*args, **kwargs):
+            return 0
+
+        with patch_attr(
+            _behaviors._core, "scheduler_drain_all_queues", _fake_drain,
+        ), patch_attr(
+            _behaviors._core, "terminator_dec", _fake_terminator_dec,
         ):
             behaviors = bocpy.behaviors.BEHAVIORS
             assert behaviors is not None, (

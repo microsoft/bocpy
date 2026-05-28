@@ -65,11 +65,11 @@ def test_wait_returns_final_snapshot():
 
     @when(c)
     def _(c):
-        send("swt_done", 1)
+        pass
 
-    tag, _payload = receive("swt_done", 5.0)
-    assert tag == "swt_done"
-
+    # `wait()` blocks on the C-level terminator until every scheduled
+    # behavior has decremented it -- no send/receive handshake needed
+    # to know the behavior body actually ran.
     snapshot = wait(stats=True)
     assert isinstance(snapshot, list)
     assert len(snapshot) == W, snapshot
@@ -92,9 +92,8 @@ def test_wait_stats_default_returns_none():
 
     @when(c)
     def _(c):
-        send("swt_default_done", 1)
+        pass
 
-    receive("swt_default_done", 5.0)
     assert wait() is None
 
 
@@ -121,11 +120,7 @@ def test_off_worker_dispatch_bumps_pushed_remote_not_pending():
     for c in cowns:
         @when(c)
         def _(c):
-            send("opp_done", 1)  # noqa: B023
-
-    for _ in range(N):
-        tag, _payload = receive("opp_done", 5.0)
-        assert tag == "opp_done"
+            pass
 
     snap = wait(stats=True)
     total_remote = sum(s["pushed_remote"] for s in snap)
@@ -157,11 +152,7 @@ def test_dispatched_to_pending_increments_from_worker_dispatch():
         def _(o):
             @when(i)  # noqa: B023
             def _inner(i):
-                send("ppi_done", 1)
-
-    for _ in range(N):
-        tag, _payload = receive("ppi_done", 5.0)
-        assert tag == "ppi_done"
+                pass
 
     snap = wait(stats=True)
     total_pending = sum(s["dispatched_to_pending"] for s in snap)

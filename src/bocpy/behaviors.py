@@ -19,7 +19,7 @@ from textwrap import dedent
 import threading
 import time
 from types import MappingProxyType
-from typing import Any, Callable, Generic, Mapping, Optional, TypeVar, Union
+from typing import Any, Callable, Generic, Mapping, NamedTuple, Optional, TypeVar, Union
 
 from . import _core, set_tags
 from .transpiler import BehaviorInfo, export_main, export_module_from_file
@@ -75,6 +75,13 @@ def _default_worker_count() -> int:
 
 WORKER_COUNT: int = _default_worker_count()
 
+# Generous deadline (seconds) for every worker-lifecycle handshake
+# receive (start_workers, stop_workers, _abort_workers). The handshakes
+# normally complete in microseconds; the only reason to wait longer is
+# pathological I/O or a wedged sub-interpreter. Promoting a wedge to a
+# loud failure here means CI fails in minutes instead of hours.
+_LIFECYCLE_RECEIVE_TIMEOUT = 120.0
+
 T = TypeVar("T")
 
 # Sentinel distinguishing "key absent" from "key is None" in noticeboard updates.
@@ -101,11 +108,36 @@ class _RemovedType:
 REMOVED = _RemovedType()
 
 
+class WaitResult(NamedTuple):
+    """Bundle of optional artifacts returned by :func:`wait`.
+
+    Only produced when both ``stats=True`` and ``noticeboard=True``
+    are passed (e.g. ``wait(stats=True, noticeboard=True)``).
+
+    :ivar stats: Per-worker scheduler-stats snapshot.
+    :ivar noticeboard: Final noticeboard contents as a plain ``dict``.
+    """
+
+    stats: list[dict]
+    noticeboard: dict[str, Any]
+
+
 class Cown(Generic[T]):
     """Lightweight wrapper around the underlying cown capsule."""
 
     def __init__(self, value: T):
-        """Create a cown."""
+        """Create a cown.
+
+        .. note::
+           Calling :func:`pickle.dumps` on a cown produces bytes that
+           carry one strong reference per embedded cown. If those
+           bytes are never unpickled in the producing process — for
+           example, if they are saved to disk or sent to an external
+           store — each embedded cown leaks one strong reference per
+           orphan byte string. The bocpy runtime never produces orphan
+           bytes; the leak surface only applies to third-party code
+           that calls ``pickle.dumps(cown)`` directly.
+        """
         logging.debug("initialising Cown with value: %r", value)
         if isinstance(value, _core.CownCapsule):
             self.impl = value
@@ -237,6 +269,13 @@ class Behaviors:
         # worker registered, or stop_workers raised before reaching the
         # capture point).
         self._final_stats: Optional[list[dict]] = None
+        # Plain-dict snapshot of the noticeboard captured by stop()
+        # after the noticeboard thread has exited but BEFORE
+        # `_core.noticeboard_clear()` frees the entries. Surfaced to
+        # the caller via `wait(noticeboard=True)`. ``None`` means no
+        # snapshot was captured (e.g. the noticeboard-timeout branch
+        # left the thread alive, or start_noticeboard failed).
+        self._final_noticeboard: Optional[dict[str, Any]] = None
         self.final_cowns: tuple[Cown, ...] = ()
         self.bid = 0
 
@@ -287,10 +326,46 @@ class Behaviors:
     def start_workers(self):
         """Launch worker interpreters and wait until they signal readiness."""
         def worker():
-            interp = interpreters.create()
-            result = interpreters.run_string(interp, dedent(self.worker_script))
+            # Every failure path below MUST send a reply on
+            # "boc_behavior": `start_workers` is blocked in a bounded
+            # receive() per worker, and a missed reply turns into a
+            # silent timeout with no traceback about why the worker
+            # died.
+            import traceback as _tb
+            interp = None
+            try:
+                interp = interpreters.create()
+            except BaseException as ex:  # noqa: B036
+                _core.send(
+                    "boc_behavior",
+                    "interpreters.create() failed: "
+                    + "".join(_tb.format_exception(ex)),
+                )
+                return
+
+            try:
+                result = interpreters.run_string(
+                    interp, dedent(self.worker_script),
+                )
+            except BaseException as ex:  # noqa: B036
+                # `run_string` itself raised (distinct from the worker
+                # script raising, which is surfaced via the returned
+                # ExecutionFailed below).
+                _core.send(
+                    "boc_behavior",
+                    "interpreters.run_string() failed: "
+                    + "".join(_tb.format_exception(ex)),
+                )
+                result = None
+
             if result is not None:
-                _core.send("boc_behavior", result.formatted)
+                # Truthy result == ExecutionFailed; `.formatted` carries
+                # the traceback captured inside the worker script.
+                try:
+                    formatted = result.formatted
+                except AttributeError:
+                    formatted = repr(result)
+                _core.send("boc_behavior", formatted)
 
             try:
                 interpreters.destroy(interp)
@@ -304,14 +379,36 @@ class Behaviors:
 
         num_errors = 0
         self.logger.debug("waiting for workers to start")
-        for _ in range(self.num_workers):
-            match _core.receive("boc_behavior"):
+        for i in range(self.num_workers):
+            match _core.receive("boc_behavior", _LIFECYCLE_RECEIVE_TIMEOUT):
                 case ["boc_behavior", "started"]:
                     self.logger.debug("boc_behavior/started")
 
                 case ["boc_behavior", error]:
                     print(error)
                     num_errors += 1
+
+                case [_core.TIMEOUT, _]:
+                    # A worker thread failed to send "started" within
+                    # the deadline. Most likely cause: the sub-
+                    # interpreter wedged during `interpreters.create()`
+                    # or `scheduler_worker_register`, or a C-level
+                    # init deadlock blocked the worker before it could
+                    # signal readiness. Without this branch the runtime
+                    # would block indefinitely; raising promotes the
+                    # deadlock to a loud RuntimeError so CI fails fast.
+                    # NOTE: `teardown_workers` may still block on a
+                    # wedged sub-interpreter's `t.join()`; the receive
+                    # timeout at least guarantees we report the failure
+                    # instead of silently hanging at this call site.
+                    self.teardown_workers()
+                    raise RuntimeError(
+                        f"start_workers: worker {i} did not signal "
+                        f"readiness within {_LIFECYCLE_RECEIVE_TIMEOUT}s; "
+                        "the worker thread is hung or its sub-interpreter "
+                        "failed to register. Check worker stderr for a "
+                        "sub-interpreter init error or C-level deadlock."
+                    )
 
         if num_errors == self.num_workers:
             self.teardown_workers()
@@ -364,8 +461,28 @@ class Behaviors:
         # unconditionally inside `finally` is safe.
         _core.scheduler_request_stop_all()
         try:
-            for _ in range(self.num_workers):
-                _, contents = _core.receive("boc_behavior")
+            for i in range(self.num_workers):
+                tag, contents = _core.receive(
+                    "boc_behavior", _LIFECYCLE_RECEIVE_TIMEOUT,
+                )
+                if tag == _core.TIMEOUT:
+                    # A worker failed to reply "shutdown" after the
+                    # C-level stop fan-out. Most likely cause: the
+                    # worker's do_work() loop is wedged inside
+                    # `scheduler_worker_pop`, or a behavior body
+                    # deadlocked. Log and proceed: the outer `finally`
+                    # below still runs `scheduler_runtime_stop`, which
+                    # is idempotent and tears down the C-side state
+                    # regardless. Without this branch stop() would
+                    # block forever and the runtime could never be
+                    # retried.
+                    self.logger.error(
+                        "stop_workers: worker %d did not reply 'shutdown' "
+                        "within %.1fs; proceeding with teardown anyway. "
+                        "The wedged worker thread may outlive the runtime.",
+                        i, _LIFECYCLE_RECEIVE_TIMEOUT,
+                    )
+                    break
                 assert contents == "shutdown"
 
             for _ in range(self.num_workers):
@@ -540,7 +657,7 @@ class Behaviors:
         """
         path = os.path.join(os.path.dirname(__file__), "worker.py")
 
-        with open(path) as file:
+        with open(path, encoding="utf-8") as file:
             worker_script = file.read()
 
         worker_script = worker_script.replace("logging.NOTSET", str(logging.getLogger().level))
@@ -590,24 +707,48 @@ class Behaviors:
         main_start = worker_script.find(WORKER_MAIN_END)
 
         bootstrap = [
+            # The user-module load below is wrapped in try/except so an
+            # import error, syntax error, or wedging top-level statement
+            # surfaces as a traceback on `boc_behavior` instead of a
+            # silent hang. `send` is already imported at the top of
+            # worker.py and is guaranteed available here. The except
+            # block re-raises so `interpreters.run_string` also reports
+            # the failure via its return value.
             "import linecache",
+            "import traceback as _bocpy_tb",
             "import types",
-            f"_bocpy_src = {src_literal}",
-            f"_bocpy_mod = types.ModuleType({sysmod_key})",
-            f"_bocpy_mod.__file__ = {linecache_key}",
+            # Module name is bound outside the try so the diagnostic can
+            # name it even if the src-literal assignment fails.
+            f"_bocpy_modname = {sysmod_key}",
+            "try:",
+            f"    _bocpy_src = {src_literal}",
+            "    _bocpy_mod = types.ModuleType(_bocpy_modname)",
+            f"    _bocpy_mod.__file__ = {linecache_key}",
             (
-                "linecache.cache["
+                "    linecache.cache["
                 f"{linecache_key}"
                 "] = (len(_bocpy_src), None, "
                 "_bocpy_src.splitlines(keepends=True), "
                 f"{linecache_key})"
             ),
             (
-                "exec(compile(_bocpy_src, "
+                "    exec(compile(_bocpy_src, "
                 f"{linecache_key}, 'exec'), _bocpy_mod.__dict__)"
             ),
-            f"sys.modules[{sysmod_key}] = _bocpy_mod",
-            "boc_export = _bocpy_mod",
+            "    sys.modules[_bocpy_modname] = _bocpy_mod",
+            "    boc_export = _bocpy_mod",
+            "except BaseException as _bocpy_boot_ex:",
+            "    _bocpy_boot_msg = (",
+            "        'worker bootstrap failed loading user module '",
+            "        + repr(_bocpy_modname) + ': '",
+            "        + ''.join(_bocpy_tb.format_exception(_bocpy_boot_ex))",
+            "    )",
+            "    try:",
+            "        send('boc_behavior', _bocpy_boot_msg)",
+            "    except BaseException:",
+            "        sys.stderr.write(_bocpy_boot_msg + '\\n')",
+            "        sys.stderr.flush()",
+            "    raise",
         ]
 
         if module_name == "__main__":
@@ -717,9 +858,21 @@ class Behaviors:
         """
         self.logger.debug("aborting workers after failed startup")
         _core.scheduler_request_stop_all()
-        for _ in range(self.num_workers):
+        for i in range(self.num_workers):
             try:
-                _, contents = _core.receive("boc_behavior")
+                tag, contents = _core.receive(
+                    "boc_behavior", _LIFECYCLE_RECEIVE_TIMEOUT,
+                )
+                if tag == _core.TIMEOUT:
+                    # Same wedge as in `stop_workers`, on the abort
+                    # path. Continue the abort regardless -- the
+                    # caller is already error-handling a failed start.
+                    self.logger.error(
+                        "_abort_workers: worker %d did not reply "
+                        "'shutdown' within %.1fs; continuing abort.",
+                        i, _LIFECYCLE_RECEIVE_TIMEOUT,
+                    )
+                    break
                 assert contents == "shutdown"
             except Exception as ex:
                 self.logger.exception(ex)
@@ -922,13 +1075,36 @@ class Behaviors:
                     "has not finished; retry once it has."
                 )
             drain_errors = []
-        _core.clear_noticeboard_thread()
-        _core.noticeboard_clear()
-        # Teardown is complete: workers are joined, the noticeboard
-        # thread has exited, and the C-level slot is released.
-        # The transpiled module is exec'd in-memory in each worker,
-        # so there is no on-disk artifact to clean up.
-        self._teardown_complete = True
+        # The block below is single-shot per Behaviors instance. A
+        # second `stop()` (or `wait()`-triggered re-entry) MUST NOT
+        # re-snapshot, or it would overwrite ``_final_noticeboard``
+        # with ``{}`` because the first call already ran
+        # ``noticeboard_clear()``. This mirrors the natural gating
+        # of ``_final_stats`` inside ``stop_workers()``, which is
+        # itself guarded by ``_workers_stopped``.
+        if not self._teardown_complete:
+            _core.clear_noticeboard_thread()
+            # Snapshot before clearing. The noticeboard thread has
+            # exited and workers are joined, so entries are stable.
+            # `cache_clear()` is required because the main thread
+            # may hold a stale `noticeboard()` proxy from earlier
+            # user code. Best-effort: any failure must not block
+            # teardown.
+            try:
+                _core.noticeboard_cache_clear()
+                self._final_noticeboard = dict(_core.noticeboard_snapshot())
+            except Exception as snap_ex:
+                self.logger.warning(
+                    "stop(): failed to snapshot noticeboard: %r", snap_ex,
+                )
+                self._final_noticeboard = None
+            _core.noticeboard_clear()
+            # Teardown is complete: workers are joined, the
+            # noticeboard thread has exited, and the C-level slot is
+            # released. The transpiled module is exec'd in-memory in
+            # each worker, so there is no on-disk artifact to clean
+            # up.
+            self._teardown_complete = True
         # Drop the __bocmain__ alias we installed in start() so a
         # subsequent bocpy.start() observes a clean sys.modules
         # (and so the main module isn't pinned in sys.modules under
@@ -1193,17 +1369,34 @@ def when(*cowns):
     return when_factory
 
 
-def wait(timeout: Optional[float] = None, *, stats: bool = False):
+def wait(timeout: Optional[float] = None, *,
+         stats: bool = False, noticeboard: bool = False):
     """Block until all behaviors complete, with optional timeout.
 
-    When ``stats=True``, returns the per-worker
-    :func:`_core.scheduler_stats` snapshot captured at shutdown
-    (after all behaviors have run, before the per-worker array is
-    freed). When ``stats=False`` (the default), returns ``None``.
-    Returns ``[]`` if the runtime was never started or the snapshot
-    could not be captured.
+    When ``stats=True``, captures the per-worker
+    :func:`_core.scheduler_stats` snapshot at shutdown. When
+    ``noticeboard=True``, captures the final noticeboard contents
+    as a plain ``dict`` at shutdown. See the stub in
+    ``__init__.pyi`` for the full contract.
+
+    Return value:
+
+    - neither flag: ``None``.
+    - ``stats=True`` only: ``list[dict]`` (or ``[]``).
+    - ``noticeboard=True`` only: ``dict[str, Any]`` (or ``{}``).
+    - both flags: :class:`WaitResult`.
     """
     global BEHAVIORS
+
+    def _format(stats_snap, nb_snap):
+        if stats and noticeboard:
+            return WaitResult(stats=stats_snap, noticeboard=nb_snap)
+        if stats:
+            return stats_snap
+        if noticeboard:
+            return nb_snap
+        return None
+
     if BEHAVIORS:
         # Clear BEHAVIORS only if stop() drove the runtime all the
         # way through teardown (workers joined, noticeboard exited,
@@ -1217,19 +1410,17 @@ def wait(timeout: Optional[float] = None, *, stats: bool = False):
             BEHAVIORS.stop(timeout)
         except BaseException:
             if BEHAVIORS._teardown_complete:
-                snapshot = BEHAVIORS._final_stats
+                stats_snap = BEHAVIORS._final_stats if BEHAVIORS._final_stats is not None else []
+                nb_snap = BEHAVIORS._final_noticeboard if BEHAVIORS._final_noticeboard is not None else {}
                 BEHAVIORS = None
-                if stats:
-                    return snapshot if snapshot is not None else []
+                if stats or noticeboard:
+                    return _format(stats_snap, nb_snap)
             raise
-        snapshot = BEHAVIORS._final_stats
+        stats_snap = BEHAVIORS._final_stats if BEHAVIORS._final_stats is not None else []
+        nb_snap = BEHAVIORS._final_noticeboard if BEHAVIORS._final_noticeboard is not None else {}
         BEHAVIORS = None
-        if stats:
-            return snapshot if snapshot is not None else []
-        return None
-    if stats:
-        return []
-    return None
+        return _format(stats_snap, nb_snap)
+    return _format([], {})
 
 
 def _validate_noticeboard_key(key: str) -> None:
@@ -1353,6 +1544,10 @@ def notice_write(key: str, value: Any) -> None:
     limit are not applied; the noticeboard thread catches the resulting
     error and logs a warning.  No exception propagates to the caller.
 
+    Values may embed :class:`Cown` references; the noticeboard keeps
+    each embedded cown alive for as long as the entry remains in the
+    noticeboard.
+
     :param key: The noticeboard key (max 63 UTF-8 bytes).
     :type key: str
     :param value: The value to store.
@@ -1408,6 +1603,10 @@ def notice_update(key: str, fn: Callable[[Any], Any], default: Any = None) -> No
 
     If *fn* returns the ``REMOVED`` sentinel, the entry is deleted from
     the noticeboard instead of being updated.
+
+    The value returned by *fn* may embed :class:`Cown` references; the
+    noticeboard retains them until the entry is overwritten or deleted,
+    identical to :func:`notice_write`.
 
     .. warning::
 

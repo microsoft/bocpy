@@ -276,15 +276,22 @@ typedef struct boc_sched_stats {
   /// @ref dispatched_to_pending instead.
   ///
   /// **Reconciliation.** This counter records this worker's *role
-  /// as producer*. Across the whole pool the global identity
+  /// as producer*. Across the whole pool the **near-identity**
   /// @c "Σ (pushed_local + dispatched_to_pending + pushed_remote)
-  /// == Σ (popped_local + popped_via_steal)" holds at quiescence.
-  /// **Per-worker** the same identity does NOT hold: nodes
-  /// redistributed onto a thief by @ref boc_wsq_enqueue_spread are
-  /// not re-counted on the thief, so a thief's per-worker
-  /// @c (pushed_local + dispatched_to_pending + pushed_remote -
-  /// popped_local - popped_via_steal) is biased and is **not** a
-  /// queue-depth estimate.
+  /// + Σ token_pops == Σ (popped_local + popped_via_steal)" holds at
+  /// quiescence. The @c token_pops correction is necessary because
+  /// the per-worker fairness token is re-enqueued via raw
+  /// @c boc_wsq_enqueue (in @ref boc_sched_worker_pop_slow's
+  /// fairness arm) rather than @ref boc_sched_dispatch, so token
+  /// consumption bumps @c popped_local / @c popped_via_steal with no
+  /// matching producer-side bump. The bias is bounded by @ref
+  /// fairness_arm_fires across the pool. **Per-worker** even the
+  /// identity above does NOT hold: nodes redistributed onto a thief
+  /// by @ref boc_wsq_enqueue_spread are not re-counted on the
+  /// thief, so a thief's per-worker @c (pushed_local +
+  /// dispatched_to_pending + pushed_remote - popped_local -
+  /// popped_via_steal) is biased and is **not** a queue-depth
+  /// estimate.
   uint64_t pushed_local;
   /// @brief Behaviours dispatched into an empty @c pending slot on
   /// the producer-local arm of @ref boc_sched_dispatch.
