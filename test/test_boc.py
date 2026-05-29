@@ -1,6 +1,8 @@
 """Behavior-oriented concurrency tests."""
 
+from dataclasses import dataclass
 import functools
+import random
 import sys
 import threading
 import traceback
@@ -8,10 +10,12 @@ from typing import NamedTuple
 
 import pytest
 
-from bocpy import Cown, drain, receive, send, start, TIMEOUT, wait, when
+from bocpy import (Cown, drain, notice_sync, notice_write, noticeboard,
+                   receive, send, start, TIMEOUT, wait, when)
 from bocpy._core import CownCapsule
 
 RECEIVE_TIMEOUT = 10
+
 
 GLOBAL_FACTOR = 7
 
@@ -161,6 +165,45 @@ class Accumulator:
     def add(self, item):
         """Append an item to the list."""
         self.items.append(item)
+
+
+class Cell:
+    """Mutable two-field container used by the cown-in-cown tests.
+
+    A ``Cell`` is stored as a cown value and gives the test a place to
+    hang an inner ``Cown`` off the outer cown without reaching for a
+    bare dict (which exercises a different pickle path).
+    """
+
+    def __init__(self, key):
+        """Initialise the cell with a marker key and an empty child slot."""
+        self.key = key
+        self.child = None
+
+
+@dataclass(slots=True)
+class DataClassSlots:
+    """``@dataclass(slots=True)`` wrapper around a single Cown field."""
+
+    c: object
+
+
+class DictOnly:
+    """``__dict__``-only wrapper around a single Cown field."""
+
+    def __init__(self, c):
+        """Stash the cown on the instance ``__dict__``."""
+        self.c = c
+
+
+class SlotsOnly:
+    """``__slots__``-only wrapper around a single Cown field."""
+
+    __slots__ = ("c",)
+
+    def __init__(self, c):
+        """Stash the cown on the single declared slot."""
+        self.c = c
 
 
 @functools.lru_cache
@@ -669,6 +712,308 @@ class TestCownAcquireDeserialiseFailure:
             send("assert", (isinstance(b.value, ZeroDivisionError), True))
 
         receive_asserts(2)
+
+
+class TestCownInCown:
+    """Regression coverage for the cown-in-cown use-after-free.
+
+    A ``CownCapsule`` embedded inside another cown's value, a message
+    queue payload, or a noticeboard snapshot does not inherently keep
+    its inner ``BOCCown`` alive: pickle bytes are dead data. Without
+    either an inheriting ``COWN_INCREF`` in ``CownCapsule_reduce`` or
+    a borrowing reconstructor backed by a noticeboard pin, the inner
+    ``BOCCown`` is freed when the writer's Python wrapper drops, and
+    the next consumer (downstream acquire, queue receiver, or
+    noticeboard reader) dereferences a dangling pointer and segfaults.
+    A regression that breaks the contract will fail the tests below;
+    in the worst case it will crash a worker and take pytest down
+    with it — louder than a silent miscompare.
+    """
+
+    @classmethod
+    def teardown_class(cls):
+        """Ensure runtime is drained after suite."""
+        wait()
+
+    def test_cown_created_in_behavior_survives_release(self):
+        """Inner Cown created inside a behavior must outlive its writer.
+
+        Behavior ``a`` allocates ``Cown(Cell(20))`` and stashes it on
+        ``c1.value.child``. Behavior ``b`` observes ``c1.value.child``
+        and schedules ``c`` against it. Without the inheriting
+        ``COWN_INCREF``, the inner cown is freed when ``a`` returns
+        and ``b``'s acquire dereferences a dangling pointer.
+        """
+        c1 = Cown(Cell(10))
+
+        @when(c1)
+        def a(c1):
+            c1.value.child = Cown(Cell(20))
+
+        @when(c1)
+        def b(c1):
+            c2 = c1.value.child
+
+            @when(c1, c2)
+            def c(c1, c2):
+                send("assert", (c2.value.key, 20))
+
+        receive_asserts(1)
+
+    def test_cown_chain_through_message_queue(self):
+        """Cown sent via message queue must survive sender's release.
+
+        The sender behavior allocates a ``Cown(42)``, hands it to
+        ``send`` and returns. Its local ``Cown`` wrapper is dropped.
+        The receiver behavior pops the message, schedules a
+        ``@when`` against the received cown and reads its value.
+        Without the inheriting ``COWN_INCREF``, the receiver decodes
+        a dangling ``BOCCown*`` from the queued xidata and UAFs on
+        acquire.
+
+        Uses a dedicated ``"cown_chain"`` tag so the payload does
+        not collide with the project-wide ``"assert"`` queue.
+        """
+        anchor = Cown(0)
+
+        @when(anchor)
+        def sender(a):
+            inner = Cown(42)
+            send("cown_chain", inner)
+            # ``inner`` goes out of scope when ``sender`` returns;
+            # only the encoded pickle bytes inside the queued
+            # message reference the underlying BOCCown after that
+            # point.
+
+        @when(anchor)
+        def receiver(a):
+            tag, payload = receive("cown_chain", RECEIVE_TIMEOUT)
+            assert tag != TIMEOUT, "receive timed out"
+
+            @when(payload)
+            def use(c):
+                send("assert", (c.value, 42))
+
+        receive_asserts(1)
+        drain("cown_chain")
+
+    def test_cown_of_cown_fuzz_container_shapes(self):
+        """Fuzz over container shapes that embed a Cown.
+
+        Runs 50 trials with ``random.Random(0xC0C0)`` so the
+        sequence is deterministic but mixes shapes. Each trial
+        constructs an inner ``Cown(expected)`` wrapped inside one
+        of seven container shapes:
+
+        * ``list[Cown]``
+        * ``tuple[Cown]``
+        * ``dict[str, Cown]`` (cown-as-value)
+        * ``@dataclass(slots=True)`` wrapper
+        * ``__dict__``-only instance
+        * ``__slots__``-only instance
+        * 2-level ``Cown[Cown[T]]`` chain
+
+        Every trial sends exactly one ``(value, expected)`` tuple
+        on the ``"assert"`` queue; the receive loop drains all 50
+        at the end via :func:`receive_asserts`.
+        """
+        n_trials = 50
+        n_shapes = 7
+        rng = random.Random(0xC0C0)
+
+        for trial in range(n_trials):
+            shape = rng.randrange(n_shapes)
+            expected = trial * 1000 + 17
+            outer = Cown(None)
+
+            @when(outer)
+            def make(o):
+                inner = Cown(expected)  # noqa: B023
+                if shape == 0:  # noqa: B023
+                    o.value = [inner]
+                elif shape == 1:  # noqa: B023
+                    o.value = (inner,)
+                elif shape == 2:  # noqa: B023
+                    o.value = {"k": inner}
+                elif shape == 3:  # noqa: B023
+                    o.value = DataClassSlots(inner)
+                elif shape == 4:  # noqa: B023
+                    o.value = DictOnly(inner)
+                elif shape == 5:  # noqa: B023
+                    o.value = SlotsOnly(inner)
+                else:
+                    o.value = Cown(inner)
+
+            @when(outer)
+            def verify(o):
+                container = o.value
+                inner_c = None
+                if isinstance(container, list):
+                    inner_c = container[0]
+                elif isinstance(container, tuple):
+                    inner_c = container[0]
+                elif isinstance(container, dict):
+                    inner_c = container["k"]
+                elif isinstance(container, DataClassSlots):
+                    inner_c = container.c
+                elif isinstance(container, (DictOnly, SlotsOnly)):
+                    inner_c = container.c
+                elif isinstance(container, Cown):
+                    # 2-level chain: schedule against the wrapping
+                    # cown to peel the layer, then check the leaf.
+                    @when(container)
+                    def peel(wc):
+                        leaf = wc.value
+
+                        @when(leaf)
+                        def check_nested(c):
+                            send("assert", (c.value, expected))  # noqa: B023
+                else:
+                    raise AssertionError(
+                        f"unhandled shape {type(container)!r}"
+                    )
+
+                if inner_c is not None:
+                    @when(inner_c)
+                    def check(c):
+                        send("assert", (c.value, expected))  # noqa: B023
+
+        receive_asserts(n_trials)
+
+    def test_cached_snapshot_survives_entry_overwrite(self):
+        """Borrowing reconstructor: snapshot's CownCapsule owns its own ref.
+
+        On the noticeboard write path, ``CownCapsule_reduce`` embeds
+        the borrowing reconstructor; the reader's reconstructor takes
+        its own fresh ``COWN_INCREF`` on unpickle. Each reader's
+        cached snapshot therefore owns an independent strong reference
+        to the inner ``BOCCown``, and the snapshot stays valid even
+        after the noticeboard entry (and its ``nb_pin_cowns`` +1) is
+        overwritten.
+        """
+        anchor = Cown(0)
+        inner = Cown(20)
+        stash = {}
+
+        @when(anchor)
+        def write_initial(a):
+            # ``inner`` arrives here as a capture-tuple reference.
+            # F821: closure variable is ``del``-ed in the enclosing
+            # scope before the behavior runs; the transpiler has
+            # already snapshotted it into the capture tuple.
+            notice_write("k", inner)  # noqa: B023, F821
+            notice_sync()
+
+        @when(anchor, write_initial)
+        def read_then_overwrite(a, _w):
+            snap = noticeboard()
+            stash["k"] = snap["k"]
+            # Overwrite the entry — releases the noticeboard's
+            # nb_pin_cowns +1 on the original inner. After this point
+            # the only strong reference to the original BOCCown is
+            # the one taken by the borrowing reconstructor when
+            # ``snap["k"]`` was materialised above.
+            notice_write("k", "unrelated_value")
+            notice_sync()
+
+            @when(anchor)
+            def use_stashed(a2):
+                stashed = stash["k"]
+
+                @when(stashed)
+                def check(s):
+                    send("assert", (s.value, 20))
+
+        # Drop the main-thread reference; the capture tuple snapshotted
+        # by the ``write_initial`` schedule above still holds it until
+        # that behavior runs.
+        del inner
+        receive_asserts(1)
+
+
+class TestAcquireFailureTerminal:
+    """Repeat acquire of a permanently-undeserialisable cown.
+
+    The first behavior that fails to deserialise a cown's value sees
+    the original exception (preserved through
+    ``PyErr_Fetch`` / ``PyErr_Restore``). Subsequent waiters on the
+    same cown receive an identical ``RuntimeError("...permanently
+    unavailable...")`` because the cown can never satisfy any
+    behavior again. None of the behavior bodies run; none of the
+    acquires segfaults.
+    """
+
+    @classmethod
+    def teardown_class(cls):
+        """Ensure runtime is drained after suite."""
+        wait()
+
+    def test_three_waiters_after_decode_failure(self):
+        """Three waiters: #1 sees original exception; #2 and #3 match.
+
+        Three waiters (not two) so the asymmetry contract is pinned:
+        only the first waiter sees the original exception; every
+        later waiter sees an identical terminal-state
+        ``RuntimeError``. Substring match keeps the test resilient
+        to wording tweaks while still catching a future caching
+        regression that produced different messages for repeat
+        waiters.
+        """
+        bad = Cown(RaiseOnUnpickle())
+
+        @when(bad)
+        def use_bad_1(b):
+            # Body must not run.
+            send("assert", (b.value, "unreachable_1"))
+
+        @when(bad)
+        def use_bad_2(b):
+            send("assert", (b.value, "unreachable_2"))
+
+        @when(bad)
+        def use_bad_3(b):
+            send("assert", (b.value, "unreachable_3"))
+
+        @when(use_bad_1)
+        def check_1(b):
+            send("assert", (b.exception, True))
+            send("assert", (isinstance(b.value, ZeroDivisionError), True))
+
+        @when(use_bad_2)
+        def check_2(b):
+            send("assert", (b.exception, True))
+            send("assert", (isinstance(b.value, RuntimeError), True))
+            send("assert", ("permanently unavailable" in str(b.value), True))
+            send("repeat_msg", str(b.value))
+
+        @when(use_bad_3)
+        def check_3(b):
+            send("assert", (b.exception, True))
+            send("assert", (isinstance(b.value, RuntimeError), True))
+            send("assert", ("permanently unavailable" in str(b.value), True))
+            send("repeat_msg", str(b.value))
+
+        # 2 from check_1 + 3 from check_2 + 3 from check_3.
+        receive_asserts(8)
+
+        # The two terminal-state messages must be byte-identical so a
+        # future regression that started producing per-waiter messages
+        # (e.g. by formatting in the calling interpreter's id) is
+        # caught.
+        msgs = []
+        try:
+            for _ in range(2):
+                result = receive("repeat_msg", RECEIVE_TIMEOUT)
+                assert result[0] != TIMEOUT, (
+                    "timed out waiting for repeat_msg from check_2/check_3"
+                )
+                msgs.append(result[1])
+        finally:
+            drain("repeat_msg")
+        assert msgs[0] == msgs[1], (
+            f"terminal-state messages diverged: {msgs[0]!r} != {msgs[1]!r}"
+        )
+        assert "permanently unavailable" in msgs[0], msgs[0]
 
 
 class TestBehaviorCapsuleArgsSize:
@@ -1244,7 +1589,10 @@ class TestBaseExceptionDiscipline:
         orphans before the deferred KI is re-raised, so no MCS chain or
         terminator hold leaks.
         """
-        from unittest import mock
+        # NOT ``unittest.mock``: workers re-import this module, and
+        # mock pulls in asyncio which can deadlock under PEP 684 init
+        # on macOS arm64.
+        from mockreplacement import patch_attr
 
         from bocpy import behaviors as _behaviors
 
@@ -1287,11 +1635,17 @@ class TestBaseExceptionDiscipline:
                 raise KeyboardInterrupt("orphan-drain KI")
             return original_set_drop(self, exc)
 
-        with mock.patch.object(FakeCapsule, "set_drop_exception",
-                               patched_set_drop), \
-             mock.patch("bocpy._core.scheduler_drain_all_queues",
-                        side_effect=fake_drain), \
-             mock.patch("bocpy._core.terminator_dec", return_value=0):
+        import bocpy._core as _core_mod
+
+        def _fake_terminator_dec(*args, **kwargs):
+            return 0
+
+        with patch_attr(FakeCapsule, "set_drop_exception",
+                        patched_set_drop), \
+             patch_attr(_core_mod, "scheduler_drain_all_queues",
+                        fake_drain), \
+             patch_attr(_core_mod, "terminator_dec",
+                        _fake_terminator_dec):
             with pytest.raises(KeyboardInterrupt, match="orphan-drain KI"):
                 b._drain_orphan_behaviors()
 

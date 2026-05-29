@@ -49,6 +49,14 @@ Then replace `src/_bocpy_probe.c` with your own sources. The
 Windows and is a no-op elsewhere, so the same build script works on
 every platform.
 
+## Pinning `bocpy`
+
+Both `[build-system].requires` and `[project].dependencies` use a
+PEP 440 compatible-release bound (``bocpy~=0.7``). Bump this version
+specifier in lock-step with the root ``pyproject.toml`` whenever the
+public C ABI changes — the ``finalize-pr`` skill lists every file
+that must move together.
+
 ### Per-interpreter requirements
 
 `_bocpy_probe.c` uses multi-phase initialisation (`Py_mod_exec`) and

@@ -163,7 +163,6 @@ def rho_work(lane: Cown[RhoLane], n: int):
             d = math.gcd(abs(x - y), n)
             if d != 1 and d != n:
                 notice_write("factor", d)
-                send("result", d)
                 print(f"  lane {info.lane_id} found factor {d}")
                 return
             if d == n:
@@ -227,11 +226,19 @@ def main():
         lane = Cown(RhoLane(i, n, args.batch))
         rho_check(lane, n)
 
-    _, factor = receive("result")
+    # Every rho lane self-terminates once `notice_read("factor")`
+    # returns a value, so the runtime quiesces on its own. `wait()`
+    # is the barrier; `noticeboard=True` lifts the result back
+    # across shutdown. `.get` (not `[]`) so a quiescence with no
+    # factor surfaces as a clean diagnostic rather than a
+    # `KeyError`.
+    snap = wait(noticeboard=True)
+    factor = snap.get("factor")
+    if factor is None:
+        print(f"no factor found for {n}; rho lanes quiesced without a hit")
+        return
     other = n // factor
     print(f"result: {n} = {factor} x {other}")
-
-    wait()
 
 
 if __name__ == "__main__":

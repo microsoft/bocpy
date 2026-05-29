@@ -1,0 +1,68 @@
+# Dependabot configuration for bocpy.
+#
+# Three ecosystems are watched:
+#
+#   1. ``pip`` rooted at ``/ci`` — the hashed constraint files generated
+#      by ``uv pip compile --universal --generate-hashes``. Updates here
+#      drive the install steps in ``.github/workflows/pr_gate.yml``.
+#      Note: dependabot can only suggest version bumps; the actual
+#      ``ci/constraints-*.txt`` regeneration is done locally with the
+#      command preserved in each file's header.
+#
+#   2. ``github-actions`` rooted at ``/`` — every ``uses:`` line in
+#      ``.github/workflows/`` is SHA-pinned (see ``B3`` in the
+#      sbom-and-dependency-audit plan). Dependabot rewrites both the
+#      SHA and the trailing ``# vX.Y.Z`` comment when a new release
+#      is published.
+#
+#   3. ``pip`` rooted at ``/templates/c_abi_consumer`` — the downstream
+#      consumer template. Its only runtime dep is ``bocpy`` itself
+#      (compatible-release pin, see B6).
+#
+# Pull requests are grouped weekly to limit churn. Security advisories
+# bypass the schedule and open immediately (default behaviour).
+version: 2
+updates:
+  # 1. Hashed CI constraints (test / linting / docs).
+  - package-ecosystem: "pip"
+    directories:
+      - "/ci"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      ci-constraints:
+        applies-to: version-updates
+        patterns:
+          - "*"
+    labels:
+      - "dependencies"
+      - "ci"
+
+  # 2. GitHub Actions used by every workflow under .github/workflows/.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        applies-to: version-updates
+        patterns:
+          - "*"
+    labels:
+      - "dependencies"
+      - "ci"
+
+  # 3. Downstream C-ABI consumer template.
+  - package-ecosystem: "pip"
+    directory: "/templates/c_abi_consumer"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "templates"

@@ -1,0 +1,77 @@
+name: Setup bocpy for testing
+description: >
+  Install a pinned Python toolchain, install the hash-pinned test
+  constraints, and install bocpy in editable mode. Used by every
+  pr_gate.yml job that runs the pytest suite against a real
+  interpreter (linux, windows, windows-x86, macos-arm64, macos-x86_64,
+  free-threaded) and by c-abi-consumer.
+
+  The caller must run ``actions/checkout`` before invoking this
+  composite action — a local ``./.github/actions/...`` action cannot
+  bootstrap its own checkout because the runner has to read this
+  ``action.yml`` from disk before any of its steps can execute.
+
+  The two-step constraints install + editable bocpy install lives here
+  because pip refuses ``--require-hashes`` for editable installs (see
+  SUPPLY_CHAIN.md). Centralising the pattern means adding a new
+  Python minor version is one diff in the calling workflow.
+
+inputs:
+  python-version:
+    description: Python interpreter version (e.g. "3.14", "3.13t").
+    required: true
+  architecture:
+    description: >
+      Optional ``actions/setup-python`` ``architecture`` input (only
+      windows-x86 sets this to ``x86``).
+    required: false
+    default: ""
+  upgrade-pip:
+    description: >
+      When ``"true"`` (the default) run ``python -m pip install
+      --upgrade pip`` before installing constraints. Set to
+      ``"false"`` to skip; harmless to leave on.
+    required: false
+    default: "true"
+  install-internal-tests:
+    description: >
+      When ``"true"`` (the default) leave the workflow-level
+      ``BOCPY_BUILD_INTERNAL_TESTS=1`` in scope so the editable
+      build compiles ``bocpy._internal_test``. Set to ``"false"``
+      to scrub it (c-abi-consumer does not exercise that
+      extension and the extra build is pure overhead).
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Use Python ${{ inputs.python-version }}
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+      with:
+        python-version: ${{ inputs.python-version }}
+        architecture: ${{ inputs.architecture }}
+
+    - name: Upgrade pip
+      if: ${{ inputs.upgrade-pip == 'true' }}
+      shell: bash
+      run: python -m pip install --upgrade pip
+
+    - name: Install pinned test dependencies
+      # Two-step install pattern: pip refuses ``--require-hashes``
+      # for editable installs, so resolve the locked dependency
+      # graph first, then install bocpy itself with ``--no-deps``.
+      # See SUPPLY_CHAIN.md.
+      shell: bash
+      run: pip install -r ci/constraints-test.txt --require-hashes
+
+    - name: Install bocpy (editable, no deps)
+      shell: bash
+      env:
+        # Override the workflow-level setting when the caller asks
+        # for it. Setting the variable to "" in the env block scrubs
+        # it for this step only; setup.py treats unset or empty as
+        # "do not build the internal test extension".
+        BOCPY_BUILD_INTERNAL_TESTS: >-
+          ${{ inputs.install-internal-tests == 'true' && '1' || '' }}
+      run: pip install -e . --no-deps --verbose

@@ -5,6 +5,13 @@ on:
     branches: ["main"]
   workflow_dispatch:
 
+# Default least-privilege token scope for every job. Override at job
+# scope only when a job legitimately needs more (none currently do —
+# all jobs read source and upload artifacts via the workflow-scoped
+# implicit ``actions`` token, which is independent of ``contents``).
+permissions:
+  contents: read
+
 # Build the private `bocpy._internal_test` C extension across all CI test
 # jobs. It is gated off by default in setup.py so it never ships in
 # distributed wheels; CI opts in here so the corresponding pytest modules
@@ -18,35 +25,82 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Use Python 3.14
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: 3.14
 
-      - name: Install flake8
-        run: pip install -e .[linting]
+      - name: Install pinned linting dependencies
+        # Two-step install pattern: pip refuses ``--require-hashes``
+        # for editable installs, so resolve the locked dependency
+        # graph first, then install bocpy itself with ``--no-deps``.
+        run: pip install -r ci/constraints-linting.txt --require-hashes
+
+      - name: Install bocpy (editable, no deps)
+        run: pip install -e . --no-deps
 
       - name: Run flake8
-        run: flake8 src/bocpy test examples
+        # ``--filename`` opts the walker into .pyi stubs, which flake8
+        # otherwise skips silently (default is ``*.py`` only).
+        run: flake8 --filename='*.py,*.pyi' src/bocpy test examples scripts
 
   docs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Use Python 3.14
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: 3.14
 
-      - name: Install docs deps
-        run: pip install -e .[docs]
+      - name: Install pinned docs dependencies
+        run: pip install -r ci/constraints-docs.txt --require-hashes
+
+      - name: Install bocpy (editable, no deps)
+        run: pip install -e . --no-deps
 
       - name: Build Sphinx docs (warnings as errors)
         run: sphinx-build -W -b html sphinx/source sphinx/build/html
+
+  audit:
+    # Vulnerability scan of the hashed CI constraint files. Each
+    # ``ci/constraints-*.txt`` is checked against the PyPI advisory
+    # database via ``pip-audit``. ``--strict`` exits non-zero if any
+    # advisory cannot be matched against the resolver's view of the
+    # dependency graph (e.g. yanked release, network failure) so we
+    # never silently skip a leg.
+    #
+    # bocpy itself has zero third-party runtime Python deps, so this
+    # job covers the entire transitive dependency surface that ships
+    # to a developer's machine via ``pip install bocpy[X]``.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Use Python 3.14
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: 3.14
+
+      - name: Install pinned pip-audit
+        run: pip install -r ci/constraints-audit.txt --require-hashes
+
+      - name: Audit test constraints
+        run: pip-audit --strict --requirement ci/constraints-test.txt
+
+      - name: Audit linting constraints
+        run: pip-audit --strict --requirement ci/constraints-linting.txt
+
+      - name: Audit docs constraints
+        run: pip-audit --strict --requirement ci/constraints-docs.txt
+
+      - name: Audit audit constraints (self-check)
+        run: pip-audit --strict --requirement ci/constraints-audit.txt
 
   c-abi-consumer:
     # Build a standalone downstream extension against the bocpy public
@@ -64,20 +118,15 @@ jobs:
         python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
-      - name: Use Python ${{matrix.python_version}}
-        uses: actions/setup-python@v6
+      - name: Setup bocpy for testing
+        uses: ./.github/actions/setup-bocpy-test
         with:
-          python-version: ${{matrix.python_version}}
-
-      - name: Install bocpy
-        # Scrub the workflow-level BOCPY_BUILD_INTERNAL_TESTS=1 here:
-        # this job never invokes the internal-test extension, so
-        # building it is pure overhead.
-        env:
-          BOCPY_BUILD_INTERNAL_TESTS: ""
-        run: pip install -e .[test] --verbose
+          python-version: ${{ matrix.python_version }}
+          # c-abi-consumer never invokes the private internal-test
+          # extension, so building it is pure overhead.
+          install-internal-tests: "false"
 
       - name: Build downstream consumer extension
         run: pip install --no-build-isolation ./templates/c_abi_consumer
@@ -95,10 +144,10 @@ jobs:
       BOCPY_BUILD_INTERNAL_TESTS: ""
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Use Python 3.14
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
         with:
           python-version: 3.14
 
@@ -125,7 +174,7 @@ jobs:
         env:
           BOCPY_TEST_WHEEL: "1"
         run: |
-          pip install pytest
+          pip install -r ci/constraints-test.txt --require-hashes
           pytest -vv test/test_public_c_abi.py
 
   cpp-format:
@@ -137,10 +186,10 @@ jobs:
           - check: templates/c_abi_consumer/src
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Run clang-format style check
-        uses: jidicula/clang-format-action@v4.18.0
+        uses: jidicula/clang-format-action@f0579197b8e560e64388bb4924ad943b8bc15552  # v4.18.0
         with:
           clang-format-version: '18'
           check-path: ${{matrix.path['check']}}
@@ -153,19 +202,12 @@ jobs:
         python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
-      - name: Use Python ${{matrix.python_version}}
-        uses: actions/setup-python@v6
+      - name: Setup bocpy for testing
+        uses: ./.github/actions/setup-bocpy-test
         with:
-          python-version: ${{matrix.python_version}}
-
-      - name: Get dependencies
-        run: |
-          python -m pip install --upgrade pip
-
-      - name: Python build
-        run: pip install -e .[test] --verbose
+          python-version: ${{ matrix.python_version }}
 
       - name: Python test
         run: pytest -vv -s
@@ -177,19 +219,12 @@ jobs:
         python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
-      - name: Use Python ${{matrix.python_version}}
-        uses: actions/setup-python@v6
+      - name: Setup bocpy for testing
+        uses: ./.github/actions/setup-bocpy-test
         with:
-          python-version: ${{matrix.python_version}}
-
-      - name: Get dependencies
-        run: |
-          python -m pip install --upgrade pip
-
-      - name: Python build
-        run: pip install -e .[test] --verbose
+          python-version: ${{ matrix.python_version }}
 
       - name: Python test
         run: pytest -vv -s
@@ -201,20 +236,13 @@ jobs:
         python_version: ["3.12"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
-      - name: Use Python ${{matrix.python_version}} (x86)
-        uses: actions/setup-python@v6
+      - name: Setup bocpy for testing
+        uses: ./.github/actions/setup-bocpy-test
         with:
-          python-version: ${{matrix.python_version}}
+          python-version: ${{ matrix.python_version }}
           architecture: x86
-
-      - name: Get dependencies
-        run: |
-          python -m pip install --upgrade pip
-
-      - name: Python build
-        run: pip install -e .[test] --verbose
 
       - name: Python test
         run: pytest -vv -s
@@ -226,19 +254,12 @@ jobs:
         python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
-      - name: Use Python ${{matrix.python_version}}
-        uses: actions/setup-python@v6
+      - name: Setup bocpy for testing
+        uses: ./.github/actions/setup-bocpy-test
         with:
-          python-version: ${{matrix.python_version}}
-
-      - name: Get dependencies
-        run: |
-          python -m pip install --upgrade pip
-
-      - name: Python build
-        run: pip install -e .[test] --verbose
+          python-version: ${{ matrix.python_version }}
 
       - name: Python test
         run: pytest -vv -s
@@ -250,19 +271,12 @@ jobs:
         python_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
-      - name: Use Python ${{matrix.python_version}}
-        uses: actions/setup-python@v6
+      - name: Setup bocpy for testing
+        uses: ./.github/actions/setup-bocpy-test
         with:
-          python-version: ${{matrix.python_version}}
-
-      - name: Get dependencies
-        run: |
-          python -m pip install --upgrade pip
-
-      - name: Python build
-        run: pip install -e .[test] --verbose
+          python-version: ${{ matrix.python_version }}
 
       - name: Python test
         run: pytest -vv -s
@@ -274,19 +288,12 @@ jobs:
         python_version: ["3.13t", "3.14t"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
-      - name: Use Python ${{matrix.python_version}}
-        uses: actions/setup-python@v6
+      - name: Setup bocpy for testing
+        uses: ./.github/actions/setup-bocpy-test
         with:
-          python-version: ${{matrix.python_version}}
-
-      - name: Get dependencies
-        run: |
-          python -m pip install --upgrade pip
-
-      - name: Python build
-        run: pip install -e .[test] --verbose
+          python-version: ${{ matrix.python_version }}
 
       - name: Verify GIL is disabled
         run: python -c "import sys; assert not sys._is_gil_enabled(), 'GIL should be disabled'"
@@ -295,7 +302,7 @@ jobs:
         run: python -c "import bocpy; import sys; assert not sys._is_gil_enabled(), 'GIL re-enabled on import'"
 
       - name: Python test
-        uses: nick-fields/retry@v4
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60  # v4.0.0
         with:
           max_attempts: 3
           timeout_minutes: 10
@@ -307,7 +314,7 @@ jobs:
       CPYTHON_VERSION: v3.14.2
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Install build dependencies
         run: |
@@ -340,8 +347,9 @@ jobs:
         run: |
           source "$RUNNER_TEMP/asan-venv/bin/activate"
           python -m pip install --upgrade pip
+          pip install -r ci/constraints-test.txt --require-hashes
           CC="clang -fsanitize=address,undefined -fno-sanitize=vptr" \
-            pip install -e .[test] --verbose
+            pip install -e . --no-deps --verbose
 
       - name: Run tests
         env:

@@ -67,8 +67,7 @@ def queue_stats() -> list[dict[str, Any]]:
 
 
 def physical_cpu_count() -> int:
-    """Return the best-effort count of physical CPU cores available to
-    this process.
+    """Return a best-effort count of physical CPU cores available to this process.
 
     Unlike ``os.cpu_count()`` and ``len(os.sched_getaffinity(0))``,
     excludes hyperthread / SMT siblings so it reflects the count of

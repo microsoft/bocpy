@@ -1434,3 +1434,382 @@ class TestNoticeSyncReturnType:
             send("assert", (result, None))
 
         receive_asserts()
+
+
+# ---------------------------------------------------------------------------
+# Pin-walker audit: cowns hidden from the walker must not survive a write.
+# ---------------------------------------------------------------------------
+#
+# The pin walker (``_gather_pins`` / ``_collect_cown_capsules``) traverses
+# ``__dict__``, ``__slots__`` (up the MRO), and the standard container
+# protocols (dict/list/tuple/set/frozenset). A value whose pickler reaches
+# a cown by *any other route* — module-level cache lookup, closure capture,
+# ``copyreg.dispatch_table``, custom ``__reduce__`` / ``__getstate__`` —
+# would, without the audit, produce a borrowing token whose underlying
+# ``BOCCown`` is not held alive by the noticeboard entry's pin set. The
+# first reader to resurrect that pointer after the writer's local wrapper
+# drops would touch freed memory (CWE-416).
+#
+# The audit checks every ``CownCapsule_reduce`` against the caller's pin
+# set during the borrowing pickle and fails the whole write closed if any
+# cown is unaccounted for. These tests pin that contract.
+
+
+# Module-level state for the hidden-cown reducer. The class can be pickled
+# by sub-interpreters (it's importable), but the inner cown is fetched via
+# the module cache rather than stored as an attribute — so the walker
+# cannot see it.
+_HIDDEN_CACHE: dict = {}
+
+
+class _HiddenCownToken:
+    """Pickles to a cown the walker cannot find.
+
+    The constructor stashes the cown in a module-level dict keyed by an
+    integer. The instance itself carries only the key, so ``__dict__``
+    holds no cowns and the walker pins nothing. ``__reduce__`` then pulls
+    the cown back out of the cache so the unpickle emits a CownCapsule —
+    exactly the shape a user might write to "optimise" a class with
+    ``__reduce__`` without realising the cown has become invisible to
+    the noticeboard's pin machinery.
+    """
+
+    def __init__(self, key, cown=None):
+        self.key = key
+        if cown is not None:
+            _HIDDEN_CACHE[key] = cown
+
+    def __reduce__(self):
+        return (_rebuild_hidden, (self.key, _HIDDEN_CACHE[self.key]))
+
+
+def _rebuild_hidden(key, cown):
+    return _HiddenCownToken(key, cown)
+
+
+class _VisibleCownPair:
+    """Custom ``__reduce__`` whose cowns are also visible to the walker.
+
+    This is the documented optimisation pattern: a class defines
+    ``__reduce__`` to control its pickle shape but keeps the cown
+    references in plain attributes so the walker pins them. The
+    pin-walker audit must keep this pattern working — rejecting it
+    would punish every user who follows the documented pickle
+    optimisation guide.
+    """
+
+    def __init__(self, a, b):
+        self.a = a
+        self.b = b
+
+    def __reduce__(self):
+        return (_VisibleCownPair, (self.a, self.b))
+
+
+class TestNoticeboardHiddenCownRejection:
+    """A cown reached only via a custom reducer must abort the write."""
+
+    @classmethod
+    def teardown_class(cls):
+        """Drain the runtime after the suite."""
+        wait()
+
+    def setup_method(self):
+        _core.noticeboard_clear()
+        _HIDDEN_CACHE.clear()
+
+    def teardown_method(self):
+        # Symmetric clear so a strong reference to the hidden cown
+        # (the dict value) does not linger past the test that created
+        # it. Without this, the cown survives until the next test's
+        # setup_method runs — long enough to alias with subsequent
+        # noticeboard activity if the suite is reordered or a new
+        # test imports _HiddenCownToken from another module.
+        _HIDDEN_CACHE.clear()
+
+    def test_hidden_cown_rejected_and_entry_not_installed(self, caplog):
+        """Walker-invisible cown -> warning logged, entry never appears."""
+        x = Cown(0)
+
+        @when(x)
+        def writer(x):
+            hidden_cown = Cown(42)
+            # _HIDDEN_CACHE entry created as a side effect; only the key
+            # is reachable through __dict__, so _gather_pins returns [].
+            token = _HiddenCownToken(7, hidden_cown)
+            notice_write("hidden", token)
+            notice_sync()
+
+        @when(x, writer)
+        def reader(x, _):
+            # The audit fires on the noticeboard thread; the exception
+            # is caught and logged at WARNING. The behavioural assertion
+            # is that the entry never landed.
+            send("assert", (notice_read("hidden"), None))
+
+        with caplog.at_level("WARNING", logger="behaviors"):
+            receive_asserts()
+
+        matching = [
+            r for r in caplog.records
+            if r.name == "behaviors"
+            and "noticeboard_write('hidden') failed" in r.getMessage()
+            and "pin walker did not see" in r.getMessage()
+        ]
+        assert matching, (
+            "expected a WARNING from the noticeboard thread naming the "
+            f"rejected key and the pin-walker error text, got: "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )
+
+    def test_custom_reduce_with_visible_cowns_still_works(self):
+        """The documented ``__reduce__`` optimisation pattern is preserved.
+
+        ``_VisibleCownPair`` defines ``__reduce__`` but keeps its cowns
+        in ``__dict__`` — the walker pins them. The write must succeed
+        and the value must round-trip; this regression-guards against an
+        over-eager pin-walker audit that rejects every custom reducer.
+        """
+        x = Cown(0)
+
+        @when(x)
+        def writer(x):
+            a = Cown("a")
+            b = Cown("b")
+            notice_write("pair", _VisibleCownPair(a, b))
+            notice_sync()
+
+        @when(x, writer)
+        def reader(x, _):
+            pair = notice_read("pair")
+            # Snapshot returned a value, the value is the right type,
+            # and both embedded cowns survived as live CownCapsules.
+            send("assert", (pair is not None, True))
+            send("assert", (isinstance(pair, _VisibleCownPair), True))
+            send("assert", (isinstance(pair.a, Cown), True))
+            send("assert", (isinstance(pair.b, Cown), True))
+
+        receive_asserts(4)
+
+
+class TestWaitNoticeboardCapture:
+    """Tests for ``wait(noticeboard=True)`` final-state capture.
+
+    Mirrors the existing ``wait(stats=True)`` pattern. The snapshot is
+    taken on the main thread after the noticeboard mutator has exited
+    but before the entries are freed by ``noticeboard_clear()``.
+
+    ``wait()`` itself is the quiescence barrier *and* drains the
+    ``boc_noticeboard`` queue (the shutdown sentinel is FIFO behind
+    every prior mutation), so the test bodies do not need an extra
+    ``send``/``receive`` handshake or a ``notice_sync()`` before
+    calling ``wait(noticeboard=True)``.
+    """
+
+    @classmethod
+    def teardown_class(cls):
+        """Drain the runtime after the suite."""
+        wait()
+
+    def test_wait_noticeboard_true_returns_final_state(self):
+        """The captured dict contains everything a behavior wrote."""
+        wait()  # baseline: runtime down
+        x = Cown(0)
+
+        @when(x)
+        def _(x):
+            notice_write("answer", 42)
+            notice_write("label", "done")
+
+        snap = wait(noticeboard=True)
+        assert isinstance(snap, dict), type(snap)
+        assert snap.get("answer") == 42, snap
+        assert snap.get("label") == "done", snap
+
+    def test_wait_noticeboard_true_returns_plain_mutable_dict(self):
+        """Returned snapshot is a plain dict (not a MappingProxyType)."""
+        wait()
+        x = Cown(0)
+
+        @when(x)
+        def _(x):
+            notice_write("k", "v")
+
+        snap = wait(noticeboard=True)
+        # Plain dict means we can mutate locally without disturbing
+        # the now-cleared runtime.
+        snap["local_only"] = True
+        assert snap["local_only"] is True
+        assert snap.get("k") == "v"
+
+    def test_wait_noticeboard_true_runtime_never_started(self):
+        """Empty dict when the runtime was never up."""
+        wait()  # ensure runtime is down
+        assert wait(noticeboard=True) == {}
+
+    def test_wait_noticeboard_true_empty_noticeboard(self):
+        """Empty dict when no behavior wrote anything."""
+        wait()
+        x = Cown(0)
+
+        @when(x)
+        def _(x):
+            pass
+
+        snap = wait(noticeboard=True)
+        assert snap == {}, snap
+
+    def test_wait_default_returns_none_even_with_noticeboard_data(self):
+        """Default ``wait()`` is still ``None``."""
+        wait()
+        x = Cown(0)
+
+        @when(x)
+        def _(x):
+            notice_write("anything", 1)
+
+        assert wait() is None
+
+    def test_wait_stats_only_returns_list_unchanged(self):
+        """Single ``stats=True`` still returns a list."""
+        wait()
+        x = Cown(0)
+
+        @when(x)
+        def _(x):
+            notice_write("k", 1)
+
+        result = wait(stats=True)
+        assert isinstance(result, list), type(result)
+        assert len(result) >= 1
+
+    def test_wait_both_flags_returns_named_tuple(self):
+        """Both flags -> ``WaitResult`` with both fields populated."""
+        from bocpy import WaitResult
+        wait()
+        x = Cown(0)
+
+        @when(x)
+        def _(x):
+            notice_write("k", "v")
+
+        result = wait(stats=True, noticeboard=True)
+        assert isinstance(result, WaitResult), type(result)
+        # Tuple-shape access still works (NamedTuple).
+        stats_snap, nb_snap = result
+        assert isinstance(stats_snap, list), type(stats_snap)
+        assert isinstance(nb_snap, dict), type(nb_snap)
+        assert nb_snap.get("k") == "v"
+        assert len(stats_snap) >= 1
+        assert result.stats is stats_snap
+        assert result.noticeboard is nb_snap
+
+    def test_wait_both_flags_runtime_never_started(self):
+        """Both flags with no runtime -> WaitResult([], {})."""
+        from bocpy import WaitResult
+        wait()
+        result = wait(stats=True, noticeboard=True)
+        assert isinstance(result, WaitResult), type(result)
+        assert result.stats == []
+        assert result.noticeboard == {}
+
+    def test_wait_noticeboard_captures_complex_value(self):
+        """Pickle-roundtrip values (dict/list) are preserved verbatim."""
+        wait()
+        x = Cown(0)
+
+        @when(x)
+        def _(x):
+            notice_write("nested", {"counter": 7, "items": [1, 2, 3]})
+
+        snap = wait(noticeboard=True)
+        assert snap.get("nested") == {"counter": 7, "items": [1, 2, 3]}
+
+    def test_wait_noticeboard_reflects_later_writes(self):
+        """The final dict reflects the last write, not the first."""
+        wait()
+        x = Cown(0)
+
+        @when(x)
+        def _(x):
+            notice_write("k", "first")
+            notice_write("k", "second")
+            notice_write("k", "third")
+
+        snap = wait(noticeboard=True)
+        assert snap.get("k") == "third", snap
+
+    def test_wait_noticeboard_reflects_deletes(self):
+        """Keys deleted via ``notice_delete`` are absent from snapshot."""
+        wait()
+        x = Cown(0)
+
+        @when(x)
+        def writer(x):
+            notice_write("keep", 1)
+            notice_write("drop", 2)
+
+        # A second behavior runs the delete -- and because it is
+        # ordered after ``writer`` via the cown chain, the delete
+        # is guaranteed to land after the writes (FIFO ordering on
+        # the noticeboard queue alone is not enough across separate
+        # behaviors, which the cown chain provides).
+        @when(x, writer)
+        def deleter(x, _):
+            notice_delete("drop")
+
+        snap = wait(noticeboard=True)
+        assert "keep" in snap
+        assert "drop" not in snap, snap
+
+    def test_wait_noticeboard_across_restart(self):
+        """A fresh session starts with an empty noticeboard snapshot."""
+        wait()
+        x = Cown(0)
+
+        @when(x)
+        def _(x):
+            notice_write("session1", True)
+
+        snap1 = wait(noticeboard=True)
+        assert snap1.get("session1") is True
+
+        # New session; the previous session's data must be gone.
+        y = Cown(0)
+
+        @when(y)
+        def _(y):
+            pass
+
+        snap2 = wait(noticeboard=True)
+        assert "session1" not in snap2, snap2
+
+    def test_wait_noticeboard_survives_explicit_stop(self):
+        """Explicit ``stop()`` before ``wait()`` preserves the snapshot.
+
+        ``stop()`` is documented as idempotent; the snapshot capture
+        is a single-shot teardown step and a second invocation (from
+        ``wait()``-triggered re-entry) must NOT re-snapshot the
+        now-empty noticeboard.
+        """
+        import bocpy.behaviors as B
+
+        wait()
+        x = Cown(0)
+
+        @when(x)
+        def _(x):
+            notice_write("k", "v")
+
+        # Explicit stop drives quiescence and captures the snapshot.
+        inst = B.BEHAVIORS
+        assert inst is not None
+        inst.stop()
+        assert inst._final_noticeboard == {"k": "v"}, (
+            inst._final_noticeboard
+        )
+
+        # Now ``wait(noticeboard=True)`` re-enters ``stop()``; the
+        # captured snapshot must survive the second pass.
+        snap = wait(noticeboard=True)
+        assert snap == {"k": "v"}, snap

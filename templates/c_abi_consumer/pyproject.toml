@@ -3,7 +3,12 @@
 # `import bocpy` in setup.py. Always install with --no-build-isolation
 # so the build resolves headers against the bocpy install actually
 # being tested. See README.md.
-requires = ["setuptools", "wheel", "bocpy"]
+#
+# The compatible-release bound (~=0.7) keeps the template aligned with
+# the public C ABI it was authored against; bump it in lock-step with
+# ``[project].version`` in the root ``pyproject.toml`` (see the
+# ``finalize-pr`` skill).
+requires = ["setuptools", "wheel", "bocpy~=0.7"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -11,4 +16,4 @@ name = "bocpy-c-abi-consumer"
 version = "0.0.0"
 description = "Smoke test and canonical downstream template for the bocpy public C ABI."
 requires-python = ">=3.10"
-dependencies = ["bocpy"]
+dependencies = ["bocpy~=0.7"]

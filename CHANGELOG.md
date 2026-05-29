@@ -1,3 +1,259 @@
+## 2026-05-28 - Version 0.7.0
+Cown-lifecycle correctness fixes — three use-after-free paths in the
+``CownCapsule`` pickle / acquire / noticeboard machinery now hold the
+inner ``BOCCown`` alive across the writer's wrapper drop — plus
+supply-chain hardening: pinned and hash-verified Python dependencies,
+SHA-pinned GitHub Actions, dependabot coverage, vulnerability scanning,
+and PEP 770 SBOMs embedded in every wheel.
+
+**New Features**
+
+- **PEP 770 SBOMs in every wheel** — every wheel built by
+  ``.github/workflows/build_wheels.yml`` now embeds a
+  `CycloneDX 1.6 <https://cyclonedx.org/specification/overview/>`_
+  JSON SBOM under ``<dist>-<version>.dist-info/sboms/bocpy.cdx.json``.
+  Generation runs inside cibuildwheel's repair step on every platform
+  (Linux ``auditwheel``, macOS ``delocate``, Windows direct injection)
+  via the new stdlib-only ``scripts/build_sbom.py``. The
+  ``inject`` subcommand rewrites the wheel's ``RECORD`` atomically
+  (temp file + rename).
+- **SBOM verification in CI** — the new ``verify_sboms`` job in
+  ``build_wheels.yml`` re-downloads the extracted SBOM artifact and
+  runs two checks: ``scripts/validate_sbom.py`` (stdlib-only
+  structural validator pinning bocpy's wire format) and
+  `grype <https://github.com/anchore/grype>`_ (third-party SBOM
+  scanner) with ``--fail-on high``. A separate ``sboms`` artifact is
+  also uploaded by the ``merge`` job for downstream consumers.
+- **``bocpy.__version__``** — a runtime version attribute derived
+  from ``importlib.metadata.version("bocpy")``, with a
+  ``PackageNotFoundError`` fallback. Exported from ``bocpy.__all__``
+  and documented in ``__init__.pyi``. ``pyproject.toml`` remains the
+  single source of truth for the version.
+- **New documentation** — :doc:`sbom` walk-through covering the
+  embedded SBOM format, extraction recipes, and verification commands.
+- **``wait(noticeboard=True)`` final-state capture** — :func:`wait`
+  now accepts a ``noticeboard`` keyword that returns the final
+  noticeboard contents as a plain ``dict`` at shutdown (after the
+  noticeboard thread exits, before the entries are freed). Useful
+  for surfacing an early-stopping result, last error, or aggregated
+  counter that a behavior deposited just before the runtime
+  quiesced, replacing the older ``send`` / ``receive`` handshake
+  that earlier examples used. Combined with ``stats=True`` it
+  returns a new :class:`WaitResult` ``NamedTuple`` (also exported
+  from ``bocpy.__all__``) carrying both snapshots. The
+  ``examples/prime_factor.py`` example was migrated to the new
+  pattern.
+
+**Bug Fixes**
+
+- **Cown-in-cown use-after-free** — a ``Cown`` embedded inside
+  another cown's value, a message-queue payload, or a noticeboard
+  snapshot was previously freed when the writer's local wrapper
+  dropped, because pickle bytes carry no refcount on their own.
+  ``CownCapsule_reduce`` now takes an inheriting ``COWN_INCREF`` that
+  ``_cown_capsule_from_pointer_inheriting`` consumes on unpickle, so
+  the inner ``BOCCown`` survives until the consumer drops its
+  decoded wrapper. Affects every cross-cown reference shape — see
+  the new ``TestCownInCown`` class for the full container-shape fuzz.
+- **Acquire-failure poisoned-state** — when ``pickle.loads`` failed
+  partway through ``cown_acquire``, the cown was left in a
+  half-acquired state with the encoded bytes still in place. A retry
+  would re-run pickle against bytes whose embedded inherited refs
+  had already been partially consumed by pickle's error path,
+  risking dereferences of freed ``BOCCown*`` pointers. The cown's
+  ``xidata`` is now recycled on the failure path and a guard at the
+  top of ``cown_acquire`` rejects any future acquire with a
+  deterministic ``RuntimeError``; the worker recovery arm surfaces
+  it on the failing behavior's result cown.
+- **Noticeboard hidden-cown audit** — when a noticeboard value
+  reached a ``Cown`` via a route the pin walker cannot see — custom
+  ``__reduce__`` / ``__getstate__``, ``copyreg.dispatch_table``,
+  closure capture, module-level cache — the borrowing reconstructor
+  produced a token whose inner ``BOCCown`` was not held alive by
+  the entry's pin set, leaving the next reader to UAF after the
+  writer's wrapper dropped. A per-thread borrowing context
+  (``BOC_NB_CTX``) now audits every ``CownCapsule_reduce`` against
+  the caller's pin set during the noticeboard write pickle and
+  fails the whole ``notice_write`` / ``notice_update`` closed if
+  any cown is unaccounted for.
+- **`UnicodeDecodeError` on non-UTF-8 Windows locales** —
+  ``Behaviors.start`` read ``worker.py`` with ``open(path)``, which
+  picks up ``locale.getpreferredencoding(False)``. On cp1252
+  (English Windows) the UTF-8 em-dashes in the worker source were
+  silently mojibake-d; on cp949 (Korean Windows) the read failed
+  with ``UnicodeDecodeError: 'cp949' codec can't decode byte 0xe2``
+  and ``bocpy`` could not start at all (reported in
+  `#14 <https://github.com/microsoft/bocpy/issues/14>`_ by
+  `@Forthoney <https://github.com/Forthoney>`_). Fixed by passing
+  ``encoding="utf-8"`` explicitly in ``Behaviors.start``, and the
+  same fix was applied to every other ``open()`` site in the repo
+  that reads or writes text known to contain non-ASCII bytes
+  (``sphinx/source/conf.py``, ``examples/sketches.py`` x2,
+  ``export_module.py``).
+- **Silent worker-startup failures** — ``Behaviors.start_workers``
+  ran ``interpreters.create()`` and ``interpreters.run_string()``
+  on the worker thread without a try/except, so a failure in either
+  killed the thread without ever replying on ``boc_behavior``. The
+  parent's bounded ``receive()`` then timed out with no diagnostic.
+  Both calls are now wrapped, and every failure path sends a
+  formatted traceback over ``boc_behavior`` so the parent sees a
+  structured error instead of a timeout.
+- **Silent worker bootstrap import failures** — the generated
+  bootstrap script that loads the user module into each worker
+  sub-interpreter is now wrapped in a top-level try/except. Any
+  ``BaseException`` is formatted with the user module name and sent
+  over ``boc_behavior`` (falls back to ``sys.stderr`` if the
+  message-queue ``send`` itself raises), then re-raised so
+  ``run_string`` reports it as well. Module-import failures that
+  previously surfaced only as a worker-startup timeout now arrive
+  as a proper traceback.
+- **``boc_sched_worker_pop_slow`` skipped ``popped_local``** — the
+  slow-path pending-fallback and WSQ-dequeue branches returned
+  work without bumping ``popped_local`` (the fast path always
+  did), so the documented producer/consumer identity in
+  :c:type:`boc_sched_stats_t` was violated whenever the fairness
+  arm fired or a worker entered the slow path directly. Both
+  branches now increment ``popped_local`` and reset the batch
+  budget, matching the fast path. The header's reconciliation
+  paragraph was also tightened to a "near-identity" that explicitly
+  accounts for fairness-token pops (which are re-enqueued via raw
+  ``boc_wsq_enqueue`` rather than ``boc_sched_dispatch``, leaving
+  consumer-side counters without a matching producer-side bump).
+
+**Supply Chain**
+
+- **Hashed and pinned Python dependencies** — every CI dependency is
+  resolved into a ``ci/constraints-<extra>.txt`` file via
+  ``uv pip compile --universal --generate-hashes`` and installed with
+  ``pip install --require-hashes``. Covers the ``test``, ``linting``,
+  ``docs``, and new ``audit`` extras. ``bocpy`` itself is then
+  installed via ``pip install -e . --no-deps`` so an editable build
+  cannot smuggle in an unpinned transitive dependency.
+- **Vulnerability scanning** — new ``audit`` job in ``pr_gate.yml``
+  runs ``pip-audit --strict`` against every constraints file on every
+  PR. ``pip-audit`` itself is pinned via ``ci/constraints-audit.txt``
+  and self-checked. A new ``.github/workflows/nightly_audit.yml``
+  re-runs the audit nightly against ``main``.
+- **SHA-pinned GitHub Actions** — every ``uses:`` line in
+  ``.github/workflows/`` is now pinned to a full 40-char commit SHA
+  with a trailing ``# vX.Y.Z`` comment.
+- **Dependabot coverage** — new ``.github/dependabot.yml`` covers
+  three ecosystems (``pip`` rooted at ``/ci``, ``github-actions``
+  rooted at ``/``, ``pip`` rooted at
+  ``/templates/c_abi_consumer``), grouped weekly per ecosystem.
+- **Downstream template pinned** — ``templates/c_abi_consumer``
+  pins ``bocpy~=MAJOR.MINOR`` as both a build requirement and a
+  runtime dependency. The ``finalize-pr`` skill bumps it in
+  lock-step with the root version.
+- **New ``SUPPLY_CHAIN.md``** — top-level policy doc describing
+  everything above with the exact regeneration commands.
+
+**Documentation**
+
+- **Cown pickle-leak note** — :class:`Cown` now documents that
+  ``pickle.dumps`` on a cown produces bytes that carry one strong
+  reference per embedded cown; orphan bytes (never unpickled in the
+  producing process) leak one strong ref per byte string. The bocpy
+  runtime never produces orphan bytes; the leak surface only
+  applies to third-party code that calls ``pickle.dumps(cown)``
+  directly.
+- **Noticeboard cown-lifetime guarantee** — :func:`notice_write` and
+  :func:`notice_update` now document that values may embed
+  :class:`Cown` references and that the noticeboard keeps each
+  embedded cown alive for as long as the entry remains. The new
+  paragraph in :doc:`noticeboard` mirrors this guarantee for
+  readers.
+- **Noticeboard final-state capture guide** — :doc:`noticeboard`
+  gained a "Reading the Final State at Shutdown" section covering
+  the ``wait(noticeboard=True)`` contract, the combined
+  ``wait(stats=True, noticeboard=True)`` form returning
+  :class:`WaitResult`, the empty-dict fallbacks for the
+  never-started and never-written cases, and the recommendation
+  to use ``snap.get(key)`` since :func:`wait` quiesces as soon as
+  every behavior completes with no guarantee any particular write
+  has landed. The early-stopping worked example in the same file
+  was rewritten around the new API.
+
+**Tests**
+
+- **``TestCownInCown``** in ``test/test_boc.py`` — pins the
+  cown-in-cown UAF fix with three cases: an inner cown allocated
+  inside a behavior and observed by a downstream behavior, a cown
+  sent through the message queue and consumed by the receiver, and
+  a 50-trial deterministic fuzz over seven container shapes
+  (``list`` / ``tuple`` / ``dict`` / ``@dataclass(slots=True)`` /
+  ``__dict__``-only / ``__slots__``-only / 2-level ``Cown[Cown[T]]``).
+- **``TestAcquireFailureTerminal``** in ``test/test_boc.py`` — pins
+  the poisoned-state contract: after a deserialisation failure the
+  cown stays permanently unavailable and every subsequent waiter
+  receives the deterministic ``RuntimeError`` on its result cown.
+- **Noticeboard hidden-cown regressions** in
+  ``test/test_noticeboard.py`` — exercises ``__reduce__`` and
+  ``copyreg.dispatch_table`` reductions that hide a cown from the
+  pin walker, and verifies the audit rejects the write closed
+  rather than leaving an unpinned borrowing token in the entry.
+  A complementary ``_VisibleCownPair`` test guards against the
+  over-eager-rejection regression.
+- **``test/test_version.py``** — covers ``bocpy.__version__``:
+  pyproject parity, PEP 440 shape, ``__all__`` export, and the
+  ``importlib.metadata`` fallback path (subprocess test that
+  verifies the WARNING is emitted when the metadata lookup raises).
+- **``test/test_build_sbom.py`` and ``test/test_validate_sbom.py``**
+  — full coverage of the SBOM generator and validator: CycloneDX
+  1.6 shape, deterministic UUIDv5 serialNumber,
+  ``SOURCE_DATE_EPOCH`` timestamp, per-entry ZIP-attribute
+  preservation (``external_attr`` / ``create_system`` /
+  ``compress_type`` / ``date_time``) across symlink and
+  ``ZIP_STORED`` entries, atomic ``RECORD`` rewrite, and the CLI
+  ``generate`` / ``inject`` / ``validate`` modes.
+- **``TestWaitNoticeboardCapture``** in ``test/test_noticeboard.py``
+  — pins the ``wait(noticeboard=True)`` contract: returned dict is a
+  plain mutable ``dict``, empty-runtime / empty-noticeboard fallbacks
+  to ``{}``, single-flag back-compat (``wait()`` stays ``None``,
+  ``wait(stats=True)`` stays ``list``), combined-flag
+  :class:`WaitResult` shape, last-write-wins, delete propagation
+  through a chained behavior, fresh-session isolation, and the
+  single-shot guarantee that an explicit ``stop()`` followed by
+  ``wait(noticeboard=True)`` preserves the snapshot rather than
+  re-snapshotting the now-empty noticeboard. The existing
+  scheduler-stats tests in ``test/test_scheduler_stats.py`` were
+  simplified to use the cown-chain barrier directly rather than a
+  ``send``/``receive`` handshake, now that the same change is
+  exercised end-to-end by the new ``wait(noticeboard=True)`` tests.
+
+**Internal**
+
+- ``flake8`` now lints ``.pyi`` stubs (the default ``--filename``
+  glob silently skipped them). Pre-existing defects in
+  ``__init__.pyi``, ``_core.pyi``, and ``test_boc.py`` cleaned up in
+  the same pass. The workflow also lints the new ``scripts/``
+  directory.
+- **`flake8-encodings` added to the `[linting]` extra** — pins the
+  Windows-locale class of bug above as a permanent regression gate.
+  Any future ``open()`` call without an explicit ``encoding=``
+  (or with ``encoding=None``) now fails the PR-gate lint job. The
+  plugin and its transitive dependencies (``flake8-helper``,
+  ``astatine``, ``domdf-python-tools``, ``natsort``) are pinned and
+  hash-verified in ``ci/constraints-linting.txt`` like every other
+  CI dependency.
+- **Defensive ``receive()`` timeouts on every lifecycle path** —
+  ``Behaviors.start_workers``, ``stop_workers``, ``_abort_workers``,
+  and the noticeboard mutator loop now pass a bounded timeout to
+  every ``_core.receive()`` they own. A wedged worker therefore
+  fails fast with a deterministic ``RuntimeError`` instead of
+  hanging the parent forever. Defence in depth against the
+  sub-interpreter wedge observed on macOS arm64 + Python 3.12/3.13.
+- **No ``unittest.mock`` in test files that schedule ``@when``** —
+  the transpiler exports the whole test module for import in every
+  worker sub-interpreter, so a top-level ``from unittest import
+  mock`` triggers an ``import asyncio`` in every worker. On macOS
+  arm64 + Python 3.12/3.13 this can deadlock during PEP 684
+  per-interpreter init. Replaced by a small in-house
+  ``test/mockreplacement.py`` (``patch_attr`` context manager +
+  ``Recorder`` / ``RecorderMethod`` stubs) imported lazily inside
+  the few tests that need it. The pitfall is documented in the
+  ``testing-with-boc`` skill.
+
 ## 2026-05-10 - Version 0.6.0
 Public C ABI for downstream extensions, enabling C-level participation
 in behavior-oriented concurrency across worker sub-interpreters.
@@ -12,7 +268,7 @@ in behavior-oriented concurrency across worker sub-interpreters.
   also explicitly rejected.
 - **Public C ABI (`<bocpy/bocpy.h>`)** — downstream C extensions can
   now link against bocpy to register custom Python types as
-  cross-interpreter shareable so :class:`Cown` can carry instances of
+  cross-interpreter shareable so `Cown` can carry instances of
   them across worker interpreters. The header is C-only, version-gated
   via the ``BOCPY_ABI`` macro, and bumped on any incompatible change
   to ``bocpy.h`` or ``xidata.h``. Wheels remain CPython-version-tagged

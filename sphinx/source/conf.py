@@ -14,7 +14,7 @@ import textwrap
 project = 'bocpy'
 copyright = '2026, Microsoft'
 author = 'Microsoft'
-release = '0.6.0'
+release = '0.7.0'
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -65,7 +65,7 @@ def _parse_pyi_stub():
     if not os.path.exists(pyi_path):
         return {}
 
-    with open(pyi_path) as f:
+    with open(pyi_path, encoding="utf-8") as f:
         tree = ast.parse(f.read())
 
     def _sig_from_args(node):

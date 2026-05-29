@@ -63,7 +63,7 @@ behaviors. A simplified version of the pattern:
 
    from functools import partial
    from bocpy import (Cown, notice_read, notice_update, notice_write,
-                      receive, send, wait, when)
+                      wait, when)
 
 
    def append_result(existing, new_item):
@@ -89,10 +89,10 @@ behaviors. A simplified version of the pattern:
 
            if is_final_answer(result):
                # Signal all other workers to stop and publish the answer
-               # over a message channel (the noticeboard is torn down by
-               # wait(), so it cannot carry the result back to main).
+               # to the noticeboard. wait(noticeboard=True) will lift the
+               # final state back across runtime shutdown for us.
                notice_write("done", True)
-               send("answer", result)
+               notice_write("answer", result)
            else:
                # Record the partial result for diagnostics, then continue.
                notice_update("partials", partial(append_result, new_item=result),
@@ -106,13 +106,11 @@ behaviors. A simplified version of the pattern:
    for w in workers:
        process_batch(w)
 
-   # Collect the first final answer produced by any worker, then drain.
-   answer = receive("answer")[1]
-   wait()
-   print("final answer:", answer)
-   # After wait(), the noticeboard is torn down; "partials" is no longer
-   # readable. Snapshot it from inside a behavior before wait() returns
-   # if you need to inspect it.
+   # Drain the runtime and lift the final noticeboard state back. See
+   # "Reading the Final State at Shutdown" below for the API contract.
+   final = wait(noticeboard=True)
+   print("final answer:", final.get("answer"))
+   print("partials:    ", final.get("partials", []))
 
 **Key points:**
 
@@ -123,11 +121,47 @@ behaviors. A simplified version of the pattern:
 - ``notice_update("partials", append_result, ...)`` shows the read-modify-
   write pattern: ``append_result`` is run atomically against the current
   list, so concurrent appends from different workers don't lose entries.
-- The final answer is delivered over the message queue rather than the
-  noticeboard, because :func:`wait` tears the noticeboard down before
-  control returns to the main thread.
+- The final answer is lifted back through :func:`wait` with
+  ``noticeboard=True`` — :func:`wait` snapshots the noticeboard between
+  joining the noticeboard thread and clearing the C-side entries, so the
+  caller gets a plain ``dict`` of the last committed state.
 - The pattern is cooperative: there is no hard cancellation. Workers stop
   at the next polling point.
+
+Reading the Final State at Shutdown
+------------------------------------
+
+The noticeboard is torn down at the end of :func:`wait`: the dedicated
+mutator thread is joined and the C-side entries are freed before control
+returns to the main thread. To carry data back across that boundary, pass
+``noticeboard=True``::
+
+    from bocpy import wait
+
+    snap = wait(noticeboard=True)        # plain dict[str, Any]
+    print(snap.get("answer"))
+
+The snapshot is taken on the main thread between joining the noticeboard
+thread and clearing the entries, so every mutation enqueued by a behavior
+that completed before :func:`wait` returns is visible.
+
+The combined form returns a :class:`WaitResult` ``NamedTuple`` carrying
+the scheduler-stats snapshot alongside the noticeboard::
+
+    result = wait(stats=True, noticeboard=True)
+    print(result.noticeboard.get("answer"))
+    print(result.stats[0]["popped_local"])
+
+Edge cases:
+
+- If the runtime was never started (or already torn down), the
+  noticeboard snapshot is the empty dict ``{}`` rather than ``None``.
+- If a key your code expects might not have been written before
+  quiescence, use ``snap.get(key)`` (or check ``key in snap``) rather
+  than indexing — :func:`wait` quiesces as soon as every behavior
+  completes, with no guarantee any particular write happened.
+- The returned dict is a plain mutable ``dict``; mutating it locally
+  does not affect the (now-freed) noticeboard.
 
 Reading the Noticeboard
 -----------------------
@@ -152,6 +186,10 @@ of all entries, or :func:`notice_read` for a single key::
 The snapshot is taken once per behavior and cached — multiple calls to
 :func:`noticeboard` or :func:`notice_read` within the same behavior return
 data from the same point in time.
+
+Cowns embedded in a noticeboard entry remain valid for the lifetime of
+the entry; they survive as long as the entry has not been overwritten or
+deleted, regardless of how many readers have observed the entry.
 
 Writing and Updating
 --------------------

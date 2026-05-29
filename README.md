@@ -336,6 +336,42 @@ BOC is built on a solid foundation of serious scholarship and engineering. For f
 2. [Reference implementation in C#](https://github.com/microsoft/verona-rt/tree/main/docs/internal/concurrency/modelimpl)
 3. [OOPSLA23 Talk](https://www.youtube.com/watch?v=iX8TJWonbGU)
 
+## C API stability
+
+bocpy is implemented as a CPython C extension that links against the
+**private** cross-interpreter data API — `_PyXIData_*` on 3.14+,
+`_PyCrossInterpreterData_*` on 3.12 / 3.13, and on 3.13+ the internal header
+`internal/pycore_crossinterp.h` (which requires `Py_BUILD_CORE`). Under
+[PEP 689][pep689] these symbols are explicitly *unstable*: they may change
+shape, semantics, or disappear entirely between CPython minor releases, and
+there is no PyPI / setuptools metadata field that advertises this kind of
+dependency. The practical consequences are:
+
+- **Per-minor wheels.** Because we do not target the limited API
+  (`Py_LIMITED_API` / `abi3`), every wheel carries a version-specific ABI
+  tag (`cp310`, `cp311`, …, `cp315`). pip will only install a wheel that
+  matches the running interpreter's minor version. The `Programming
+  Language :: Python :: 3.x` classifiers in [pyproject.toml](pyproject.toml)
+  mirror this set.
+- **Source builds may lag CPython.** Alpha / beta / RC builds of a new
+  CPython minor frequently rename or reshape these private symbols. When
+  that happens, bocpy's `xidata.h` shim needs an update before it will
+  compile against the new headers; until then, install on a released
+  minor version.
+- **No CPython implementation other than CPython itself.** The internal
+  cross-interpreter machinery is CPython-specific, which is why the only
+  implementation classifier we set is
+  `Programming Language :: Python :: Implementation :: CPython`. PyPy,
+  GraalPy, and other alternatives are not supported.
+
+The compatibility ladder lives in
+[src/bocpy/include/bocpy/xidata.h](src/bocpy/include/bocpy/xidata.h);
+the `Py_BUILD_CORE` `#define` / `#undef` save-and-restore there is scoped
+narrowly to the one `#include` that needs it, so downstream C extensions
+that pull in `bocpy.h` do **not** inherit it.
+
+[pep689]: https://peps.python.org/pep-0689/
+
 > **Trademarks** This project may contain trademarks or logos for projects, products, or services.
 > Authorized use of Microsoft trademarks or logos is subject to and must follow Microsoft's
 > Trademark & Brand Guidelines. Use of Microsoft trademarks or logos in modified versions of this

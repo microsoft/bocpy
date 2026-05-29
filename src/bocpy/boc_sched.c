@@ -746,22 +746,37 @@ boc_bq_node_t *boc_sched_worker_pop_slow(boc_sched_worker_t *self) {
     }
 
     // Defensive: under normal flow `pop_fast` exhausts pending
-    // before falling through to `pop_slow`, but a future caller may
-    // enter slow-path directly (e.g. test harness). Honour pending
-    // first so we never park while an unconsumed thread-local item
-    // is sitting on this thread.
+    // before falling through to `pop_slow`, but the fairness gate
+    // in `pop_fast` returns NULL without consuming `pending` when
+    // it fires, and a future caller may enter slow-path directly
+    // (e.g. test harness). Honour pending first so we never park
+    // while an unconsumed thread-local item is sitting on this
+    // thread. Mirrors `pop_fast`'s pending-fallback branch: reset
+    // `batch` and bump `popped_local` to preserve the near-identity
+    // documented in @ref boc_sched_stats_t.
     if (pending != NULL) {
       boc_bq_node_t *n = pending;
       pending = NULL;
+      batch = BOC_BQ_BATCH_SIZE;
+      boc_atomic_fetch_add_u64_explicit(&self->stats.popped_local, 1,
+                                        BOC_MO_RELAXED);
       return n;
     }
 
     // ----- Local-queue dequeue -----
     //
     // Verona `get_work:165`. With the fairness arm cleared (or
-    // skipped) this is the primary work source.
+    // skipped) this is the primary work source. Mirrors `pop_fast`'s
+    // wsq-dequeue success: reset `batch` and bump `popped_local` so
+    // the global stats invariant holds. The `batch_resets` bump is
+    // intentionally omitted here -- this branch is only reached
+    // when the `pending` check above found NULL, so there was no
+    // pending to "reset over".
     boc_bq_node_t *n = boc_wsq_dequeue(self);
     if (n != NULL) {
+      batch = BOC_BQ_BATCH_SIZE;
+      boc_atomic_fetch_add_u64_explicit(&self->stats.popped_local, 1,
+                                        BOC_MO_RELAXED);
       return n;
     }
 
