@@ -729,3 +729,106 @@ def test_cli_generate_accepts_wheel_filename_alone(
     )
     assert rc == 0
     assert out_path.is_file()
+
+
+# ---------------------------------------------------------------------------
+# PyPI RECORD-mismatch regression (the 0.7.0 warning email bug)
+# ---------------------------------------------------------------------------
+
+
+def _build_probe_wheel_with_dir_entries(path: Path) -> None:
+    """Build a probe wheel that includes explicit ZIP directory entries.
+
+    ``auditwheel`` (and ``delocate``) emit one ZIP entry per directory
+    in the repaired wheel — ``bocpy/``, ``bocpy/include/``,
+    ``bocpy-X.Y.Z.dist-info/`` and so on. ``zipfile.writestr(str, ...)``
+    does not produce these, so the default ``_build_probe_wheel`` did
+    not exercise the code path that broke 0.7.0. This helper does.
+    """
+    file_entries = [
+        (f"{DIST}/__init__.py", b'__version__ = "0.6.0"\n'),
+        (f"{DIST}/_core.so", PROBE_PAYLOAD),
+        (f"{DIST_INFO}/METADATA", PROBE_METADATA),
+        (f"{DIST_INFO}/WHEEL", PROBE_WHEEL_META),
+    ]
+    dir_entries = [
+        f"{DIST}/",
+        f"{DIST_INFO}/",
+    ]
+
+    record_buf = io.StringIO()
+    writer = csv.writer(record_buf, lineterminator="\n")
+    # Mimic the pre-fix injector exactly: emit a RECORD row for every
+    # ZIP entry, including the directories (empty hash, size 0).
+    for arcname, data in file_entries:
+        writer.writerow(_record_row(arcname, data))
+    for arcname in dir_entries:
+        writer.writerow((arcname, "", "0"))
+    writer.writerow((f"{DIST_INFO}/RECORD", "", ""))
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as wheel:
+        for arcname in dir_entries:
+            info = zipfile.ZipInfo(filename=arcname)
+            info.external_attr = (0o040755 << 16) | 0x10
+            wheel.writestr(info, b"")
+        for arcname, data in file_entries:
+            wheel.writestr(arcname, data)
+        wheel.writestr(f"{DIST_INFO}/RECORD", record_buf.getvalue())
+
+
+def test_inject_sbom_strips_directory_entries(tmp_path: Path) -> None:
+    """Regression: an SBOM-injected wheel must pass PyPI's validate_record.
+
+    A wheel produced by ``auditwheel``/``delocate`` carries explicit
+    ZIP directory entries. The pre-fix injector copied every entry —
+    directories included — into the new RECORD with empty SHA-256
+    rows. PyPI's ``validate_record`` strips trailing-slash entries
+    from the ZIP side before comparing as a set, so those rows
+    became phantom RECORD entries and triggered
+    ``send_wheel_record_mismatch_email`` for every 0.7.0 wheel.
+
+    After the fix, the injector drops directory entries entirely.
+    """
+    import sys
+
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    try:
+        from _vendored_warehouse_wheel import (  # type: ignore
+            InvalidWheelRecordError,
+            validate_record,
+        )
+    finally:
+        sys.path.pop(0)
+
+    wheel_path = (
+        tmp_path
+        / f"{DIST}-{VERSION}-cp314-cp314-manylinux_2_28_x86_64.whl"
+    )
+    _build_probe_wheel_with_dir_entries(wheel_path)
+
+    # Sanity check: the pre-injection wheel reproduces the 0.7.0
+    # failure (i.e. our regression fixture is faithful).
+    with pytest.raises(InvalidWheelRecordError):
+        validate_record(str(wheel_path))
+
+    build_sbom.inject_sbom_into_wheel(wheel_path, b'{"v": 1}\n')
+
+    # 1. PyPI's validator now accepts the wheel.
+    validate_record(str(wheel_path))
+
+    # 2. No directory entries leaked into the new ZIP or RECORD.
+    with zipfile.ZipFile(wheel_path, "r") as wheel:
+        for info in wheel.infolist():
+            assert not info.is_dir(), (
+                f"directory entry survived injection: {info.filename!r}"
+            )
+        record_text = wheel.read(
+            f"{DIST_INFO}/RECORD"
+        ).decode("utf-8")
+
+    for row in csv.reader(io.StringIO(record_text)):
+        if not row:
+            continue
+        assert not row[0].endswith("/"), (
+            f"RECORD still lists a directory row: {row[0]!r}"
+        )

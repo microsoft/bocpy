@@ -328,6 +328,11 @@ def inject_sbom_into_wheel(
                     # command running the injector twice.
                     sbom_already_present = True
                     continue
+                if info.is_dir():
+                    # PyPI strips trailing-slash entries from the ZIP
+                    # side before comparing RECORD; keeping a row for
+                    # them triggers send_wheel_record_mismatch_email.
+                    continue
                 with src.open(info) as f:
                     data = f.read()
                 new_info = zipfile.ZipInfo(

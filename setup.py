@@ -57,6 +57,25 @@ _headers = [
 #     etc.) when this directory ends up on a downstream ``-I`` path.
 _include_dirs = ["src/bocpy/include", "src/bocpy"]
 
+# Numeric kernels in _math.c are stamped as small noinline helpers so the
+# autovectoriser sees a clean inner loop. GCC's distutils default is
+# ``-O2``, which sets ``-fvect-cost-model=very-cheap`` and declines to
+# vectorise these loops; ``-O3`` promotes the model to ``dynamic`` and
+# enables loop unrolling on top. Apple clang on macOS already vectorises
+# at ``-O2`` but accepts ``-O3`` for parity. MSVC has no ``-O3``; its
+# ``/O2`` is the autovectorising default that cibuildwheel already uses,
+# included here explicitly so the build invariant is documented in one
+# place. Per-extension scope: only ``_math`` opts in. The scheduler /
+# messaging code in ``_core`` has no compute-bound inner loops and we do
+# not want to perturb concurrency-critical code with extra IPA passes.
+#
+# Stays at ``-O3``; never ``-Ofast``/``-ffast-math``, which would break
+# IEEE semantics that ``fabs``, ``nearbyint``, and NaN handling depend on.
+if sys.platform == "win32":
+    _math_extra_compile_args = ["/O2"]
+else:
+    _math_extra_compile_args = ["-O3"]
+
 _ext_modules = [
     Extension(
         name="bocpy._core",
@@ -70,6 +89,7 @@ _ext_modules = [
         sources=["src/bocpy/_math.c", "src/bocpy/boc_compat.c"],
         depends=_headers,
         include_dirs=_include_dirs,
+        extra_compile_args=_math_extra_compile_args,
     ),
 ]
 

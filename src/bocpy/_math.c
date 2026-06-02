@@ -1,7 +1,10 @@
 #define PY_SSIZE_T_CLEAN
 
 #include <Python.h>
+#include <assert.h>
+#include <float.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -11,6 +14,23 @@
 
 #ifndef _WIN32
 #include <math.h>
+#endif
+
+/* Inlining barrier for asm-capture builds only. Default-off so the
+   release wheel and the bench-baseline binary are byte-equivalent to
+   today's optimisation profile. Define BOC_CANARY_NOINLINE_ON at
+   compile time to capture per-helper disassembly.
+
+   Note: a canary-noinline build shows kernel shape but NOT release
+   call overhead — release ``-O3`` inlines these helpers into the
+   public ``Matrix_*`` methods, eliminating call overhead and enabling
+   cross-call IPO. Wall-clock measurements should always be taken
+   against a wheel built without this macro; canary builds over-report
+   per-call cost. */
+#ifdef BOC_CANARY_NOINLINE_ON
+#define BOC_CANARY_NOINLINE __attribute__((noinline))
+#else
+#define BOC_CANARY_NOINLINE
 #endif
 
 /// @brief Underlying C-based matrix implementation
@@ -219,92 +239,182 @@ enum BinaryOps {
   RDivide = 1005
 };
 
-static double binary_op(enum BinaryOps op, double lhs, double rhs) {
+/* --------------------------------------------------------------------------
+   Binary family X-macro template.
+
+   Purpose: stamp one tight per-op helper for each (op x broadcast pattern)
+   pair so the inner loop is a single straight-line expression visible to
+   the autovectoriser. Replaces the per-iteration switch through binary_op.
+
+   Add an op: append one X(ENUM, STAMP, EXPR) row to BOC_BINARY_OPS and
+   add the matching value to enum BinaryOps. The four dispatchers below
+   are stamped from the same table.
+     ENUM = matching value in enum BinaryOps.
+     STAMP = lowercase identifier used in the generated symbol names.
+     EXPR = right-hand-side expression assigned to the output cell each
+            iteration; emitted as `*out_ptr = (EXPR);`. Reflected operators
+            (RSubtract, RDivide) encode the swap in EXPR itself, so the
+            per-shape stamping stays uniform across all six rows.
+
+   Stamped symbol names: impl_<STAMP>_ewise, impl_<STAMP>_rowwise,
+   impl_<STAMP>_columnwise, impl_<STAMP>_scalar.
+
+   Names in scope inside EXPR: `lhs` (left operand element), `rhs` (right
+   operand element). For the scalar shape, `rhs` is bound to the scalar
+   argument; for the rowwise / columnwise broadcast shapes, `rhs` is the
+   broadcast vector element.
+
+   See `.github/skills/commenting-c-and-python/SKILL.md` for the
+   "Exception: X-macro descriptor tables" convention.
+   -------------------------------------------------------------------------- */
+#define BOC_BINARY_OPS(X)                                                      \
+  /*  enum        stamp       expr */                                          \
+  X(Add, add, lhs + rhs)                                                       \
+  X(Subtract, subtract, lhs - rhs)                                             \
+  X(RSubtract, rsubtract, rhs - lhs)                                           \
+  X(Multiply, multiply, lhs *rhs)                                              \
+  X(Divide, divide, lhs / rhs)                                                 \
+  X(RDivide, rdivide, rhs / lhs)
+
+#define DEFINE_BINARY_EWISE(ENUM, STAMP, EXPR)                                 \
+  BOC_CANARY_NOINLINE                                                          \
+  static void impl_##STAMP##_ewise(matrix_impl *lhs_m, matrix_impl *rhs_m,     \
+                                   matrix_impl *out) {                         \
+    assert(lhs_m->rows == out->rows && lhs_m->columns == out->columns);        \
+    assert(lhs_m->rows == rhs_m->rows && lhs_m->columns == rhs_m->columns);    \
+    const double *lhs_ptr = lhs_m->data;                                       \
+    const double *rhs_ptr = rhs_m->data;                                       \
+    double *out_ptr = out->data;                                               \
+    for (size_t i = 0; i < lhs_m->size;                                        \
+         ++i, ++lhs_ptr, ++rhs_ptr, ++out_ptr) {                               \
+      const double lhs = *lhs_ptr;                                             \
+      const double rhs = *rhs_ptr;                                             \
+      *out_ptr = (EXPR);                                                       \
+    }                                                                          \
+  }
+
+#define DEFINE_BINARY_ROWWISE(ENUM, STAMP, EXPR)                               \
+  BOC_CANARY_NOINLINE                                                          \
+  static void impl_##STAMP##_rowwise(matrix_impl *matrix, matrix_impl *vector, \
+                                     matrix_impl *out) {                       \
+    const size_t M = matrix->rows;                                             \
+    const size_t N = matrix->columns;                                          \
+    assert(M == out->rows && N == out->columns);                               \
+    assert(N == vector->columns && vector->rows == 1);                         \
+    const double *lhs_ptr = matrix->data;                                      \
+    double *out_ptr = out->data;                                               \
+    for (size_t r = 0; r < M; ++r) {                                           \
+      const double *rhs_ptr = vector->data;                                    \
+      for (size_t c = 0; c < N; ++c, ++lhs_ptr, ++rhs_ptr, ++out_ptr) {        \
+        const double lhs = *lhs_ptr;                                           \
+        const double rhs = *rhs_ptr;                                           \
+        *out_ptr = (EXPR);                                                     \
+      }                                                                        \
+    }                                                                          \
+  }
+
+#define DEFINE_BINARY_COLUMNWISE(ENUM, STAMP, EXPR)                            \
+  BOC_CANARY_NOINLINE                                                          \
+  static void impl_##STAMP##_columnwise(                                       \
+      matrix_impl *matrix, matrix_impl *vector, matrix_impl *out) {            \
+    const size_t M = matrix->rows;                                             \
+    const size_t N = matrix->columns;                                          \
+    assert(M == out->rows && N == out->columns);                               \
+    assert(M == vector->rows && vector->columns == 1);                         \
+    const double *lhs_ptr = matrix->data;                                      \
+    const double *rhs_ptr = vector->data;                                      \
+    double *out_ptr = out->data;                                               \
+    for (size_t r = 0; r < M; ++r, ++rhs_ptr) {                                \
+      const double rhs = *rhs_ptr;                                             \
+      for (size_t c = 0; c < N; ++c, ++lhs_ptr, ++out_ptr) {                   \
+        const double lhs = *lhs_ptr;                                           \
+        *out_ptr = (EXPR);                                                     \
+      }                                                                        \
+    }                                                                          \
+  }
+
+#define DEFINE_BINARY_SCALAR(ENUM, STAMP, EXPR)                                \
+  BOC_CANARY_NOINLINE                                                          \
+  static void impl_##STAMP##_scalar(matrix_impl *matrix, double rhs,           \
+                                    matrix_impl *out) {                        \
+    assert(matrix->rows == out->rows && matrix->columns == out->columns);      \
+    const double *lhs_ptr = matrix->data;                                      \
+    double *out_ptr = out->data;                                               \
+    for (size_t i = 0; i < matrix->size; ++i, ++lhs_ptr, ++out_ptr) {          \
+      const double lhs = *lhs_ptr;                                             \
+      *out_ptr = (EXPR);                                                       \
+    }                                                                          \
+  }
+
+#define X(E, S, EX) DEFINE_BINARY_EWISE(E, S, EX)
+BOC_BINARY_OPS(X)
+#undef X
+
+#define X(E, S, EX) DEFINE_BINARY_ROWWISE(E, S, EX)
+BOC_BINARY_OPS(X)
+#undef X
+
+#define X(E, S, EX) DEFINE_BINARY_COLUMNWISE(E, S, EX)
+BOC_BINARY_OPS(X)
+#undef X
+
+#define X(E, S, EX) DEFINE_BINARY_SCALAR(E, S, EX)
+BOC_BINARY_OPS(X)
+#undef X
+
+static void dispatch_bin_ewise(matrix_impl *lhs, matrix_impl *rhs,
+                               matrix_impl *out, enum BinaryOps op) {
   switch (op) {
-  case Add:
-    return lhs + rhs;
-
-  case Subtract:
-    return lhs - rhs;
-
-  case RSubtract:
-    return rhs - lhs;
-
-  case Multiply:
-    return lhs * rhs;
-
-  case Divide:
-    return lhs / rhs;
-
-  case RDivide:
-    return rhs / lhs;
-
+#define X(ENUM, STAMP, ...)                                                    \
+  case ENUM:                                                                   \
+    impl_##STAMP##_ewise(lhs, rhs, out);                                       \
+    return;
+    BOC_BINARY_OPS(X)
+#undef X
   default:
     fprintf(stderr, "Unknown binary op\n");
-    return nan("");
   }
 }
 
-/// @brief This computes the result of a binary operation on every value in both
-/// matrices
-static void impl_ewise_binary(matrix_impl *lhs, matrix_impl *rhs,
-                              matrix_impl *out, enum BinaryOps op) {
-  assert(lhs->rows == out->rows && lhs->columns == out->columns);
-  assert(lhs->rows == rhs->rows && lhs->columns == rhs->columns);
-
-  const double *lhs_ptr = lhs->data;
-  const double *rhs_ptr = rhs->data;
-  double *out_ptr = out->data;
-  for (size_t i = 0; i < lhs->size; ++i, ++lhs_ptr, ++rhs_ptr, ++out_ptr) {
-    *out_ptr = binary_op(op, *lhs_ptr, *rhs_ptr);
+static void dispatch_bin_rowwise(matrix_impl *matrix, matrix_impl *vector,
+                                 matrix_impl *out, enum BinaryOps op) {
+  switch (op) {
+#define X(ENUM, STAMP, ...)                                                    \
+  case ENUM:                                                                   \
+    impl_##STAMP##_rowwise(matrix, vector, out);                               \
+    return;
+    BOC_BINARY_OPS(X)
+#undef X
+  default:
+    fprintf(stderr, "Unknown binary op\n");
   }
 }
 
-/// @brief Same as above, but broadcasts a row vector to the matrix
-static void impl_rowwise_binary(matrix_impl *matrix, matrix_impl *vector,
+static void dispatch_bin_columnwise(matrix_impl *matrix, matrix_impl *vector,
+                                    matrix_impl *out, enum BinaryOps op) {
+  switch (op) {
+#define X(ENUM, STAMP, ...)                                                    \
+  case ENUM:                                                                   \
+    impl_##STAMP##_columnwise(matrix, vector, out);                            \
+    return;
+    BOC_BINARY_OPS(X)
+#undef X
+  default:
+    fprintf(stderr, "Unknown binary op\n");
+  }
+}
+
+static void dispatch_bin_scalar(matrix_impl *matrix, double scalar,
                                 matrix_impl *out, enum BinaryOps op) {
-  const size_t M = matrix->rows;
-  const size_t N = matrix->columns;
-  assert(M == out->rows && N == out->columns);
-  assert(N == vector->columns && vector->rows == 1);
-
-  const double *lhs_ptr = matrix->data;
-  double *out_ptr = out->data;
-  for (size_t r = 0; r < M; ++r) {
-    const double *rhs_ptr = vector->data;
-    for (size_t c = 0; c < N; ++c, ++lhs_ptr, ++rhs_ptr, ++out_ptr) {
-      *out_ptr = binary_op(op, *lhs_ptr, *rhs_ptr);
-    }
-  }
-}
-
-/// @brief Same as above, but broadcasts a column vector to the matrix
-static void impl_columnwise_binary(matrix_impl *matrix, matrix_impl *vector,
-                                   matrix_impl *out, enum BinaryOps op) {
-  const size_t M = matrix->rows;
-  const size_t N = matrix->columns;
-  assert(M == out->rows && N == out->columns);
-  assert(M == vector->rows && vector->columns == 1);
-
-  const double *lhs_ptr = matrix->data;
-  const double *rhs_ptr = vector->data;
-  double *out_ptr = out->data;
-
-  for (size_t r = 0; r < M; ++r, ++rhs_ptr) {
-    for (size_t c = 0; c < N; ++c, ++lhs_ptr, ++out_ptr) {
-      *out_ptr = binary_op(op, *lhs_ptr, *rhs_ptr);
-    }
-  }
-}
-
-/// @brief Same as te above, but broadcasts a scalar to the matrix
-static void impl_scalar_binary(matrix_impl *matrix, double scalar,
-                               matrix_impl *out, enum BinaryOps op) {
-  assert(matrix->rows == out->rows && matrix->columns == out->columns);
-  const double *lhs_ptr = matrix->data;
-  double *out_ptr = out->data;
-  for (size_t i = 0; i < matrix->size; ++i, ++lhs_ptr, ++out_ptr) {
-    *out_ptr = binary_op(op, *lhs_ptr, scalar);
+  switch (op) {
+#define X(ENUM, STAMP, ...)                                                    \
+  case ENUM:                                                                   \
+    impl_##STAMP##_scalar(matrix, scalar, out);                                \
+    return;
+    BOC_BINARY_OPS(X)
+#undef X
+  default:
+    fprintf(stderr, "Unknown binary op\n");
   }
 }
 
@@ -313,143 +423,344 @@ enum AggregateOps {
   Mean = 2001,
   Magnitude = 2002,
   Maximum = 2003,
-  Minimum = 2004
+  Minimum = 2004,
+  MagnitudeSquared = 2005
 };
 
-static double aggregate_op(enum AggregateOps op, double aggregate, double value,
-                           size_t count) {
+/* --------------------------------------------------------------------------
+   Aggregate family X-macro template.
+
+   Purpose: stamp one tight per-op helper for each (op x shape) pair so the
+   inner loop is a single straight-line accumulator visible to the
+   autovectoriser. Replaces the per-iteration switch through aggregate_op.
+
+   Add an op: append one X(ENUM, STAMP, INIT, STEP, MERGE, FINAL, LANES)
+   row to BOC_AGG_OPS and add the matching value to enum AggregateOps.
+   The dispatchers below are stamped from the same table.
+     ENUM  = matching value in enum AggregateOps.
+     STAMP = lowercase identifier used in the generated symbol names.
+     INIT  = initial value of the accumulator (double expression).
+     STEP  = right-hand-side expression assigned to the accumulator each
+             iteration; emitted as `agg = (STEP);`.
+     MERGE = right-hand-side expression that combines two partial
+             accumulator values into one; emitted as
+             `acc[0] = (MERGE);` in the LANES=4 horizontal merge.
+             For ops where STEP already has the form
+             `combine(agg, value)`, MERGE == STEP; for ops where STEP
+             also transforms `value` (e.g. Magnitude's `agg + value*value`)
+             MERGE must drop the transform (`agg + value`) because each
+             lane already holds a partial reduction. Ignored when LANES=1
+             and by columnwise stamping.
+     FINAL = right-hand-side expression that produces the published result
+             from the accumulator after the loop.
+     LANES = number of parallel accumulators for ewise + rowwise stamping.
+             Must be a literal `1` or `4`. LANES=4 splits the reduction
+             into 4 independent dep chains so the OoO engine pipelines
+             through the minsd/addsd 4-cycle latency. LANES=1 reuses the
+             original single-accumulator form (bit-identical codegen to a
+             single accumulator) for ops where parallel accumulation
+             would change semantics. Columnwise stamping ignores LANES
+             (the inner loop already walks distinct output cells).
+
+   Stamped symbol names: impl_<STAMP>_ewise, impl_<STAMP>_rowwise,
+   impl_<STAMP>_columnwise.
+
+   Names in scope inside STEP: `agg` (the accumulator), `value` (the
+   current matrix element).
+   Names in scope inside FINAL: `agg`, `cnt` (the element count over the
+   reduction axis: matrix size for ewise, columns for rowwise, rows for
+   columnwise).
+
+   Empty-axis contract: when cnt == 0, Mean returns 0 rather than NaN.
+   The FINAL expression for Mean handles this guard inline.
+
+   See `.github/skills/commenting-c-and-python/SKILL.md` for the
+   "Exception: X-macro descriptor tables" convention.
+   -------------------------------------------------------------------------- */
+#define BOC_AGG_OPS(X)                                                         \
+  X(Sum, sum, 0.0, agg + value, agg + value, agg, 4)                           \
+  X(Mean, mean, 0.0, agg + value, agg + value,                                 \
+    (cnt > 0 ? agg / (double)cnt : agg), 4)                                    \
+  X(Magnitude, magnitude, 0.0, agg + value * value, agg + value, sqrt(agg), 4) \
+  X(MagnitudeSquared, magnitude_squared, 0.0, agg + value * value,             \
+    agg + value, agg, 4)                                                       \
+  X(Minimum, minimum, DBL_MAX, (agg < value ? agg : value),                    \
+    (agg < value ? agg : value), agg, 4)                                       \
+  X(Maximum, maximum, -DBL_MAX, (agg > value ? agg : value),                   \
+    (agg > value ? agg : value), agg, 4)
+
+/* Codegen guard: every row in BOC_AGG_OPS must keep LANES=4. A typo
+   walking it back to 1 would silently regress the parallel-accumulator
+   unroll speedup, and the bench is manual-only (not wired into CI). */
+#define X(E, S, I, ST, MG, F, L)                                               \
+  static_assert((L) == 4,                                                      \
+                "BOC_AGG_OPS row " #E " must use LANES=4 to keep parallel-"    \
+                "accumulator unrolling");
+BOC_AGG_OPS(X)
+#undef X
+
+/* Parallel-accumulator helpers used by LANES=4 stamping. Each AGG_LANE_STEP
+   invocation evaluates STEP against a single fixed lane K with private
+   `agg` and `value` locals, so the four lanes inside AGG_UNROLL_4 are four
+   independent dep chains the OoO engine can pipeline. The do-while-0 gives
+   each lane a fresh scope so name shadowing works without name leaks. */
+#define AGG_LANE_STEP(STEP, acc, value_expr, K)                                \
+  do {                                                                         \
+    const double value = (value_expr);                                         \
+    double agg = (acc)[K];                                                     \
+    (acc)[K] = (STEP);                                                         \
+  } while (0)
+
+#define AGG_UNROLL_4(STEP, acc, sp, i)                                         \
+  do {                                                                         \
+    AGG_LANE_STEP(STEP, acc, (sp)[(i) + 0], 0);                                \
+    AGG_LANE_STEP(STEP, acc, (sp)[(i) + 1], 1);                                \
+    AGG_LANE_STEP(STEP, acc, (sp)[(i) + 2], 2);                                \
+    AGG_LANE_STEP(STEP, acc, (sp)[(i) + 3], 3);                                \
+  } while (0)
+
+#define DEFINE_AGG_EWISE_1(ENUM, STAMP, INIT, STEP, MERGE, FINAL)              \
+  BOC_CANARY_NOINLINE                                                          \
+  static double impl_##STAMP##_ewise(const matrix_impl *m) {                   \
+    double agg = (INIT);                                                       \
+    const double *sp = m->data;                                                \
+    const size_t cnt = m->size;                                                \
+    for (size_t i = 0; i < cnt; ++i, ++sp) {                                   \
+      const double value = *sp;                                                \
+      agg = (STEP);                                                            \
+    }                                                                          \
+    return (FINAL);                                                            \
+  }
+
+#define DEFINE_AGG_EWISE_4(ENUM, STAMP, INIT, STEP, MERGE, FINAL)              \
+  BOC_CANARY_NOINLINE                                                          \
+  static double impl_##STAMP##_ewise(const matrix_impl *m) {                   \
+    double acc[4] = {(INIT), (INIT), (INIT), (INIT)};                          \
+    const double *sp = m->data;                                                \
+    const size_t cnt = m->size;                                                \
+    const size_t main_end = cnt - (cnt & 3u);                                  \
+    for (size_t i = 0; i < main_end; i += 4) {                                 \
+      AGG_UNROLL_4(STEP, acc, sp, i);                                          \
+    }                                                                          \
+    for (size_t i = main_end; i < cnt; ++i) {                                  \
+      AGG_LANE_STEP(STEP, acc, sp[i], 0);                                      \
+    }                                                                          \
+    if (main_end > 0) {                                                        \
+      for (size_t k = 1; k < 4; ++k) {                                         \
+        const double value = acc[k];                                           \
+        double agg = acc[0];                                                   \
+        acc[0] = (MERGE);                                                      \
+      }                                                                        \
+    }                                                                          \
+    double agg = acc[0];                                                       \
+    return (FINAL);                                                            \
+  }
+
+#define DEFINE_AGG_EWISE(ENUM, STAMP, INIT, STEP, MERGE, FINAL, LANES)         \
+  DEFINE_AGG_EWISE_##LANES(ENUM, STAMP, INIT, STEP, MERGE, FINAL)
+
+#define DEFINE_AGG_ROWWISE_1(ENUM, STAMP, INIT, STEP, MERGE, FINAL)            \
+  BOC_CANARY_NOINLINE                                                          \
+  static void impl_##STAMP##_rowwise(const matrix_impl *m, matrix_impl *vec) { \
+    const size_t M = m->rows;                                                  \
+    const size_t cnt = m->columns;                                             \
+    assert(vec->rows == M && vec->columns == 1);                               \
+    const double *mp = m->data;                                                \
+    double *vp = vec->data;                                                    \
+    for (size_t r = 0; r < M; ++r, ++vp) {                                     \
+      double agg = (INIT);                                                     \
+      for (size_t i = 0; i < cnt; ++i, ++mp) {                                 \
+        const double value = *mp;                                              \
+        agg = (STEP);                                                          \
+      }                                                                        \
+      *vp = (FINAL);                                                           \
+    }                                                                          \
+  }
+
+#define DEFINE_AGG_ROWWISE_4(ENUM, STAMP, INIT, STEP, MERGE, FINAL)            \
+  BOC_CANARY_NOINLINE                                                          \
+  static void impl_##STAMP##_rowwise(const matrix_impl *m, matrix_impl *vec) { \
+    const size_t M = m->rows;                                                  \
+    const size_t cnt = m->columns;                                             \
+    assert(vec->rows == M && vec->columns == 1);                               \
+    const double *mp = m->data;                                                \
+    double *vp = vec->data;                                                    \
+    const size_t main_end = cnt - (cnt & 3u);                                  \
+    for (size_t r = 0; r < M; ++r, ++vp, mp += cnt) {                          \
+      double acc[4] = {(INIT), (INIT), (INIT), (INIT)};                        \
+      for (size_t i = 0; i < main_end; i += 4) {                               \
+        AGG_UNROLL_4(STEP, acc, mp, i);                                        \
+      }                                                                        \
+      for (size_t i = main_end; i < cnt; ++i) {                                \
+        AGG_LANE_STEP(STEP, acc, mp[i], 0);                                    \
+      }                                                                        \
+      if (main_end > 0) {                                                      \
+        for (size_t k = 1; k < 4; ++k) {                                       \
+          const double value = acc[k];                                         \
+          double agg = acc[0];                                                 \
+          acc[0] = (MERGE);                                                    \
+        }                                                                      \
+      }                                                                        \
+      double agg = acc[0];                                                     \
+      *vp = (FINAL);                                                           \
+    }                                                                          \
+  }
+
+#define DEFINE_AGG_ROWWISE(ENUM, STAMP, INIT, STEP, MERGE, FINAL, LANES)       \
+  DEFINE_AGG_ROWWISE_##LANES(ENUM, STAMP, INIT, STEP, MERGE, FINAL)
+
+/* Columnwise: the inner accumulator is the output vector slot itself.
+   INIT is applied with one explicit pass over the output vector before
+   the main loop, so Min/Max (which need +/-DBL_MAX, not 0) work
+   correctly. FINAL is applied in a separate second-pass loop over the
+   output vector after all rows have been consumed (mirrors today's sqrt
+   pass for Magnitude). MERGE and LANES are ignored: the inner loop
+   already walks distinct output cells so each column has its own
+   independent dep chain across rows. */
+#define DEFINE_AGG_COLUMNWISE(ENUM, STAMP, INIT, STEP, MERGE, FINAL, LANES)    \
+  BOC_CANARY_NOINLINE                                                          \
+  static void impl_##STAMP##_columnwise(const matrix_impl *m,                  \
+                                        matrix_impl *vec) {                    \
+    const size_t cnt = m->rows;                                                \
+    const size_t N = m->columns;                                               \
+    assert(vec->columns == N && vec->rows == 1);                               \
+    const double *mp = m->data;                                                \
+    {                                                                          \
+      double *vp = vec->data;                                                  \
+      for (size_t c = 0; c < N; ++c, ++vp) {                                   \
+        *vp = (INIT);                                                          \
+      }                                                                        \
+    }                                                                          \
+    for (size_t r = 0; r < cnt; ++r) {                                         \
+      double *vp = vec->data;                                                  \
+      for (size_t c = 0; c < N; ++c, ++mp, ++vp) {                             \
+        const double value = *mp;                                              \
+        double agg = *vp;                                                      \
+        *vp = (STEP);                                                          \
+      }                                                                        \
+    }                                                                          \
+    double *vp = vec->data;                                                    \
+    for (size_t c = 0; c < N; ++c, ++vp) {                                     \
+      double agg = *vp;                                                        \
+      *vp = (FINAL);                                                           \
+    }                                                                          \
+  }
+
+#define X(E, S, I, ST, MG, F, L) DEFINE_AGG_EWISE(E, S, I, ST, MG, F, L)
+BOC_AGG_OPS(X)
+#undef X
+
+#define X(E, S, I, ST, MG, F, L) DEFINE_AGG_ROWWISE(E, S, I, ST, MG, F, L)
+BOC_AGG_OPS(X)
+#undef X
+
+#define X(E, S, I, ST, MG, F, L) DEFINE_AGG_COLUMNWISE(E, S, I, ST, MG, F, L)
+BOC_AGG_OPS(X)
+#undef X
+
+static double dispatch_agg_ewise(matrix_impl *m, enum AggregateOps op) {
   switch (op) {
-  case Sum:
-    return aggregate + value;
-
-  case Mean:
-    return aggregate + (value - aggregate) / count;
-
-  case Magnitude:
-    return aggregate + (value * value);
-
-  case Minimum:
-    if (count == 1) {
-      return value;
-    }
-
-    return aggregate < value ? aggregate : value;
-
-  case Maximum:
-    if (count == 1) {
-      return value;
-    }
-
-    return aggregate > value ? aggregate : value;
-
+#define X(ENUM, STAMP, ...)                                                    \
+  case ENUM:                                                                   \
+    return impl_##STAMP##_ewise(m);
+    BOC_AGG_OPS(X)
+#undef X
   default:
     fprintf(stderr, "Unknown aggregate op\n");
     return nan("");
   }
 }
 
-static double impl_ewise_aggregate(matrix_impl *matrix, enum AggregateOps op) {
-  double agg = 0;
-  double *ptr = matrix->data;
-  for (size_t i = 0; i < matrix->size; ++i, ++ptr) {
-    agg = aggregate_op(op, agg, *ptr, i + 1);
-  }
-
-  if (op == Magnitude) {
-    agg = sqrt(agg);
-  }
-
-  return agg;
-}
-
-static void impl_rowwise_aggregate(matrix_impl *matrix, enum AggregateOps op,
-                                   matrix_impl *vector) {
-  const size_t M = matrix->rows;
-  const size_t N = matrix->columns;
-
-  assert(vector->rows == M && vector->columns == 1);
-
-  const double *mat_ptr = matrix->data;
-  double *vec_ptr = vector->data;
-  for (size_t r = 0; r < M; ++r, ++vec_ptr) {
-    double agg = 0;
-    for (size_t c = 0; c < N; ++c, ++mat_ptr) {
-      agg = aggregate_op(op, agg, *mat_ptr, c + 1);
-    }
-
-    if (op == Magnitude) {
-      agg = sqrt(agg);
-    }
-
-    *vec_ptr = agg;
-  }
-}
-
-static void impl_columnwise_aggregate(matrix_impl *matrix, enum AggregateOps op,
-                                      matrix_impl *vector) {
-  const size_t M = matrix->rows;
-  const size_t N = matrix->columns;
-
-  assert(vector->columns == N && vector->rows == 1);
-
-  const double *mat_ptr = matrix->data;
-
-  for (size_t r = 0; r < M; ++r) {
-    double *vec_ptr = vector->data;
-    for (size_t c = 0; c < N; ++c, ++mat_ptr, ++vec_ptr) {
-      *vec_ptr = aggregate_op(op, *vec_ptr, *mat_ptr, r + 1);
-    }
-  }
-
-  if (op == Magnitude) {
-    double *vec_ptr = vector->data;
-    for (size_t c = 0; c < N; ++c, ++vec_ptr) {
-      *vec_ptr = sqrt(*vec_ptr);
-    }
-  }
-}
-
-enum UnaryOps {
-  Ceil = 3000,
-  Floor = 3001,
-  Round = 3002,
-  Negate = 3003,
-  Abs = 3004
-};
-
-static double unary_op(enum UnaryOps op, double value) {
+static void dispatch_agg_rowwise(matrix_impl *m, enum AggregateOps op,
+                                 matrix_impl *vec) {
   switch (op) {
-  case Ceil:
-    return ceil(value);
-
-  case Floor:
-    return floor(value);
-
-  case Round:
-    return round(value);
-
-  case Negate:
-    return -value;
-
-  case Abs:
-    return fabs(value);
-
+#define X(ENUM, STAMP, ...)                                                    \
+  case ENUM:                                                                   \
+    impl_##STAMP##_rowwise(m, vec);                                            \
+    return;
+    BOC_AGG_OPS(X)
+#undef X
   default:
-    fprintf(stderr, "Unknown unary op\n");
-    return nan("");
+    fprintf(stderr, "Unknown aggregate op\n");
   }
 }
 
-static void impl_unary(matrix_impl *matrix, enum UnaryOps op,
-                       matrix_impl *out) {
-  assert(matrix->rows == out->rows && matrix->columns == out->columns);
-
-  const double *src_ptr = matrix->data;
-  double *dst_ptr = out->data;
-  for (size_t i = 0; i < matrix->size; ++i, ++src_ptr, ++dst_ptr) {
-    *dst_ptr = unary_op(op, *src_ptr);
+static void dispatch_agg_columnwise(matrix_impl *m, enum AggregateOps op,
+                                    matrix_impl *vec) {
+  switch (op) {
+#define X(ENUM, STAMP, ...)                                                    \
+  case ENUM:                                                                   \
+    impl_##STAMP##_columnwise(m, vec);                                         \
+    return;
+    BOC_AGG_OPS(X)
+#undef X
+  default:
+    fprintf(stderr, "Unknown aggregate op\n");
   }
 }
+
+/* --------------------------------------------------------------------------
+   Unary family X-macro template.
+
+   BOC_UNARY_OPS is the single source of truth for the unary op set. It is
+   stamped in three places:
+     1. impl_<STAMP>_ewise        (here)        — tight per-op kernel; the
+                                                  inner loop sees the per-row
+                                                  EXPR as a compile-time
+                                                  constant, so the
+                                                  autovectoriser succeeds.
+     2. Matrix_<ENUM>_method      (later)       — Python METH_NOARGS wrapper.
+     3. Matrix_<ENUM>_op          (number-protocol slots) — only Abs / Negate
+                                                  have a slot, stamped
+                                                  explicitly at those two
+                                                  call sites.
+
+   Unlike binary/aggregate, there is no runtime dispatcher: every Python
+   entry point is statically bound to exactly one stamped kernel, because
+   unary has no operand-shape routing to decide at call time.
+
+   Add an op: append one X(ENUM, STAMP, EXPR) row to BOC_UNARY_OPS. The
+   impl kernel and Matrix_<ENUM>_method wrapper are stamped automatically;
+   if the op also needs a number-protocol slot, add one
+   MATRIX_UNARY_OP(ENUM, STAMP) line near the bottom of the file.
+     ENUM  = capitalised identifier used in symbol names
+             (impl_<stamp_lowered>_ewise vs Matrix_<ENUM>_method).
+     STAMP = lowercase identifier used in the impl symbol name.
+     EXPR  = per-element expression in terms of `v` (the current source
+             value) that yields the destination value.
+
+   Names in scope inside EXPR: `v` (double, the current source value).
+
+   Round uses `nearbyint` (round-half-to-even, IEEE 754 default — banker's
+   rounding). Compiles to a single vectorisable `roundsd $0x04` on SSE4.1+;
+   libm's `round()` (half away from zero) is scalar and ~5x slower.
+
+   See `.github/skills/commenting-c-and-python/SKILL.md` for the
+   "Exception: X-macro descriptor tables" convention.
+   -------------------------------------------------------------------------- */
+#define BOC_UNARY_OPS(X)                                                       \
+  /*  enum    stamp   expr */                                                  \
+  X(Ceil, ceil, ceil(v))                                                       \
+  X(Floor, floor, floor(v))                                                    \
+  X(Round, round, nearbyint(v))                                                \
+  X(Negate, negate, -v)                                                        \
+  X(Abs, abs, fabs(v))
+
+#define DEFINE_UNARY(ENUM, STAMP, EXPR)                                        \
+  BOC_CANARY_NOINLINE                                                          \
+  static void impl_##STAMP##_ewise(const matrix_impl *m, matrix_impl *out) {   \
+    assert(m->rows == out->rows && m->columns == out->columns);                \
+    const double *sp = m->data;                                                \
+    double *dp = out->data;                                                    \
+    for (size_t i = 0; i < m->size; ++i, ++sp, ++dp) {                         \
+      const double v = *sp;                                                    \
+      *dp = (EXPR);                                                            \
+    }                                                                          \
+  }
+
+#define X(E, S, EX) DEFINE_UNARY(E, S, EX)
+BOC_UNARY_OPS(X)
+#undef X
 
 static void impl_matmul(matrix_impl *lhs, matrix_impl *rhs, matrix_impl *out) {
   const size_t M0 = lhs->rows;
@@ -843,12 +1154,26 @@ matrix_impl *unwrap_matrix(PyObject *op, bool seq_as_column) {
   return impl;
 }
 
-static PyObject *Matrix_transpose(PyObject *op, PyObject *Py_UNUSED(dummy)) {
+static PyObject *Matrix_transpose(PyObject *op, PyObject *args,
+                                  PyObject *kwds) {
   MatrixObject *matrix = (MatrixObject *)op;
   matrix_impl *impl = matrix->impl;
 
+  int in_place = 0;
+  static char *kwlist[] = {"in_place", NULL};
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "|p", kwlist, &in_place)) {
+    return NULL;
+  }
+
   if (!impl_check_acquired(impl, true)) {
     return NULL;
+  }
+
+  if (in_place) {
+    if (impl_transpose_in_place(impl) < 0) {
+      return NULL;
+    }
+    return Py_NewRef(op);
   }
 
   matrix_impl *transpose = impl_transpose(impl);
@@ -857,19 +1182,6 @@ static PyObject *Matrix_transpose(PyObject *op, PyObject *Py_UNUSED(dummy)) {
   }
 
   return wrap_impl_or_free(transpose);
-}
-
-static PyObject *Matrix_transpose_in_place(PyObject *op,
-                                           PyObject *Py_UNUSED(dummy)) {
-  MatrixObject *matrix = (MatrixObject *)op;
-  matrix_impl *impl = matrix->impl;
-
-  if (!impl_check_acquired(impl, true)) {
-    return NULL;
-  }
-
-  impl_transpose_in_place(impl);
-  Py_RETURN_NONE;
 }
 
 /// @brief Sets the output of an arithmetic operation.
@@ -904,10 +1216,77 @@ static matrix_impl *set_output(PyObject *lhs_op, PyObject **out_op,
   return out;
 }
 
-const int NO_AXIS = -1000;
+/// @brief Tri-state representation of an optional ``axis`` kwarg.
+/// @details ``has_axis`` is true iff the caller passed a non-None axis;
+///          ``axis`` is the validated int value (and is undefined when
+///          ``has_axis`` is false). Replaces the historical NO_AXIS=-1000
+///          sentinel which collided with the integer -1000.
+typedef struct {
+  bool has_axis;
+  int axis;
+} AxisArg;
 
-static int Matrix_aggregate(PyObject *matrix_op, int axis, PyObject **out_op,
-                            enum AggregateOps agg) {
+/// @brief Decode an optional ``axis`` keyword argument into an AxisArg.
+/// @details Accepts ``NULL`` or ``Py_None`` (no axis), an ``int`` in
+///          ``INT_MIN..INT_MAX``. Rejects ``bool`` (subclass of int) and
+///          overflows. Returns 0 on success and writes through ``*out``;
+///          returns -1 with TypeError / OverflowError set on failure.
+static int decode_axis_kwarg(PyObject *axis_obj, AxisArg *out) {
+  if (axis_obj == NULL || axis_obj == Py_None) {
+    out->has_axis = false;
+    out->axis = 0;
+    return 0;
+  }
+  if (PyBool_Check(axis_obj)) {
+    PyErr_SetString(PyExc_TypeError, "axis must be an int or None, not bool");
+    return -1;
+  }
+  if (!PyLong_Check(axis_obj)) {
+    PyErr_SetString(PyExc_TypeError, "axis must be an int or None");
+    return -1;
+  }
+  long ax = PyLong_AsLong(axis_obj);
+  if (ax == -1 && PyErr_Occurred()) {
+    return -1;
+  }
+  if (ax < INT_MIN || ax > INT_MAX) {
+    PyErr_Format(PyExc_OverflowError, "axis %ld out of int range", ax);
+    return -1;
+  }
+  out->has_axis = true;
+  out->axis = (int)ax;
+  return 0;
+}
+
+/// @brief Decode, validate (-2/-1/0/1) and normalise (-1->1, -2->0) axis.
+/// @details Single entry point for the cross / perpendicular / angle /
+///          normalize / aggregate methods that accept only the four
+///          standard axis values. After this call, ``out->axis`` is
+///          either 0 (column-wise) or 1 (row-wise) when ``has_axis`` is
+///          true. Returns -1 with the appropriate exception set on any
+///          decode or range error.
+static int parse_validate_normalise_axis(PyObject *axis_obj, AxisArg *out) {
+  if (decode_axis_kwarg(axis_obj, out) < 0) {
+    return -1;
+  }
+  if (!out->has_axis) {
+    return 0;
+  }
+  int ax = out->axis;
+  if (ax != 0 && ax != 1 && ax != -1 && ax != -2) {
+    PyErr_SetString(PyExc_NotImplementedError, "axis must be -2, -1, 0, or 1");
+    return -1;
+  }
+  if (ax == -1) {
+    out->axis = 1;
+  } else if (ax == -2) {
+    out->axis = 0;
+  }
+  return 0;
+}
+
+static int Matrix_aggregate(PyObject *matrix_op, AxisArg axis,
+                            PyObject **out_op, enum AggregateOps agg) {
   MatrixObject *matrix = (MatrixObject *)matrix_op;
   matrix_impl *impl = matrix->impl;
 
@@ -915,18 +1294,18 @@ static int Matrix_aggregate(PyObject *matrix_op, int axis, PyObject **out_op,
     return -1;
   }
 
-  if (axis == NO_AXIS) {
-    *out_op = PyFloat_FromDouble(impl_ewise_aggregate(impl, agg));
+  if (!axis.has_axis) {
+    *out_op = PyFloat_FromDouble(dispatch_agg_ewise(impl, agg));
     return 0;
   }
 
-  if (axis == 0 || axis == -2) {
+  if (axis.axis == 0) {
     matrix_impl *vector = impl_new(1, impl->columns);
     if (vector == NULL) {
       return -1;
     }
 
-    impl_columnwise_aggregate(impl, agg, vector);
+    dispatch_agg_columnwise(impl, agg, vector);
     *out_op = wrap_matrix(Py_TYPE(matrix_op), vector);
     if (*out_op == NULL) {
       impl_free(vector);
@@ -936,47 +1315,40 @@ static int Matrix_aggregate(PyObject *matrix_op, int axis, PyObject **out_op,
     return 0;
   }
 
-  if (axis == 1 || axis == -1) {
-    matrix_impl *vector = impl_new(impl->rows, 1);
-    if (vector == NULL) {
-      return -1;
-    }
-
-    impl_rowwise_aggregate(impl, agg, vector);
-    *out_op = wrap_matrix(Py_TYPE(matrix_op), vector);
-    if (*out_op == NULL) {
-      impl_free(vector);
-      return -1;
-    }
-
-    return 0;
+  /* axis.axis == 1 (row-wise). parse_validate_normalise_axis already
+     rejected anything else. */
+  matrix_impl *vector = impl_new(impl->rows, 1);
+  if (vector == NULL) {
+    return -1;
   }
 
-  PyErr_SetString(PyExc_NotImplementedError, "axis must be -2, -1, 0, or 1");
-  return -1;
+  dispatch_agg_rowwise(impl, agg, vector);
+  *out_op = wrap_matrix(Py_TYPE(matrix_op), vector);
+  if (*out_op == NULL) {
+    impl_free(vector);
+    return -1;
+  }
+
+  return 0;
 }
 
 // this macro provides a kind of template for all the aggregate methods to
 // follow, as they are all identical with the exception of the operator
 
 #define MATRIX_AGGREGATE(agg)                                                  \
-  static PyObject *Matrix_##agg##_method(PyObject *op, PyObject *args) {       \
+  static PyObject *Matrix_##agg##_method(PyObject *op, PyObject *args,         \
+                                         PyObject *kwds) {                     \
     PyObject *out = NULL;                                                      \
-    PyObject *axis = NULL;                                                     \
-    if (!PyArg_ParseTuple(args, "|O", &axis)) {                                \
+    PyObject *axis_obj = NULL;                                                 \
+    static char *kwlist[] = {"axis", NULL};                                    \
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|O", kwlist, &axis_obj)) {   \
       return NULL;                                                             \
     }                                                                          \
-    if (axis == NULL) {                                                        \
-      if (Matrix_aggregate(op, NO_AXIS, &out, agg) < 0) {                      \
-        return NULL;                                                           \
-      }                                                                        \
-      return out;                                                              \
-    }                                                                          \
-    if (!PyLong_Check(axis)) {                                                 \
-      PyErr_SetString(PyExc_TypeError, "axis must be a long");                 \
+    AxisArg axis;                                                              \
+    if (parse_validate_normalise_axis(axis_obj, &axis) < 0) {                  \
       return NULL;                                                             \
     }                                                                          \
-    if (Matrix_aggregate(op, PyLong_AsLong(axis), &out, agg) < 0) {            \
+    if (Matrix_aggregate(op, axis, &out, agg) < 0) {                           \
       return NULL;                                                             \
     }                                                                          \
     return out;                                                                \
@@ -987,40 +1359,1033 @@ MATRIX_AGGREGATE(Mean)
 MATRIX_AGGREGATE(Magnitude)
 MATRIX_AGGREGATE(Minimum)
 MATRIX_AGGREGATE(Maximum)
+MATRIX_AGGREGATE(MagnitudeSquared)
 
-static int Matrix_unary(PyObject *matrix_op, PyObject **out_op,
-                        enum UnaryOps unary) {
-  MatrixObject *self = (MatrixObject *)matrix_op;
-  matrix_impl *impl = self->impl;
+enum BroadcastShape { BCAST_NONE = 0, BCAST_ROW, BCAST_COL };
 
-  if (!impl_check_acquired(impl, true)) {
-    return -1;
+/* --------------------------------------------------------------------------
+   Two-operand aggregate family X-macro template.
+
+   BOC_2AGG_OPS is the single source of truth for the two-operand aggregate
+   op set. It is stamped in three places:
+     1. impl_<NAME>_total       — flat traversal returning a scalar.
+     2. impl_<NAME>_rowwise     — per-row reduction writing Mx1 output.
+     3. impl_<NAME>_columnwise  — per-column accumulation writing 1xN output.
+                                  REQUIRES caller-zeroed output buffer
+                                  (dispatcher uses impl_new -> PyMem_RawCalloc).
+
+   Each walker carries the per-shape switch at the TOP of the body, with
+   three specialised inner loops (NONE / ROW / COL). Moving the switch
+   inside the inner loop would defeat contraction; the per-shape pointer
+   arithmetic and broadcast behaviour are intentionally different.
+   The dispatcher (Matrix_vecdot) canonicalises operands so the matrix is
+   always the LHS and the vector is always the RHS before calling the
+   helpers.
+
+   Names in scope inside STEP:
+     lhs (double)   — current left-hand-side value
+     rhs (double)   — current right-hand-side value (in BCAST_COL: the
+                       per-row scalar, hoisted out of the inner loop)
+     agg (double)   — accumulator (for total/rowwise it is a local;
+                       for columnwise the per-iteration cell of the output
+                       vector is loaded into `agg`, STEP runs, then the
+                       cell is written back)
+
+   Add an op: append one X(NAME, INIT, STEP) row to BOC_2AGG_OPS and the
+   three impl_<NAME>_* kernels are stamped automatically. Wire it into a
+   Python entry point separately (mirrors Matrix_vecdot).
+
+   See `.github/skills/commenting-c-and-python/SKILL.md` for the
+   "Exception: X-macro descriptor tables" convention.
+   -------------------------------------------------------------------------- */
+#define BOC_2AGG_OPS(X)                                                        \
+  /*  name      init   step (lhs, rhs in scope; agg accumulator) */            \
+  X(vecdot, 0.0, agg += lhs * rhs)
+
+#define DEFINE_2AGG_TOTAL(NAME, INIT, STEP)                                    \
+  BOC_CANARY_NOINLINE                                                          \
+  static double impl_##NAME##_total(const matrix_impl *lm,                     \
+                                    const matrix_impl *rm,                     \
+                                    enum BroadcastShape shape) {               \
+    double agg = (INIT);                                                       \
+    switch (shape) {                                                           \
+    case BCAST_NONE: {                                                         \
+      const double *lp = lm->data;                                             \
+      const double *rp = rm->data;                                             \
+      for (size_t i = 0; i < lm->size; ++i, ++lp, ++rp) {                      \
+        const double lhs = *lp;                                                \
+        const double rhs = *rp;                                                \
+        STEP;                                                                  \
+      }                                                                        \
+      break;                                                                   \
+    }                                                                          \
+    case BCAST_ROW: {                                                          \
+      const double *lp = lm->data;                                             \
+      const size_t M = lm->rows;                                               \
+      const size_t N = lm->columns;                                            \
+      for (size_t r = 0; r < M; ++r) {                                         \
+        const double *rp = rm->data;                                           \
+        for (size_t c = 0; c < N; ++c, ++lp, ++rp) {                           \
+          const double lhs = *lp;                                              \
+          const double rhs = *rp;                                              \
+          STEP;                                                                \
+        }                                                                      \
+      }                                                                        \
+      break;                                                                   \
+    }                                                                          \
+    case BCAST_COL: {                                                          \
+      const double *lp = lm->data;                                             \
+      const double *rp = rm->data;                                             \
+      const size_t M = lm->rows;                                               \
+      const size_t N = lm->columns;                                            \
+      for (size_t r = 0; r < M; ++r) {                                         \
+        const double rhs = *rp++;                                              \
+        for (size_t c = 0; c < N; ++c, ++lp) {                                 \
+          const double lhs = *lp;                                              \
+          STEP;                                                                \
+        }                                                                      \
+      }                                                                        \
+      break;                                                                   \
+    }                                                                          \
+    }                                                                          \
+    return agg;                                                                \
   }
 
-  matrix_impl *out = set_output(matrix_op, out_op, false);
-  if (out == NULL) {
-    return -1;
+#define DEFINE_2AGG_ROWWISE(NAME, INIT, STEP)                                  \
+  BOC_CANARY_NOINLINE                                                          \
+  static void impl_##NAME##_rowwise(                                           \
+      const matrix_impl *lm, const matrix_impl *rm, matrix_impl *out_Mx1,      \
+      enum BroadcastShape shape) {                                             \
+    const size_t M = lm->rows;                                                 \
+    const size_t N = lm->columns;                                              \
+    double *out_ptr = out_Mx1->data;                                           \
+    switch (shape) {                                                           \
+    case BCAST_NONE: {                                                         \
+      const double *lp = lm->data;                                             \
+      const double *rp = rm->data;                                             \
+      for (size_t r = 0; r < M; ++r, ++out_ptr) {                              \
+        double agg = (INIT);                                                   \
+        for (size_t c = 0; c < N; ++c, ++lp, ++rp) {                           \
+          const double lhs = *lp;                                              \
+          const double rhs = *rp;                                              \
+          STEP;                                                                \
+        }                                                                      \
+        *out_ptr = agg;                                                        \
+      }                                                                        \
+      break;                                                                   \
+    }                                                                          \
+    case BCAST_ROW: {                                                          \
+      const double *lp = lm->data;                                             \
+      for (size_t r = 0; r < M; ++r, ++out_ptr) {                              \
+        const double *rp = rm->data;                                           \
+        double agg = (INIT);                                                   \
+        for (size_t c = 0; c < N; ++c, ++lp, ++rp) {                           \
+          const double lhs = *lp;                                              \
+          const double rhs = *rp;                                              \
+          STEP;                                                                \
+        }                                                                      \
+        *out_ptr = agg;                                                        \
+      }                                                                        \
+      break;                                                                   \
+    }                                                                          \
+    case BCAST_COL: {                                                          \
+      const double *lp = lm->data;                                             \
+      const double *rp = rm->data;                                             \
+      for (size_t r = 0; r < M; ++r, ++out_ptr) {                              \
+        const double rhs = *rp++;                                              \
+        double agg = (INIT);                                                   \
+        for (size_t c = 0; c < N; ++c, ++lp) {                                 \
+          const double lhs = *lp;                                              \
+          STEP;                                                                \
+        }                                                                      \
+        *out_ptr = agg;                                                        \
+      }                                                                        \
+      break;                                                                   \
+    }                                                                          \
+    }                                                                          \
   }
 
-  impl_unary(impl, unary, out);
+/* Columnwise: the per-output-cell accumulator IS the output vector slot
+   itself. Loading `*out_ptr` into a local `agg`, running STEP, and
+   writing back keeps STEP uniform across all three walkers; the compiler
+   collapses the load/store pair to a single += against memory. The
+   caller must hand in a zero-initialised buffer (impl_new -> calloc);
+   a recycled non-zero buffer would silently produce wrong sums because
+   STEP accumulates with `+=`. */
+#define DEFINE_2AGG_COLUMNWISE(NAME, INIT, STEP)                               \
+  BOC_CANARY_NOINLINE                                                          \
+  static void impl_##NAME##_columnwise(                                        \
+      const matrix_impl *lm, const matrix_impl *rm, matrix_impl *out_1xN,      \
+      enum BroadcastShape shape) {                                             \
+    const size_t M = lm->rows;                                                 \
+    const size_t N = lm->columns;                                              \
+    (void)(INIT);                                                              \
+    switch (shape) {                                                           \
+    case BCAST_NONE: {                                                         \
+      const double *lp = lm->data;                                             \
+      const double *rp = rm->data;                                             \
+      for (size_t r = 0; r < M; ++r) {                                         \
+        double *out_ptr = out_1xN->data;                                       \
+        for (size_t c = 0; c < N; ++c, ++lp, ++rp, ++out_ptr) {                \
+          const double lhs = *lp;                                              \
+          const double rhs = *rp;                                              \
+          double agg = *out_ptr;                                               \
+          STEP;                                                                \
+          *out_ptr = agg;                                                      \
+        }                                                                      \
+      }                                                                        \
+      break;                                                                   \
+    }                                                                          \
+    case BCAST_ROW: {                                                          \
+      const double *lp = lm->data;                                             \
+      for (size_t r = 0; r < M; ++r) {                                         \
+        const double *rp = rm->data;                                           \
+        double *out_ptr = out_1xN->data;                                       \
+        for (size_t c = 0; c < N; ++c, ++lp, ++rp, ++out_ptr) {                \
+          const double lhs = *lp;                                              \
+          const double rhs = *rp;                                              \
+          double agg = *out_ptr;                                               \
+          STEP;                                                                \
+          *out_ptr = agg;                                                      \
+        }                                                                      \
+      }                                                                        \
+      break;                                                                   \
+    }                                                                          \
+    case BCAST_COL: {                                                          \
+      const double *lp = lm->data;                                             \
+      const double *rp = rm->data;                                             \
+      for (size_t r = 0; r < M; ++r) {                                         \
+        const double rhs = *rp++;                                              \
+        double *out_ptr = out_1xN->data;                                       \
+        for (size_t c = 0; c < N; ++c, ++lp, ++out_ptr) {                      \
+          const double lhs = *lp;                                              \
+          double agg = *out_ptr;                                               \
+          STEP;                                                                \
+          *out_ptr = agg;                                                      \
+        }                                                                      \
+      }                                                                        \
+      break;                                                                   \
+    }                                                                          \
+    }                                                                          \
+  }
+
+#define X(N, I, S) DEFINE_2AGG_TOTAL(N, I, S)
+BOC_2AGG_OPS(X)
+#undef X
+
+#define X(N, I, S) DEFINE_2AGG_ROWWISE(N, I, S)
+BOC_2AGG_OPS(X)
+#undef X
+
+#define X(N, I, S) DEFINE_2AGG_COLUMNWISE(N, I, S)
+BOC_2AGG_OPS(X)
+#undef X
+
+/// @brief Axis-aware inner product: sum of element-wise products.
+/// @details The canonicalisation swap rearranges the dispatch-argument
+///          pointers ``mat_arg`` / ``vec_arg`` so the helpers always see
+///          ``(matrix, vector)``. The refcounted ``rhs`` from
+///          ``unwrap_matrix`` is preserved unchanged so the IMPL_DECREF at
+///          ``done`` always matches the single INCREF. ``self->impl`` is
+///          NOT refcount-paired here (mirrors Matrix_transpose).
+static PyObject *Matrix_vecdot(PyObject *op, PyObject *args, PyObject *kwds) {
+  MatrixObject *self = (MatrixObject *)op;
+  PyObject *other = NULL;
+  PyObject *axis = NULL;
+  PyObject *result = NULL;
+  matrix_impl *rhs = NULL;
+
+  /* ``other`` is positional-only; ``axis`` accepts both forms. */
+  static char *kwlist[] = {"", "axis", NULL};
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|O", kwlist, &other, &axis)) {
+    return NULL;
+  }
+  if (!impl_check_acquired(self->impl, true)) {
+    return NULL;
+  }
+
+  rhs = unwrap_matrix(other, false);
+  if (rhs == NULL) {
+    goto done;
+  }
+
+  matrix_impl *lhs = self->impl;
+  matrix_impl *mat_arg = lhs;
+  matrix_impl *vec_arg = rhs;
+  enum BroadcastShape shape;
+
+  /* Shape classification — mirrors Matrix_binary_op's broadcast switch.
+     Two call sites is not enough duplication to warrant a shared helper. */
+  if (lhs->rows == rhs->rows && lhs->columns == rhs->columns) {
+    shape = BCAST_NONE;
+  } else if (lhs->rows == rhs->rows &&
+             (lhs->columns == 1 || rhs->columns == 1)) {
+    /* Column-vector broadcast. Canonicalise so the helper sees
+       (matrix, vector). vecdot is commutative — no swap needed. */
+    shape = BCAST_COL;
+    if (lhs->columns == 1) {
+      mat_arg = rhs;
+      vec_arg = lhs;
+    }
+  } else if (lhs->columns == rhs->columns &&
+             (lhs->rows == 1 || rhs->rows == 1)) {
+    /* Row-vector broadcast — same canonicalisation as above. */
+    shape = BCAST_ROW;
+    if (lhs->rows == 1) {
+      mat_arg = rhs;
+      vec_arg = lhs;
+    }
+  } else if ((lhs->rows == 1 || lhs->columns == 1) &&
+             (rhs->rows == 1 || rhs->columns == 1) && lhs->size == rhs->size) {
+    /* Both vectors, possibly mixed orientation (1xN vs Nx1): walk the
+       flat buffers in lockstep. No matrix/vector roles, so no swap. */
+    shape = BCAST_NONE;
+  } else {
+    PyErr_Format(PyExc_NotImplementedError,
+                 "vecdot: lhs %zux%zu incompatible with rhs %zux%zu", lhs->rows,
+                 lhs->columns, rhs->rows, rhs->columns);
+    goto done;
+  }
+
+  AxisArg axis_arg;
+  if (parse_validate_normalise_axis(axis, &axis_arg) < 0) {
+    goto done;
+  }
+
+  if (!axis_arg.has_axis) {
+    result = PyFloat_FromDouble(impl_vecdot_total(mat_arg, vec_arg, shape));
+  } else if (axis_arg.axis == 0) {
+    matrix_impl *out = impl_new(1, mat_arg->columns);
+    if (out != NULL) {
+      impl_vecdot_columnwise(mat_arg, vec_arg, out, shape);
+      result = wrap_impl_or_free(out);
+    }
+  } else {
+    /* axis_arg.axis == 1 (row-wise). parse_validate_normalise_axis
+       already rejected anything else. */
+    matrix_impl *out = impl_new(mat_arg->rows, 1);
+    if (out != NULL) {
+      impl_vecdot_rowwise(mat_arg, vec_arg, out, shape);
+      result = wrap_impl_or_free(out);
+    }
+  }
+
+done:
+  IMPL_DECREF(rhs);
+  return result;
+}
+
+/// @brief Classify a matrix as a 2D/3D cross-product operand or batch.
+/// @details ``has_axis`` / ``explicit_axis`` carry an optional caller-
+///          supplied axis (already normalised to 0 or 1 by
+///          ``parse_validate_normalise_axis``). For the doubly-valid
+///          ``2x2`` / ``3x3`` shapes ``explicit_axis`` picks the
+///          orientation (``0`` -> columns, default -> rows). For all
+///          other shapes only one orientation is valid; supplying an
+///          ``explicit_axis`` that contradicts that orientation returns
+///          ``CROSS_INVALID`` so the caller raises rather than running
+///          the wrong kernel. Returns ``CROSS_INVALID`` for any shape
+///          that has no valid cross-product interpretation.
+enum CrossAxis {
+  CROSS_SCALAR_2D_1x2,
+  CROSS_SCALAR_2D_2x1,
+  CROSS_ROWS_2D_Nx2,
+  CROSS_COLS_2D_2xN,
+  CROSS_SCALAR_3D_1x3,
+  CROSS_SCALAR_3D_3x1,
+  CROSS_ROWS_3D_Nx3,
+  CROSS_COLS_3D_3xN,
+  CROSS_INVALID
+};
+
+static enum CrossAxis classify_cross_axis(const matrix_impl *impl,
+                                          bool has_axis, int explicit_axis) {
+  const size_t M = impl->rows;
+  const size_t N = impl->columns;
+  /* Ambiguous square shapes: axis picks orientation, default is rows. */
+  if (M == 2 && N == 2) {
+    return (has_axis && explicit_axis == 0) ? CROSS_COLS_2D_2xN
+                                            : CROSS_ROWS_2D_Nx2;
+  }
+  if (M == 3 && N == 3) {
+    return (has_axis && explicit_axis == 0) ? CROSS_COLS_3D_3xN
+                                            : CROSS_ROWS_3D_Nx3;
+  }
+  /* Inherently row-oriented scalars: only axis=1 (or no axis) is valid. */
+  if (M == 1 && N == 2) {
+    if (has_axis && explicit_axis == 0) {
+      return CROSS_INVALID;
+    }
+    return CROSS_SCALAR_2D_1x2;
+  }
+  if (M == 1 && N == 3) {
+    if (has_axis && explicit_axis == 0) {
+      return CROSS_INVALID;
+    }
+    return CROSS_SCALAR_3D_1x3;
+  }
+  /* Inherently column-oriented scalars: only axis=0 (or no axis) is valid. */
+  if (M == 2 && N == 1) {
+    if (has_axis && explicit_axis == 1) {
+      return CROSS_INVALID;
+    }
+    return CROSS_SCALAR_2D_2x1;
+  }
+  if (M == 3 && N == 1) {
+    if (has_axis && explicit_axis == 1) {
+      return CROSS_INVALID;
+    }
+    return CROSS_SCALAR_3D_3x1;
+  }
+  /* Batch shapes with a unique orientation: explicit axis must match.
+     (2x3 and 3x2 remain doubly-valid and fall through to the legacy
+     default selection.) */
+  if (N == 2 && M != 3) {
+    if (has_axis && explicit_axis == 0) {
+      return CROSS_INVALID;
+    }
+    return CROSS_ROWS_2D_Nx2;
+  }
+  if (M == 2 && N != 3) {
+    if (has_axis && explicit_axis == 1) {
+      return CROSS_INVALID;
+    }
+    return CROSS_COLS_2D_2xN;
+  }
+  if (N == 3 && M != 2) {
+    if (has_axis && explicit_axis == 0) {
+      return CROSS_INVALID;
+    }
+    return CROSS_ROWS_3D_Nx3;
+  }
+  if (M == 3 && N != 2) {
+    if (has_axis && explicit_axis == 1) {
+      return CROSS_INVALID;
+    }
+    return CROSS_COLS_3D_3xN;
+  }
+  /* Doubly-valid 2x3 / 3x2: legacy default (Nx2 / 2xN wins). */
+  if (N == 2) {
+    return CROSS_ROWS_2D_Nx2;
+  }
+  if (M == 2) {
+    return CROSS_COLS_2D_2xN;
+  }
+  if (N == 3) {
+    return CROSS_ROWS_3D_Nx3;
+  }
+  if (M == 3) {
+    return CROSS_COLS_3D_3xN;
+  }
+  return CROSS_INVALID;
+}
+
+/// @brief 2D / 3D cross product against another vector or batch.
+/// @details Five paths share one dispatcher. For 1x2 / 2x1 inputs the
+///          result is the scalar z-component
+///          ``self.x * other.y - self.y * other.x`` as a Python float;
+///          for 1x3 / 3x1 the result is a same-shape Matrix preserving
+///          ``self``'s orientation. For Nx2 / 2xN batches the result is
+///          a per-vector scalar collected in a Mx1 (rows) or 1xN (cols)
+///          Matrix; for Nx3 / 3xN batches the result is a same-shape
+///          Matrix of per-vector cross products. The ``axis`` keyword
+///          disambiguates 2x2 / 3x3 squares (default: rows; ``axis=0``
+///          forces columns). For scalar inputs ``other``'s orientation
+///          is irrelevant; for batch inputs ``other`` must have the same
+///          shape as ``self``.
+static PyObject *Matrix_cross(PyObject *op, PyObject *args, PyObject *kwds) {
+  MatrixObject *self = (MatrixObject *)op;
+  PyObject *other_op = NULL;
+  PyObject *axis_obj = NULL;
+  PyObject *result = NULL;
+  matrix_impl *rhs = NULL;
+
+  static char *kwlist[] = {"", "axis", NULL};
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|O", kwlist, &other_op,
+                                   &axis_obj)) {
+    return NULL;
+  }
+  if (!impl_check_acquired(self->impl, true)) {
+    return NULL;
+  }
+
+  AxisArg axis;
+  if (parse_validate_normalise_axis(axis_obj, &axis) < 0) {
+    return NULL;
+  }
+
+  rhs = unwrap_matrix(other_op, false);
+  if (rhs == NULL) {
+    goto done;
+  }
+
+  matrix_impl *lhs = self->impl;
+  enum CrossAxis flavor = classify_cross_axis(lhs, axis.has_axis, axis.axis);
+  if (flavor == CROSS_INVALID) {
+    PyErr_SetString(
+        PyExc_NotImplementedError,
+        "cross requires a 2D or 3D vector or Nx2 or 2xN or Nx3 or 3xN matrix");
+    goto done;
+  }
+
+  // Scalar inputs: other's orientation is irrelevant, only the flat
+  // element count must match.
+  if (flavor == CROSS_SCALAR_2D_1x2 || flavor == CROSS_SCALAR_2D_2x1) {
+    if (rhs->size != 2) {
+      PyErr_Format(PyExc_NotImplementedError,
+                   "cross: 2D vector lhs %zux%zu incompatible with rhs %zux%zu",
+                   lhs->rows, lhs->columns, rhs->rows, rhs->columns);
+      goto done;
+    }
+    const double *a = lhs->data;
+    const double *b = rhs->data;
+    result = PyFloat_FromDouble(a[0] * b[1] - a[1] * b[0]);
+    goto done;
+  }
+  if (flavor == CROSS_SCALAR_3D_1x3 || flavor == CROSS_SCALAR_3D_3x1) {
+    if (rhs->size != 3) {
+      PyErr_Format(PyExc_NotImplementedError,
+                   "cross: 3D vector lhs %zux%zu incompatible with rhs %zux%zu",
+                   lhs->rows, lhs->columns, rhs->rows, rhs->columns);
+      goto done;
+    }
+    matrix_impl *out = impl_new(lhs->rows, lhs->columns);
+    if (out == NULL) {
+      goto done;
+    }
+    const double *a = lhs->data;
+    const double *b = rhs->data;
+    out->data[0] = a[1] * b[2] - a[2] * b[1];
+    out->data[1] = a[2] * b[0] - a[0] * b[2];
+    out->data[2] = a[0] * b[1] - a[1] * b[0];
+    result = wrap_impl_or_free(out);
+    goto done;
+  }
+
+  // Batch inputs accept either a same-shape batch or a single 2D/3D
+  // vector (1xK / Kx1) broadcast against every per-vector slot. Cross is
+  // anticommutative, so we deliberately do NOT silently swap operands;
+  // ``self`` must be the batch. Per-branch validation below decides which
+  // mode applies and reports the canonical error if neither fits.
+
+  if (flavor == CROSS_ROWS_2D_Nx2) {
+    const size_t N = lhs->rows;
+    const bool same_shape =
+        (lhs->rows == rhs->rows && lhs->columns == rhs->columns);
+    const bool broadcast =
+        (rhs->size == 2 && (rhs->rows == 1 || rhs->columns == 1));
+    if (!same_shape && !broadcast) {
+      PyErr_Format(PyExc_NotImplementedError,
+                   "cross: Nx2 batch lhs %zux%zu incompatible with rhs %zux%zu",
+                   lhs->rows, lhs->columns, rhs->rows, rhs->columns);
+      goto done;
+    }
+    matrix_impl *out = impl_new(N, 1);
+    if (out == NULL) {
+      goto done;
+    }
+    const double *a = lhs->data;
+    double *dst = out->data;
+    if (same_shape) {
+      const double *b = rhs->data;
+      for (size_t i = 0; i < N; ++i) {
+        double ax = *a++;
+        double ay = *a++;
+        double bx = *b++;
+        double by = *b++;
+        *dst++ = ax * by - ay * bx;
+      }
+    } else {
+      const double bx = rhs->data[0];
+      const double by = rhs->data[1];
+      for (size_t i = 0; i < N; ++i) {
+        double ax = *a++;
+        double ay = *a++;
+        *dst++ = ax * by - ay * bx;
+      }
+    }
+    result = wrap_impl_or_free(out);
+    goto done;
+  }
+
+  if (flavor == CROSS_COLS_2D_2xN) {
+    const size_t N = lhs->columns;
+    const bool same_shape =
+        (lhs->rows == rhs->rows && lhs->columns == rhs->columns);
+    const bool broadcast =
+        (rhs->size == 2 && (rhs->rows == 1 || rhs->columns == 1));
+    if (!same_shape && !broadcast) {
+      PyErr_Format(PyExc_NotImplementedError,
+                   "cross: 2xN batch lhs %zux%zu incompatible with rhs %zux%zu",
+                   lhs->rows, lhs->columns, rhs->rows, rhs->columns);
+      goto done;
+    }
+    matrix_impl *out = impl_new(1, N);
+    if (out == NULL) {
+      goto done;
+    }
+    const double *ax_row = lhs->data;
+    const double *ay_row = lhs->data + N;
+    double *dst = out->data;
+    if (same_shape) {
+      const double *bx_row = rhs->data;
+      const double *by_row = rhs->data + N;
+      for (size_t j = 0; j < N; ++j) {
+        *dst++ = ax_row[j] * by_row[j] - ay_row[j] * bx_row[j];
+      }
+    } else {
+      const double bx = rhs->data[0];
+      const double by = rhs->data[1];
+      for (size_t j = 0; j < N; ++j) {
+        *dst++ = ax_row[j] * by - ay_row[j] * bx;
+      }
+    }
+    result = wrap_impl_or_free(out);
+    goto done;
+  }
+
+  if (flavor == CROSS_ROWS_3D_Nx3) {
+    const size_t N = lhs->rows;
+    const bool same_shape =
+        (lhs->rows == rhs->rows && lhs->columns == rhs->columns);
+    const bool broadcast =
+        (rhs->size == 3 && (rhs->rows == 1 || rhs->columns == 1));
+    if (!same_shape && !broadcast) {
+      PyErr_Format(PyExc_NotImplementedError,
+                   "cross: Nx3 batch lhs %zux%zu incompatible with rhs %zux%zu",
+                   lhs->rows, lhs->columns, rhs->rows, rhs->columns);
+      goto done;
+    }
+    matrix_impl *out = impl_new(N, 3);
+    if (out == NULL) {
+      goto done;
+    }
+    const double *a = lhs->data;
+    double *dst = out->data;
+    if (same_shape) {
+      const double *b = rhs->data;
+      for (size_t i = 0; i < N; ++i) {
+        double ax = a[0], ay = a[1], az = a[2];
+        double bx = b[0], by = b[1], bz = b[2];
+        dst[0] = ay * bz - az * by;
+        dst[1] = az * bx - ax * bz;
+        dst[2] = ax * by - ay * bx;
+        a += 3;
+        b += 3;
+        dst += 3;
+      }
+    } else {
+      const double bx = rhs->data[0];
+      const double by = rhs->data[1];
+      const double bz = rhs->data[2];
+      for (size_t i = 0; i < N; ++i) {
+        double ax = a[0], ay = a[1], az = a[2];
+        dst[0] = ay * bz - az * by;
+        dst[1] = az * bx - ax * bz;
+        dst[2] = ax * by - ay * bx;
+        a += 3;
+        dst += 3;
+      }
+    }
+    result = wrap_impl_or_free(out);
+    goto done;
+  }
+
+  if (flavor == CROSS_COLS_3D_3xN) {
+    const size_t N = lhs->columns;
+    const bool same_shape =
+        (lhs->rows == rhs->rows && lhs->columns == rhs->columns);
+    const bool broadcast =
+        (rhs->size == 3 && (rhs->rows == 1 || rhs->columns == 1));
+    if (!same_shape && !broadcast) {
+      PyErr_Format(PyExc_NotImplementedError,
+                   "cross: 3xN batch lhs %zux%zu incompatible with rhs %zux%zu",
+                   lhs->rows, lhs->columns, rhs->rows, rhs->columns);
+      goto done;
+    }
+    matrix_impl *out = impl_new(3, N);
+    if (out == NULL) {
+      goto done;
+    }
+    const double *ax_row = lhs->data;
+    const double *ay_row = lhs->data + N;
+    const double *az_row = lhs->data + 2 * N;
+    double *dx_row = out->data;
+    double *dy_row = out->data + N;
+    double *dz_row = out->data + 2 * N;
+    if (same_shape) {
+      const double *bx_row = rhs->data;
+      const double *by_row = rhs->data + N;
+      const double *bz_row = rhs->data + 2 * N;
+      for (size_t j = 0; j < N; ++j) {
+        double ax = ax_row[j], ay = ay_row[j], az = az_row[j];
+        double bx = bx_row[j], by = by_row[j], bz = bz_row[j];
+        dx_row[j] = ay * bz - az * by;
+        dy_row[j] = az * bx - ax * bz;
+        dz_row[j] = ax * by - ay * bx;
+      }
+    } else {
+      const double bx = rhs->data[0];
+      const double by = rhs->data[1];
+      const double bz = rhs->data[2];
+      for (size_t j = 0; j < N; ++j) {
+        double ax = ax_row[j], ay = ay_row[j], az = az_row[j];
+        dx_row[j] = ay * bz - az * by;
+        dy_row[j] = az * bx - ax * bz;
+        dz_row[j] = ax * by - ay * bx;
+      }
+    }
+    result = wrap_impl_or_free(out);
+    goto done;
+  }
+
+  // Unreachable: every CrossAxis value is handled above.
+  PyErr_SetString(PyExc_RuntimeError,
+                  "internal: unhandled CrossAxis in Matrix_cross");
+
+done:
+  IMPL_DECREF(rhs);
+  return result;
+}
+
+/// @brief Replace every zero entry in @p vector with 1.0.
+/// @note Contract: @p vector must be a freshly-computed magnitude vector
+///       produced by `Magnitude` aggregation. A zero entry therefore
+///       implies the corresponding row or column of the dividend is
+///       all-zeros, so the subsequent divide yields 0.0 / 1.0 = 0.0 —
+///       i.e. the all-zero row/column is preserved instead of producing
+///       NaN. Do not call this helper on user-supplied data.
+static void sanitize_divisor(matrix_impl *vector) {
+  double *ptr = vector->data;
+  for (size_t i = 0; i < vector->size; ++i, ++ptr) {
+    if (*ptr == 0.0) {
+      *ptr = 1.0;
+    }
+  }
+}
+
+/// @brief Normalize @p impl into @p out along the given axis.
+/// @details ``axis.has_axis == false`` divides every element by the matrix's
+///          total magnitude; ``axis.axis == 0`` divides each column by its
+///          own magnitude; ``axis.axis == 1`` divides each row by its own
+///          magnitude. The all-zero input case is preserved (see
+///          ``sanitize_divisor``). Self-aliasing is supported — pass
+///          ``out == impl`` for in-place operation.
+static int do_normalize(matrix_impl *impl, AxisArg axis, matrix_impl *out) {
+  if (!axis.has_axis) {
+    double m = dispatch_agg_ewise(impl, Magnitude);
+    if (m == 0.0) {
+      if (out != impl) {
+        memcpy(out->data, impl->data, impl->size * sizeof(double));
+      }
+      return 0;
+    }
+    dispatch_bin_scalar(impl, m, out, Divide);
+    return 0;
+  }
+
+  if (axis.axis == 0) {
+    matrix_impl *divisor = impl_new(1, impl->columns);
+    if (divisor == NULL) {
+      return -1;
+    }
+    dispatch_agg_columnwise(impl, Magnitude, divisor);
+    sanitize_divisor(divisor);
+    dispatch_bin_rowwise(impl, divisor, out, Divide);
+    impl_free(divisor);
+    return 0;
+  }
+
+  /* axis.axis == 1 (row-wise). parse_validate_normalise_axis already
+     rejected anything else. */
+  matrix_impl *divisor = impl_new(impl->rows, 1);
+  if (divisor == NULL) {
+    return -1;
+  }
+  dispatch_agg_rowwise(impl, Magnitude, divisor);
+  sanitize_divisor(divisor);
+  dispatch_bin_columnwise(impl, divisor, out, Divide);
+  impl_free(divisor);
   return 0;
 }
 
-#define MATRIX_UNARY_METHOD(unary)                                             \
-  static PyObject *Matrix_##unary##_method(PyObject *op,                       \
-                                           PyObject *Py_UNUSED(dummy)) {       \
-    PyObject *out = NULL;                                                      \
-    if (Matrix_unary(op, &out, unary) < 0) {                                   \
-      return NULL;                                                             \
-    }                                                                          \
-    return out;                                                                \
+static PyObject *Matrix_normalize(PyObject *op, PyObject *args,
+                                  PyObject *kwds) {
+  MatrixObject *self = (MatrixObject *)op;
+  PyObject *axis_obj = NULL;
+  int in_place = 0;
+  PyObject *out_op = NULL;
+
+  static char *kwlist[] = {"axis", "in_place", NULL};
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "|Op", kwlist, &axis_obj,
+                                   &in_place)) {
+    return NULL;
+  }
+  if (!impl_check_acquired(self->impl, true)) {
+    return NULL;
   }
 
-MATRIX_UNARY_METHOD(Ceil)
-MATRIX_UNARY_METHOD(Floor)
-MATRIX_UNARY_METHOD(Round)
-MATRIX_UNARY_METHOD(Negate)
-MATRIX_UNARY_METHOD(Abs)
+  AxisArg axis;
+  if (parse_validate_normalise_axis(axis_obj, &axis) < 0) {
+    return NULL;
+  }
+
+  matrix_impl *out = set_output(op, &out_op, in_place);
+  if (out == NULL) {
+    return NULL;
+  }
+  if (do_normalize(self->impl, axis, out) < 0) {
+    Py_DECREF(out_op);
+    return NULL;
+  }
+  return out_op;
+}
+
+enum Vec2Axis {
+  VEC2_SCALAR_1x2,
+  VEC2_SCALAR_2x1,
+  VEC2_ROWS_Nx2,
+  VEC2_COLS_2xN,
+  VEC2_INVALID
+};
+
+/// @brief Classify a matrix as a 2D vector or batch of 2D vectors.
+/// @details ``has_axis`` / ``explicit_axis`` carry an optional caller-
+///          supplied axis (already normalised to 0 or 1). The ``2x2``
+///          shape is doubly-valid and ``explicit_axis`` picks the
+///          orientation (``0`` -> columns, default -> rows). For all
+///          other shapes only one orientation is valid; supplying an
+///          ``explicit_axis`` that contradicts that orientation returns
+///          ``VEC2_INVALID``. Returns ``VEC2_INVALID`` for any shape
+///          that is not a 2D vector or Nx2 / 2xN batch.
+static enum Vec2Axis classify_vec2_axis(const matrix_impl *impl, bool has_axis,
+                                        int explicit_axis) {
+  const size_t M = impl->rows;
+  const size_t N = impl->columns;
+  if (M == 1 && N == 2) {
+    if (has_axis && explicit_axis == 0) {
+      return VEC2_INVALID;
+    }
+    return VEC2_SCALAR_1x2;
+  }
+  if (M == 2 && N == 1) {
+    if (has_axis && explicit_axis == 1) {
+      return VEC2_INVALID;
+    }
+    return VEC2_SCALAR_2x1;
+  }
+  if (M == 2 && N == 2) {
+    return (has_axis && explicit_axis == 0) ? VEC2_COLS_2xN : VEC2_ROWS_Nx2;
+  }
+  if (N == 2) {
+    if (has_axis && explicit_axis == 0) {
+      return VEC2_INVALID;
+    }
+    return VEC2_ROWS_Nx2;
+  }
+  if (M == 2) {
+    if (has_axis && explicit_axis == 1) {
+      return VEC2_INVALID;
+    }
+    return VEC2_COLS_2xN;
+  }
+  return VEC2_INVALID;
+}
+
+/// @brief Fill @p out with the 2D perpendicular of every vector in @p impl.
+/// @details Row-batch and ``1x2`` scalar share one pointer walk; column-
+///          batch and ``2x1`` scalar share another. Self-aliasing is NOT
+///          supported here \u2014 callers needing in-place must use the
+///          dedicated in-place helper.
+static void impl_perpendicular_out_of_place(const matrix_impl *impl,
+                                            matrix_impl *out,
+                                            enum Vec2Axis flavor) {
+  const size_t M = impl->rows;
+  const size_t N = impl->columns;
+  if (flavor == VEC2_SCALAR_1x2 || flavor == VEC2_ROWS_Nx2) {
+    const double *src = impl->data;
+    double *dst = out->data;
+    for (size_t r = 0; r < M; ++r) {
+      const double sx = *src++;
+      const double sy = *src++;
+      *dst++ = -sy;
+      *dst++ = sx;
+    }
+    return;
+  }
+  /* VEC2_SCALAR_2x1 or VEC2_COLS_2xN. */
+  const double *src_x = impl->data;
+  const double *src_y = impl->data + N;
+  double *dst_x = out->data;
+  double *dst_y = out->data + N;
+  for (size_t c = 0; c < N; ++c, ++src_x, ++src_y, ++dst_x, ++dst_y) {
+    *dst_x = -*src_y;
+    *dst_y = *src_x;
+  }
+}
+
+/// @brief In-place 2D perpendicular: swap each (x, y) pair to (-y, x).
+static void impl_perpendicular_in_place(matrix_impl *impl,
+                                        enum Vec2Axis flavor) {
+  const size_t M = impl->rows;
+  const size_t N = impl->columns;
+  if (flavor == VEC2_SCALAR_1x2 || flavor == VEC2_ROWS_Nx2) {
+    double *p = impl->data;
+    for (size_t r = 0; r < M; ++r, p += 2) {
+      const double temp = p[0];
+      p[0] = -p[1];
+      p[1] = temp;
+    }
+    return;
+  }
+  /* VEC2_SCALAR_2x1 or VEC2_COLS_2xN. */
+  double *p = impl->data;
+  for (size_t c = 0; c < N; ++c, ++p) {
+    const double temp = p[0];
+    p[0] = -p[N];
+    p[N] = temp;
+  }
+}
+
+static PyObject *Matrix_perpendicular(PyObject *op, PyObject *args,
+                                      PyObject *kwds) {
+  MatrixObject *self = (MatrixObject *)op;
+  PyObject *axis_obj = NULL;
+  int in_place = 0;
+  PyObject *out_op = NULL;
+
+  static char *kwlist[] = {"axis", "in_place", NULL};
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "|Op", kwlist, &axis_obj,
+                                   &in_place)) {
+    return NULL;
+  }
+  if (!impl_check_acquired(self->impl, true)) {
+    return NULL;
+  }
+
+  AxisArg axis;
+  if (parse_validate_normalise_axis(axis_obj, &axis) < 0) {
+    return NULL;
+  }
+
+  enum Vec2Axis flavor =
+      classify_vec2_axis(self->impl, axis.has_axis, axis.axis);
+  if (flavor == VEC2_INVALID) {
+    PyErr_SetString(PyExc_NotImplementedError,
+                    "perpendicular requires a 2D vector or Nx2 or 2xN matrix");
+    return NULL;
+  }
+
+  if (in_place) {
+    impl_perpendicular_in_place(self->impl, flavor);
+    return Py_NewRef(op);
+  }
+
+  matrix_impl *out = set_output(op, &out_op, false);
+  if (out == NULL) {
+    return NULL;
+  }
+  impl_perpendicular_out_of_place(self->impl, out, flavor);
+  return out_op;
+}
+
+/// @brief Angle of every 2D vector in @p impl, computed via ``atan2``.
+/// @details Returns a Python float for a single vector input, an ``M\xc3\x971``
+///          column matrix for an ``Nx2`` row batch, or a ``1\xc3\x97N`` row
+///          matrix for a ``2xN`` column batch. The ``2x2`` ambiguous shape
+///          defaults to per-row; pass ``axis=0`` to force per-column.
+static PyObject *Matrix_angle(PyObject *op, PyObject *args, PyObject *kwds) {
+  MatrixObject *self = (MatrixObject *)op;
+  PyObject *axis_obj = NULL;
+
+  static char *kwlist[] = {"axis", NULL};
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "|O", kwlist, &axis_obj)) {
+    return NULL;
+  }
+  if (!impl_check_acquired(self->impl, true)) {
+    return NULL;
+  }
+
+  AxisArg axis;
+  if (parse_validate_normalise_axis(axis_obj, &axis) < 0) {
+    return NULL;
+  }
+
+  enum Vec2Axis flavor =
+      classify_vec2_axis(self->impl, axis.has_axis, axis.axis);
+  if (flavor == VEC2_INVALID) {
+    PyErr_SetString(PyExc_NotImplementedError,
+                    "angle requires a 2D vector or Nx2 or 2xN matrix");
+    return NULL;
+  }
+
+  matrix_impl *impl = self->impl;
+  if (flavor == VEC2_SCALAR_1x2 || flavor == VEC2_SCALAR_2x1) {
+    return PyFloat_FromDouble(atan2(impl->data[1], impl->data[0]));
+  }
+
+  if (flavor == VEC2_ROWS_Nx2) {
+    const size_t M = impl->rows;
+    matrix_impl *out = impl_new(M, 1);
+    if (out == NULL) {
+      return NULL;
+    }
+    const double *src = impl->data;
+    double *dst = out->data;
+    for (size_t r = 0; r < M; ++r) {
+      *dst++ = atan2(src[1], src[0]);
+      src += 2;
+    }
+    return wrap_impl_or_free(out);
+  }
+
+  /* VEC2_COLS_2xN. */
+  const size_t N = impl->columns;
+  matrix_impl *out = impl_new(1, N);
+  if (out == NULL) {
+    return NULL;
+  }
+  const double *xp = impl->data;
+  const double *yp = impl->data + N;
+  double *dst = out->data;
+  for (size_t c = 0; c < N; ++c, ++xp, ++yp, ++dst) {
+    *dst = atan2(*yp, *xp);
+  }
+  return wrap_impl_or_free(out);
+}
+
+/* MATRIX_UNARY_METHOD stamps a Python METH_VARARGS|METH_KEYWORDS wrapper
+   that calls the per-op kernel impl_<STAMP>_ewise directly — no runtime
+   dispatch. The ``in_place`` kwarg routes the output through
+   ``set_output``: when true, the kernel aliases its input and output
+   buffers and the method returns ``self`` (refcount-incremented); when
+   false, a fresh matrix is allocated and returned. See the
+   BOC_UNARY_OPS top-of-family block comment for the full template. */
+#define MATRIX_UNARY_METHOD(ENUM, STAMP)                                       \
+  static PyObject *Matrix_##ENUM##_method(PyObject *op, PyObject *args,        \
+                                          PyObject *kwds) {                    \
+    MatrixObject *self = (MatrixObject *)op;                                   \
+    matrix_impl *impl = self->impl;                                            \
+    int in_place = 0;                                                          \
+    static char *kwlist[] = {"in_place", NULL};                                \
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|p", kwlist, &in_place)) {   \
+      return NULL;                                                             \
+    }                                                                          \
+    if (!impl_check_acquired(impl, true)) {                                    \
+      return NULL;                                                             \
+    }                                                                          \
+    PyObject *out_op = NULL;                                                   \
+    matrix_impl *out = set_output(op, &out_op, in_place);                      \
+    if (out == NULL) {                                                         \
+      return NULL;                                                             \
+    }                                                                          \
+    impl_##STAMP##_ewise(impl, out);                                           \
+    return out_op;                                                             \
+  }
+
+#define X(E, S, EX) MATRIX_UNARY_METHOD(E, S)
+BOC_UNARY_OPS(X)
+#undef X
 
 static PyObject *Matrix_clip(PyObject *op, PyObject *args) {
   MatrixObject *self = (MatrixObject *)op;
@@ -1586,30 +2951,80 @@ static PyObject *Matrix_concat(PyObject *cls, PyObject *args) {
 }
 
 static PyMethodDef Matrix_methods[] = {
-    {"transpose", Matrix_transpose, METH_NOARGS,
-     "transpose($self, /)\n--\n\nReturn a transposed copy."},
-    {"transpose_in_place", Matrix_transpose_in_place, METH_NOARGS,
-     "transpose_in_place($self, /)\n--\n\nTranspose in place."},
-    {"sum", Matrix_Sum_method, METH_VARARGS,
+    {"transpose", (PyCFunction)Matrix_transpose, METH_VARARGS | METH_KEYWORDS,
+     "transpose($self, /, in_place=False)\n--\n\n"
+     "Return a transposed copy, or transpose ``self`` in place when "
+     "``in_place=True`` (in which case ``self`` is returned)."},
+    {"sum", (PyCFunction)Matrix_Sum_method, METH_VARARGS | METH_KEYWORDS,
      "sum($self, /, axis=None)\n--\n\nSum of elements."},
-    {"mean", Matrix_Mean_method, METH_VARARGS,
+    {"mean", (PyCFunction)Matrix_Mean_method, METH_VARARGS | METH_KEYWORDS,
      "mean($self, /, axis=None)\n--\n\nMean of elements."},
-    {"magnitude", Matrix_Magnitude_method, METH_VARARGS,
+    {"magnitude", (PyCFunction)Matrix_Magnitude_method,
+     METH_VARARGS | METH_KEYWORDS,
      "magnitude($self, /, axis=None)\n--\n\nEuclidean magnitude."},
-    {"min", Matrix_Minimum_method, METH_VARARGS,
+    {"magnitude_squared", (PyCFunction)Matrix_MagnitudeSquared_method,
+     METH_VARARGS | METH_KEYWORDS,
+     "magnitude_squared($self, /, axis=None)\n--\n\n"
+     "Sum of squared elements (Euclidean magnitude without the sqrt)."},
+    {"vecdot", (PyCFunction)Matrix_vecdot, METH_VARARGS | METH_KEYWORDS,
+     "vecdot($self, other, /, axis=None)\n--\n\n"
+     "Axis-aware inner product: sum of element-wise products. "
+     "Equivalent to numpy.linalg.vecdot for 1-D inputs with axis=None; "
+     "**not** equivalent to numpy.dot."},
+    {"cross", (PyCFunction)Matrix_cross, METH_VARARGS | METH_KEYWORDS,
+     "cross($self, other, /, axis=None)\n--\n\n"
+     "2D (scalar z-component) or 3D cross product against another "
+     "vector or batch. 1x2 / 2x1 inputs return a float; 1x3 / 3x1 return "
+     "a Matrix preserving self's orientation. Nx2 / 2xN row/column "
+     "batches return per-vector scalars (Mx1 / 1xN); Nx3 / 3xN return "
+     "same-shape batches. Batch operands accept either a same-shape "
+     "other or a single 2D/3D vector (1xK / Kx1) broadcast against "
+     "every per-vector slot \u2014 ``self`` must be the batch (cross is "
+     "anticommutative). ``axis`` disambiguates the 2x2 / 3x3 squares "
+     "(default rows, ``axis=0`` for columns)."},
+    {"normalize", (PyCFunction)Matrix_normalize, METH_VARARGS | METH_KEYWORDS,
+     "normalize($self, /, axis=None, in_place=False)\n--\n\n"
+     "Divide elements by their magnitude. ``axis=None`` divides by the "
+     "matrix's total magnitude; ``axis=0`` divides each column by its own "
+     "magnitude; ``axis=1`` divides each row by its own magnitude. Rows or "
+     "columns whose magnitude is zero are left as the all-zero vector. "
+     "Sub-normal magnitudes may overflow during division; threshold with "
+     "magnitude_squared() if safety matters. When ``in_place=True``, mutates "
+     "``self`` and returns it."},
+    {"perpendicular", (PyCFunction)Matrix_perpendicular,
+     METH_VARARGS | METH_KEYWORDS,
+     "perpendicular($self, /, axis=None, in_place=False)\n--\n\n"
+     "Rotate every 2D vector 90 degrees counter-clockwise: ``(x, y) -> "
+     "(-y, x)``. Accepts a single 2D vector (``1x2`` or ``2x1``), a row "
+     "batch (``Nx2``), or a column batch (``2xN``). On the ambiguous "
+     "``2x2`` shape the default is per-row; pass ``axis=0`` to force "
+     "per-column. When ``in_place=True``, mutates ``self`` and returns it."},
+    {"angle", (PyCFunction)Matrix_angle, METH_VARARGS | METH_KEYWORDS,
+     "angle($self, /, axis=None)\n--\n\n"
+     "Polar angle (``atan2(y, x)``) of every 2D vector. Returns a float "
+     "for a single 2D vector, an ``Mx1`` column matrix for an ``Nx2`` row "
+     "batch, or a ``1xN`` row matrix for a ``2xN`` column batch. On the "
+     "ambiguous ``2x2`` shape the default is per-row; pass ``axis=0`` to "
+     "force per-column."},
+    {"min", (PyCFunction)Matrix_Minimum_method, METH_VARARGS | METH_KEYWORDS,
      "min($self, /, axis=None)\n--\n\nMinimum of elements."},
-    {"max", Matrix_Maximum_method, METH_VARARGS,
+    {"max", (PyCFunction)Matrix_Maximum_method, METH_VARARGS | METH_KEYWORDS,
      "max($self, /, axis=None)\n--\n\nMaximum of elements."},
-    {"ceil", Matrix_Ceil_method, METH_NOARGS,
-     "ceil($self, /)\n--\n\nElement-wise ceiling."},
-    {"floor", Matrix_Floor_method, METH_NOARGS,
-     "floor($self, /)\n--\n\nElement-wise floor."},
-    {"round", Matrix_Round_method, METH_NOARGS,
-     "round($self, /)\n--\n\nElement-wise rounding."},
-    {"negate", Matrix_Negate_method, METH_NOARGS,
-     "negate($self, /)\n--\n\nElement-wise negation."},
-    {"abs", Matrix_Abs_method, METH_NOARGS,
-     "abs($self, /)\n--\n\nElement-wise absolute value."},
+    {"ceil", (PyCFunction)Matrix_Ceil_method, METH_VARARGS | METH_KEYWORDS,
+     "ceil($self, /, in_place=False)\n--\n\n"
+     "Element-wise ceiling."},
+    {"floor", (PyCFunction)Matrix_Floor_method, METH_VARARGS | METH_KEYWORDS,
+     "floor($self, /, in_place=False)\n--\n\n"
+     "Element-wise floor."},
+    {"round", (PyCFunction)Matrix_Round_method, METH_VARARGS | METH_KEYWORDS,
+     "round($self, /, in_place=False)\n--\n\n"
+     "Element-wise rounding (banker's; IEEE round-half-to-even)."},
+    {"negate", (PyCFunction)Matrix_Negate_method, METH_VARARGS | METH_KEYWORDS,
+     "negate($self, /, in_place=False)\n--\n\n"
+     "Element-wise negation."},
+    {"abs", (PyCFunction)Matrix_Abs_method, METH_VARARGS | METH_KEYWORDS,
+     "abs($self, /, in_place=False)\n--\n\n"
+     "Element-wise absolute value."},
     {"clip", Matrix_clip, METH_VARARGS,
      "clip($self, min_or_maxval, /, maxval=None)\n--\n\n"
      "Clip elements to a range."},
@@ -1662,8 +3077,38 @@ static PyObject *Matrix_get_columns(PyObject *op, void *Py_UNUSED(dummy)) {
   return PyLong_FromSize_t(impl->columns);
 }
 
+static PyObject *Matrix_get_size(PyObject *op, void *Py_UNUSED(dummy)) {
+  MatrixObject *self = (MatrixObject *)op;
+  matrix_impl *impl = self->impl;
+  if (!impl_check_acquired(impl, true)) {
+    return NULL;
+  }
+  return PyLong_FromSize_t(impl->size);
+}
+
 static PyObject *Matrix_get_T(PyObject *op, void *Py_UNUSED(dummy)) {
-  return Matrix_transpose(op, NULL);
+  MatrixObject *matrix = (MatrixObject *)op;
+  matrix_impl *impl = matrix->impl;
+  if (!impl_check_acquired(impl, true)) {
+    return NULL;
+  }
+  matrix_impl *transpose = impl_transpose(impl);
+  if (transpose == NULL) {
+    return NULL;
+  }
+  return wrap_impl_or_free(transpose);
+}
+
+/// @brief Total Frobenius magnitude (read-only property).
+/// @details Shortcut for ``magnitude()`` with no axis argument; same
+///          underlying ``dispatch_agg_ewise(impl, Magnitude)`` call.
+static PyObject *Matrix_get_length(PyObject *op, void *Py_UNUSED(dummy)) {
+  MatrixObject *self = (MatrixObject *)op;
+  matrix_impl *impl = self->impl;
+  if (!impl_check_acquired(impl, true)) {
+    return NULL;
+  }
+  return PyFloat_FromDouble(dispatch_agg_ewise(impl, Magnitude));
 }
 
 static PyObject *Matrix_get_x(PyObject *op, void *Py_UNUSED(dummy)) {
@@ -1812,7 +3257,9 @@ static PyGetSetDef Matrix_getset[] = {
     {"acquired", (getter)Matrix_get_acquired, NULL, NULL, NULL},
     {"rows", (getter)Matrix_get_rows, NULL, NULL, NULL},
     {"columns", (getter)Matrix_get_columns, NULL, NULL, NULL},
+    {"size", (getter)Matrix_get_size, NULL, NULL, NULL},
     {"T", (getter)Matrix_get_T, NULL, NULL, NULL},
+    {"length", (getter)Matrix_get_length, NULL, NULL, NULL},
     {"x", (getter)Matrix_get_x, (setter)Matrix_set_x, NULL, NULL},
     {"y", (getter)Matrix_get_y, (setter)Matrix_set_y, NULL, NULL},
     {"z", (getter)Matrix_get_z, (setter)Matrix_set_z, NULL, NULL},
@@ -1861,7 +3308,7 @@ static int Matrix_binary_op(PyObject *lhs_op, PyObject *rhs_op,
       goto error;
     }
 
-    impl_scalar_binary(lhs, scalar, out, op);
+    dispatch_bin_scalar(lhs, scalar, out, op);
     goto exit;
   }
 
@@ -1905,7 +3352,7 @@ static int Matrix_binary_op(PyObject *lhs_op, PyObject *rhs_op,
       goto error;
     }
 
-    impl_rowwise_binary(matrix, vector, out, op);
+    dispatch_bin_rowwise(matrix, vector, out, op);
     goto exit;
   }
 
@@ -1932,7 +3379,7 @@ static int Matrix_binary_op(PyObject *lhs_op, PyObject *rhs_op,
       goto error;
     }
 
-    impl_columnwise_binary(matrix, vector, out, op);
+    dispatch_bin_columnwise(matrix, vector, out, op);
     goto exit;
   }
 
@@ -1942,7 +3389,7 @@ static int Matrix_binary_op(PyObject *lhs_op, PyObject *rhs_op,
     goto error;
   }
 
-  impl_ewise_binary(lhs, rhs, out, op);
+  dispatch_bin_ewise(lhs, rhs, out, op);
   goto exit;
 
 error:
@@ -1973,13 +3420,23 @@ exit:
     return out;                                                                \
   }
 
-#define MATRIX_UNARY_OP(unary)                                                 \
-  static PyObject *Matrix_##unary##_op(PyObject *op) {                         \
-    PyObject *out = NULL;                                                      \
-    if (Matrix_unary(op, &out, unary) < 0) {                                   \
+/* MATRIX_UNARY_OP stamps a Python number-protocol slot wrapper that calls
+   the per-op kernel impl_<STAMP>_ewise directly. Only stamped for ops with
+   a number-protocol slot (Py_nb_absolute, Py_nb_negative). */
+#define MATRIX_UNARY_OP(ENUM, STAMP)                                           \
+  static PyObject *Matrix_##ENUM##_op(PyObject *op) {                          \
+    MatrixObject *self = (MatrixObject *)op;                                   \
+    matrix_impl *impl = self->impl;                                            \
+    if (!impl_check_acquired(impl, true)) {                                    \
       return NULL;                                                             \
     }                                                                          \
-    return out;                                                                \
+    PyObject *out_op = NULL;                                                   \
+    matrix_impl *out = set_output(op, &out_op, false);                         \
+    if (out == NULL) {                                                         \
+      return NULL;                                                             \
+    }                                                                          \
+    impl_##STAMP##_ewise(impl, out);                                           \
+    return out_op;                                                             \
   }
 
 MATRIX_BINARY_OP(Add)
@@ -1990,8 +3447,8 @@ MATRIX_INPLACE_BINARY_OP(Add)
 MATRIX_INPLACE_BINARY_OP(Subtract)
 MATRIX_INPLACE_BINARY_OP(Multiply)
 MATRIX_INPLACE_BINARY_OP(Divide)
-MATRIX_UNARY_OP(Abs)
-MATRIX_UNARY_OP(Negate)
+MATRIX_UNARY_OP(Abs, abs)
+MATRIX_UNARY_OP(Negate, negate)
 
 static PyObject *Matrix_matmul(PyObject *lhs_op, PyObject *rhs_op) {
   matrix_impl *lhs = NULL;

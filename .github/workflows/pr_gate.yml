@@ -189,7 +189,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Run clang-format style check
-        uses: jidicula/clang-format-action@f0579197b8e560e64388bb4924ad943b8bc15552  # v4.18.0
+        uses: jidicula/clang-format-action@654a770daa28443dd111d133e4083e21c1075674  # v4.18.0
         with:
           clang-format-version: '18'
           check-path: ${{matrix.path['check']}}

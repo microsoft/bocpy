@@ -52,7 +52,7 @@ every platform.
 ## Pinning `bocpy`
 
 Both `[build-system].requires` and `[project].dependencies` use a
-PEP 440 compatible-release bound (``bocpy~=0.7``). Bump this version
+PEP 440 compatible-release bound (``bocpy~=0.8``). Bump this version
 specifier in lock-step with the root ``pyproject.toml`` whenever the
 public C ABI changes — the ``finalize-pr`` skill lists every file
 that must move together.

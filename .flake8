@@ -8,6 +8,11 @@ application-import-names = bocpy,examples
 
 extend-ignore = E203, N812, N817
 
+# Verbatim Apache-2.0 vendor of pypi/warehouse — do not lint upstream style.
+# Use ``extend-exclude`` so flake8's default exclusions (``.git``, ``__pycache__``,
+# ``.tox``, ``.nox``, ``.eggs``, ``.venv`` …) are kept in addition to ours.
+extend-exclude = scripts/_vendored_warehouse_wheel.py
+
 #============================ Repo-specific config ===========================
 per-file-ignores =
     test/*:D102,D103,D403

@@ -192,6 +192,47 @@ injection into a copy of the wheel in ``DIR``, leaving the original
 untouched — this is how the Windows ``CIBW_REPAIR_WHEEL_COMMAND_WINDOWS``
 moves repaired wheels to the cibuildwheel ``{dest_dir}``.
 
+Wheel integrity validation
+--------------------------
+
+Because ``build_sbom.py inject`` rewrites every wheel's ``RECORD``
+file after ``auditwheel`` / ``delocate`` / ``delvewheel`` have already
+rewritten the ZIP, every release candidate goes through one more gate
+before it can ship:
+
+.. code-block:: console
+
+   $ python scripts/validate_wheel.py path/to/wheelhouse/
+   OK   wheelhouse/bocpy-0.7.0-cp314-cp314-manylinux_2_28_x86_64.whl
+   OK   wheelhouse/bocpy-0.7.0-cp314-cp314-win_amd64.whl
+
+``scripts/validate_wheel.py`` is a thin CLI driver over
+``scripts/_vendored_warehouse_wheel.py`` — a stdlib-only,
+verbatim-vendored copy of PyPI / Warehouse's own
+``validate_record`` and ``validate_entrypoints``.  Running it locally
+is the only reliable way to predict whether PyPI will accept a wheel:
+``twine check`` only validates ``long_description``, ``wheel unpack``
+only checks RECORD hashes and sizes, and ``check-wheel-contents`` only
+checks layout — none of them runs PyPI's actual acceptance code.
+
+The vendored file's docstring records the exact upstream commit it
+was synced from and the refresh procedure.  The wheel-integrity job
+in ``.github/workflows/build_wheels.yml`` runs it twice per release:
+once inside ``CIBW_REPAIR_WHEEL_COMMAND`` (so a per-platform build
+fails immediately on any defect) and once again in the ``merge`` job
+(defense in depth — the last gate before the ``wheels`` artifact is
+uploaded).
+
+.. note::
+
+   Per-component hash drift between 0.7.0 and 0.8.0+: ``_math.*.so``
+   is now compiled with ``-O3`` (was ``-O2`` in 0.7.0) so its
+   SHA-256 in any auditor's component diff will change even when
+   nothing else moved. The flag is pinned in ``setup.py`` and scoped
+   to ``_math`` only; ``_core.*.so`` is unaffected. See the comment
+   in ``setup.py`` for the rationale (``-fvect-cost-model=very-cheap``
+   at ``-O2`` declines to vectorise the M1 aggregate kernels).
+
 See also
 --------
 
