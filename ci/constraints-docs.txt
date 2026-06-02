@@ -181,9 +181,9 @@ docutils==0.21.2 ; python_full_version < '3.11' \
     #   sphinx-prompt
     #   sphinx-tabs
     #   sphinx-toolbox
-docutils==0.22.4 ; python_full_version >= '3.11' \
-    --hash=sha256:4db53b1fde9abecbb74d91230d32ab626d94f6badfc575d6db9194a49df29968 \
-    --hash=sha256:d0013f540772d1420576855455d050a2180186c91c15779301ac2ccb3eeb68de
+docutils==0.23 ; python_full_version >= '3.11' \
+    --hash=sha256:25d013af9bf23bc1c7b2b093dff4208166c53a94786c9e447808335ef1185fea \
+    --hash=sha256:746f5060322511280a1e50eb76846ed6bf2342984b2ac04dc42caa1a8d78799e
     # via
     #   sphinx
     #   sphinx-prompt
@@ -211,9 +211,9 @@ html5lib==1.1 \
     --hash=sha256:0d78f8fde1c230e99fe37986a60526d7049ed4bf8a9fadbad5f00e22e58e041d \
     --hash=sha256:b2e5b40261e20f354d198eae92afc10d750afb487ed5e50f9c4eaf07c184146f
     # via sphinx-toolbox
-idna==3.17 \
-    --hash=sha256:466e48829084efe2548012b855df21540b96f2e20e51bd124c851536556a592c \
-    --hash=sha256:5eb0cb53bc467c12eadcf6de83163ad8527cec9416f44b9b61b19caedad2b87f
+idna==3.18 \
+    --hash=sha256:7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2 \
+    --hash=sha256:ffb385a7e039654cef1ab9ef32c6fafe283c0c0467bba1d9029738ce4a14a848
     # via
     #   apeye-core
     #   requests
@@ -422,9 +422,9 @@ roman-numerals==4.1.0 ; python_full_version >= '3.11' \
     --hash=sha256:1af8b147eb1405d5839e78aeb93131690495fe9da5c91856cb33ad55a7f1e5b2 \
     --hash=sha256:647ba99caddc2cc1e55a51e4360689115551bf4476d90e8162cf8c345fe233c7
     # via sphinx
-ruamel-yaml==0.18.16 \
-    --hash=sha256:048f26d64245bae57a4f9ef6feb5b552a386830ef7a826f235ffb804c59efbba \
-    --hash=sha256:a6e587512f3c998b2225d68aa1f35111c29fad14aed561a26e73fab729ec5e5a
+ruamel-yaml==0.19.1 \
+    --hash=sha256:27592957fedf6e0b62f281e96effd28043345e0e66001f97683aa9a40c667c93 \
+    --hash=sha256:53eb66cd27849eff968ebf8f0bf61f46cdac2da1d1f3576dd4ccee9b25c31993
     # via sphinx-toolbox
 ruamel-yaml-clib==0.2.15 ; python_full_version < '3.14' and platform_python_implementation == 'CPython' \
     --hash=sha256:014181cdec565c8745b7cbc4de3bf2cc8ced05183d986e6d1200168e5bb59490 \
@@ -566,13 +566,13 @@ sphinx-prompt==1.10.2 ; python_full_version >= '3.11' \
     --hash=sha256:47b592ba75caebd044b0eddf7a5a1b6e0aef6df587b034377cd101a999b686ba \
     --hash=sha256:6594337962c4b1498602e6984634bed4a0dc7955852e3cfc255eb0af766ed859
     # via sphinx-toolbox
-sphinx-tabs==3.4.5 \
-    --hash=sha256:92cc9473e2ecf1828ca3f6617d0efc0aa8acb06b08c56ba29d1413f2f0f6cf09 \
-    --hash=sha256:ba9d0c1e3e37aaadd4b5678449eb08176770e0fc227e769b6ce747df3ceea531
+sphinx-tabs==3.4.7 \
+    --hash=sha256:991ad4a424ff54119799ba1491701aa8130dd43509474aef45a81c42d889784d \
+    --hash=sha256:c12d7a36fd413b369e9e9967a0a4015781b71a9c393575419834f19204bd1915
     # via sphinx-toolbox
-sphinx-toolbox==4.1.2 \
-    --hash=sha256:0438f8342ba1c6c0d6e47207f4eac167adba61742e8c2b1dc9624ff955b7bc89 \
-    --hash=sha256:c30a4f86c4c29e97adb0eb9337d35f5093cb96a44f49caffcf7d5bc58a88b781
+sphinx-toolbox==4.2.0 \
+    --hash=sha256:09f7bef48ee8936ecd890a298b3e1908fda11fe9e6a21fc623495ac34e42c962 \
+    --hash=sha256:f4dac92fc70e09e9af15d6b8ff003bde1f2aa3573118910f81cf486ced68d4ea
     # via enum-tools
 sphinxcontrib-applehelp==2.0.0 \
     --hash=sha256:2f29ef331735ce958efa4734873f084941970894c6090408b079c61b2e1c06d1 \
@@ -598,9 +598,9 @@ sphinxcontrib-serializinghtml==2.0.0 \
     --hash=sha256:6e2cb0eef194e10c27ec0023bfeb25badbbb5868244cf5bc5bdc04e4464bf331 \
     --hash=sha256:e9d912827f872c029017a53f0ef2180b327c3f7fd23c87229f7a8e8b70031d4d
     # via sphinx
-standard-imghdr==3.10.14 ; python_full_version >= '3.13' \
-    --hash=sha256:2598fe2e7c540dbda34b233295e10957ab8dc8ac6f3bd9eaa8d38be167232e52 \
-    --hash=sha256:cdf6883163349624dee9a81d2853a20260337c4cd41c04e99c082e01833a08e2
+standard-imghdr==3.13.0 ; python_full_version >= '3.13' \
+    --hash=sha256:30a1bff5465605bb496f842a6ac3cc1f2131bf3025b0da28d4877d6d4b7cc8e9 \
+    --hash=sha256:8d9c68058d882f6fc3542a8d39ef9ff94d2187dc90bd0c851e0902776b7b7a42
     # via sphinx-jinja2-compat
 tabulate==0.10.0 \
     --hash=sha256:e2cfde8f79420f6deeffdeda9aaec3b6bc5abce947655d17ac662b126e48a60d \
