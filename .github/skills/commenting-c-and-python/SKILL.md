@@ -89,6 +89,17 @@ Traditional block comments are used **exclusively** as sentinel markers in
 
 Do not use `/* */` for any other purpose.
 
+### Exception: X-macro descriptor tables
+
+Multi-line `/* */` blocks immediately above an `X(...)`-style
+descriptor table (e.g. the `BOC_AGG_OPS`, `BOC_BINARY_OPS`,
+`BOC_UNARY_OPS`, `BOC_2AGG_OPS` tables in
+[src/bocpy/_math.c](../../src/bocpy/_math.c)) are permitted as an
+exception to the sentinel-only rule. The block must list:
+(1) the family's purpose, (2) how to add a new op, (3) the stamped
+symbol-naming scheme, and (4) the names in scope inside the per-op
+expression.
+
 ### Method Table Doc Strings
 
 Short one-phrase descriptions in `PyMethodDef` tables:

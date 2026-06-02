@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bocpy"
-version = "0.7.0"
+version = "0.8.0"
 authors = [
     {name = "bocpy Team", email="bocpy@microsoft.com"}
 ]
@@ -12,6 +12,12 @@ description = "bocpy is a Python extension that adds Behavior-oriented concurren
 dynamic = ["readme"]
 keywords = ["behavior-oriented", "concurrency", "subinterpreters"]
 license = "MIT"
+# When Python 3.10 reaches EOL (October 2026) and we bump this floor
+# to >=3.11, regenerate ``ci/constraints-docs.txt`` to pick up the
+# deferred Dependabot bumps (docutils 0.23, ruamel-yaml 0.19.x,
+# sphinx-tabs 3.4.7+, sphinx-toolbox 4.2.x, standard-imghdr 3.13.x)
+# that currently require Python >=3.11 and so cannot enter a
+# universal lock that still includes 3.10.
 requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 4 - Beta",

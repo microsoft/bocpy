@@ -110,8 +110,26 @@ class Matrix:
         """The number of columns in the matrix."""
 
     @property
+    def size(self) -> int:
+        """The total element count of the matrix (``rows * columns``)."""
+
+    @property
     def T(self) -> "Matrix":
         """Return a new matrix that is the transpose of this one."""
+
+    @property
+    def length(self) -> float:
+        """Frobenius (L2) magnitude of the matrix as a read-only property.
+
+        Equivalent to :meth:`magnitude` called with no axis argument:
+        ``sqrt(sum(x**2 for x in m))`` over all elements. Exposed as a
+        ``@property`` so that vector-like code reads naturally
+        (``direction.length``, ``velocity.length``) without the extra
+        parentheses of a method call.
+
+        Note: this is **not** the element count. For ``rows * columns``
+        use :attr:`size` (or :func:`len`, which returns :attr:`rows`).
+        """
 
     @property
     def x(self) -> float:
@@ -153,11 +171,13 @@ class Matrix:
     def shape(self) -> tuple[int, int]:
         """The ``(rows, columns)`` shape of the matrix."""
 
-    def transpose(self) -> "Matrix":
-        """Return a new matrix that is the transpose of this one."""
+    def transpose(self, in_place: bool = False) -> "Matrix":
+        """Return a transposed matrix.
 
-    def transpose_in_place(self):
-        """Transpose this matrix in place, swapping its rows and columns."""
+        :param in_place: When ``True``, transpose ``self`` in place and
+            return it (no allocation). When ``False`` (the default),
+            return a new transposed :class:`Matrix`.
+        """
 
     def sum(self, axis: Optional[int] = None) -> Union[float, "Matrix"]:
         """Sum of matrix elements.
@@ -183,6 +203,126 @@ class Matrix:
             If ``1``, return a *rows* x 1 column vector of row magnitudes.
         """
 
+    def magnitude_squared(self, axis: Optional[int] = None) -> Union[float, "Matrix"]:
+        """Sum of squared elements (squared L2 norm), avoiding the square-root step.
+
+        :param axis: If ``None``, return the total squared magnitude as a float.
+            If ``0``, return a 1 x *columns* row vector of column squared magnitudes.
+            If ``1``, return a *rows* x 1 column vector of row squared magnitudes.
+        """
+
+    def vecdot(self, other: "Matrix",
+               axis: Optional[int] = None) -> Union[float, "Matrix"]:
+        """Axis-aware inner product: sum of element-wise products.
+
+        **Not** equivalent to :func:`numpy.dot` — use ``@`` /
+        :func:`numpy.matmul` for matrix multiplication. This matches
+        :func:`numpy.linalg.vecdot` for 1-D inputs with ``axis=None``.
+
+        :param other: A matrix of compatible shape. Same-shape inputs sum
+            over every element. Row-vector broadcast (``1xN`` vs ``MxN``)
+            and column-vector broadcast (``Mx1`` vs ``MxN``) are supported.
+        :param axis: If ``None``, return the total inner product as a float.
+            If ``0``, return a 1 x *columns* row vector of per-column dots.
+            If ``1``, return a *rows* x 1 column vector of per-row dots.
+        :return: A float when ``axis is None``, otherwise a :class:`Matrix`.
+        :seealso: ``@`` / :func:`numpy.matmul` for matrix multiplication.
+        """
+
+    def cross(self, other: "Matrix",
+              axis: Optional[int] = None) -> Union[float, "Matrix"]:
+        """2D or 3D cross product against another vector or batch.
+
+        Five paths share one method:
+
+        * ``1x2`` / ``2x1`` -- returns the scalar z-component
+          ``self.x * other.y - self.y * other.x`` as a float.
+        * ``1x3`` / ``3x1`` -- returns a same-shape :class:`Matrix`
+          preserving ``self``'s row/column orientation.
+        * ``Nx2`` / ``2xN`` -- per-vector scalars collected in an
+          ``Mx1`` (rows) or ``1xN`` (cols) :class:`Matrix`.
+        * ``Nx3`` / ``3xN`` -- a same-shape :class:`Matrix` of
+          per-vector 3D cross products.
+
+        ``other``'s orientation is irrelevant for the scalar inputs
+        (only the flat element count matters).
+
+        For batch ``self``, ``other`` may be either a same-shape batch
+        or a single 2D / 3D vector (``1xK`` or ``Kx1``) which is
+        broadcast against every per-vector slot. Because cross is
+        anticommutative, the broadcast convention is one-directional:
+        ``self`` must be the batch operand. To compute ``v.cross(batch)``,
+        write ``-batch.cross(v)`` (cross is anticommutative) or build
+        the right-shaped operand on the caller side.
+
+        :param other: A vector or matrix with a compatible shape.
+        :param axis: Disambiguates the ambiguous square ``2x2`` and
+            ``3x3`` shapes. Default (``None``) and ``axis=1`` treat
+            rows as components; ``axis=0`` treats columns. Ignored on
+            every other shape, including the doubly-valid ``2x3`` and
+            ``3x2`` batches — those always use the 2D-batch
+            interpretation (the 3D-batch reading is not reachable
+            through this method).
+        :return: A float for ``1x2`` / ``2x1`` inputs; otherwise a
+            :class:`Matrix`.
+        :raises NotImplementedError: on incompatible shapes or
+            mismatched batch sizes.
+        """
+
+    def normalize(self, axis: Optional[int] = None,
+                  in_place: bool = False) -> "Matrix":
+        """Divide every element by its magnitude.
+
+        Zero-magnitude rows/columns are returned as exact zeros — no
+        division by zero and no NaN. Sub-normal magnitudes may overflow
+        during division; threshold with :meth:`magnitude_squared` if
+        safety matters.
+
+        :param axis: If ``None``, divide every element by the matrix's total
+            magnitude. If ``0``, divide each column by its own magnitude.
+            If ``1``, divide each row by its own magnitude.
+        :param in_place: When ``True``, mutate ``self`` and return it.
+            When ``False`` (the default), return a new normalised
+            :class:`Matrix`.
+        :return: A :class:`Matrix` (``self`` when ``in_place=True``).
+        """
+
+    def perpendicular(self, axis: Optional[int] = None,
+                      in_place: bool = False) -> "Matrix":
+        """Rotate every 2D vector 90 degrees counter-clockwise: ``(x, y) -> (-y, x)``.
+
+        Accepts a single 2D vector (``1x2`` or ``2x1``), a row batch
+        (``Nx2``), or a column batch (``2xN``). On the ambiguous ``2x2``
+        input this method treats rows as components (``axis=1``). Pass
+        ``axis=0`` explicitly if you mean columns.
+
+        :param axis: Axis override for the ambiguous ``2x2`` shape; ignored
+            on unambiguous shapes.
+        :param in_place: When ``True``, mutate ``self`` and return it.
+            When ``False`` (the default), return a new :class:`Matrix`
+            with the rotated vectors.
+        :return: A :class:`Matrix` (``self`` when ``in_place=True``).
+        :raises NotImplementedError: on any shape that is not a 2D vector
+            or a ``Nx2`` / ``2xN`` batch.
+        """
+
+    def angle(self, axis: Optional[int] = None) -> Union[float, "Matrix"]:
+        """Polar angle (``atan2(y, x)``) of every 2D vector.
+
+        Returns a float for a single 2D vector, an ``Mx1`` column matrix
+        for an ``Nx2`` row batch, or a ``1xN`` row matrix for a ``2xN``
+        column batch. On the ambiguous ``2x2`` input this method treats
+        rows as components (``axis=1``). Pass ``axis=0`` explicitly if
+        you mean columns.
+
+        :param axis: Axis override for the ambiguous ``2x2`` shape; ignored
+            on unambiguous shapes.
+        :return: A float for a single 2D vector input, otherwise a
+            :class:`Matrix` of per-vector angles.
+        :raises NotImplementedError: on any shape that is not a 2D vector
+            or a ``Nx2`` / ``2xN`` batch.
+        """
+
     def min(self, axis: Optional[int] = None) -> Union[float, "Matrix"]:
         """Minimum of matrix elements.
 
@@ -199,20 +339,35 @@ class Matrix:
             If ``1``, return a *rows* x 1 column vector of row maxima.
         """
 
-    def ceil(self) -> "Matrix":
-        """Return a new matrix with each element rounded up to the nearest integer."""
+    def ceil(self, in_place: bool = False) -> "Matrix":
+        """Round each element up to the nearest integer.
 
-    def floor(self) -> "Matrix":
-        """Return a new matrix with each element rounded down to the nearest integer."""
+        :param in_place: When ``True``, mutate ``self`` and return it.
+        """
 
-    def round(self) -> "Matrix":
-        """Return a new matrix with each element rounded to the nearest integer."""
+    def floor(self, in_place: bool = False) -> "Matrix":
+        """Round each element down to the nearest integer.
 
-    def negate(self) -> "Matrix":
-        """Return a new matrix with every element negated."""
+        :param in_place: When ``True``, mutate ``self`` and return it.
+        """
 
-    def abs(self) -> "Matrix":
-        """Return a new matrix with the absolute value of every element."""
+    def round(self, in_place: bool = False) -> "Matrix":
+        """Round each element to the nearest integer (banker's rounding).
+
+        :param in_place: When ``True``, mutate ``self`` and return it.
+        """
+
+    def negate(self, in_place: bool = False) -> "Matrix":
+        """Negate every element.
+
+        :param in_place: When ``True``, mutate ``self`` and return it.
+        """
+
+    def abs(self, in_place: bool = False) -> "Matrix":
+        """Take the absolute value of every element.
+
+        :param in_place: When ``True``, mutate ``self`` and return it.
+        """
 
     def clip(self, min_or_maxval: float, maxval: Optional[float] = None) -> "Matrix":
         """Clip every element to a given range.

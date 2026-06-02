@@ -1,3 +1,155 @@
+## 2026-06-02 - Version 0.8.0
+Vector-oriented ``Matrix`` API — six new methods (``vecdot``,
+``cross``, ``normalize``, ``perpendicular``, ``angle``,
+``magnitude_squared``), two new read-only properties (``size``,
+``length``), and a unified ``in_place=`` keyword on every unary
+method round out ``Matrix`` as a first-class vector and
+batch-of-vectors type — plus an internal X-macro template refactor
+of every ``_math.c`` op family that restores the compiler's
+auto-vectoriser. 44 of 71 benched rows improved by ≥10%, with
+representative wins of −50% to −88% on aggregates, broadcast
+arithmetic, and ``normalize``. The ``_math`` extension now ships
+with ``-O3`` (Linux/macOS) / ``/O2`` (Windows) so end users pick
+up the wins by default.
+
+**New Features**
+
+- **Vector-oriented ``Matrix`` methods** — six new methods designed
+  for the ``Nx2`` / ``2xN`` / ``Nx3`` / ``3xN`` vector and
+  batch-of-vectors shapes that show up in ``examples/boids.py`` and
+  similar simulation code:
+
+  - ``magnitude_squared(axis=None)`` — squared L2 norm without the
+    ``sqrt`` step. Cheaper than ``magnitude()`` and safe for
+    sub-normal thresholding.
+  - ``vecdot(other, axis=None)`` — axis-aware inner product matching
+    ``numpy.linalg.vecdot``. **Not** equivalent to ``numpy.dot``;
+    use ``@`` for matrix multiplication. Same-shape, row-broadcast
+    (``1xN`` vs ``MxN``), and column-broadcast (``Mx1`` vs ``MxN``)
+    operands are all supported.
+  - ``cross(other, axis=None)`` — 2D scalar z-component or 3D cross
+    product. Five shape paths share one method: ``1x2`` / ``2x1``
+    returns a float; ``1x3`` / ``3x1`` returns a same-orientation
+    ``Matrix``; ``Nx2`` / ``2xN`` batches collect per-vector
+    scalars; ``Nx3`` / ``3xN`` batches return same-shape ``Matrix``
+    results. ``axis=`` disambiguates the square ``2x2`` / ``3x3``
+    shapes (default per-row).
+  - ``normalize(axis=None, in_place=False)`` — divide every element
+    by its magnitude. Zero-magnitude rows / columns are returned as
+    exact zeros (no NaN, no division by zero). ``axis=`` selects
+    per-row, per-column, or total normalisation.
+  - ``perpendicular(axis=None, in_place=False)`` — rotate every 2D
+    vector 90° counter-clockwise: ``(x, y) -> (-y, x)``. Accepts a
+    single 2D vector, an ``Nx2`` row batch, or a ``2xN`` column
+    batch.
+  - ``angle(axis=None)`` — polar angle ``atan2(y, x)`` of every 2D
+    vector. Returns a float for a single 2D vector input,
+    otherwise a ``Matrix`` of per-vector angles.
+- **``Matrix.size`` property** — total element count
+  (``rows * columns``). Matches ``numpy.ndarray.size``.
+- **``Matrix.length`` property** — Frobenius (L2) magnitude as a
+  read-only ``@property`` so vector-like code reads naturally
+  (``direction.length``, ``velocity.length``) without the
+  parentheses of a method call. Equivalent to ``magnitude()`` with
+  no axis argument.
+- **``in_place=`` keyword on every unary ``Matrix`` method** —
+  ``transpose``, ``ceil``, ``floor``, ``round``, ``negate``,
+  ``abs``, plus the new ``normalize`` and ``perpendicular`` all
+  accept ``in_place=True`` to mutate ``self`` and return it.
+  Replaces the older ``transpose_in_place()`` method (see
+  **Breaking Changes** below).
+- **``axis=`` keyword on aggregate methods** — ``sum``, ``mean``,
+  ``min``, ``max``, ``magnitude``, and the new ``magnitude_squared``
+  now share a tri-state ``axis=`` argument (``None`` / ``0`` / ``1``)
+  decoded through a single classifier. Negative axes (``-1`` /
+  ``-2``) accepted for NumPy parity.
+
+**Improvements**
+
+- **Auto-vectorised ``_math.c`` op kernels** — the binary,
+  aggregate, unary, and two-operand-aggregate op families inside
+  ``_math.c`` are now stamped from per-family descriptor tables,
+  one kernel per (op, shape) combination. Each per-element body is
+  literally substituted into its own monomorphic inner loop,
+  restoring the precondition for GCC's / Clang's auto-vectoriser.
+  Representative wins (lower is better):
+
+  | Bench row                                 | 0.7.0 (ns) | 0.8.0 (ns) | Δ       |
+  | ----------------------------------------- | ---------- | ---------- | ------- |
+  | ``mean()`` shape=(1000, 100)              | 44179.6    | 9001.6     | −79.6%  |
+  | ``mean(1)`` shape=(1000, 100)             | 51699.4    | 7058.5     | −86.3%  |
+  | ``max(1)`` shape=(1000, 100)              | 97184.2    | 11322.7    | −88.3%  |
+  | ``magnitude()`` shape=(1000, 3)           | 1098.2     | 306.8      | −72.1%  |
+  | ``add col-bcast`` shape=(1000, 100)       | 37823.4    | 20172.5    | −46.7%  |
+  | ``div same-shape`` shape=(1000, 100)      | 80134.2    | 45458.9    | −43.3%  |
+  | ``normalize()`` shape=(1000, 3) axis=None | 3644.6     | 1775.5     | −51.3%  |
+
+  Four rows in code paths untouched by the refactor regressed by
+  5–15% from layout drift (``_math.so`` ``.text`` grew +125% from
+  kernel specialisation); none are on a hot path. No behavioural
+  change; ``test_matrix.py`` passes unchanged.
+- **``-O3`` / ``/O2`` on ``bocpy._math``** — the math extension now
+  sets per-platform ``extra_compile_args`` in ``setup.py``
+  (``-O3 -fno-plt`` on Linux/macOS, ``/O2`` on Windows) so end-user
+  wheels and editable installs both pick up the auto-vectoriser
+  wins above. Other ``bocpy`` extensions are unaffected. The SBOM
+  hash for ``_math.*.so`` will drift accordingly — see
+  :doc:`sbom` for the auditor-facing note.
+
+**Breaking Changes**
+
+- **``Matrix.transpose_in_place()`` removed** — superseded by
+  ``Matrix.transpose(in_place=True)``, which returns ``self`` and
+  so composes the same way every other unary method does.
+  Migration is mechanical: replace ``m.transpose_in_place()`` with
+  ``m.transpose(in_place=True)``.
+
+**Documentation**
+
+- New ``Matrix`` API entries in :doc:`api` for ``size``, ``length``,
+  ``magnitude_squared``, ``vecdot``, ``cross``, ``normalize``,
+  ``perpendicular``, and ``angle``, plus updated ``in_place=``
+  keyword signatures on the existing unary methods.
+
+**Tests**
+
+- **234 new test cases** for the new ``Matrix`` methods and
+  properties (1571 → 1805 passed). Coverage includes a stub-guard
+  test that greps ``__init__.pyi`` for every new C-level name and
+  in-cown coverage exercising each new method inside ``@when``.
+- **Portable overflow regex + cross 2x3/3x2 contract pinning** —
+  the cross-product test for the doubly-valid ``2x3`` / ``3x2``
+  shapes now pins the 2D-batch interpretation explicitly, locking
+  the documented behaviour.
+
+**Internal**
+
+- **``scripts/bench_matrix.py``** — bench harness used to gate the
+  refactor: ``--json`` append mode, ``--report-median`` per-row
+  merge, 200 ms warmup, batch-size auto-tuning.
+- **``scripts/validate_wheel.py`` +
+  ``scripts/_vendored_warehouse_wheel.py``** — stdlib-only wheel
+  ``RECORD`` validator and a vendored slice of Warehouse's wheel
+  parser; used by the PR gate to catch ``RECORD`` regressions
+  before PyPI does.
+
+**CI / build**
+
+- **``cibuildwheel`` v3.4.0 → v3.4.1** and **``clang-format-action``**
+  pin normalised to the underlying commit SHA (Dependabot's
+  preferred format). Both pins move in lock-step with the
+  github-actions Dependabot group.
+- **``idna`` 3.16 → 3.17** in ``ci/constraints-docs.txt``. Five
+  other Dependabot proposals (``docutils`` 0.23, ``ruamel-yaml``
+  0.19, ``sphinx-tabs`` 3.4.7+, ``sphinx-toolbox`` 4.2, and
+  ``standard-imghdr`` 3.13) require Python ≥3.11 and so cannot
+  enter a universal lock that still includes Python 3.10; a
+  comment above ``requires-python = ">=3.10"`` in
+  ``pyproject.toml`` lists them for the post-3.10-EOL bump.
+- **``flake8`` ``extend-exclude``** for ``.copilot/``, ``build/``,
+  ``sphinx/build/``, and the scratch ``.env*`` venvs so the walker
+  no longer trips on generated or vendored Python files.
+
 ## 2026-05-28 - Version 0.7.0
 Cown-lifecycle correctness fixes — three use-after-free paths in the
 ``CownCapsule`` pickle / acquire / noticeboard machinery now hold the

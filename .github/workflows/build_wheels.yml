@@ -27,7 +27,7 @@ jobs:
           git config --global --add remote.origin.fetch +refs/pull/*/merge:refs/remotes/pull/*
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@54a71d3375df80d84b6d4537d04614fec04e637f  # v3.4.0
+        uses: pypa/cibuildwheel@8d2b08b68458a16aeb24b64e68a09ab1c8e82084  # v3.4.1
         env:
           CIBW_BUILD: ${{ matrix.python }}-win*
           CIBW_TEST_REQUIRES: "pytest setuptools wheel"
@@ -41,8 +41,11 @@ jobs:
           CIBW_BEFORE_BUILD: "pip install -r {project}/ci/constraints-cibw-bootstrap.txt --require-hashes"
           # Windows has no default wheel-repair tool, so build_sbom.py is
           # responsible for both copying the wheel into {dest_dir} and
-          # injecting the PEP 770 SBOM into the copy.
-          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: 'python {project}/scripts/build_sbom.py inject {wheel} --copy-to {dest_dir}'
+          # injecting the PEP 770 SBOM into the copy. validate_wheel.py
+          # runs PyPI's own RECORD/entry-point checks against the result
+          # so a regression like the 0.7.0 RECORD-mismatch bug fails the
+          # build instead of triggering a PyPI warning email post-upload.
+          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: 'python {project}/scripts/build_sbom.py inject {wheel} --copy-to {dest_dir} && python {project}/scripts/validate_wheel.py {dest_dir}'
         with:
           package-dir: ${{github.workspace}}
 
@@ -75,7 +78,7 @@ jobs:
           export PATH=$(python3 -m site --user-base)/bin:$PATH
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@54a71d3375df80d84b6d4537d04614fec04e637f  # v3.4.0
+        uses: pypa/cibuildwheel@8d2b08b68458a16aeb24b64e68a09ab1c8e82084  # v3.4.1
         env:
           CIBW_BUILD: ${{ matrix.python }}-macosx*
           CIBW_ARCHS_MACOS: arm64
@@ -88,9 +91,12 @@ jobs:
           # ``python_version < '3.11'`` marker makes the install a no-op
           # on 3.11+ where the stdlib already provides tomllib.
           CIBW_BEFORE_BUILD: "pip install -r {project}/ci/constraints-cibw-bootstrap.txt --require-hashes"
-          # Run delocate (the macOS default) then inject the PEP 770 SBOM into
-          # the single wheel left in {dest_dir}.
-          CIBW_REPAIR_WHEEL_COMMAND_MACOS: 'delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel} && python {project}/scripts/build_sbom.py inject {dest_dir}'
+          # Run delocate (the macOS default), inject the PEP 770 SBOM into
+          # the single wheel left in {dest_dir}, then run PyPI's own
+          # RECORD/entry-point checks against the result so a regression
+          # like the 0.7.0 RECORD-mismatch bug fails the build instead of
+          # triggering a PyPI warning email post-upload.
+          CIBW_REPAIR_WHEEL_COMMAND_MACOS: 'delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel} && python {project}/scripts/build_sbom.py inject {dest_dir} && python {project}/scripts/validate_wheel.py {dest_dir}'
         with:
           package-dir: ${{github.workspace}}
 
@@ -123,7 +129,7 @@ jobs:
           export PATH=$(python3 -m site --user-base)/bin:$PATH
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@54a71d3375df80d84b6d4537d04614fec04e637f  # v3.4.0
+        uses: pypa/cibuildwheel@8d2b08b68458a16aeb24b64e68a09ab1c8e82084  # v3.4.1
         env:
           CIBW_BUILD: ${{ matrix.python }}-macosx*
           CIBW_ARCHS_MACOS: x86_64
@@ -137,9 +143,12 @@ jobs:
           # ``python_version < '3.11'`` marker makes the install a no-op
           # on 3.11+ where the stdlib already provides tomllib.
           CIBW_BEFORE_BUILD: "pip install -r {project}/ci/constraints-cibw-bootstrap.txt --require-hashes"
-          # Run delocate (the macOS default) then inject the PEP 770 SBOM into
-          # the single wheel left in {dest_dir}.
-          CIBW_REPAIR_WHEEL_COMMAND_MACOS: 'delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel} && python {project}/scripts/build_sbom.py inject {dest_dir}'
+          # Run delocate (the macOS default), inject the PEP 770 SBOM into
+          # the single wheel left in {dest_dir}, then run PyPI's own
+          # RECORD/entry-point checks against the result so a regression
+          # like the 0.7.0 RECORD-mismatch bug fails the build instead of
+          # triggering a PyPI warning email post-upload.
+          CIBW_REPAIR_WHEEL_COMMAND_MACOS: 'delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel} && python {project}/scripts/build_sbom.py inject {dest_dir} && python {project}/scripts/validate_wheel.py {dest_dir}'
         with:
           package-dir: ${{github.workspace}}
 
@@ -162,7 +171,7 @@ jobs:
           git config --global --add remote.origin.fetch +refs/pull/*/merge:refs/remotes/pull/*
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@54a71d3375df80d84b6d4537d04614fec04e637f  # v3.4.0
+        uses: pypa/cibuildwheel@8d2b08b68458a16aeb24b64e68a09ab1c8e82084  # v3.4.1
         env:
           CIBW_BUILD: ${{ matrix.python }}-manylinux*
           CIBW_BEFORE_ALL: yum makecache
@@ -175,9 +184,12 @@ jobs:
           # ``python_version < '3.11'`` marker makes the install a no-op
           # on 3.11+ where the stdlib already provides tomllib.
           CIBW_BEFORE_BUILD: "pip install -r {project}/ci/constraints-cibw-bootstrap.txt --require-hashes"
-          # Run auditwheel (the Linux default) then inject the PEP 770 SBOM
-          # into the single wheel left in {dest_dir}.
-          CIBW_REPAIR_WHEEL_COMMAND_LINUX: 'auditwheel repair -w {dest_dir} {wheel} && python {project}/scripts/build_sbom.py inject {dest_dir}'
+          # Run auditwheel (the Linux default), inject the PEP 770 SBOM
+          # into the single wheel left in {dest_dir}, then run PyPI's own
+          # RECORD/entry-point checks against the result so a regression
+          # like the 0.7.0 RECORD-mismatch bug fails the build instead of
+          # triggering a PyPI warning email post-upload.
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: 'auditwheel repair -w {dest_dir} {wheel} && python {project}/scripts/build_sbom.py inject {dest_dir} && python {project}/scripts/validate_wheel.py {dest_dir}'
         with:
           package-dir: ${{github.workspace}}
 
@@ -201,7 +213,7 @@ jobs:
           git config --global --add remote.origin.fetch +refs/pull/*/merge:refs/remotes/pull/*
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@54a71d3375df80d84b6d4537d04614fec04e637f  # v3.4.0
+        uses: pypa/cibuildwheel@8d2b08b68458a16aeb24b64e68a09ab1c8e82084  # v3.4.1
         env:
           CIBW_BUILD: ${{ matrix.python }}-musllinux*
           CIBW_TEST_REQUIRES: "pytest setuptools wheel"
@@ -213,9 +225,12 @@ jobs:
           # ``python_version < '3.11'`` marker makes the install a no-op
           # on 3.11+ where the stdlib already provides tomllib.
           CIBW_BEFORE_BUILD: "pip install -r {project}/ci/constraints-cibw-bootstrap.txt --require-hashes"
-          # Run auditwheel (the Linux default) then inject the PEP 770 SBOM
-          # into the single wheel left in {dest_dir}.
-          CIBW_REPAIR_WHEEL_COMMAND_LINUX: 'auditwheel repair -w {dest_dir} {wheel} && python {project}/scripts/build_sbom.py inject {dest_dir}'
+          # Run auditwheel (the Linux default), inject the PEP 770 SBOM
+          # into the single wheel left in {dest_dir}, then run PyPI's own
+          # RECORD/entry-point checks against the result so a regression
+          # like the 0.7.0 RECORD-mismatch bug fails the build instead of
+          # triggering a PyPI warning email post-upload.
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: 'auditwheel repair -w {dest_dir} {wheel} && python {project}/scripts/build_sbom.py inject {dest_dir} && python {project}/scripts/validate_wheel.py {dest_dir}'
         with:
           package-dir: ${{github.workspace}}
 
@@ -240,6 +255,26 @@ jobs:
           pattern: wheels-*
           merge-multiple: true
       - run: ls -R wheelhouse
+
+      # Defense in depth. Each per-platform build already runs
+      # validate_wheel.py inside CIBW_REPAIR_WHEEL_COMMAND, but the
+      # merge job is the last point at which a broken wheel can still
+      # be rejected before it ships. Re-running the validator over the
+      # collected wheelhouse means a single per-platform step regressing
+      # to skip the call (or running on a stale checkout of scripts/)
+      # still cannot let a RECORD-mismatched wheel reach the upload
+      # artifact.
+      - name: Use Python 3.14
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.14"
+      - name: Checkout (for scripts/)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          path: source
+      - name: Validate every wheel against PyPI's checks
+        run: python source/scripts/validate_wheel.py wheelhouse
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: wheels
