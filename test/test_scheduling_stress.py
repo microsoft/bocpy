@@ -815,10 +815,13 @@ class TestOrphanDropException:
             assert behaviors is not None, (
                 "runtime must be alive for _drain_orphan_behaviors test"
             )
-            errors = behaviors._drain_orphan_behaviors()
+            errors, drained_count = behaviors._drain_orphan_behaviors()
 
         assert errors == [], (
             f"orphan drain reported unexpected errors: {errors!r}"
+        )
+        assert drained_count == 1, (
+            f"expected exactly one capsule drained; got {drained_count}"
         )
         fake_capsule.set_drop_exception.assert_called_once()
         # The argument must be a RuntimeError carrying a stop()

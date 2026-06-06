@@ -20,6 +20,7 @@ Behaviors
 .. autofunction:: wait
 .. autoclass:: WaitResult
     :members:
+.. autofunction:: quiesce
 .. autofunction:: start
 
 Cown Groups
@@ -66,6 +67,11 @@ The bocpy runtime follows a simple lifecycle:
    is no central scheduler thread.
 3. **Wait** — :func:`wait` blocks until all scheduled behaviors complete, then
    tears down the runtime (joins workers, closes the noticeboard).
+   For a non-tearing-down checkpoint (e.g. parallel-search inspection
+   between rounds), use :func:`quiesce` instead — it blocks until
+   the runtime is quiescent, returns optional ``stats`` /
+   ``noticeboard`` snapshots, and leaves workers and the noticeboard
+   thread running so further ``@when`` calls work immediately.
 4. **Re-start** — after ``wait()`` returns, the next ``@when`` call spins up
    a fresh runtime. The noticeboard is cleared and worker statistics are
    reset; existing :class:`Cown` objects survive and can be scheduled
@@ -78,6 +84,24 @@ Advanced
 ^^^^^^^^
 
 .. autofunction:: whencall
+
+
+Pinned Cowns
+------------
+
+See :ref:`pinned-cowns` for the conceptual overview, the
+coarse-grained dispatch pattern, event-loop integration recipes,
+and the free-threaded support trajectory.
+
+.. autoclass:: PinnedCown
+    :members:
+    :undoc-members:
+
+.. autofunction:: pump
+.. autoclass:: PumpResult
+    :members:
+.. autofunction:: set_pump_watchdog
+.. autofunction:: set_wait_pump_poll
 
 
 Noticeboard

@@ -9,7 +9,9 @@ from ._core import drain, receive, send, set_tags, TIMEOUT
 from ._math import Matrix
 from .behaviors import (Behaviors, Cown, notice_delete, notice_read,
                         notice_sync, notice_update, notice_write, noticeboard,
+                        PinnedCown, pump, PumpResult, quiesce,
                         REMOVED,
+                        set_pump_watchdog, set_wait_pump_poll,
                         start, wait, WaitResult, when, whencall, WORKER_COUNT)
 
 try:
@@ -78,11 +80,15 @@ def get_sources() -> list[str]:
     return []
 
 
-__all__ = ["Behaviors", "Cown", "Matrix", "REMOVED", "TIMEOUT",
+__all__ = ["Behaviors", "Cown", "Matrix", "PinnedCown", "PumpResult",
+           "REMOVED", "TIMEOUT",
            "WORKER_COUNT", "__version__", "drain",
            "get_include", "get_sources",
            "notice_delete", "notice_read",
            "notice_sync", "notice_update", "notice_write", "noticeboard",
+           "pump",
+           "quiesce",
            "receive",
-           "send", "set_tags", "start", "wait", "WaitResult",
+           "send", "set_pump_watchdog", "set_tags", "set_wait_pump_poll",
+           "start", "wait", "WaitResult",
            "when", "whencall"]

@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-from bocpy import Cown, Matrix, wait, when
+from bocpy import Cown, drain, Matrix, receive, send, TIMEOUT, wait, when
 
 
 # ---------------------------------------------------------------------------
@@ -4360,12 +4360,47 @@ class TestVectorMethodsInCown:
 
     Mirrors the in-process Matrix-vector tests but routes every call
     through the worker dispatch path so Matrix XIData round-trip plus
-    in-cown mutation are both exercised. Scalar-returning methods land
-    their result on ``result.value`` directly; matrix-returning methods
-    return an element tuple to keep the assertion self-contained;
-    in-place methods schedule a second behavior on the same cown to
-    read back the mutated matrix.
+    in-cown mutation are both exercised. Assertions are shipped out of
+    the behaviors via ``send("assert", ...)`` and collected on the test
+    thread by :meth:`receive_asserts`, per the project's BOC testing
+    convention; reading ``result.value`` directly from the test thread
+    would violate cown ownership.
     """
+
+    RECEIVE_TIMEOUT = 10
+
+    @classmethod
+    def teardown_class(cls):
+        wait()
+
+    def receive_asserts(self, count=1):
+        """Collect ``count`` ('assert', (actual, expected)) messages.
+
+        Drains the queue on exit so a failure in one test does not leak
+        residual messages into the next.
+        """
+        failed = None
+        timed_out = False
+        try:
+            for _ in range(count):
+                result = receive("assert", self.RECEIVE_TIMEOUT)
+                if result[0] == TIMEOUT:
+                    timed_out = True
+                    break
+                _, (actual, expected) = result
+                if failed is None and actual != expected:
+                    failed = (actual, expected)
+        finally:
+            drain("assert")
+
+        assert not timed_out, (
+            "Timed out waiting for an 'assert' message from a behavior. "
+            "Check that every @when arg count matches the decorated "
+            "function's parameter count."
+        )
+        if failed is not None:
+            actual, expected = failed
+            assert actual == expected, f"expected {expected!r}, got {actual!r}"
 
     # ---- scalar-returning -------------------------------------------------
 
@@ -4378,9 +4413,12 @@ class TestVectorMethodsInCown:
         def result(a):
             return a.value.vecdot(b)
 
-        wait()
-        assert result.exception is False
-        assert result.value == pytest.approx(32.0)
+        @when(result)
+        def _(r):
+            send("assert", (r.exception, False))
+            send("assert", (r.value == pytest.approx(32.0), True))
+
+        self.receive_asserts(2)
 
     def test_length_in_behavior(self):
         """``length`` getter ``[3, 4] == 5`` via worker dispatch (it's a property)."""
@@ -4390,9 +4428,12 @@ class TestVectorMethodsInCown:
         def result(v):
             return v.value.length
 
-        wait()
-        assert result.exception is False
-        assert result.value == pytest.approx(5.0)
+        @when(result)
+        def _(r):
+            send("assert", (r.exception, False))
+            send("assert", (r.value == pytest.approx(5.0), True))
+
+        self.receive_asserts(2)
 
     def test_magnitude_squared_in_behavior(self):
         """``magnitude_squared([3, 4]) == 25`` via worker dispatch."""
@@ -4402,9 +4443,12 @@ class TestVectorMethodsInCown:
         def result(v):
             return v.value.magnitude_squared()
 
-        wait()
-        assert result.exception is False
-        assert result.value == pytest.approx(25.0)
+        @when(result)
+        def _(r):
+            send("assert", (r.exception, False))
+            send("assert", (r.value == pytest.approx(25.0), True))
+
+        self.receive_asserts(2)
 
     def test_angle_in_behavior(self):
         """``angle([0, 1]) == pi/2`` via worker dispatch."""
@@ -4414,9 +4458,12 @@ class TestVectorMethodsInCown:
         def result(v):
             return v.value.angle()
 
-        wait()
-        assert result.exception is False
-        assert result.value == pytest.approx(math.pi / 2.0)
+        @when(result)
+        def _(r):
+            send("assert", (r.exception, False))
+            send("assert", (r.value == pytest.approx(math.pi / 2.0), True))
+
+        self.receive_asserts(2)
 
     # ---- matrix-returning (copy form) ------------------------------------
 
@@ -4430,11 +4477,14 @@ class TestVectorMethodsInCown:
             out = a.value.cross(b)
             return (out[0, 0], out[0, 1], out[0, 2])
 
-        wait()
-        assert result.exception is False
-        assert result.value[0] == pytest.approx(-3.0)
-        assert result.value[1] == pytest.approx(6.0)
-        assert result.value[2] == pytest.approx(-3.0)
+        @when(result)
+        def _(r):
+            send("assert", (r.exception, False))
+            send("assert", (r.value[0] == pytest.approx(-3.0), True))
+            send("assert", (r.value[1] == pytest.approx(6.0), True))
+            send("assert", (r.value[2] == pytest.approx(-3.0), True))
+
+        self.receive_asserts(4)
 
     def test_normalize_copy_in_behavior(self):
         """``normalize([3, 4]) == [0.6, 0.8]``; original cown value untouched."""
@@ -4445,13 +4495,16 @@ class TestVectorMethodsInCown:
             n = v.value.normalize()
             return (n[0, 0], n[0, 1], v.value[0, 0], v.value[0, 1])
 
-        wait()
-        assert result.exception is False
-        n0, n1, src0, src1 = result.value
-        assert n0 == pytest.approx(0.6)
-        assert n1 == pytest.approx(0.8)
-        assert src0 == pytest.approx(3.0)
-        assert src1 == pytest.approx(4.0)
+        @when(result)
+        def _(r):
+            send("assert", (r.exception, False))
+            n0, n1, src0, src1 = r.value
+            send("assert", (n0 == pytest.approx(0.6), True))
+            send("assert", (n1 == pytest.approx(0.8), True))
+            send("assert", (src0 == pytest.approx(3.0), True))
+            send("assert", (src1 == pytest.approx(4.0), True))
+
+        self.receive_asserts(5)
 
     def test_perpendicular_copy_in_behavior(self):
         """``perpendicular([1, 0]) == [0, 1]``; original cown value untouched."""
@@ -4462,13 +4515,16 @@ class TestVectorMethodsInCown:
             p = v.value.perpendicular()
             return (p[0, 0], p[0, 1], v.value[0, 0], v.value[0, 1])
 
-        wait()
-        assert result.exception is False
-        p0, p1, src0, src1 = result.value
-        assert p0 == pytest.approx(0.0)
-        assert p1 == pytest.approx(1.0)
-        assert src0 == pytest.approx(1.0)
-        assert src1 == pytest.approx(0.0)
+        @when(result)
+        def _(r):
+            send("assert", (r.exception, False))
+            p0, p1, src0, src1 = r.value
+            send("assert", (p0 == pytest.approx(0.0), True))
+            send("assert", (p1 == pytest.approx(1.0), True))
+            send("assert", (src0 == pytest.approx(1.0), True))
+            send("assert", (src1 == pytest.approx(0.0), True))
+
+        self.receive_asserts(5)
 
     # ---- in-place mutators -----------------------------------------------
 
@@ -4484,10 +4540,13 @@ class TestVectorMethodsInCown:
         def check(v):
             return (v.value[0, 0], v.value[0, 1])
 
-        wait()
-        assert check.exception is False
-        assert check.value[0] == pytest.approx(0.6)
-        assert check.value[1] == pytest.approx(0.8)
+        @when(check)
+        def _(r):
+            send("assert", (r.exception, False))
+            send("assert", (r.value[0] == pytest.approx(0.6), True))
+            send("assert", (r.value[1] == pytest.approx(0.8), True))
+
+        self.receive_asserts(3)
 
     def test_perpendicular_in_place_in_behavior(self):
         """``perpendicular(in_place=True)`` mutates the matrix held by the cown."""
@@ -4501,10 +4560,13 @@ class TestVectorMethodsInCown:
         def check(v):
             return (v.value[0, 0], v.value[0, 1])
 
-        wait()
-        assert check.exception is False
-        assert check.value[0] == pytest.approx(0.0)
-        assert check.value[1] == pytest.approx(1.0)
+        @when(check)
+        def _(r):
+            send("assert", (r.exception, False))
+            send("assert", (r.value[0] == pytest.approx(0.0), True))
+            send("assert", (r.value[1] == pytest.approx(1.0), True))
+
+        self.receive_asserts(3)
 
     def test_negate_in_place_in_behavior(self):
         """``negate(in_place=True)`` mutates the matrix held by the cown."""
@@ -4518,8 +4580,11 @@ class TestVectorMethodsInCown:
         def check(v):
             return (v.value[0, 0], v.value[0, 1], v.value[0, 2])
 
-        wait()
-        assert check.exception is False
-        assert check.value[0] == pytest.approx(-1.0)
-        assert check.value[1] == pytest.approx(2.0)
-        assert check.value[2] == pytest.approx(-3.0)
+        @when(check)
+        def _(r):
+            send("assert", (r.exception, False))
+            send("assert", (r.value[0] == pytest.approx(-1.0), True))
+            send("assert", (r.value[1] == pytest.approx(2.0), True))
+            send("assert", (r.value[2] == pytest.approx(-3.0), True))
+
+        self.receive_asserts(4)

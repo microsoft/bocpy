@@ -577,6 +577,264 @@ class Cown(Generic[T]):
         """Debug representation."""
 
 
+class PinnedCown(Cown[T]):
+    """A cown whose value never leaves the main interpreter.
+
+    Behaviors whose request set contains *any* PinnedCown run on the
+    main interpreter, scheduled onto a pump queue that the runtime
+    drains under :func:`wait` and that hosts may drive explicitly via
+    :func:`bocpy.pump`.
+
+    A regular :class:`Cown` stores its value as cross-interpreter
+    data: every time a worker acquires the cown the value is
+    unpickled into the worker's interpreter, mutated, and re-pickled
+    on release. That round-trip is the reason a cown can be acquired
+    by any worker -- but it also means the value must be picklable
+    and that **the same Python object is never observed twice** in
+    a worker.
+
+    Many useful values cannot survive that round-trip: pyglet shapes,
+    Tk widgets, open file handles, ctypes pointers into a library
+    loaded by ``__main__``, an asyncio event loop, a GPU context.
+    Their ``__reduce__`` either raises or silently reconstructs a
+    broken object on the other side.
+
+    A :class:`PinnedCown` holds its value as a plain
+    :c:type:`PyObject` reference in the main interpreter. The value
+    never goes through ``XIData``; the same Python object is
+    observed on every acquire. The trade-off: every behavior whose
+    request set contains a pinned cown runs **on the main thread**,
+    drained by :func:`pump` (called from your event loop) or
+    implicitly by :func:`wait`.
+
+    Pattern: coarse-grained pinned dispatch
+        The pinned arm is single-consumer (the main thread). If you
+        schedule a pinned behavior per item, those behaviors
+        serialise on the main thread and you lose worker
+        parallelism. Schedule pinned behaviors coarsely -- one per
+        logical frame or batch, not per item. Do per-item
+        computation on workers against per-item :class:`Cown`
+        slices, then dispatch **one** pinned ``@when`` per frame
+        that captures all of them together with the main-thread
+        canvas / handle and performs the batched write-back.
+
+    Thread affinity
+        Pinned cowns may only be constructed from the **main
+        interpreter**. Constructing one from a worker raises
+        :class:`RuntimeError`; the value would have no home
+        interpreter to live in. :func:`pump` likewise requires the
+        main interpreter -- any thread within it on classic CPython;
+        on free-threaded builds (``Py_GIL_DISABLED``) a single
+        thread at a time, enforced by a CAS on pump entry that
+        raises :class:`RuntimeError` if a second thread tries to
+        pump concurrently. The CAS is cleared on **every** exit
+        path, including ``BaseException`` propagation from a
+        pinned body.
+
+    Mixed request sets
+        A behavior may freely combine pinned and unpinned cowns;
+        the 2PL acquisition order is unchanged. As soon as the
+        request set contains any pinned cown, the body runs on the
+        main thread. Unpinned cowns in the set still travel through
+        XIData into the main interpreter for the body's duration.
+
+    Exception model
+        Body exceptions follow the same rules as worker behaviors:
+        captured on the result :class:`Cown` and surfaced through
+        ``cown.exception``. The default :func:`pump` does **not**
+        re-raise; pass ``raise_on_error=True`` to opt into
+        fail-fast propagation.
+
+    Nested pumping
+        Calling :func:`pump` from inside a pinned-behavior body
+        raises :class:`RuntimeError` (v1).
+
+    Handle vs. value
+        A :class:`PinnedCown` *handle* (the Python wrapper object
+        and its C capsule) is a normal cross-interpreter shareable.
+        It travels via the same XIData mechanism as a regular
+        :class:`Cown` and may be:
+
+        - shipped as a captured variable to a worker behavior,
+        - embedded in any value graph stored in a regular
+          :class:`Cown` (``Cown(PinnedCown(x))`` is supported),
+        - placed in a noticeboard entry via :func:`notice_write`
+          or :func:`notice_update`.
+
+        What never crosses interpreter boundaries is the *value*
+        ``x``. A worker that ends up holding a pinned-cown handle
+        can do exactly one useful thing with it: schedule pinned
+        behaviors against it (which the runtime auto-routes to
+        the main pump queue). Any attempt to acquire the value
+        from a worker is rejected by the C-level owner CAS -- the
+        value's owner is permanently the main interpreter.
+
+    Restrictions
+        - Constructible only on the main interpreter (see
+          *Thread affinity* above).
+        - The pinning interpreter is the main interpreter, by
+          design. There is one pinned queue per process and one
+          consumer of that queue (the main pumper); pinned cowns do
+          not split across interpreters.
+    """
+
+    def __init__(self, value: T):
+        """Create a pinned cown wrapping *value*.
+
+        :param value: The initial value to wrap. Stored as a plain
+            :c:type:`PyObject` reference in the main interpreter --
+            no pickling, no XIData round-trip.
+        :raises RuntimeError: If called from a non-main interpreter.
+        """
+
+
+class PumpResult(NamedTuple):
+    """Result of a :func:`pump` call.
+
+    :ivar executed: Pinned behaviors whose lifecycle ran to
+        completion this call. Counts the iteration even if the body
+        raised or the acquire failed (the MCS chain still drained).
+    :ivar deadline_reached: ``True`` iff the loop exited because
+        ``deadline_ms`` tripped before the queue drained and before
+        ``max_behaviors`` capped. ``False`` on drain, on
+        ``max_behaviors`` cap, or when ``deadline_ms`` is ``None``.
+    :ivar raised: Pinned behaviors whose body raised an
+        :class:`Exception` captured to the result cown's
+        ``.exception``. Cleanup-path failures (acquire, release,
+        noticeboard cache-clear) do **not** count: they are logged
+        via ``PyErr_WriteUnraisable`` and the iteration is still
+        counted in ``executed``. On :class:`BaseException`
+        propagation, :func:`pump` raises and no
+        :class:`PumpResult` is returned.
+    """
+
+    executed: int
+    deadline_reached: bool
+    raised: int
+
+
+def pump(deadline_ms: Optional[int] = None,
+         max_behaviors: Optional[int] = None,
+         raise_on_error: bool = False) -> PumpResult:
+    """Run pinned behaviors that are ready, then return.
+
+    Drains the main-thread queue of behaviors whose request sets
+    contain at least one :class:`PinnedCown`. Each behavior runs to
+    completion before the next starts. The pump is non-preemptive:
+    ``deadline_ms`` gates *starting* the next behavior, not
+    interrupting one already running.
+
+    Call :func:`pump` from your event loop's idle / on-tick hook.
+    Script-mode programs need not call it explicitly -- :func:`wait`
+    pumps internally when any :class:`PinnedCown` exists in the
+    process.
+
+    Bounding
+        - ``deadline_ms``: wall-clock budget. ``None`` drains to
+          empty; otherwise a positive :class:`int`.
+        - ``max_behaviors``: hard count. ``None`` drains to empty;
+          otherwise a positive :class:`int`.
+        ``0`` is rejected for both bounds (use ``if budget:`` at
+        the call site instead of relying on the pump to no-op).
+
+    Exception model
+        By default body exceptions land on the result cown; pump
+        continues. With ``raise_on_error=True``, the first body
+        exception re-raises on the pump thread after the queue
+        finishes draining. :class:`BaseException`
+        (``KeyboardInterrupt``, ``SystemExit``, ``GeneratorExit``)
+        propagates immediately after the offending behavior's
+        per-iteration cleanup completes; any behaviors still queued
+        are left in place for the next :func:`pump` call.
+
+    Thread affinity
+        :func:`pump` must run on the **main interpreter**. Calling
+        from a worker interpreter raises :class:`RuntimeError`
+        immediately. On free-threaded builds (``Py_GIL_DISABLED``)
+        only one thread may pump at a time: a concurrent call from
+        a different thread raises :class:`RuntimeError`. Calling
+        :func:`pump` when no :class:`PinnedCown` exists is a no-op
+        returning ``PumpResult(0, False, 0)``.
+
+    Reentrance
+        Not reentrant. Calling from inside a pinned-behavior body
+        raises :class:`RuntimeError` (v1).
+
+    :param deadline_ms: Wall-clock budget in milliseconds.
+        ``None`` for unbounded; otherwise a positive :class:`int`.
+        Must not be :class:`bool`.
+    :type deadline_ms: Optional[int]
+    :param max_behaviors: Maximum behaviors to start this call.
+        ``None`` for unbounded; otherwise a positive :class:`int`.
+        Must not be :class:`bool`.
+    :type max_behaviors: Optional[int]
+    :param raise_on_error: Re-raise the first body exception after
+        drain.
+    :type raise_on_error: bool
+    :return: :class:`PumpResult` (``executed``,
+        ``deadline_reached``, ``raised``). On
+        :class:`BaseException` propagation, :func:`pump` raises
+        and no :class:`PumpResult` is returned.
+    :rtype: PumpResult
+    :raises TypeError: if ``deadline_ms`` or ``max_behaviors`` is
+        not ``None``, a positive :class:`int`, or is :class:`bool`.
+    :raises RuntimeError: wrong interpreter, concurrent pump on
+        free-threaded, nested pump, no live runtime
+        (:func:`start` has not been called), or watchdog raise
+        threshold tripped.
+    """
+
+
+def set_pump_watchdog(warn_ms: Optional[int] = 1000,
+                      on_starve: Optional[
+                          Callable[[int, str], None]] = None) -> None:
+    """Configure the pinned-queue starvation watchdog.
+
+    **The watchdog is disabled until this function is called.** No
+    call means no warnings, regardless of how long the pinned queue
+    has been non-empty. ``warn_ms=1000`` is the kwarg default that
+    applies *if and when* you opt in, not the runtime default.
+
+    Warn-side sampling fires from :func:`pump` on entry (so
+    :func:`wait`'s auto-pump loop counts). The threshold gates on
+    **queue-non-empty time**: a program that runs only unpinned work
+    indefinitely never trips it.
+
+    - ``warn_ms`` (kwarg default 1000): logs a warning carrying the
+      queue's non-empty duration (ms) and current depth. Pass
+      ``None`` to disable. Must be a positive int when set.
+    - ``on_starve``: optional callable ``(severity, message)`` to
+      replace the default logger. Use this to escalate (for
+      example ``on_starve=lambda s, m: pytest.fail(m)`` in tests, or
+      a counter / alert hook in production).
+
+    :param warn_ms: Warn-after threshold in milliseconds, or
+        ``None`` to disable warnings.
+    :type warn_ms: Optional[int]
+    :param on_starve: Optional ``(severity, message)`` callback that
+        replaces the default logger sink.
+    :type on_starve: Optional[Callable[[int, str], None]]
+    :raises TypeError: if ``warn_ms`` is not ``None`` or a positive
+        :class:`int`, or ``on_starve`` is not callable.
+    :raises OverflowError: if ``warn_ms`` exceeds the maximum
+        representable nanosecond value.
+    """
+
+
+def set_wait_pump_poll(ms: int = 50) -> None:
+    """Set the poll cadence for :func:`wait`'s auto-pump loop.
+
+    Default cadence is **50 ms** — the upper bound on how long the
+    auto-pump loop will park between checks when no broadcast wakes
+    it. The setting is process-global and may be changed at any
+    time; the active :func:`wait` loop picks up the new value on
+    its next iteration.
+
+    :param ms: Poll cadence in milliseconds. Must be positive.
+    :type ms: int
+    """
+
+
 def notice_write(key: str, value: Any) -> None:
     """Write a value to the noticeboard.
 
@@ -676,15 +934,29 @@ def notice_delete(key: str) -> None:
 def noticeboard() -> Mapping[str, Any]:
     """Return a cached snapshot of the noticeboard.
 
-    Must be called from within a ``@when`` behavior. The first call within a
-    behavior captures all entries under mutex and caches the data.
-    Subsequent calls in the same behavior return a view of the same
-    cached data.
+    The noticeboard is a behavior-scope read surface. The supported
+    use is from inside a ``@when`` body: the first call captures all
+    entries under mutex and caches them, and every subsequent call
+    in the same behavior returns the same cached view.
 
     The returned mapping is read-only.
 
-    Calling from outside a behavior (e.g. the main thread) will return a
-    snapshot that is never refreshed for that thread.
+    The only supported way to read the noticeboard from the main
+    thread is to ask :func:`wait` for it via ``wait(noticeboard=True)``
+    (or ``wait(stats=True, noticeboard=True)``); that snapshot is taken
+    on the main thread between joining the noticeboard mutator thread
+    and clearing the C-side entries.
+
+    Calling :func:`noticeboard` or :func:`notice_read` from any other
+    main-thread context (outside a behavior, outside
+    ``wait(noticeboard=True)``) is **undefined behavior**: the cached
+    proxy is never re-anchored on a behavior boundary, so subsequent
+    calls may observe either a stale snapshot or partially-applied
+    writes.
+
+    Seeding the noticeboard with :func:`notice_write` from the main
+    thread *before* scheduling behaviors is fine and is the
+    recommended pattern for installing read-mostly configuration.
 
     :return: A read-only mapping of keys to their stored values.
     :rtype: Mapping[str, Any]
@@ -694,11 +966,11 @@ def noticeboard() -> Mapping[str, Any]:
 def notice_read(key: str, default: Any = None) -> Any:
     """Read a single key from the noticeboard.
 
-    Must be called from within a ``@when`` behavior. Convenience wrapper
-    that takes a snapshot and returns one value.
-
-    Calling from outside a behavior (e.g. the main thread) will return a
-    snapshot that is never refreshed for that thread.
+    Convenience wrapper over :func:`noticeboard` that takes a snapshot
+    and returns one value. The same supported-usage contract applies:
+    call from inside a ``@when`` behavior, or read the final state on
+    main via ``wait(noticeboard=True)``. Calling :func:`notice_read`
+    from any other main-thread context is **undefined behavior**.
 
     :param key: The noticeboard key to read.
     :type key: str
@@ -844,6 +1116,94 @@ class WaitResult(NamedTuple):
     noticeboard: dict[str, Any]
 
 
+@overload
+def quiesce(timeout: Optional[float] = None, *,
+            stats: Literal[False] = False,
+            noticeboard: Literal[False] = False) -> None: ...
+
+
+@overload
+def quiesce(timeout: Optional[float] = None, *,
+            stats: Literal[True],
+            noticeboard: Literal[False] = False) -> list[dict]: ...
+
+
+@overload
+def quiesce(timeout: Optional[float] = None, *,
+            stats: Literal[False] = False,
+            noticeboard: Literal[True]) -> dict[str, Any]: ...
+
+
+@overload
+def quiesce(timeout: Optional[float] = None, *,
+            stats: Literal[True],
+            noticeboard: Literal[True]) -> "WaitResult": ...
+
+
+def quiesce(timeout: Optional[float] = None, *,
+            stats: bool = False,
+            noticeboard: bool = False
+            ) -> Union[None, list[dict], dict[str, Any], "WaitResult"]:
+    """Block until in-flight behaviors complete **without** teardown.
+
+    Unlike :func:`wait`, this leaves the runtime fully usable:
+    workers remain running, the noticeboard thread remains
+    registered, and the terminator is **not** closed. Further
+    ``@when`` calls work immediately after ``quiesce()`` returns.
+
+    Typical use is to lift a result out of a long-running parallel
+    job at a defined synchronization point — e.g. a parallel search
+    that periodically wants to inspect its best-so-far state — and
+    then keep working. The flags mirror :func:`wait`:
+
+    - neither flag set: returns ``None`` once the runtime is quiescent.
+    - ``stats=True`` only: returns the per-worker scheduler-stats
+      snapshot as ``list[dict]`` (same shape as :func:`wait`).
+    - ``noticeboard=True`` only: returns a plain ``dict[str, Any]``
+      with the noticeboard contents at the quiescence point.
+    - both flags set: returns :class:`WaitResult`.
+
+    The noticeboard snapshot is captured by cycling the dedicated
+    mutator thread: a shutdown sentinel is enqueued on the FIFO
+    ``boc_noticeboard`` tag, the thread is joined (guaranteeing
+    every prior mutation has been committed), the live state is
+    read, and the thread is restarted. The result is a true
+    cross-interpreter point-in-time view that reflects every
+    ``notice_write`` / ``notice_update`` / ``notice_delete`` posted
+    by a behavior that completed before the quiesce point.
+
+    Single-caller: like :func:`wait`, ``quiesce`` assumes one
+    thread at a time on the primary interpreter. Concurrent
+    ``@when`` calls from secondary threads during a ``quiesce`` are
+    waited for (their behaviors are part of the quiescence
+    condition); concurrent ``notice_write`` calls have undefined
+    ordering with respect to the returned snapshot.
+
+    :param timeout: Maximum seconds to wait. ``None`` means wait
+        forever. The same deadline bounds both the terminator wait
+        and the noticeboard-cycle join.
+    :type timeout: Optional[float]
+    :param stats: If ``True``, capture per-worker scheduler stats
+        AFTER quiescence so the counts are stable.
+    :type stats: bool
+    :param noticeboard: If ``True``, capture a noticeboard snapshot
+        via the thread-cycle protocol described above.
+    :type noticeboard: bool
+    :return: ``None`` when neither flag is set; the scheduler-stats
+        list when only ``stats=True``; the noticeboard dict when
+        only ``noticeboard=True``; a :class:`WaitResult` when both
+        flags are set.
+    :rtype: Union[None, list[dict], dict[str, Any], WaitResult]
+    :raises TimeoutError: If quiescence is not reached within
+        ``timeout`` (or if the noticeboard-cycle join times out).
+        Unlike :func:`wait`, ``quiesce`` propagates this rather
+        than swallowing it -- callers who need silent best-effort
+        behavior should wrap the call.
+    :raises RuntimeError: If called from a non-primary interpreter
+        while pinned cowns are live (same constraint as :func:`wait`).
+    """
+
+
 def when(*cowns):
     """Decorator to schedule a function as a behavior using given cowns.
 
@@ -889,6 +1249,15 @@ def start(**kwargs):
     thread. Scheduling and release run on the caller and worker
     threads themselves — there is no central scheduler thread.
 
+    Idempotent: if the runtime is already up, returns silently. A
+    follow-up :func:`start` from a sibling code path in the same
+    process is a no-op rather than an error, which makes "ensure
+    the runtime is live before I :func:`notice_write`" usable as a
+    one-liner without try/except scaffolding. Arguments supplied to
+    a short-circuited call are **ignored**; callers who need a
+    different ``worker_count`` or ``module`` must :func:`wait` /
+    :func:`stop` the existing runtime first.
+
     :param worker_count: The number of worker interpreters to start.  If
         ``None``, defaults to the number of available cores minus one.
     :type worker_count: Optional[int]
@@ -896,6 +1265,7 @@ def start(**kwargs):
         export for worker import.  If ``None``, the caller's module will
         be used.
     :type module: Optional[tuple[str, str]]
+    :raises RuntimeError: If called from a non-primary interpreter.
     """
 
 

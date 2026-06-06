@@ -70,6 +70,19 @@ class TestCapturedLocals:
                 return helper
         """) == set()
 
+    def test_except_as_name_excluded(self):
+        # ``except ... as X`` binds X via ``ExceptHandler.name`` (a
+        # plain identifier, not an ``ast.Name(Store)`` node). The
+        # finder must still treat it as local so a subsequent ``str(X)``
+        # read is not classified as a capture.
+        assert "ex" not in self._captures("""\
+            def f():
+                try:
+                    pass
+                except RuntimeError as ex:
+                    return str(ex)
+        """, known_vars={"RuntimeError", "str"})
+
 
 class TestCapturedFreeVars:
     """Free variables that are not params, locals, or known are captured."""
@@ -908,3 +921,182 @@ class TestImportAlias:
             assert "OD" not in info.captures, (
                 f"'OD' should not be captured; captures = {info.captures}"
             )
+
+
+# ── Defaults-as-captures (loop-snapshot idiom) ──────────────────────────
+
+
+class TestDefaultsAsCaptures:
+    """``def b(c, i=i)`` and ``def b(c, x=y)`` hoist defaults to captures."""
+
+    @staticmethod
+    def _export(source, path="/tmp/test.py"):
+        tree = ast.parse(textwrap.dedent(source))
+        return export_module(tree, path)
+
+    def test_loop_snapshot_idiom(self):
+        """``def b(c, i=i)`` — capture ``i`` by name, strip the default."""
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            def run(c, i):
+                @when(c)
+                def b(c, i=i):
+                    return i
+        """)
+        info = list(result.behaviors.values())[0]
+        assert info.captures == ["i"]
+        # Default must be stripped from the exported behavior.
+        gen_tree = ast.parse(result.code)
+        for node in ast.walk(gen_tree):
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("__behavior__"):
+                assert node.args.defaults == [], (
+                    "default for capture must be stripped from behavior signature"
+                )
+                names = [a.arg for a in node.args.args]
+                assert names == ["c", "i"]
+
+    def test_rename_default(self):
+        """``def b(c, x=y)`` — capture ``y``, bind into param ``x``."""
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            c = Cown(0)
+            y = 42
+            @when(c)
+            def b(c, x=y):
+                return x
+        """)
+        info = list(result.behaviors.values())[0]
+        assert info.captures == ["y"]
+        gen_tree = ast.parse(result.code)
+        for node in ast.walk(gen_tree):
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("__behavior__"):
+                names = [a.arg for a in node.args.args]
+                assert names == ["c", "x"]
+                assert node.args.defaults == []
+
+    def test_undefaulted_extra_captured_by_name(self):
+        """``def b(c, factor)`` — bare extra captured by its own name."""
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            c = Cown(0)
+            factor = 3
+            @when(c)
+            def b(c, factor):
+                return factor
+        """)
+        info = list(result.behaviors.values())[0]
+        assert info.captures == ["factor"]
+
+    def test_combined_default_and_body_capture(self):
+        """Defaults precede body free-vars in the captures list."""
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            def run(c, i, factor):
+                @when(c)
+                def b(c, i=i):
+                    return i * factor
+        """)
+        info = list(result.behaviors.values())[0]
+        # Extras come first, then body captures.
+        assert info.captures == ["i", "factor"]
+
+    def test_non_name_default_rejected(self):
+        """Non-Name defaults cannot be hoisted — must be a bare name."""
+        try:
+            self._export("""\
+                from bocpy import when, whencall, Cown
+
+                c = Cown(0)
+                @when(c)
+                def b(c, k=foo()):
+                    return k
+            """)
+        except SyntaxError as e:
+            assert "must be a plain name" in str(e)
+        else:
+            raise AssertionError("expected SyntaxError for non-Name default")
+
+    def test_default_on_cown_position_rejected(self):
+        """Defaults on cown positions are not allowed."""
+        try:
+            self._export("""\
+                from bocpy import when, whencall, Cown
+
+                c = Cown(0)
+                @when(c)
+                def b(c=c):
+                    return 1
+            """)
+        except SyntaxError as e:
+            assert "cown positions" in str(e)
+        else:
+            raise AssertionError("expected SyntaxError for default on cown position")
+
+
+# ── @when alias support ─────────────────────────────────────────────────
+
+
+class TestWhenAlias:
+    """Aliased ``when`` decorators are detected and rewritten."""
+
+    @staticmethod
+    def _export(source, path="/tmp/test.py"):
+        tree = ast.parse(textwrap.dedent(source))
+        return export_module(tree, path)
+
+    def test_from_import_alias(self):
+        """``from bocpy import when as boc_when`` works end-to-end."""
+        result = self._export("""\
+            from bocpy import when as boc_when, whencall, Cown
+
+            c = Cown(0)
+            @boc_when(c)
+            def b(c):
+                return c.value
+        """)
+        names = [info.name for info in result.behaviors.values()]
+        assert names == ["__behavior__0"]
+        # The aliased decorator must be stripped from the behavior.
+        gen_tree = ast.parse(result.code)
+        for node in ast.walk(gen_tree):
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("__behavior__"):
+                for dec in node.decorator_list:
+                    assert "boc_when" not in ast.unparse(dec)
+
+    def test_module_attr_decorator(self):
+        """``import bocpy`` + ``@bocpy.when(c)`` is recognized."""
+        result = self._export("""\
+            import bocpy
+
+            c = bocpy.Cown(0)
+            @bocpy.when(c)
+            def b(c):
+                return c.value
+        """)
+        names = [info.name for info in result.behaviors.values()]
+        assert names == ["__behavior__0"]
+        # whencall must be auto-imported when only ``import bocpy`` is present.
+        assert "from bocpy import whencall" in result.code
+        gen_tree = ast.parse(result.code)
+        for node in ast.walk(gen_tree):
+            if isinstance(node, ast.FunctionDef) and node.name.startswith("__behavior__"):
+                for dec in node.decorator_list:
+                    assert "bocpy.when" not in ast.unparse(dec)
+
+    def test_module_alias_decorator(self):
+        """``import bocpy as boc`` + ``@boc.when(c)`` is recognized."""
+        result = self._export("""\
+            import bocpy as boc
+
+            c = boc.Cown(0)
+            @boc.when(c)
+            def b(c):
+                return c.value
+        """)
+        names = [info.name for info in result.behaviors.values()]
+        assert names == ["__behavior__0"]
+        assert "from bocpy import whencall" in result.code

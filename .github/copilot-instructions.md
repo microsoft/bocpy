@@ -190,9 +190,14 @@ interpreter's headers.
 extracts each decorated function into a top-level `__behavior__N` definition
 and rewrites the call site as `whencall('__behavior__N', cowns, captures)`.
 The captures tuple is built **at schedule time**, so loop variables are
-snapshotted by value — no `x=x` default-arg idiom is needed (and adding one
-breaks the behavior because the transpiler treats every signature name as a
-behavior parameter and discards the default).
+snapshotted by value. Two spellings of the loop-snapshot idiom are
+supported transparently: just reference the loop variable in the body, or
+write `def b(c, i=i)` and let the transpiler hoist the default into a
+capture. Trailing positional parameters beyond the cown count are also
+auto-captured by name (`def b(c, factor)` captures `factor`). The
+transpiler also recognises aliased decorators — `from bocpy import when as
+boc_when` and `import bocpy [as alias]` followed by `@bocpy.when(...)` or
+`@alias.when(...)` — provided the aliasing import is at module level.
 
 When debugging behavior dispatch, capture resolution, parameter-count
 mismatches, or anything else that depends on the transpiler's output, use the

@@ -6,6 +6,7 @@
 #include "boc_sched.h"
 #include "boc_tags.h"
 #include "boc_terminator.h"
+#include <assert.h>
 #include <bocpy/bocpy.h>
 
 // Forward declaration — BOCQueue is defined below.
@@ -48,6 +49,72 @@ const char *BOC_TIMEOUT = "__timeout__";
 const int BOC_CAPACITY = 1024 * 16;
 atomic_int_least64_t BOC_COUNT = 0;
 atomic_int_least64_t BOC_COWN_COUNT = 0;
+// Live pinned-cown count (incremented in the PinnedCownCapsule factory,
+// decremented when a pinned cown's strong refcount reaches zero).
+atomic_int_least64_t PINNED_COWN_COUNT = 0;
+
+// Process-global queue carrying behaviours that touch one or more
+// pinned cowns. Producers (worker / caller threads, via
+// `boc_sched_dispatch` -> `boc_main_pinned_enqueue`) enqueue the
+// prehdr's `bq_node`; the main interpreter drains it from
+// `main_pump_bounded`. Initialised once per process in
+// `_core_module_exec`; never destroyed (kernel objects outlive
+// module unload, matching the BOC_QUEUES / terminator pattern).
+static boc_bq_t MAIN_PINNED_QUEUE;
+
+// Depth of MAIN_PINNED_QUEUE. Bumped by `boc_main_pinned_enqueue`,
+// decremented by the main pump as it consumes nodes. A
+// `wait()`-blocked main thread observes a non-zero depth via the
+// terminator condvar (woken by `terminator_wake_all`). Signed type: MSVC
+// stdatomic has no unsigned variant; depth never goes negative.
+static atomic_int_least64_t MAIN_PINNED_DEPTH = 0;
+
+// Monotonic-ns timestamp of the most recent 0 -> 1 transition of
+// MAIN_PINNED_DEPTH. Used by the main pump as a fairness signal
+// (oldest-pending-pinned-work age). Sampled lock-free; race-tolerant.
+static atomic_int_least64_t MAIN_PINNED_NONEMPTY_SINCE_NS = 0;
+
+// Thread-local re-entry flag for main_pump_bounded. Set true at the
+// start of each pinned-body iteration and cleared in the per-iteration
+// cleanup block, so a nested pump() called from inside a pinned body
+// observes true at gate 3 and is rejected. Thread-local + plain bool
+// (no atomicity needed): only the owning thread reads or writes it.
+static thread_local bool IN_PUMP_BODY = false;
+
+// Monotonic-ns timestamp of the most recent pump iteration completion.
+// Sampled lock-free; race-tolerant. The pump updates it after each
+// iteration so the watchdog can compare against
+// MAIN_PINNED_NONEMPTY_SINCE_NS.
+static atomic_int_least64_t LAST_PUMP_NS = 0;
+
+#ifdef Py_GIL_DISABLED
+// Free-threaded build only: ID (thrd_current() cast to uintptr_t) of
+// the thread that currently owns the main pump CAS. Zero when idle.
+// Gate 2 of main_pump_bounded CAS-acquires this so two distinct
+// threads cannot pump concurrently. Same-thread re-entry leaves the
+// CAS owned by the outer frame; gate 3's IN_PUMP_BODY check rejects
+// the nested call. intptr_t (not uintptr_t) for MSVC: thread-id bits round-trip
+// bit-cast losslessly.
+static atomic_intptr_t MAIN_PUMP_THREAD = 0;
+#endif
+
+// Pump-starvation watchdog config (set via _core.set_pump_watchdog).
+// Both atomics default to "disabled": the watchdog produces no
+// output until the user opts in by calling set_pump_watchdog().
+// Read on the hot path (boc_main_pinned_check_warn runs on pump
+// entry), so the atomics are deliberately the cheapest shape --
+// relaxed reads against ms-resolution counters. 0 means disabled
+// for WATCHDOG_WARN_MS. WATCHDOG_ON_STARVE is only touched from
+// the main interpreter (set_pump_watchdog refuses non-main; the
+// warn callback fires on pump entry which is also main-only); the
+// atomic_intptr_t is for store/load visibility; intptr_t (not uintptr_t) for
+// MSVC, PyObject* round-trips losslessly.
+static atomic_int_least64_t WATCHDOG_WARN_MS = 0;
+static atomic_intptr_t WATCHDOG_ON_STARVE = 0;
+// Monotonic-ns timestamp of the most recent warn log emission, used
+// to rate-limit the warn channel so a slow pump does not flood logs
+// once per call. 0 = never warned in this NONEMPTY_SINCE epoch.
+static atomic_int_least64_t WATCHDOG_LAST_WARN_NS = 0;
 
 #define BOC_SPIN_COUNT 64
 #define BOC_BACKOFF_CAP_NS 1000000 // 1 ms
@@ -948,6 +1015,32 @@ static PyObject *_core_terminator_wait(PyObject *self, PyObject *args) {
   Py_RETURN_FALSE;
 }
 
+/// @brief Pumpable variant of @ref _core_terminator_wait.
+/// @details Forwards to @ref terminator_wait_pumpable, supplying the
+/// @ref _core_pinned_depth_load reader. Returns one of the three
+/// integer constants exposed on the module (`TERMINATED`,
+/// `PUMP_READY`, `WAIT_TIMED_OUT`). Releases the GIL across the wait.
+/// @param self The module (unused)
+/// @param timeout_obj A Python float — seconds to wait. Non-positive
+///                    performs a non-blocking poll.
+/// @return Python int — one of the wake-reason sentinels.
+static uint64_t _core_pinned_depth_load(void);
+static PyObject *_core_terminator_wait_pumpable(PyObject *self,
+                                                PyObject *timeout_obj) {
+  BOC_STATE_SET(self);
+  double timeout_s = PyFloat_AsDouble(timeout_obj);
+  if (timeout_s == -1.0 && PyErr_Occurred()) {
+    return NULL;
+  }
+
+  boc_terminator_wake_reason_t reason;
+  Py_BEGIN_ALLOW_THREADS reason =
+      terminator_wait_pumpable(timeout_s, _core_pinned_depth_load);
+  Py_END_ALLOW_THREADS
+
+      return PyLong_FromLong((long)reason);
+}
+
 /// @brief Idempotent one-shot decrement of the Pyrona seed.
 /// @details Called by stop()/wait() to remove the seed that keeps the
 /// terminator count above zero across momentary quiescence. Safe to call
@@ -971,6 +1064,26 @@ static PyObject *_core_terminator_seed_dec(PyObject *self,
   Py_RETURN_FALSE;
 }
 
+/// @brief Idempotent one-shot re-arm of the Pyrona seed.
+/// @param self The module (unused)
+/// @param args Unused
+/// @return Python bool — True if this call restored the seed, False if
+/// the seed was already present.
+static PyObject *_core_terminator_seed_inc(PyObject *self,
+                                           PyObject *Py_UNUSED(args)) {
+  BOC_STATE_SET(self);
+  if (BOC_STATE->index != 0) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "terminator_seed_inc must be called from the primary "
+                    "interpreter");
+    return NULL;
+  }
+  if (terminator_seed_inc()) {
+    Py_RETURN_TRUE;
+  }
+  Py_RETURN_FALSE;
+}
+
 /// @brief Restore terminator state for a fresh runtime start.
 /// @details Sets count=1 (the Pyrona seed), clears the closed bit, and
 /// re-arms the seed one-shot. Called from Behaviors.start(). Returns
@@ -983,6 +1096,7 @@ static PyObject *_core_terminator_seed_dec(PyObject *self,
 /// @return A 2-tuple @c (prior_count, prior_seeded).
 static PyObject *_core_terminator_reset(PyObject *self,
                                         PyObject *Py_UNUSED(args)) {
+  PRINTDBG("_core_terminator_reset\n");
   BOC_STATE_SET(self);
   if (BOC_STATE->index != 0) {
     PyErr_SetString(PyExc_RuntimeError,
@@ -993,6 +1107,17 @@ static PyObject *_core_terminator_reset(PyObject *self,
   int_least64_t prior_count = 0;
   int_least64_t prior_seeded = 0;
   terminator_reset(&prior_count, &prior_seeded);
+  // Pump-watchdog state: depth and timestamps must return to the
+  // depth==0 baseline so the watchdog does not carry stale "queue
+  // has been non-empty since X" / "last warn at Y" readings into
+  // the next run. MAIN_PINNED_DEPTH is reset by the drain in
+  // stop_workers; the rest live here.
+  atomic_store(&MAIN_PINNED_NONEMPTY_SINCE_NS, 0);
+  atomic_store(&WATCHDOG_LAST_WARN_NS, 0);
+  atomic_store(&LAST_PUMP_NS, 0);
+#ifdef Py_GIL_DISABLED
+  atomic_store_intptr(&MAIN_PUMP_THREAD, (intptr_t)0);
+#endif
   return Py_BuildValue("(LL)", (long long)prior_count, (long long)prior_seeded);
 }
 
@@ -1026,6 +1151,15 @@ typedef struct boc_cown {
   bool pickled;
   /// @brief Whether the cown holds an exception object
   bool exception;
+  /// @brief Whether this cown is pinned to the main interpreter.
+  /// @details Set permanently by the @c PinnedCownCapsule constructor;
+  /// never modified afterwards. Adjacent to @c pickled / @c exception
+  /// so all three bools occupy the same alignment-fill slot and the
+  /// struct size is unchanged. Read (relaxed) by @c cown_acquire /
+  /// @c cown_release / @c cown_decref_inline /
+  /// @c report_unhandled_exception / @c cown_disown to short-circuit
+  /// the owner CAS and skip the XIData round-trip for pinned cowns.
+  bool is_pinned;
   /// @brief the threadsafe serialized cown contents
   XIDATA_T *xidata;
   /// @brief the module which last released this cown
@@ -1139,12 +1273,78 @@ static inline int_least64_t cown_decref_inline(BOCCown *cown) {
 
   // we can clear the object and recycle the xidata
   if (cown->value != NULL) {
-    assert(cown->owner == bocpy_interpid());
-    Py_CLEAR(cown->value);
+    if (cown->is_pinned) {
+      // Pinned cowns hold a main-interpreter PyObject* in
+      // ``cown->value``. Running ``Py_CLEAR`` from a worker that
+      // happens to drop the last handle would invoke the value's
+      // destructor on the wrong interpreter — undefined behaviour
+      // under PEP 684 and ``Py_GIL_DISABLED``. The safe ship choice
+      // is a controlled leak: skip the clear here, surface the leak
+      // via ``PyErr_WriteUnraisable`` so it is at least observable
+      // in test runs, and let the main interpreter's process-exit
+      // reclaim the bytes. Callers that want zero leaks must keep
+      // pinned-cown handles on main.
+      if (bocpy_interpid() != bocpy_main_interpid()) {
+        // Preserve any pending exception on the calling thread:
+        // ``PyErr_WriteUnraisable(NULL)`` writes-and-clears the
+        // error indicator, so a caller mid-unwind would silently
+        // lose its in-flight exception when this leak path fires
+        // (e.g. interpreter shutdown that raced a worker dropping
+        // the last handle). Fetch around the format/write pair and
+        // restore on the way out.
+        PyObject *prev_exc_type, *prev_exc_val, *prev_exc_tb;
+        PyErr_Fetch(&prev_exc_type, &prev_exc_val, &prev_exc_tb);
+        PyErr_Format(PyExc_RuntimeError,
+                     "leaking pinned cown %p value: last handle "
+                     "dropped on a non-main interpreter (interp=%" PRIdLEAST64
+                     "); call Py_DECREF on the "
+                     "originating main interpreter to free the "
+                     "underlying PyObject*",
+                     (void *)cown, bocpy_interpid());
+        PyErr_WriteUnraisable(NULL);
+        PyErr_Restore(prev_exc_type, prev_exc_val, prev_exc_tb);
+      } else {
+        Py_CLEAR(cown->value);
+      }
+    } else {
+      assert(cown->owner == bocpy_interpid());
+      Py_CLEAR(cown->value);
+    }
   }
 
   if (cown->xidata != NULL) {
+    assert(!cown->is_pinned);
+
+    // Deserialize-and-drop encoded xidata so embedded CownCapsule INCREFs
+    // balance on orphan death (CWE-401): CownCapsule_reduce takes an
+    // inheriting COWN_INCREF per embedded BOCCown that is normally
+    // consumed when the bytes are unpickled; running pickle.loads + DECREF
+    // here lets CPython's GC fire the matching COWN_DECREFs recursively.
+    // Gated on `pickled` because native XIData round-trips (e.g. Matrix)
+    // cannot embed CownCapsule and would just waste a pickle round-trip.
+    if (cown->pickled) {
+      // Preserve any in-flight error across the deserialize;
+      // PyErr_WriteUnraisable below clears it otherwise.
+      PyObject *prev_exc_type, *prev_exc_val, *prev_exc_tb;
+      PyErr_Fetch(&prev_exc_type, &prev_exc_val, &prev_exc_tb);
+
+      PyObject *drained = xidata_to_object(cown->xidata, true);
+      if (drained == NULL) {
+        // Partial unpickle: already-decoded capsules unwind cleanly; tail-end
+        // opcodes leak, same as cown_acquire on failure. Surface as unraisable.
+        PyErr_WriteUnraisable(NULL);
+      } else {
+        Py_DECREF(drained);
+      }
+
+      PyErr_Restore(prev_exc_type, prev_exc_val, prev_exc_tb);
+    }
+
     BOCRecycleQueue_enqueue(cown->recycle_queue, cown->xidata);
+  }
+
+  if (cown->is_pinned) {
+    atomic_fetch_sub(&PINNED_COWN_COUNT, 1);
   }
 
   cown_weak_decref(cown);
@@ -1234,6 +1434,7 @@ static BOCCown *BOCCown_new(PyObject *value) {
   cown->xidata = NULL;
   cown->pickled = false;
   cown->exception = false;
+  cown->is_pinned = false;
   atomic_store_intptr(&cown->last, 0);
   // each cown starts with both a strong and weak reference
   // the weak reference will only be decremented when the strong
@@ -1611,6 +1812,31 @@ static PyObject *CownCapsule_acquired(PyObject *op,
 /// @param cown The cown to acquire
 /// @return -1 if failure, 0 if success
 static int cown_acquire(BOCCown *cown) {
+  if (cown->is_pinned) {
+    // Pinned cowns are permanently owned by main and never serialised:
+    // the structural owner-CAS would also reject worker callers (their
+    // bocpy_interpid() never matches BOCPY_NO_OWNER on a pinned cown),
+    // but the short-circuit avoids a wasted CAS and the xidata-NULL
+    // poisoning guard further down.
+    //
+    // The interpreter check is a runtime guard, not an assert: pinned
+    // acquire must never run off-main (it would race the main pump on
+    // ``cown->value`` without the MCS ordering protecting unpinned
+    // cowns). Release builds promote this to a hard ``RuntimeError``
+    // so a structural bug surfaces deterministically instead of
+    // silently corrupting state.
+    if (bocpy_interpid() != bocpy_main_interpid()) {
+      PyErr_Format(PyExc_RuntimeError,
+                   "cannot acquire pinned cown %p from non-main "
+                   "interpreter (interp=%" PRIdLEAST64 "); pinned "
+                   "cowns are owned by the main interpreter and "
+                   "acquired only by the main pump",
+                   (void *)cown, bocpy_interpid());
+      return -1;
+    }
+    assert(cown->owner == bocpy_main_interpid());
+    return 0;
+  }
   int_least64_t expected = BOCPY_NO_OWNER;
   int_least64_t desired = bocpy_interpid();
   if (!atomic_compare_exchange_strong(&cown->owner, &expected, desired)) {
@@ -1712,6 +1938,24 @@ static PyObject *CownCapsule_acquire(PyObject *op, PyObject *Py_UNUSED(dummy)) {
 /// @param cown The cown to release
 /// @return -1 if error, 0 otherwise
 static int cown_release(BOCCown *cown) {
+  if (cown->is_pinned) {
+    // Pinned cowns never serialise out of main; release is a no-op so
+    // the value stays resident in main and the owner stays == main_id.
+    //
+    // Mirror the runtime guard in ``cown_acquire``: a release coming
+    // from a non-main interpreter is a structural bug, surface it as
+    // a hard ``RuntimeError`` instead of relying on debug asserts.
+    if (bocpy_interpid() != bocpy_main_interpid()) {
+      PyErr_Format(PyExc_RuntimeError,
+                   "cannot release pinned cown %p from non-main "
+                   "interpreter (interp=%" PRIdLEAST64 "); pinned "
+                   "cowns are released only by the main pump",
+                   (void *)cown, bocpy_interpid());
+      return -1;
+    }
+    assert(cown->owner == bocpy_main_interpid());
+    return 0;
+  }
   int_least64_t expected = bocpy_interpid();
   int_least64_t owner = atomic_load(&cown->owner);
   if (owner != expected) {
@@ -1779,6 +2023,15 @@ static PyObject *CownCapsule_release(PyObject *op, PyObject *Py_UNUSED(dummy)) {
 /// @param cown The cown to disown
 /// @return -1 if error, 0 otherwise
 static int cown_disown(BOCCown *cown) {
+  if (cown->is_pinned) {
+    // Defense-in-depth. Pinned cowns must never be disowned: the
+    // value lives permanently on main. The existing owner-CAS below
+    // already rejects worker callers because owner is permanently
+    // main_id, but a direct main-thread call would otherwise drop the
+    // value. Treat as a successful no-op.
+    assert(cown->owner == bocpy_main_interpid());
+    return 0;
+  }
   int_least64_t expected = bocpy_interpid();
   int_least64_t owner = atomic_load(&cown->owner);
   if (owner != expected) {
@@ -2106,6 +2359,180 @@ BOCCown *cown_unwrap(PyObject *op) {
   CownCapsuleObject *self = (CownCapsuleObject *)op;
   PRINTDBG("CownCapsule_unwrap(%p, rc=%zu)\n", self, op->ob_refcnt);
   return self->cown;
+}
+
+/// @brief Module-level factory: allocate a pinned CownCapsule.
+/// @details Refuses to run outside the main interpreter; the
+/// pinned-ownership invariant requires owner == main_id
+/// permanently, which only main can establish. The returned capsule
+/// wraps a BOCCown with @c is_pinned set, value non-NULL, xidata
+/// NULL, and owner == main_id, so it is "born acquired" by main and
+/// every subsequent acquire/release on main is a no-op.
+/// @param self The module (unused)
+/// @param value The Python object to pin into the cown
+/// @return A new CownCapsule object, or NULL on error
+static PyObject *_core_pinned_cown_capsule(PyObject *self, PyObject *value) {
+  if (bocpy_interpid() != bocpy_main_interpid()) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "PinnedCown must be constructed on the main interpreter");
+    return NULL;
+  }
+
+  BOC_STATE_SET(self);
+  PyTypeObject *type = BOC_STATE->cown_capsule_type;
+  CownCapsuleObject *capsule = (CownCapsuleObject *)type->tp_alloc(type, 0);
+  if (capsule == NULL) {
+    return NULL;
+  }
+  capsule->cown = NULL;
+
+  BOCCown *cown = BOCCown_new(value);
+  if (cown == NULL) {
+    Py_DECREF((PyObject *)capsule);
+    return NULL;
+  }
+
+  cown->is_pinned = true;
+  assert(cown->owner == bocpy_main_interpid());
+  atomic_fetch_add(&PINNED_COWN_COUNT, 1);
+  capsule->cown = cown;
+
+  PRINTDBG("PinnedCownCapsule(%p, cown=%p, cid=%" PRIdLEAST64 ", value=",
+           capsule, cown, cown->id);
+  PRINTOBJDBG(value);
+  PRINTFDBG(")\n");
+
+  return (PyObject *)capsule;
+}
+
+/// @brief Module-level accessor: report whether a capsule is pinned.
+/// @param self The module (unused)
+/// @param op The CownCapsule (or any object with .impl) to inspect
+/// @return Py_True if pinned, Py_False otherwise, or NULL on error
+static PyObject *_core_cown_is_pinned(PyObject *Py_UNUSED(self), PyObject *op) {
+  BOCCown *cown = cown_unwrap(op);
+  if (cown == NULL) {
+    return NULL;
+  }
+  if (cown->is_pinned) {
+    Py_RETURN_TRUE;
+  }
+  Py_RETURN_FALSE;
+}
+
+/// @brief Module-level accessor: report the live pinned-cown count.
+/// @param self The module (unused)
+/// @param args Unused
+/// @return Python int -- current value of PINNED_COWN_COUNT
+static PyObject *_core_pinned_cown_count(PyObject *Py_UNUSED(self),
+                                         PyObject *Py_UNUSED(args)) {
+  return PyLong_FromLongLong((long long)atomic_load(&PINNED_COWN_COUNT));
+}
+
+/// @brief Enqueue a pinned-bearing behaviour on the main-pinned queue.
+/// @details Invoked from `boc_sched_dispatch` when a behaviour's
+/// prehdr has the pinned byte set. The scheduler is layout-blind: it
+/// reads `pinned` via @ref boc_behavior_node_is_pinned and then hands
+/// the node to this function, which owns the actual queue. On the
+/// `0 -> 1` depth transition we stamp
+/// @ref MAIN_PINNED_NONEMPTY_SINCE_NS and broadcast on the terminator
+/// condvar so a `wait()`-blocked main thread wakes to drive the pump.
+///
+/// There is intentionally no `queue_max`-style cap: by construction
+/// `MAIN_PINNED_DEPTH` cannot exceed the live pinned-cown count
+/// (chained pinned `@when`s park in MCS rather than enqueuing), and
+/// pinned cowns are only constructed on main -- a worker cannot
+/// flood the queue. Run-away depth therefore signals a host-side
+/// allocation bug (which is easier to debug at the `PinnedCown(...)`
+/// call site than via an opaque library-internal cap). The same
+/// invariant is why there is no raise-side back-pressure gate here:
+/// only `warn_ms` diagnostics are warranted.
+/// @param n The prehdr's `bq_node` (already populated, refcount
+///          already incremented by the producer for queue ownership).
+/// @return 0 on success. Cannot fail.
+int boc_main_pinned_enqueue(boc_bq_node_t *n) {
+  boc_bq_enqueue(&MAIN_PINNED_QUEUE, n);
+  uint64_t prev = atomic_fetch_add(&MAIN_PINNED_DEPTH, 1);
+  if (prev == 0) {
+    atomic_store(&MAIN_PINNED_NONEMPTY_SINCE_NS, boc_now_ns());
+  }
+  // Wake any wait()-blocked main thread so it can re-evaluate (the
+  // main pump will drain MAIN_PINNED_QUEUE before re-blocking).
+  terminator_wake_all();
+  return 0;
+}
+
+/// @brief Module-level accessor: report the current main-pinned queue
+///        depth.
+/// @details Test/diagnostic only.
+/// @param self The module (unused)
+/// @param args Unused
+/// @return Python int -- current value of MAIN_PINNED_DEPTH.
+static PyObject *_core_main_pump_queue_depth(PyObject *Py_UNUSED(self),
+                                             PyObject *Py_UNUSED(args)) {
+  return PyLong_FromUnsignedLongLong(
+      (unsigned long long)atomic_load(&MAIN_PINNED_DEPTH));
+}
+
+/// @brief Lock-free reader handed to @ref terminator_wait_pumpable.
+/// @details Function-pointer indirection so `boc_terminator.c` does
+/// not need to see the file-scope `MAIN_PINNED_DEPTH` atomic.
+static uint64_t _core_pinned_depth_load(void) {
+  return (uint64_t)atomic_load(&MAIN_PINNED_DEPTH);
+}
+
+/// @brief Configure the pump-starvation watchdog.
+/// @details Refuses non-main callers (the watchdog state is process-
+/// global but only meaningful on the pumping interpreter). Each
+/// argument may be a positive Python int (enable / set threshold) or
+/// @c None (disable that side). Defaults restore the
+/// "disabled, no callback" state. Stores are atomic so the hot-path
+/// reader (`boc_main_pinned_check_warn` on pump entry) sees a
+/// consistent value without a lock.
+/// @param self The module (unused)
+/// @param args Positional fallback for keyword args
+/// @param kwargs `warn_ms`, `on_starve`
+/// @return @c None on success; raises @c TypeError / @c RuntimeError
+///         otherwise.
+static PyObject *_core_set_pump_watchdog(PyObject *self, PyObject *args,
+                                         PyObject *kwargs) {
+  BOC_STATE_SET(self);
+  if (BOC_STATE->index != 0) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "set_pump_watchdog() must be called from the main "
+                    "interpreter");
+    return NULL;
+  }
+  static char *kwlist[] = {"warn_ms", "on_starve", NULL};
+  PyObject *warn_obj = Py_None;
+  PyObject *on_starve = Py_None;
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|OO", kwlist, &warn_obj,
+                                   &on_starve)) {
+    return NULL;
+  }
+  uint64_t warn_ms = 0;
+  if (warn_obj != Py_None) {
+    long long v = PyLong_AsLongLong(warn_obj);
+    if (v < 0 || (v == -1 && PyErr_Occurred())) {
+      PyErr_SetString(PyExc_TypeError,
+                      "warn_ms must be a positive int or None");
+      return NULL;
+    }
+    warn_ms = (uint64_t)v;
+  }
+  if (on_starve != Py_None && !PyCallable_Check(on_starve)) {
+    PyErr_SetString(PyExc_TypeError, "on_starve must be a callable or None");
+    return NULL;
+  }
+  atomic_store(&WATCHDOG_WARN_MS, warn_ms);
+  // Swap the callback under refcount discipline. The previous slot
+  // is decref'd after the store so the new readers see the new
+  // callback before the old one can run to zero.
+  PyObject *new_cb = (on_starve == Py_None) ? NULL : Py_NewRef(on_starve);
+  PyObject *prev =
+      (PyObject *)atomic_exchange_intptr(&WATCHDOG_ON_STARVE, (intptr_t)new_cb);
+  Py_XDECREF(prev);
+  Py_RETURN_NONE;
 }
 
 static PyObject *BOCRecycleQueue_promote_cowns(BOCRecycleQueue *queue) {
@@ -3171,17 +3598,6 @@ typedef struct behavior_s {
   struct boc_request **requests;
   /// @brief Number of entries in @c requests (post-dedup, ≤ args_size + 1).
   Py_ssize_t requests_size;
-  /// @brief Intrusive link node for the Verona-style behaviour MPMC
-  /// queue (`boc_bq_*` API in `sched.{h,c}`).
-  /// @details Ports `verona-rt/src/rt/sched/work.h::Work::next_in_queue`.
-  /// Initialised to NULL in @c behavior_new under the GIL, before the
-  /// behaviour can be reached from any other thread (preserves the
-  /// link-loop infallibility invariant). Hooked into the `boc_bq_*`
-  /// enqueue/dequeue path by `behavior_resolve_one` and
-  /// `request_release_inner`. Placement at struct end is
-  /// `pahole`-driven to keep the hot fields on their existing cache
-  /// lines.
-  boc_bq_node_t bq_node;
   /// @brief Fairness-token discriminator.
   /// @details 0 for ordinary behaviours; 1 for the per-worker
   /// @c token_work sentinel allocated by
@@ -3190,9 +3606,7 @@ typedef struct behavior_s {
   /// flips @c should_steal_for_fairness on the popping worker and
   /// re-enqueues the token instead of calling @c run_behavior.
   /// Verona equivalent: @c Core::token_work + @c is_token discriminator
-  /// (`verona-rt/src/rt/sched/core.h:22-37`). Trailing position keeps
-  /// the hot fields (count, rc, thunk) on their existing cache lines;
-  /// the byte costs an 8-byte tail pad on x86_64.
+  /// (`verona-rt/src/rt/sched/core.h:22-37`).
   uint8_t is_token;
   /// @brief Index of the worker that owns this fairness token (or
   /// @c -1 for ordinary behaviours).
@@ -3209,11 +3623,25 @@ typedef struct behavior_s {
   /// flag, not the running thread's.
   ///
   /// Width: @c int16_t. Sized to comfortably exceed any plausible
-  /// worker count (≤32767) while preserving the existing 8-byte
-  /// trailing pad with @c is_token; struct size is unchanged from
-  /// the original @c int8_t encoding (verified by pahole).
+  /// worker count (≤32767).
   int16_t owner_worker_index;
 } BOCBehavior;
+
+// Layout note. The intrusive queue link (`bq_node`) and the OR-fold
+// `pinned` byte live in a scheduler-owned `boc_behavior_prehdr_t`
+// allocated immediately before each BOCBehavior — CPython
+// `_PyGC_Head` / `_Py_AS_GC()` style. See `boc_sched.h` for the
+// prehdr definition and the `BOC_BEHAVIOR_PREHDR(b)` recovery macro.
+// `behavior_new` / `behavior_free` / the token allocator below own
+// the combined allocation; the rest of `_core.c` keeps treating
+// BOCBehavior as an ordinary pointer-indirect struct.
+
+// Recover a BOCBehavior pointer from the prehdr's bq_node. Inverse
+// of `BOC_BEHAVIOR_PREHDR`; used by the worker pop sites that pull
+// nodes out of the scheduler queues. `bq_node` sits at offset 0 of
+// the prehdr, so the cast IS the container_of (no offsetof needed).
+#define BEHAVIOR_FROM_PREHDR_NODE(node)                                        \
+  ((BOCBehavior *)(((boc_behavior_prehdr_t *)(node)) + 1))
 
 /// @brief Capsule for holding a pointer to a behavior
 typedef struct behavior_capsule_object {
@@ -3223,30 +3651,32 @@ typedef struct behavior_capsule_object {
 #define BehaviorCapsule_CheckExact(op)                                         \
   Py_IS_TYPE((op), BOC_STATE->behavior_capsule_type)
 
-/// @brief Recover the enclosing @c BOCBehavior from its embedded
-/// @c bq_node.
-/// @details The dispatch path moves @c BOCBehavior * pointers
-/// through the scheduler queue indirectly: the producer hands
-/// @c &behavior->bq_node to @ref boc_sched_dispatch, the consumer
-/// pops a @c boc_bq_node_t * back, and this macro reverses the
-/// embedding offset to recover the owning @c BOCBehavior. Equivalent
-/// to the kernel's @c container_of pattern; @c offsetof is the
-/// portable C11 idiom.
-#define BEHAVIOR_FROM_BQ_NODE(node_ptr)                                        \
-  ((BOCBehavior *)((char *)(node_ptr) - offsetof(BOCBehavior, bq_node)))
-
 // Forward declaration: defined alongside the request helpers further down.
 // behavior_free uses it to clean up any unreleased request array if a
 // behavior is destroyed without going through behavior_release_all.
 static void request_decref(BOCRequest *request);
 
 BOCBehavior *behavior_new() {
-  BOCBehavior *behavior;
-  behavior = (BOCBehavior *)PyMem_RawMalloc(sizeof(BOCBehavior));
-  if (behavior == NULL) {
+  // Combined `prehdr + BOCBehavior` allocation per the pre-header
+  // scheme (see `boc_sched.h` and the layout note above the struct).
+  // The returned pointer is past the prehdr so all existing
+  // `BOCBehavior *` consumers stay unchanged; `behavior_free`
+  // recovers the allocation origin via `BOC_BEHAVIOR_PREHDR(b)`.
+  void *raw =
+      PyMem_RawMalloc(sizeof(boc_behavior_prehdr_t) + sizeof(BOCBehavior));
+  if (raw == NULL) {
     PyErr_NoMemory();
     return NULL;
   }
+
+  boc_behavior_prehdr_t *prehdr = (boc_behavior_prehdr_t *)raw;
+  // Zero the prehdr in full — `pinned`, `_reserved`, and the
+  // intrusive link's `next_in_queue` (the boc_bq_* enqueue path
+  // requires this field to start NULL, and we are still under the
+  // GIL before the behaviour can be reached from any other thread).
+  memset(prehdr, 0, sizeof(*prehdr));
+
+  BOCBehavior *behavior = (BOCBehavior *)(prehdr + 1);
 
   behavior->id = atomic_fetch_add(&BOC_BEHAVIOR_COUNT, 1);
   behavior->thunk = NULL;
@@ -3259,11 +3689,6 @@ BOCBehavior *behavior_new() {
   behavior->captures = NULL;
   behavior->requests = NULL;
   behavior->requests_size = 0;
-  // Init the boc_bq link before the behaviour becomes reachable from
-  // any other thread (we are still under the GIL here). The boc_bq_*
-  // enqueue path requires this field to start NULL.
-  boc_atomic_store_ptr_explicit(&behavior->bq_node.next_in_queue, NULL,
-                                BOC_MO_RELAXED);
   // Ordinary behaviours are not fairness tokens. Token allocation
   // is performed directly in `_core_scheduler_runtime_start` and
   // bypasses `behavior_new`.
@@ -3327,7 +3752,9 @@ void behavior_free(BOCBehavior *behavior) {
     BOCTag_free(behavior->thunk);
   }
 
-  PyMem_RawFree(behavior);
+  // Free at the combined allocation's origin (one slot before the
+  // BOCBehavior, per the pre-header scheme).
+  PyMem_RawFree(BOC_BEHAVIOR_PREHDR(behavior));
   BOC_REF_TRACKING_REMOVE_BEHAVIOR();
 }
 
@@ -3504,6 +3931,7 @@ static int BehaviorCapsule_init(PyObject *op, PyObject *args,
     PyErr_NoMemory();
     return -1;
   }
+  uint8_t pinned = 0;
   for (Py_ssize_t i = 0; i < args_size; ++i) {
     PyObject *item = PySequence_Fast_GET_ITEM(cowns_list_fast, i);
     int group_id;
@@ -3515,10 +3943,18 @@ static int BehaviorCapsule_init(PyObject *op, PyObject *args,
     }
 
     behavior->group_ids[i] = group_id;
+    pinned |= ((CownCapsuleObject *)cown)->cown->is_pinned;
     PyTuple_SET_ITEM(cowns, i, Py_NewRef(cown));
   }
 
   Py_DECREF(cowns_list_fast);
+
+  // Publish the OR-fold to the prehdr. The scheduler reads this via
+  // `boc_behavior_node_is_pinned` from `boc_sched_dispatch` to route
+  // pinned-touching behaviours onto MAIN_PINNED_QUEUE instead of a
+  // worker WSQ. Token behaviours never reach this path (their prehdr
+  // stays zero-initialised by `_core_scheduler_runtime_start`).
+  BOC_BEHAVIOR_PREHDR(behavior)->pinned = pinned;
 
   behavior->args = add_vars(cowns, &behavior->args_size);
   Py_DECREF(cowns);
@@ -3547,8 +3983,9 @@ static int BehaviorCapsule_init(PyObject *op, PyObject *args,
 /// @details Called when a request is at the head of the queue for a
 /// particular cown. If this is the last request (count -> 0) the thunk
 /// is dispatched: the unique caller that observes the transition takes
-/// a queue-owned reference via @c BEHAVIOR_INCREF and hands
-/// @c &behavior->bq_node to @ref boc_sched_dispatch. The matching
+/// a queue-owned reference via @c BEHAVIOR_INCREF and hands the prehdr's
+/// @c bq_node (recovered via @c BOC_BEHAVIOR_PREHDR) to
+/// @ref boc_sched_dispatch. The matching
 /// @c BEHAVIOR_DECREF runs when the consumer's freshly allocated
 /// @c BehaviorCapsule (built by @c _core.scheduler_worker_pop) is
 /// deallocated on the worker side.
@@ -3591,7 +4028,7 @@ static int behavior_resolve_one(BOCBehavior *behavior) {
   int_least64_t count = atomic_fetch_add(&behavior->count, -1) - 1;
   if (count == 0) {
     BEHAVIOR_INCREF(behavior);
-    if (boc_sched_dispatch(&behavior->bq_node) < 0) {
+    if (boc_sched_dispatch(&BOC_BEHAVIOR_PREHDR(behavior)->bq_node) < 0) {
       // Roll back the queue-owned reference we just took. The
       // dispatch failure means no consumer will ever see this
       // behavior, so no DECREF will fire from the worker side.
@@ -3732,20 +4169,9 @@ static PyObject *BehaviorCapsule_create_requests(PyObject *op,
   return list;
 }
 
-/// @brief Release every request the behavior owns and free the array.
-/// @details Walks @c behavior->requests, calling @c request_release_inner
-/// (MCS unlink + handoff to next behavior) on each, then frees the
-/// per-request structs and the array itself. Invoked by the worker's
-/// release arm in place of the per-request Python @c Request.release loop.
-/// @param op The BehaviorCapsule whose requests should be released
-/// @return Py_None on success, NULL on error
-static PyObject *BehaviorCapsule_release_all(PyObject *op,
-                                             PyObject *Py_UNUSED(dummy)) {
-  BehaviorCapsuleObject *capsule = (BehaviorCapsuleObject *)op;
-  BOCBehavior *behavior = capsule->behavior;
-
+static int behavior_release_all_impl(BOCBehavior *behavior) {
   if (behavior->requests == NULL) {
-    Py_RETURN_NONE;
+    return 0;
   }
 
   // Detach the array from the behavior up front so behavior_free's
@@ -3762,12 +4188,28 @@ static PyObject *BehaviorCapsule_release_all(PyObject *op,
         request_decref(requests[k]);
       }
       PyMem_RawFree(requests);
-      return NULL;
+      return -1;
     }
     request_decref(requests[i]);
   }
 
   PyMem_RawFree(requests);
+  return 0;
+}
+
+/// @brief Release every request the behavior owns and free the array.
+/// @details Walks @c behavior->requests, calling @c request_release_inner
+/// (MCS unlink + handoff to next behavior) on each, then frees the
+/// per-request structs and the array itself. Invoked by the worker's
+/// release arm in place of the per-request Python @c Request.release loop.
+/// @param op The BehaviorCapsule whose requests should be released
+/// @return Py_None on success, NULL on error
+static PyObject *BehaviorCapsule_release_all(PyObject *op,
+                                             PyObject *Py_UNUSED(dummy)) {
+  BehaviorCapsuleObject *capsule = (BehaviorCapsuleObject *)op;
+  if (behavior_release_all_impl(capsule->behavior) < 0) {
+    return NULL;
+  }
   Py_RETURN_NONE;
 }
 
@@ -3779,7 +4221,7 @@ static PyObject *BehaviorCapsule_release_all(PyObject *op,
 /// @c Behavior.schedule() collapses to a single call to this function.
 /// Dispatch itself (the count → 0 transition in
 /// @ref behavior_resolve_one) is allocation-free and infallible:
-/// @ref boc_sched_dispatch enqueues @c &behavior->bq_node directly
+/// @ref boc_sched_dispatch enqueues the prehdr's @c bq_node directly
 /// onto a worker's per-task queue, so there is nothing to pre-build.
 /// @param op The BehaviorCapsule to schedule
 /// @return Py_None on success, NULL on error
@@ -3868,6 +4310,12 @@ static PyObject *BehaviorCapsule_schedule(PyObject *op,
   Py_RETURN_NONE;
 }
 
+static void behavior_set_exception_impl(BOCBehavior *behavior,
+                                        PyObject *value) {
+  cown_set_value(behavior->result, value);
+  behavior->result->exception = true;
+}
+
 /// @brief Store an exception as the behavior's result
 /// @details Sets the result value and marks the exception flag. Intended for
 /// the worker exception handler.
@@ -3882,9 +4330,7 @@ static PyObject *BehaviorCapsule_set_exception(PyObject *op, PyObject *args) {
   }
 
   BehaviorCapsuleObject *self = (BehaviorCapsuleObject *)op;
-  BOCBehavior *behavior = self->behavior;
-  cown_set_value(behavior->result, value);
-  behavior->result->exception = true;
+  behavior_set_exception_impl(self->behavior, value);
   Py_RETURN_NONE;
 }
 
@@ -3934,28 +4380,33 @@ static int acquire_vars(BOCCown **vars, Py_ssize_t size) {
   return 0;
 }
 
+static int behavior_acquire_impl(BOCBehavior *behavior) {
+  PRINTDBG("behavior_acquire(%" PRIdLEAST64 ")\n", behavior->id);
+
+  if (cown_acquire(behavior->result) < 0) {
+    return -1;
+  }
+
+  if (acquire_vars(behavior->args, behavior->args_size) < 0) {
+    return -1;
+  }
+
+  if (acquire_vars(behavior->captures, behavior->captures_size) < 0) {
+    return -1;
+  }
+
+  return 0;
+}
+
 /// @brief Acquire all the cowns for the behavior.
 /// @param args The behavior capsule
 /// @return Py_None if successful, NULL otherwise
 static PyObject *BehaviorCapsule_acquire(PyObject *op,
                                          PyObject *Py_UNUSED(dummy)) {
   BehaviorCapsuleObject *self = (BehaviorCapsuleObject *)op;
-  BOCBehavior *behavior = self->behavior;
-
-  PRINTDBG("behavior_acquire(%" PRIdLEAST64 ")\n", behavior->id);
-
-  if (cown_acquire(behavior->result) < 0) {
+  if (behavior_acquire_impl(self->behavior) < 0) {
     return NULL;
   }
-
-  if (acquire_vars(behavior->args, behavior->args_size) < 0) {
-    return NULL;
-  }
-
-  if (acquire_vars(behavior->captures, behavior->captures_size) < 0) {
-    return NULL;
-  }
-
   Py_RETURN_NONE;
 }
 
@@ -3970,47 +4421,51 @@ static int release_vars(BOCCown **vars, Py_ssize_t size) {
   return 0;
 }
 
+static int behavior_release_impl(BOCBehavior *behavior) {
+  PRINTDBG("behavior_release(%" PRIdLEAST64 ")\n", behavior->id);
+
+  if (cown_release(behavior->result) < 0) {
+    return -1;
+  }
+
+  if (release_vars(behavior->args, behavior->args_size) < 0) {
+    return -1;
+  }
+
+  if (release_vars(behavior->captures, behavior->captures_size) < 0) {
+    return -1;
+  }
+
+  return 0;
+}
+
 /// @brief Release the cowns for this behavior.
 /// @param args The behavior capsule
 /// @return Py_None if successful, NULL otherwise
 static PyObject *BehaviorCapsule_release(PyObject *op,
                                          PyObject *Py_UNUSED(dummy)) {
   BehaviorCapsuleObject *self = (BehaviorCapsuleObject *)op;
-  BOCBehavior *behavior = self->behavior;
-
-  PRINTDBG("behavior_release(%" PRIdLEAST64 ")\n", behavior->id);
-
-  if (cown_release(behavior->result) < 0) {
+  if (behavior_release_impl(self->behavior) < 0) {
     return NULL;
   }
-
-  if (release_vars(behavior->args, behavior->args_size) < 0) {
-    return NULL;
-  }
-
-  if (release_vars(behavior->captures, behavior->captures_size) < 0) {
-    return NULL;
-  }
-
   Py_RETURN_NONE;
 }
 
-/// @brief Executes the thunk on the behavior.
-/// @details Before this function can be called, all of the cowns for the
-/// behavior must be acquired.
-/// @param args The Behavior, and the object or module which contains the named
-/// thunk function.
-/// @return The result of calling the thunk
-static PyObject *BehaviorCapsule_execute(PyObject *op, PyObject *args) {
-  PyObject *boc_export = NULL;
-
-  if (!PyArg_ParseTuple(args, "O", &boc_export)) {
-    return NULL;
-  }
-
-  BehaviorCapsuleObject *self = (BehaviorCapsuleObject *)op;
-  BOCBehavior *behavior = self->behavior;
-
+/// @brief C-level worker for the thunk execution path.
+/// @details Builds the thunk argument tuple, looks up the named thunk on
+/// @p boc_export, invokes it, and stashes the result on @c behavior->result.
+/// Any raised exception (:class:`Exception` or :class:`BaseException`) is
+/// captured into the result cown with @c exception=true and is **not**
+/// propagated; only deeper setup failures (allocation errors, missing
+/// thunk, etc.) return NULL with PyErr set. Callers that need to fork on
+/// Exception vs BaseException must inspect the result cown's value type
+/// after the call returns.
+/// @param behavior The behavior whose thunk to invoke
+/// @param boc_export Namespace (module or object) carrying the thunk
+/// @return Borrowed reference to the stored result value, NULL on setup
+/// failure
+static PyObject *behavior_execute_impl(BOCBehavior *behavior,
+                                       PyObject *boc_export) {
   size_t num_groups = 0;
   if (behavior->args_size > 0) {
     num_groups = abs(behavior->group_ids[behavior->args_size - 1]);
@@ -4090,6 +4545,7 @@ static PyObject *BehaviorCapsule_execute(PyObject *op, PyObject *args) {
   PyObject *thunk = PyObject_GetAttrString(boc_export, behavior->thunk->str);
 
   if (thunk == NULL) {
+    Py_DECREF(thunk_args);
     return NULL;
   }
 
@@ -4128,7 +4584,25 @@ static PyObject *BehaviorCapsule_execute(PyObject *op, PyObject *args) {
   if (is_error) {
     behavior->result->exception = true;
   }
-  return behavior->result->value;
+  Py_XDECREF(result);
+  return Py_XNewRef(behavior->result->value);
+}
+
+/// @brief Executes the thunk on the behavior.
+/// @details Before this function can be called, all of the cowns for the
+/// behavior must be acquired.
+/// @param args The Behavior, and the object or module which contains the named
+/// thunk function.
+/// @return The result of calling the thunk
+static PyObject *BehaviorCapsule_execute(PyObject *op, PyObject *args) {
+  PyObject *boc_export = NULL;
+
+  if (!PyArg_ParseTuple(args, "O", &boc_export)) {
+    return NULL;
+  }
+
+  BehaviorCapsuleObject *self = (BehaviorCapsuleObject *)op;
+  return behavior_execute_impl(self->behavior, boc_export);
 }
 
 static PyMethodDef BehaviorCapsule_methods[] = {
@@ -4157,6 +4631,451 @@ static PyType_Spec BehaviorCapsule_Spec = {
     .itemsize = 0,
     .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_IMMUTABLETYPE,
     .slots = BehaviorCapsule_slots};
+
+// ---------------------------------------------------------------------------
+// main_pump_bounded: drive the main-pinned queue from the main interpreter.
+// Mirrors `worker.run_behavior`'s layered try/finally so the per-iteration
+// cleanup (IN_PUMP_BODY clear + release pair + terminator_dec) always runs.
+// ---------------------------------------------------------------------------
+
+// Convert a Python deadline_ms (long or None) to an absolute monotonic-ns
+// deadline. Returns 0 when no deadline (None) or on invalid input; callers
+// validate non-None inputs separately so we only reach the conversion path
+// with a known-valid PyLong.
+static uint64_t deadline_or_zero(PyObject *deadline_ms) {
+  if (deadline_ms == NULL || deadline_ms == Py_None) {
+    return 0;
+  }
+  long long ms = PyLong_AsLongLong(deadline_ms);
+  if (ms <= 0) {
+    PyErr_Clear();
+    return 0;
+  }
+  return boc_now_ns() + (uint64_t)ms * 1000000ULL;
+}
+
+// True if more iterations are permitted by the user's max_behaviors cap.
+// None / non-positive values are treated as unbounded.
+static bool max_behaviors_or_inf(PyObject *max_behaviors, Py_ssize_t executed) {
+  if (max_behaviors == NULL || max_behaviors == Py_None) {
+    return true;
+  }
+  long long lim = PyLong_AsLongLong(max_behaviors);
+  if (lim <= 0) {
+    PyErr_Clear();
+    return true;
+  }
+  return (long long)executed < lim;
+}
+
+// Release-path error logger. Mirrors worker.run_behavior's outer-finally
+// logger.exception arms (release / release_all): log + swallow so a single
+// misbehaving step cannot strand the runtime.
+static inline void _core_log_release_error(void) {
+  PyErr_WriteUnraisable(NULL);
+}
+
+// Pump-starvation watchdog warn-side check. Fires when the pinned
+// queue has been non-empty for at least WATCHDOG_WARN_MS without a
+// pump call making progress. Rate-limited: only one warn emission
+// per non-empty epoch (cleared when the queue drains).
+//
+// Three exit paths:
+//   * watchdog disabled (warn_ms == 0): no work.
+//   * queue empty (NONEMPTY_SINCE_NS == 0): no work.
+//   * threshold not crossed: no work.
+// Otherwise: invoke the user's on_starve callback if set, else log a
+// default warning. Called from the main interpreter only (pump entry).
+static void boc_main_pinned_check_warn(void) {
+  uint64_t warn_ms = atomic_load(&WATCHDOG_WARN_MS);
+  if (warn_ms == 0) {
+    return;
+  }
+  uint64_t since_ns = atomic_load(&MAIN_PINNED_NONEMPTY_SINCE_NS);
+  if (since_ns == 0) {
+    return;
+  }
+  uint64_t now_ns = boc_now_ns();
+  if (now_ns < since_ns || (now_ns - since_ns) < warn_ms * 1000000ULL) {
+    return;
+  }
+  // Rate-limit: one warn per non-empty epoch. The epoch closes when
+  // the queue drains (NONEMPTY_SINCE_NS -> 0); WATCHDOG_LAST_WARN_NS
+  // is reset alongside. A relaxed compare against since_ns suffices
+  // because both are monotonic and only main reads/writes them.
+  uint64_t last_warn = atomic_load(&WATCHDOG_LAST_WARN_NS);
+  if (last_warn >= since_ns) {
+    return;
+  }
+  atomic_store(&WATCHDOG_LAST_WARN_NS, now_ns);
+
+  uint64_t age_ms = (now_ns - since_ns) / 1000000ULL;
+  uint64_t depth = atomic_load(&MAIN_PINNED_DEPTH);
+  PyObject *callback = (PyObject *)atomic_load_intptr(&WATCHDOG_ON_STARVE);
+  PyObject *msg = PyUnicode_FromFormat(
+      "pinned-cown queue non-empty for %llu ms with no pump() progress "
+      "(depth=%llu)",
+      (unsigned long long)age_ms, (unsigned long long)depth);
+  if (msg == NULL) {
+    PyErr_WriteUnraisable(NULL);
+    return;
+  }
+  if (callback != NULL) {
+    // Severity 0 = warn (raise side would use 1; reserved for future).
+    PyObject *res = PyObject_CallFunction(callback, "iO", 0, msg);
+    if (res == NULL) {
+      PyErr_WriteUnraisable(callback);
+    } else {
+      Py_DECREF(res);
+    }
+  } else {
+    PyObject *logging = PyImport_ImportModule("logging");
+    if (logging != NULL) {
+      PyObject *logger =
+          PyObject_CallMethod(logging, "getLogger", "s", "bocpy.pump");
+      if (logger != NULL) {
+        PyObject *r = PyObject_CallMethod(logger, "warning", "O", msg);
+        Py_XDECREF(r);
+        Py_DECREF(logger);
+      }
+      Py_DECREF(logging);
+    }
+    if (PyErr_Occurred()) {
+      PyErr_WriteUnraisable(NULL);
+    }
+  }
+  Py_DECREF(msg);
+}
+
+// Acquire-failure capture. behavior_acquire_impl returned < 0 with
+// PyErr set. Stash the exception on the result cown so a consumer reading
+// it sees a diagnostic, then clear PyErr so the next iteration starts
+// clean.
+static void handle_pinned_acquire_failure(BOCBehavior *b) {
+  PyObject *exc = PyErr_GetRaisedException();
+  if (exc == NULL) {
+    exc = PyObject_CallFunction(
+        PyExc_RuntimeError, "s",
+        "behavior_acquire failed without a Python exception");
+    if (exc == NULL) {
+      PyErr_WriteUnraisable(NULL);
+      return;
+    }
+  }
+  behavior_set_exception_impl(b, exc);
+  Py_DECREF(exc);
+}
+
+// Body-failure capture. behavior_execute_impl returned NULL.
+// Fork on `Exception` vs `BaseException`:
+//   - `Exception`: capture on the result cown, clear PyErr, count as
+//     raised, populate first_err under raise_on_error.
+//   - `BaseException` (KeyboardInterrupt, SystemExit, GeneratorExit):
+//     stash via the out-param. Restored by the caller AFTER per-iteration
+//     cleanup completes, so the cleanup arms run with PyErr clear.
+static void handle_pinned_body_exception(BOCBehavior *b, bool raise_on_error,
+                                         PyObject **first_err,
+                                         Py_ssize_t *raised,
+                                         PyObject **base_err) {
+  PyObject *exc = PyErr_GetRaisedException();
+  if (exc == NULL) {
+    return;
+  }
+  if (PyErr_GivenExceptionMatches(exc, PyExc_Exception)) {
+    behavior_set_exception_impl(b, exc);
+    *raised += 1;
+    if (raise_on_error && *first_err == NULL) {
+      *first_err = Py_NewRef(exc);
+    }
+    Py_DECREF(exc);
+  } else {
+    // Transfer ownership to the caller's stash slot.
+    *base_err = exc;
+  }
+}
+
+#ifdef Py_GIL_DISABLED
+// Portable thread-id source for the FT-only single-pumper CAS. Linux/BSD
+// use C11 `thrd_current`; macOS exposes pthread directly; Windows uses
+// GetCurrentThreadId. All cast to uintptr_t for atomic storage.
+static inline uintptr_t boc_pump_thread_id(void) {
+#if defined(_WIN32)
+  return (uintptr_t)GetCurrentThreadId();
+#elif defined(__APPLE__)
+  return (uintptr_t)pthread_self();
+#else
+  return (uintptr_t)thrd_current();
+#endif
+}
+#endif
+
+/// @brief Drive the main-pinned queue from the main interpreter.
+/// @details Implements the three pump gates (main-interp, FT
+/// single-pumper CAS, nested-pump) plus the per-behavior layered
+/// try/finally pattern from `worker.run_behavior`. Every popped
+/// behavior runs its per-iteration cleanup (IN_PUMP_BODY clear +
+/// release pair + terminator_dec) regardless of where the body
+/// failed. ``BaseException`` is stashed across cleanup and restored
+/// at the post-iteration check so the pump exits cleanly with the
+/// FT CAS released.
+/// @param args (deadline_ms, max_behaviors, raise_on_error,
+///              boc_export). deadline_ms / max_behaviors accept None
+///              for "no limit"; boc_export is the namespace whose
+///              attributes resolve `__behavior__N` thunks (typically
+///              ``sys.modules[__main__]``).
+/// @return ``(executed, deadline_reached, raised)`` 3-tuple on
+///         success, NULL on gate rejection or raise_on_error trigger.
+static PyObject *_core_main_pump_bounded(PyObject *Py_UNUSED(self),
+                                         PyObject *args, PyObject *kwds) {
+  static char *kwlist[] = {"deadline_ms", "max_behaviors", "raise_on_error",
+                           "boc_export", NULL};
+  PyObject *deadline_ms = Py_None;
+  PyObject *max_behaviors = Py_None;
+  int raise_on_error_flag = 0;
+  PyObject *boc_export = NULL;
+
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "OOpO", kwlist, &deadline_ms,
+                                   &max_behaviors, &raise_on_error_flag,
+                                   &boc_export)) {
+    return NULL;
+  }
+  bool raise_on_error = (bool)raise_on_error_flag;
+
+  Py_ssize_t executed = 0;
+  Py_ssize_t raised = 0;
+  bool deadline_reached = false;
+  PyObject *first_err = NULL;
+  PyObject *base_err = NULL;
+#ifdef Py_GIL_DISABLED
+  bool pump_cas_owner = false;
+#endif
+
+  // Gate 1: main interpreter only.
+  if (bocpy_interpid() != bocpy_main_interpid()) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "pump() must be called from the main interpreter");
+    goto pump_exit;
+  }
+
+#ifdef Py_GIL_DISABLED
+  // Gate 2: free-threaded single-pumper CAS.
+  {
+    intptr_t self_id = (intptr_t)boc_pump_thread_id();
+    intptr_t expected = 0;
+    if (atomic_compare_exchange_strong_intptr(&MAIN_PUMP_THREAD, &expected,
+                                              self_id)) {
+      pump_cas_owner = true;
+    } else if (expected != self_id) {
+      PyErr_SetString(PyExc_RuntimeError,
+                      "pump() is in use by another thread on this "
+                      "free-threaded build");
+      goto pump_exit;
+    }
+    // expected == self_id: re-entry on same thread; gate 3 rejects
+    // nested calls. pump_cas_owner stays false so we do NOT clear
+    // MAIN_PUMP_THREAD on exit (outer frame still owns it).
+  }
+#endif
+
+  // Gate 3: nested pump.
+  if (IN_PUMP_BODY) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "pump() is not reentrant; cannot be called from "
+                    "inside a pinned-behavior body (v1 limitation)");
+    goto pump_exit;
+  }
+
+  uint64_t deadline_ns = deadline_or_zero(deadline_ms);
+  boc_main_pinned_check_warn();
+
+  while (max_behaviors_or_inf(max_behaviors, executed)) {
+    assert(!PyErr_Occurred());
+
+    boc_bq_node_t *n = boc_bq_dequeue(&MAIN_PINNED_QUEUE);
+    if (n == NULL) {
+      break;
+    }
+    uint64_t new_depth = atomic_fetch_sub(&MAIN_PINNED_DEPTH, 1) - 1;
+    if (new_depth == 0) {
+      atomic_store(&MAIN_PINNED_NONEMPTY_SINCE_NS, 0);
+      // Close the watchdog warn epoch: the next time the queue
+      // becomes non-empty, the warn fires fresh.
+      atomic_store(&WATCHDOG_LAST_WARN_NS, 0);
+    }
+
+    BOCBehavior *b = BEHAVIOR_FROM_PREHDR_NODE(n);
+
+    IN_PUMP_BODY = true;
+
+    bool acquired = false;
+    noticeboard_cache_clear_for_behavior();
+    if (behavior_acquire_impl(b) < 0) {
+      handle_pinned_acquire_failure(b);
+    } else {
+      acquired = true;
+    }
+
+    if (acquired) {
+      PyObject *rv = behavior_execute_impl(b, boc_export);
+      if (rv == NULL) {
+        // Setup failure inside execute_impl (missing thunk,
+        // allocation error). PyErr is live; capture to the result
+        // cown so a consumer sees the diagnostic, then count it as
+        // a raised Exception (it can only be a non-BaseException).
+        handle_pinned_body_exception(b, raise_on_error, &first_err, &raised,
+                                     &base_err);
+      } else {
+        // Body returned normally OR an exception was captured onto
+        // the result cown. Fork on the stored value type:
+        //   - exception flag set and value is BaseException-but-not-
+        //     Exception (KI/SystemExit/GeneratorExit): stash for
+        //     re-raise AFTER cleanup completes.
+        //   - exception flag set and value is Exception: count as
+        //     raised, populate first_err under raise_on_error.
+        //   - exception flag clear: ordinary return value.
+        if (b->result->exception) {
+          PyObject *captured = b->result->value;
+          if (PyObject_IsInstance(captured, PyExc_Exception) == 1) {
+            raised++;
+            if (raise_on_error && first_err == NULL) {
+              first_err = Py_NewRef(captured);
+            }
+          } else {
+            // BaseException-but-not-Exception: re-raise after cleanup.
+            base_err = Py_NewRef(captured);
+          }
+        }
+        Py_DECREF(rv);
+      }
+    }
+
+    // release / release_all ALWAYS run (mirrors worker.run_behavior outer
+    // finally). cown_release tolerates partial-acquire by short-circuiting
+    // NO_OWNER cowns, so we can call it even when acquire failed midway.
+    if (behavior_release_impl(b) < 0) {
+      _core_log_release_error();
+    }
+    if (behavior_release_all_impl(b) < 0) {
+      _core_log_release_error();
+    }
+    terminator_dec();
+    // Drop the queue-owned BEHAVIOR_INCREF from behavior_resolve_one; the
+    // inline pump path has no BehaviorCapsule dealloc to do it for us.
+    BEHAVIOR_DECREF(b);
+
+    IN_PUMP_BODY = false;
+    atomic_store(&LAST_PUMP_NS, boc_now_ns());
+    executed++;
+
+    if (base_err) {
+      PyErr_SetRaisedException(base_err);
+      base_err = NULL;
+      goto pump_exit;
+    }
+    if (raise_on_error && first_err) {
+      goto pump_exit;
+    }
+    if (deadline_ns && boc_now_ns() >= deadline_ns) {
+      deadline_reached = true;
+      break;
+    }
+  }
+
+pump_exit:
+#ifdef Py_GIL_DISABLED
+  if (pump_cas_owner) {
+    atomic_store_intptr(&MAIN_PUMP_THREAD, (intptr_t)0);
+  }
+#endif
+
+  if (first_err) {
+    PyErr_SetRaisedException(first_err);
+    first_err = NULL;
+    return NULL;
+  }
+  if (PyErr_Occurred()) {
+    return NULL;
+  }
+  return Py_BuildValue("(nOn)", executed, deadline_reached ? Py_True : Py_False,
+                       raised);
+}
+
+/// @brief Shutdown-drain the main-pinned queue without executing bodies.
+/// @details Pops every queued behavior, marks its result cown with a
+/// drop-exception so any consumer sees a deterministic diagnostic, then
+/// releases the per-behavior request array (MCS unlink + handoff). Does
+/// NOT invoke @ref behavior_acquire_impl or @ref behavior_execute_impl
+/// — the runtime is tearing down and user code must not run on a
+/// half-stopped runtime. Mirrors the depth/watchdog bookkeeping in
+/// @ref _core_main_pump_bounded so the global counters return to the
+/// depth==0 baseline.
+/// @param self The module (unused)
+/// @param args Unused
+/// @return Python int — number of behaviors drained.
+static PyObject *_core_main_pump_drain_all(PyObject *Py_UNUSED(self),
+                                           PyObject *Py_UNUSED(args)) {
+  // Gate: drain runs only from the main interpreter. The pinned queue
+  // is single-consumer by design and the result-cown acquire below
+  // asserts main ownership.
+  if (bocpy_interpid() != bocpy_main_interpid()) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "main_pump_drain_all must be called from the main "
+                    "interpreter");
+    return NULL;
+  }
+
+  Py_ssize_t drained = 0;
+  for (;;) {
+    boc_bq_node_t *n = boc_bq_dequeue(&MAIN_PINNED_QUEUE);
+    if (n == NULL) {
+      break;
+    }
+    uint64_t new_depth = atomic_fetch_sub(&MAIN_PINNED_DEPTH, 1) - 1;
+    if (new_depth == 0) {
+      atomic_store(&MAIN_PINNED_NONEMPTY_SINCE_NS, 0);
+      atomic_store(&WATCHDOG_LAST_WARN_NS, 0);
+    }
+
+    BOCBehavior *b = BEHAVIOR_FROM_PREHDR_NODE(n);
+
+    PyObject *exc =
+        PyObject_CallFunction(PyExc_RuntimeError, "s",
+                              "behavior drained at shutdown without executing");
+    if (exc == NULL) {
+      PyErr_WriteUnraisable(NULL);
+    } else {
+      // Result cown sits in published-and-released state (NO_OWNER,
+      // xidata set, value NULL). Acquire on main, write the
+      // drop-exception, then release back to NO_OWNER so any consumer
+      // reading the result cown observes a deterministic diagnostic.
+      // Mirrors `BehaviorCapsule_set_drop_exception`.
+      if (cown_acquire(b->result) < 0) {
+        PyErr_WriteUnraisable(NULL);
+      } else {
+        cown_set_value(b->result, exc);
+        b->result->exception = true;
+        if (cown_release(b->result) < 0) {
+          PyErr_WriteUnraisable(NULL);
+        }
+      }
+      Py_DECREF(exc);
+    }
+
+    // MCS unlink + successor handoff on every request the drained
+    // behavior owned. Must run so dependent behaviors on the same
+    // cowns are advanced (even though we're shutting down, the
+    // request arrays still hold strong refs that need to be dropped).
+    if (behavior_release_all_impl(b) < 0) {
+      PyErr_WriteUnraisable(NULL);
+    }
+    terminator_dec();
+    // Drop the queue-owned BEHAVIOR_INCREF from behavior_resolve_one (same as
+    // _core_main_pump_bounded).
+    BEHAVIOR_DECREF(b);
+    drained++;
+  }
+  return PyLong_FromSsize_t(drained);
+}
 
 static PyObject *_new_behavior_object(XIDATA_T *xidata) {
   BOCBehavior *behavior = (BOCBehavior *)xidata->data;
@@ -4899,40 +5818,44 @@ static PyObject *_core_scheduler_runtime_start(PyObject *Py_UNUSED(module),
   // `boc_sched_init`) because `boc_sched.c` deliberately treats
   // `BOCBehavior` as opaque.
   for (Py_ssize_t i = 0; i < (Py_ssize_t)n; ++i) {
-    BOCBehavior *token = (BOCBehavior *)PyMem_RawCalloc(1, sizeof(BOCBehavior));
-    if (token == NULL) {
+    // Combined `prehdr + BOCBehavior` allocation per the pre-header
+    // scheme (see `boc_sched.h`). PyMem_RawCalloc zeroes both halves;
+    // the BOCBehavior pointer starts past the prehdr.
+    void *token_raw =
+        PyMem_RawCalloc(1, sizeof(boc_behavior_prehdr_t) + sizeof(BOCBehavior));
+    if (token_raw == NULL) {
       // Roll back any tokens already installed and tear the runtime
       // back down so the caller sees a clean failure (no half-init).
       for (Py_ssize_t j = 0; j < i; ++j) {
-        BOCBehavior *prev = NULL;
         boc_bq_node_t *prev_node = boc_sched_get_token_node(j);
-        if (prev_node != NULL) {
-          prev = BEHAVIOR_FROM_BQ_NODE(prev_node);
-        }
         boc_sched_set_token_node(j, NULL);
-        if (prev != NULL) {
-          PyMem_RawFree(prev);
+        if (prev_node != NULL) {
+          // prev_node points at the prehdr's bq_node (offset 0),
+          // so the cast IS the allocation origin.
+          PyMem_RawFree((boc_behavior_prehdr_t *)prev_node);
         }
       }
       boc_sched_shutdown();
       PyErr_NoMemory();
       return NULL;
     }
+    boc_behavior_prehdr_t *token_prehdr = (boc_behavior_prehdr_t *)token_raw;
+    BOCBehavior *token = (BOCBehavior *)(token_prehdr + 1);
     // Mark as token. PyMem_RawCalloc has zeroed everything (NULL
     // thunk/result/args/captures/requests, count == rc == 0,
-    // bq_node.next_in_queue == NULL). The behaviour is never
-    // reference-counted via BEHAVIOR_INCREF/DECREF and never visits
-    // the request/cown machinery; it is recycled in place by the
-    // token re-enqueue path. We give it an `id` of -1 so any
-    // diagnostic that prints `behavior->id` for a token is
-    // immediately recognisable.
+    // prehdr->bq_node.next_in_queue == NULL, prehdr->pinned == 0).
+    // The behaviour is never reference-counted via
+    // BEHAVIOR_INCREF/DECREF and never visits the request/cown
+    // machinery; it is recycled in place by the token re-enqueue
+    // path. We give it an `id` of -1 so any diagnostic that prints
+    // `behavior->id` for a token is immediately recognisable.
     token->is_token = 1;
     token->id = -1;
     token->owner_worker_index = (int16_t)i;
-    if (boc_sched_set_token_node(i, &token->bq_node) < 0) {
+    if (boc_sched_set_token_node(i, &token_prehdr->bq_node) < 0) {
       // worker_index out of range: only possible if WORKER_COUNT
       // changed under us, which the GIL precludes. Defensive.
-      PyMem_RawFree(token);
+      PyMem_RawFree(token_prehdr);
       boc_sched_shutdown();
       PyErr_SetString(PyExc_RuntimeError,
                       "scheduler_runtime_start: token install failed");
@@ -4975,9 +5898,11 @@ static PyObject *_core_scheduler_runtime_stop(PyObject *Py_UNUSED(module),
     if (node == NULL) {
       continue;
     }
-    BOCBehavior *token = BEHAVIOR_FROM_BQ_NODE(node);
     boc_sched_set_token_node(i, NULL);
-    PyMem_RawFree(token);
+    // The bq_node sits at offset 0 of the prehdr, so the node
+    // pointer IS the allocation origin (per the pre-header scheme;
+    // see `boc_sched.h`). Free at the prehdr.
+    PyMem_RawFree((boc_behavior_prehdr_t *)node);
   }
   boc_sched_shutdown();
   Py_RETURN_NONE;
@@ -5091,7 +6016,7 @@ static PyObject *_core_scheduler_worker_pop(PyObject *Py_UNUSED(module),
         Py_RETURN_NONE;
       }
     }
-    behavior = BEHAVIOR_FROM_BQ_NODE(n);
+    behavior = BEHAVIOR_FROM_PREHDR_NODE(n);
     if (!behavior->is_token) {
       break;
     }
@@ -5165,7 +6090,7 @@ static PyObject *_core_scheduler_drain_all_queues(PyObject *Py_UNUSED(module),
       if (n == NULL) {
         break;
       }
-      BOCBehavior *behavior = BEHAVIOR_FROM_BQ_NODE(n);
+      BOCBehavior *behavior = BEHAVIOR_FROM_PREHDR_NODE(n);
       if (behavior->is_token) {
         // Token sentinels are not reference-counted and own no
         // cowns; they live in the per-worker `token_work` slot and
@@ -5250,6 +6175,37 @@ static PyMethodDef _core_module_methods[] = {
     {"cown_pin_pointers", _core_cown_pin_pointers, METH_VARARGS,
      "cown_pin_pointers($module, pins, /)\n--\n\n"
      "INCREF each CownCapsule and return raw pointer ints (transfers refs)."},
+    {"PinnedCownCapsule", _core_pinned_cown_capsule, METH_O,
+     "PinnedCownCapsule($module, value, /)\n--\n\n"
+     "Allocate a CownCapsule whose value is permanently pinned to the "
+     "main interpreter. Acquire and release are no-ops on main and "
+     "structurally rejected on workers."},
+    {"cown_is_pinned", _core_cown_is_pinned, METH_O,
+     "cown_is_pinned($module, capsule, /)\n--\n\n"
+     "Return True if the cown is pinned to the main interpreter."},
+    {"pinned_cown_count", _core_pinned_cown_count, METH_NOARGS,
+     "pinned_cown_count($module, /)\n--\n\n"
+     "Return the number of pinned cowns currently alive in the process."},
+    {"main_pump_queue_depth", _core_main_pump_queue_depth, METH_NOARGS,
+     "main_pump_queue_depth($module, /)\n--\n\n"
+     "Return the current depth of the main-pinned behaviour queue."},
+    {"main_pump_bounded", (PyCFunction)_core_main_pump_bounded,
+     METH_VARARGS | METH_KEYWORDS,
+     "main_pump_bounded($module, deadline_ms, max_behaviors, "
+     "raise_on_error, boc_export, /)\n--\n\n"
+     "Drive the main-pinned queue from the main interpreter. "
+     "Returns (executed, deadline_reached, raised)."},
+    {"main_pump_drain_all", _core_main_pump_drain_all, METH_NOARGS,
+     "main_pump_drain_all($module, /)\n--\n\n"
+     "Drain every queued pinned behavior without executing its body; "
+     "marks each result cown with a drop-exception. Used by stop() "
+     "to clear post-shutdown pinned work. Main-interp only."},
+    {"set_pump_watchdog", (PyCFunction)_core_set_pump_watchdog,
+     METH_VARARGS | METH_KEYWORDS,
+     "set_pump_watchdog($module, /, warn_ms=None, on_starve=None)\n--\n\n"
+     "Configure the pinned-pump starvation watchdog. Pass a positive "
+     "int for warn_ms to enable warnings; pass None to disable. "
+     "Main-interp only."},
     {"noticeboard_write_direct", _core_noticeboard_write_direct, METH_VARARGS,
      "noticeboard_write_direct($module, key, value, /)"
      "\n--\n\nWrites a key-value pair to the noticeboard."},
@@ -5293,9 +6249,17 @@ static PyMethodDef _core_module_methods[] = {
     {"terminator_wait", _core_terminator_wait, METH_VARARGS,
      "terminator_wait($module, timeout, /)"
      "\n--\n\nBlock until the terminator count reaches 0 or timeout."},
+    {"terminator_wait_pumpable", _core_terminator_wait_pumpable, METH_O,
+     "terminator_wait_pumpable($module, timeout_s, /)"
+     "\n--\n\nBlock until the terminator count reaches 0, the "
+     "pinned-queue depth becomes positive, or timeout_s elapses. "
+     "Returns one of TERMINATED, PUMP_READY, or WAIT_TIMED_OUT."},
     {"terminator_seed_dec", _core_terminator_seed_dec, METH_NOARGS,
      "terminator_seed_dec($module, /)"
      "\n--\n\nIdempotent one-shot decrement of the Pyrona seed."},
+    {"terminator_seed_inc", _core_terminator_seed_inc, METH_NOARGS,
+     "terminator_seed_inc($module, /)"
+     "\n--\n\nIdempotent one-shot re-arm of the Pyrona seed."},
     {"terminator_reset", _core_terminator_reset, METH_NOARGS,
      "terminator_reset($module, /)"
      "\n--\n\nRestore terminator state for a fresh runtime start. "
@@ -5375,6 +6339,13 @@ static int _core_module_exec(PyObject *module) {
     // The Pyrona seed (count=1, seeded=1) is set by terminator_reset()
     // when the runtime starts; here we only initialize the kernel objects.
     terminator_init();
+
+    // Initialize the main-pinned dispatch queue. This is a
+    // process-global Verona-style intrusive queue drained by
+    // `main_pump_bounded`. The depth/timestamp counters were
+    // zero-initialised at file scope; only the queue itself needs
+    // explicit init.
+    boc_bq_init(&MAIN_PINNED_QUEUE);
 
     // Initialize the scheduler module with no workers. The
     // per-worker array stays unallocated and `_core.scheduler_stats()`
@@ -5498,6 +6469,21 @@ static int _core_module_exec(PyObject *module) {
   BOC_STATE = state;
 
   PyModule_AddStringConstant(module, "TIMEOUT", BOC_TIMEOUT);
+  // Wake-reason sentinels returned by ``terminator_wait_pumpable``.
+  // Values mirror ``boc_terminator_wake_reason_t`` so the Python loop
+  // can compare against module-level constants without re-importing.
+  if (PyModule_AddIntConstant(module, "TERMINATED", BOC_TERMINATOR_TERMINATED) <
+      0) {
+    return -1;
+  }
+  if (PyModule_AddIntConstant(module, "PUMP_READY", BOC_TERMINATOR_PUMP_READY) <
+      0) {
+    return -1;
+  }
+  if (PyModule_AddIntConstant(module, "WAIT_TIMED_OUT",
+                              BOC_TERMINATOR_WAIT_TIMED_OUT) < 0) {
+    return -1;
+  }
   return 0;
 }
 

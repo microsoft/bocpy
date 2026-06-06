@@ -163,11 +163,35 @@ Edge cases:
 - The returned dict is a plain mutable ``dict``; mutating it locally
   does not affect the (now-freed) noticeboard.
 
+Reading the State Between Rounds
+---------------------------------
+
+When you want a noticeboard snapshot at a synchronization point
+*without* tearing the runtime down — e.g. a parallel search that
+inspects its best-so-far state between rounds and then keeps
+working — use :func:`quiesce` with ``noticeboard=True``::
+
+    from bocpy import quiesce
+
+    snap = quiesce(noticeboard=True)  # plain dict[str, Any]
+    print("best so far:", snap.get("best"))
+    # ... next batch of @when calls runs immediately ...
+
+:func:`quiesce` blocks until every in-flight behavior completes,
+captures the snapshot the same way :func:`wait` does (by cycling
+the dedicated mutator thread, which guarantees every prior
+``notice_write`` / ``notice_update`` / ``notice_delete`` has been
+committed before the read), and then leaves the workers and the
+noticeboard thread running. The combined ``stats=True,
+noticeboard=True`` form returns a :class:`WaitResult` just like
+:func:`wait`.
+
 Reading the Noticeboard
 -----------------------
 
-From inside a behavior, call :func:`noticeboard` to get a read-only mapping
-of all entries, or :func:`notice_read` for a single key::
+The noticeboard is a **behavior-scope read surface**. Inside a behavior,
+call :func:`noticeboard` to get a read-only mapping of all entries, or
+:func:`notice_read` for a single key::
 
     from bocpy import noticeboard, notice_read, when, Cown
 
@@ -183,13 +207,25 @@ of all entries, or :func:`notice_read` for a single key::
         # Single key with a default
         threshold = notice_read("threshold", 0.5)
 
-The snapshot is taken once per behavior and cached — multiple calls to
+The snapshot is taken once per behavior and cached -- multiple calls to
 :func:`noticeboard` or :func:`notice_read` within the same behavior return
 data from the same point in time.
 
 Cowns embedded in a noticeboard entry remain valid for the lifetime of
 the entry; they survive as long as the entry has not been overwritten or
 deleted, regardless of how many readers have observed the entry.
+
+.. warning::
+
+   Calling :func:`noticeboard` or :func:`notice_read` from the main
+   thread *outside* a behavior is **undefined behavior**. The only
+   supported ways to read the noticeboard from the main thread are
+   :func:`wait` with ``noticeboard=True`` (see "Reading the Final
+   State at Shutdown" above) and :func:`quiesce` with
+   ``noticeboard=True`` (see "Reading the State Between Rounds"
+   above). Seeding the noticeboard with :func:`notice_write` from
+   the main thread *before* scheduling behaviors is fine and is
+   the recommended pattern for installing read-mostly configuration.
 
 Writing and Updating
 --------------------

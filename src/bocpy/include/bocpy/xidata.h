@@ -310,6 +310,17 @@ static inline PyObject *PyErr_GetRaisedException(void) {
   return ev;
 }
 
+static inline void PyErr_SetRaisedException(PyObject *exc) {
+  if (exc == NULL) {
+    PyErr_Clear();
+    return;
+  }
+  PyObject *typ = Py_NewRef((PyObject *)Py_TYPE(exc));
+  PyObject *tb = PyException_GetTraceback(exc);
+  // PyErr_Restore steals all three references.
+  PyErr_Restore(typ, exc, tb);
+}
+
 #endif
 
 /**

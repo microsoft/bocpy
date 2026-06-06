@@ -95,6 +95,17 @@ bool terminator_seed_dec(void) {
   return false;
 }
 
+bool terminator_seed_inc(void) {
+  // CAS 0->1: single-shot inc; no broadcast needed (terminator_wait only wakes
+  // on count==0).
+  int_least64_t expected = 0;
+  if (atomic_compare_exchange_strong(&TERMINATOR_SEEDED, &expected, 1)) {
+    atomic_fetch_add(&TERMINATOR_COUNT, 1);
+    return true;
+  }
+  return false;
+}
+
 void terminator_reset(int_least64_t *prior_count, int_least64_t *prior_seeded) {
   // Fence: raise the closed bit before we touch anything else so any
   // stray thread still holding a reference to the previous runtime
@@ -118,3 +129,34 @@ int_least64_t terminator_seeded(void) {
 }
 
 int_least64_t terminator_count(void) { return atomic_load(&TERMINATOR_COUNT); }
+
+void terminator_wake_all(void) {
+  mtx_lock(&TERMINATOR_MUTEX);
+  cnd_broadcast(&TERMINATOR_COND);
+  mtx_unlock(&TERMINATOR_MUTEX);
+}
+
+boc_terminator_wake_reason_t
+terminator_wait_pumpable(double timeout_s, uint64_t (*pinned_depth_fn)(void)) {
+  boc_terminator_wake_reason_t reason = BOC_TERMINATOR_WAIT_TIMED_OUT;
+  double end_time = boc_now_s() + timeout_s;
+  mtx_lock(&TERMINATOR_MUTEX);
+  for (;;) {
+    if (atomic_load(&TERMINATOR_COUNT) == 0) {
+      reason = BOC_TERMINATOR_TERMINATED;
+      break;
+    }
+    if (pinned_depth_fn != NULL && pinned_depth_fn() > 0) {
+      reason = BOC_TERMINATOR_PUMP_READY;
+      break;
+    }
+    double now = boc_now_s();
+    if (now >= end_time) {
+      reason = BOC_TERMINATOR_WAIT_TIMED_OUT;
+      break;
+    }
+    cnd_timedwait_s(&TERMINATOR_COND, &TERMINATOR_MUTEX, end_time - now);
+  }
+  mtx_unlock(&TERMINATOR_MUTEX);
+  return reason;
+}

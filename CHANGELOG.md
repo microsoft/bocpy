@@ -1,74 +1,347 @@
+## 2026-06-05 - Version 0.9.0
+Main-pinned cowns — a new `PinnedCown` subclass holds its
+value as a plain `PyObject *` on the main interpreter, never
+round-tripped through XIData. Behaviors whose request set contains
+any pinned cown are routed by the scheduler to a single-consumer
+main-thread queue and drained by the new `pump` entry point
+(or implicitly by `wait`, which auto-pumps when pinned cowns
+exist). Designed for objects that cannot survive cross-interpreter
+shipping — pyglet shapes, Tk widgets, GPU contexts, open file
+handles, ctypes pointers. The companion `examples/boids.py`
+rewrite demonstrates the coarse-grained pinned-dispatch pattern:
+per-cell physics stays on workers, and one `@when(PinnedCown)`
+per frame batches the write-back into main-thread matrices.
+Also in this release: `quiesce`, a non-tearing-down
+checkpoint primitive.
+
+
+**New Features**
+
+- **`quiesce(timeout=None, *, stats=False, noticeboard=False)`** —
+  blocks until every in-flight behavior completes, without tearing
+  down workers or the noticeboard thread. Implemented via a new
+  `terminator_seed_inc` peer of `terminator_seed_dec`
+  (Pyrona-style seed-up / seed-down pairing) so quiescence becomes
+  a *checkpoint* rather than a shutdown. Useful for parallel-search
+  patterns that need to inspect a best-so-far cown between rounds
+  and for tests that must read a worker-produced `send` queue
+  before its producer interpreter is destroyed. The `stats` and
+  `noticeboard` flags mirror `wait`: returns `None` by
+  default, a per-worker stats `list[dict]` when `stats=True`,
+  a noticeboard `dict[str, Any]` when `noticeboard=True`, or a
+  `WaitResult` when both are set. Raises `TimeoutError`
+  if quiescence is not reached within `timeout`. Exported from
+  `bocpy.__all__`.
+- **`PinnedCown(Cown[T])`** — a cown whose value lives
+  permanently on the main interpreter. Constructible only from the
+  main interpreter (raises `RuntimeError` from workers);
+  the value is never picklable, never reified twice, and never
+  reconstructed in a worker. The capsule *handle* remains a
+  first-class cross-interpreter shareable — workers may hold it,
+  embed it in a regular `Cown` value graph, and place it in
+  noticeboard entries, but only the main thread may acquire the
+  value. See the new `pinned_cowns` page for the full
+  contract and the coarse-grained-dispatch pattern.
+- **`pump(deadline_ms=None, max_behaviors=None, raise_on_error=False)`**
+  — drains the main-thread queue of behaviors whose request sets
+  contain a `PinnedCown`. Call from your event loop's
+  idle / on-tick hook (pyglet `schedule_interval`, Tk `after`,
+  asyncio task, …); script-mode programs need not call it
+  explicitly because `wait` pumps internally. Non-preemptive:
+  `deadline_ms` gates *starting* the next behavior, not
+  interrupting one already running. Body exceptions default to
+  landing on the result cown's `.exception`;
+  `raise_on_error=True` re-raises the first body exception after
+  drain. Returns a new `PumpResult` `NamedTuple`
+  (`executed`, `deadline_reached`, `raised`).
+- **`set_pump_watchdog(warn_ms=1000, raise_ms=None, on_starve=None)`**
+  — configure the pinned-queue starvation watchdog. Both thresholds
+  gate on **queue-non-empty time**, not raw last-pump time, so
+  programs running only unpinned work never trip them. Default is
+  warn-only; users opt into fail-fast via an explicit `raise_ms`
+  so interactive debugger sessions are not wedged by a breakpoint.
+- **`set_wait_pump_poll(ms=50)`** — set the poll cadence for
+  `wait`'s auto-pump loop. Re-read every iteration so a
+  concurrent call updates the active wait immediately.
+- **`bocpy.PumpResult`** — three-field `NamedTuple` returned by
+  `pump`. `executed` counts pinned behaviors whose lifecycle
+  completed (including acquire-failure paths whose MCS chain still
+  drained). `deadline_reached` is `True` only when the
+  `deadline_ms` budget tripped before the queue drained.
+  `raised` counts only body exceptions captured to a result cown
+  (cleanup-path failures use `PyErr_WriteUnraisable` and do not
+  count). Exported from `bocpy.__all__`.
+- **Coarse-grained pinned-dispatch `examples/boids.py`** — the
+  per-cell `send("update")` / main-thread `receive("update")`
+  barrier is replaced by per-cell physics on workers plus one
+  pinned `@when` per frame that captures every per-cell result
+  cown together with the two main-thread `PinnedCown` matrices
+  and performs the batched write-back. Same visual output, fully
+  worker-parallel per-cell work, single main-thread touchpoint.
+
+**Public C ABI**
+
+- **`bocpy_main_interpid()`** — new `static inline` helper in
+  `<bocpy/bocpy.h>` returning `PyInterpreterState_GetID(
+  PyInterpreterState_Main())` pre-typed as `int_least64_t` to
+  match `bocpy_interpid` for owner-field equality checks.
+  Safe to call from a worker sub-interpreter for diagnostic /
+  assert use. Additive — existing consumers recompile unchanged;
+  `BOCPY_ABI` is unchanged at 1. The
+  `templates/c_abi_consumer` `bocpy~=` pin moves to
+  `~=0.9` to signal the new ABI surface it was authored against.
+
+**Improvements**
+
+- **`@when` loop-variable snapshot via default arg** — the
+  transpiler now accepts `def b(c, i=i)` as an explicit
+  loop-snapshot idiom in addition to the existing implicit form
+  (just reference the loop variable in the body). Trailing
+  positional parameters beyond the cown count are also
+  auto-captured by name (`def b(c, factor)` captures
+  `factor`).
+- **`@when` alias decorators** — the transpiler now recognises
+  `from bocpy import when as boc_when` and `import bocpy [as
+  alias]` followed by `@bocpy.when(...)` or
+  `@alias.when(...)`, provided the aliasing import is at module
+  level. Previously only the bare `@when` form was detected.
+- **`Behaviors.start()` compiles the export module on main** —
+  the transpiler's rewritten module is now also instantiated as an
+  in-memory `types.ModuleType` on the main thread (plus a
+  `linecache` entry for traceback fidelity) so `pump` can
+  resolve `__behavior__N` the same way workers do via their
+  bootstrap.
+- **Scheduler-owned behavior pre-header** — `bq_node` and the
+  new `pinned` OR-fold byte moved out of the opaque
+  `BOCBehavior` into a scheduler-owned `boc_behavior_prehdr_t`
+  allocated immediately before each behavior (CPython
+  `_PyGC_Head` style). `boc_sched.c` no longer needs any
+  knowledge of `BOCBehavior`'s internal layout; layout drift
+  between the scheduler and its users is impossible by
+  construction.
+- **`terminator_wait_pumpable`** — new entry in
+  `boc_terminator.{c,h}` lets the auto-pump loop wake on either
+  count-zero or main-pinned-depth-becoming-non-zero, both wired
+  through the existing single condition variable. Single-pumper
+  enforcement on free-threaded builds (`Py_GIL_DISABLED`) lives
+  alongside via a `MAIN_PUMP_THREAD` CAS that raises
+  `RuntimeError` if a second thread tries to pump
+  concurrently, cleared on every exit path including
+  `BaseException`.
+
+**Bug Fixes**
+
+- **CWE-401: inheriting INCREF leak in `cown_decref_inline`** —
+  `CownCapsule_reduce` packs an encoded `XIData` payload by
+  taking an *inheriting* `COWN_INCREF` per embedded
+  `CownCapsule`, normally balanced when the bytes are
+  unpickled inside a worker. On the orphan-death path (the
+  consumer side never deserialised the payload) the matching
+  `COWN_DECREF`s never fired and every embedded cown leaked.
+  `cown_decref_inline` now feeds the encoded bytes through
+  `pickle.loads` and immediately drops the result, which lets
+  CPython's GC fire the matching `COWN_DECREF`s recursively.
+  Gated on the `pickled` flag so native `XIData` round-trips
+  (e.g. `Matrix`) skip the work entirely.
+- **Main-pump behavior reference leak** — both
+  `_core_main_pump_bounded` and `_core_main_pump_drain_all`
+  popped a `BehaviorCapsule` from `MAIN_PINNED_QUEUE` but
+  never released the strong reference the capsule held on the
+  underlying `BOCBehavior`. Each pinned behavior leaked
+  one reference until the runtime was torn down. The pump
+  helpers now `BEHAVIOR_DECREF` the behavior immediately after
+  the worker-equivalent cleanup runs.
+- **MSVC `<stdatomic.h>` compatibility** — Microsoft's
+  `<stdatomic.h>` (used by CPython's headers on Windows) does
+  not expose the unsigned `atomic_uint_least64_t` or
+  `atomic_uintptr_t` forms that the pinned-pump bookkeeping
+  used. `MAIN_PINNED_DEPTH`, `MAIN_PINNED_NONEMPTY_SINCE_NS`,
+  `LAST_PUMP_NS`, `WATCHDOG_WARN_MS`, `WATCHDOG_LAST_WARN_NS`,
+  `WATCHDOG_ON_STARVE` and `MAIN_PUMP_THREAD` are now
+  `atomic_int_least64_t` / `atomic_intptr_t`. Depth never
+  goes negative; pointer bits round-trip losslessly through the
+  signed atomic boundary.
+- **CPython 3.10/3.11 `PyErr_SetRaisedException` polyfill** —
+  added to `include/bocpy/xidata.h` alongside the existing
+  `PyErr_GetRaisedException` polyfill so the public C ABI's
+  exception-stash pattern compiles on Python versions before
+  3.12. `BOCPY_ABI` is unchanged.
+- **Portable `boc_max_align_t`** — added to `boc_compat.h` as
+  a union of the most-strictly-aligned fundamental types
+  (`long long`, `long double`, `void *`, function pointer).
+  MSVC exposes the C11 `max_align_t` only under `/std:c11`,
+  which the CPython build does not pass; the
+  `boc_behavior_prehdr_t` size assertion now uses
+  `alignof(boc_max_align_t)` so the alignment contract holds on
+  every supported toolchain.
+- **PEP 678 `add_note` 3.10 fallback** — the new
+  `Behaviors.quiesce` exception-context shim attaches a note
+  describing the seed-inc / seed-dec balance on failure. CPython
+  3.10 predates `BaseException.add_note`; the shim now
+  writes to `BaseException.__notes__` directly when `add_note`
+  is missing.
+- **Transpiler `except ... as X` mis-classification** —
+  `ExceptHandler` binds `X` on the handler node
+  itself rather than via `Name` `Store`, so the
+  transpiler's free-variable walker mis-classified any read of
+  `X` inside the handler body as a free variable, appended it
+  as a behavior parameter, and emitted a call site that
+  referenced an out-of-scope name. Fixed by a new
+  `visit_ExceptHandler` hook that registers `X` as a local
+  before recursing into the handler. Regression locked by
+  `TestCapturedLocals::test_except_as_name_excluded`.
+
+**Documentation**
+
+- New `pinned_cowns` page — concept and when to use,
+  `PinnedCown` / `pump` / `PumpResult` / `set_pump_watchdog`
+  / `set_wait_pump_poll` API, coarse-grained pinned-dispatch
+  pattern, event-loop integration recipes (pyglet, Tk, asyncio),
+  the queue-non-empty-time watchdog contract, free-threaded
+  single-pumper rule, and free-threaded support trajectory.
+  Linked from the root toctree.
+- `api` expanded with the new `PinnedCown` / `pump` /
+  `PumpResult` / `set_pump_watchdog` / `set_wait_pump_poll`
+  entries.
+- New "Talking to main-thread objects" subsection in the root
+  `README.md`'s "A taste of BOC" with a 10-line pyglet snippet
+  illustrating the coarse-grained pattern; the public-API list
+  picks up the five new symbols.
+- `examples/README.md` calls out the rewritten `boids.py` and
+  the new `examples/benchmark.py --pinned-spinner` flag.
+
+**Tests**
+
+- **`test/test_pinned_pump.py`** — new module covering the
+  full `PinnedCown` / `pump` matrix: pure-pinned, mixed
+  request sets, off-main construction rejection, locked
+  error-string smoke tests, `deadline_ms` / `max_behaviors`
+  bounding, body exceptions under default and
+  `raise_on_error=True`, `wait()` auto-pump, shutdown drain
+  via drop-exceptions, the watchdog warn-only and explicit-raise
+  paths, the `QUEUE_NONEMPTY_SINCE` regression for unpinned-only
+  workloads, hypothesis fuzz over mixed request sets,
+  `PinnedCown`-handle round-trip through closure capture and
+  through the noticeboard, `Cown(PinnedCown)` interop, and an
+  acquire-failure fault-injection test that proves
+  `IN_PUMP_BODY` / `terminator_dec` / `MAIN_PUMP_THREAD`
+  cleanup runs on every exit path.
+- **`test/test_transpiler.py`** — 192 new lines covering the
+  `def b(c, i=i)` loop-snapshot form, `@when` alias decorators,
+  and the `except ... as X` regression.
+- **`test_main_pump_drain_all_marks_result_cowns` flaky-shutdown
+  rewrite** — the original version scheduled eight pinned
+  behaviors, called `wait(timeout=0)` to force shutdown, then
+  asserted on the result cowns. The `timeout=0` propagated
+  through every stage of `Behaviors.stop` (quiescence,
+  noticeboard drain) and raised `TimeoutError` from one of
+  them under load before the post-`wait` assertions could run.
+  The rewritten test calls `_core.main_pump_drain_all` directly
+  to exercise the shutdown drain in isolation and asserts every
+  drained result cown carries the shutdown `RuntimeError`.
+
+**Internal**
+
+- **`examples/benchmark.py --pinned-spinner`** — high-rate
+  pinned-dispatch overlay that adds one tail-recursing
+  `@when(PinnedCown)` driven by `pump(max_behaviors=1)` on the
+  main thread at a configurable rate while the existing chain-ring
+  workload runs on workers. Used during development to verify
+  worker-throughput regression under high-rate pinned dispatch;
+  on CPython 3.14 at 4 workers / 10 s / 3 repeats the measured
+  delta with the spinner active was −0.38%.
+- **Noticeboard read contract tightened** — `noticeboard`
+  now explicitly documents that calling `noticeboard` or
+  `notice_read` from the main thread *outside* a behavior is
+  undefined behavior; the supported main-thread read path is
+  `wait(noticeboard=True)`. Seeding the noticeboard with
+  `notice_write` from the main thread before scheduling any
+  behavior remains supported.
+- **`test_matrix.TestVectorMethodsInCown` migrated to the
+  `send("assert", ...)` pattern** — the in-cown `Matrix` vector
+  tests previously asserted on `result.value` directly from the
+  test thread, which violates the cown ownership contract. They now
+  ship assertions out of each behavior via `send("assert", ...)`
+  and collect on the test thread via a `receive_asserts(count)`
+  helper, matching the project's BOC testing convention.
+- **CI: ASAN `detect_leaks=1`** — the pinned-pump leak hunt
+  cleared the last masking leak; the ASAN job in
+  `.github/workflows/pr_gate.yml` now sets
+  `ASAN_OPTIONS=detect_leaks=1:halt_on_error=1` so any new
+  reachable leak fails the build at the source instead of
+  silently accumulating under `detect_leaks=0`.
+
 ## 2026-06-02 - Version 0.8.0
-Vector-oriented ``Matrix`` API — six new methods (``vecdot``,
-``cross``, ``normalize``, ``perpendicular``, ``angle``,
-``magnitude_squared``), two new read-only properties (``size``,
-``length``), and a unified ``in_place=`` keyword on every unary
-method round out ``Matrix`` as a first-class vector and
+Vector-oriented `Matrix` API — six new methods (`vecdot`,
+`cross`, `normalize`, `perpendicular`, `angle`,
+`magnitude_squared`), two new read-only properties (`size`,
+`length`), and a unified `in_place=` keyword on every unary
+method round out `Matrix` as a first-class vector and
 batch-of-vectors type — plus an internal X-macro template refactor
-of every ``_math.c`` op family that restores the compiler's
+of every `_math.c` op family that restores the compiler's
 auto-vectoriser. 44 of 71 benched rows improved by ≥10%, with
 representative wins of −50% to −88% on aggregates, broadcast
-arithmetic, and ``normalize``. The ``_math`` extension now ships
-with ``-O3`` (Linux/macOS) / ``/O2`` (Windows) so end users pick
+arithmetic, and `normalize`. The `_math` extension now ships
+with `-O3` (Linux/macOS) / `/O2` (Windows) so end users pick
 up the wins by default.
 
 **New Features**
 
-- **Vector-oriented ``Matrix`` methods** — six new methods designed
-  for the ``Nx2`` / ``2xN`` / ``Nx3`` / ``3xN`` vector and
-  batch-of-vectors shapes that show up in ``examples/boids.py`` and
+- **Vector-oriented `Matrix` methods** — six new methods designed
+  for the `Nx2` / `2xN` / `Nx3` / `3xN` vector and
+  batch-of-vectors shapes that show up in `examples/boids.py` and
   similar simulation code:
 
-  - ``magnitude_squared(axis=None)`` — squared L2 norm without the
-    ``sqrt`` step. Cheaper than ``magnitude()`` and safe for
+  - `magnitude_squared(axis=None)` — squared L2 norm without the
+    `sqrt` step. Cheaper than `magnitude()` and safe for
     sub-normal thresholding.
-  - ``vecdot(other, axis=None)`` — axis-aware inner product matching
-    ``numpy.linalg.vecdot``. **Not** equivalent to ``numpy.dot``;
-    use ``@`` for matrix multiplication. Same-shape, row-broadcast
-    (``1xN`` vs ``MxN``), and column-broadcast (``Mx1`` vs ``MxN``)
+  - `vecdot(other, axis=None)` — axis-aware inner product matching
+    `numpy.linalg.vecdot`. **Not** equivalent to `numpy.dot`;
+    use `@` for matrix multiplication. Same-shape, row-broadcast
+    (`1xN` vs `MxN`), and column-broadcast (`Mx1` vs `MxN`)
     operands are all supported.
-  - ``cross(other, axis=None)`` — 2D scalar z-component or 3D cross
-    product. Five shape paths share one method: ``1x2`` / ``2x1``
-    returns a float; ``1x3`` / ``3x1`` returns a same-orientation
-    ``Matrix``; ``Nx2`` / ``2xN`` batches collect per-vector
-    scalars; ``Nx3`` / ``3xN`` batches return same-shape ``Matrix``
-    results. ``axis=`` disambiguates the square ``2x2`` / ``3x3``
+  - `cross(other, axis=None)` — 2D scalar z-component or 3D cross
+    product. Five shape paths share one method: `1x2` / `2x1`
+    returns a float; `1x3` / `3x1` returns a same-orientation
+    `Matrix`; `Nx2` / `2xN` batches collect per-vector
+    scalars; `Nx3` / `3xN` batches return same-shape `Matrix`
+    results. `axis=` disambiguates the square `2x2` / `3x3`
     shapes (default per-row).
-  - ``normalize(axis=None, in_place=False)`` — divide every element
+  - `normalize(axis=None, in_place=False)` — divide every element
     by its magnitude. Zero-magnitude rows / columns are returned as
-    exact zeros (no NaN, no division by zero). ``axis=`` selects
+    exact zeros (no NaN, no division by zero). `axis=` selects
     per-row, per-column, or total normalisation.
-  - ``perpendicular(axis=None, in_place=False)`` — rotate every 2D
-    vector 90° counter-clockwise: ``(x, y) -> (-y, x)``. Accepts a
-    single 2D vector, an ``Nx2`` row batch, or a ``2xN`` column
+  - `perpendicular(axis=None, in_place=False)` — rotate every 2D
+    vector 90° counter-clockwise: `(x, y) -> (-y, x)`. Accepts a
+    single 2D vector, an `Nx2` row batch, or a `2xN` column
     batch.
-  - ``angle(axis=None)`` — polar angle ``atan2(y, x)`` of every 2D
+  - `angle(axis=None)` — polar angle `atan2(y, x)` of every 2D
     vector. Returns a float for a single 2D vector input,
-    otherwise a ``Matrix`` of per-vector angles.
-- **``Matrix.size`` property** — total element count
-  (``rows * columns``). Matches ``numpy.ndarray.size``.
-- **``Matrix.length`` property** — Frobenius (L2) magnitude as a
-  read-only ``@property`` so vector-like code reads naturally
-  (``direction.length``, ``velocity.length``) without the
-  parentheses of a method call. Equivalent to ``magnitude()`` with
+    otherwise a `Matrix` of per-vector angles.
+- **`Matrix.size` property** — total element count
+  (`rows * columns`). Matches `numpy.ndarray.size`.
+- **`Matrix.length` property** — Frobenius (L2) magnitude as a
+  read-only `@property` so vector-like code reads naturally
+  (`direction.length`, `velocity.length`) without the
+  parentheses of a method call. Equivalent to `magnitude()` with
   no axis argument.
-- **``in_place=`` keyword on every unary ``Matrix`` method** —
-  ``transpose``, ``ceil``, ``floor``, ``round``, ``negate``,
-  ``abs``, plus the new ``normalize`` and ``perpendicular`` all
-  accept ``in_place=True`` to mutate ``self`` and return it.
-  Replaces the older ``transpose_in_place()`` method (see
+- **`in_place=` keyword on every unary `Matrix` method** —
+  `transpose`, `ceil`, `floor`, `round`, `negate`,
+  `abs`, plus the new `normalize` and `perpendicular` all
+  accept `in_place=True` to mutate `self` and return it.
+  Replaces the older `transpose_in_place()` method (see
   **Breaking Changes** below).
-- **``axis=`` keyword on aggregate methods** — ``sum``, ``mean``,
-  ``min``, ``max``, ``magnitude``, and the new ``magnitude_squared``
-  now share a tri-state ``axis=`` argument (``None`` / ``0`` / ``1``)
-  decoded through a single classifier. Negative axes (``-1`` /
-  ``-2``) accepted for NumPy parity.
+- **`axis=` keyword on aggregate methods** — `sum`, `mean`,
+  `min`, `max`, `magnitude`, and the new `magnitude_squared`
+  now share a tri-state `axis=` argument (`None` / `0` / `1`)
+  decoded through a single classifier. Negative axes (`-1` /
+  `-2`) accepted for NumPy parity.
 
 **Improvements**
 
-- **Auto-vectorised ``_math.c`` op kernels** — the binary,
+- **Auto-vectorised `_math.c` op kernels** — the binary,
   aggregate, unary, and two-operand-aggregate op families inside
-  ``_math.c`` are now stamped from per-family descriptor tables,
+  `_math.c` are now stamped from per-family descriptor tables,
   one kernel per (op, shape) combination. Each per-element body is
   literally substituted into its own monomorphic inner loop,
   restoring the precondition for GCC's / Clang's auto-vectoriser.
@@ -76,84 +349,84 @@ up the wins by default.
 
   | Bench row                                 | 0.7.0 (ns) | 0.8.0 (ns) | Δ       |
   | ----------------------------------------- | ---------- | ---------- | ------- |
-  | ``mean()`` shape=(1000, 100)              | 44179.6    | 9001.6     | −79.6%  |
-  | ``mean(1)`` shape=(1000, 100)             | 51699.4    | 7058.5     | −86.3%  |
-  | ``max(1)`` shape=(1000, 100)              | 97184.2    | 11322.7    | −88.3%  |
-  | ``magnitude()`` shape=(1000, 3)           | 1098.2     | 306.8      | −72.1%  |
-  | ``add col-bcast`` shape=(1000, 100)       | 37823.4    | 20172.5    | −46.7%  |
-  | ``div same-shape`` shape=(1000, 100)      | 80134.2    | 45458.9    | −43.3%  |
-  | ``normalize()`` shape=(1000, 3) axis=None | 3644.6     | 1775.5     | −51.3%  |
+  | `mean()` shape=(1000, 100)              | 44179.6    | 9001.6     | −79.6%  |
+  | `mean(1)` shape=(1000, 100)             | 51699.4    | 7058.5     | −86.3%  |
+  | `max(1)` shape=(1000, 100)              | 97184.2    | 11322.7    | −88.3%  |
+  | `magnitude()` shape=(1000, 3)           | 1098.2     | 306.8      | −72.1%  |
+  | `add col-bcast` shape=(1000, 100)       | 37823.4    | 20172.5    | −46.7%  |
+  | `div same-shape` shape=(1000, 100)      | 80134.2    | 45458.9    | −43.3%  |
+  | `normalize()` shape=(1000, 3) axis=None | 3644.6     | 1775.5     | −51.3%  |
 
   Four rows in code paths untouched by the refactor regressed by
-  5–15% from layout drift (``_math.so`` ``.text`` grew +125% from
+  5–15% from layout drift (`_math.so` `.text` grew +125% from
   kernel specialisation); none are on a hot path. No behavioural
-  change; ``test_matrix.py`` passes unchanged.
-- **``-O3`` / ``/O2`` on ``bocpy._math``** — the math extension now
-  sets per-platform ``extra_compile_args`` in ``setup.py``
-  (``-O3 -fno-plt`` on Linux/macOS, ``/O2`` on Windows) so end-user
+  change; `test_matrix.py` passes unchanged.
+- **`-O3` / `/O2` on `bocpy._math`** — the math extension now
+  sets per-platform `extra_compile_args` in `setup.py`
+  (`-O3 -fno-plt` on Linux/macOS, `/O2` on Windows) so end-user
   wheels and editable installs both pick up the auto-vectoriser
-  wins above. Other ``bocpy`` extensions are unaffected. The SBOM
-  hash for ``_math.*.so`` will drift accordingly — see
-  :doc:`sbom` for the auditor-facing note.
+  wins above. Other `bocpy` extensions are unaffected. The SBOM
+  hash for `_math.*.so` will drift accordingly — see
+  `sbom` for the auditor-facing note.
 
 **Breaking Changes**
 
-- **``Matrix.transpose_in_place()`` removed** — superseded by
-  ``Matrix.transpose(in_place=True)``, which returns ``self`` and
+- **`Matrix.transpose_in_place()` removed** — superseded by
+  `Matrix.transpose(in_place=True)`, which returns `self` and
   so composes the same way every other unary method does.
-  Migration is mechanical: replace ``m.transpose_in_place()`` with
-  ``m.transpose(in_place=True)``.
+  Migration is mechanical: replace `m.transpose_in_place()` with
+  `m.transpose(in_place=True)`.
 
 **Documentation**
 
-- New ``Matrix`` API entries in :doc:`api` for ``size``, ``length``,
-  ``magnitude_squared``, ``vecdot``, ``cross``, ``normalize``,
-  ``perpendicular``, and ``angle``, plus updated ``in_place=``
+- New `Matrix` API entries in `api` for `size`, `length`,
+  `magnitude_squared`, `vecdot`, `cross`, `normalize`,
+  `perpendicular`, and `angle`, plus updated `in_place=`
   keyword signatures on the existing unary methods.
 
 **Tests**
 
-- **234 new test cases** for the new ``Matrix`` methods and
+- **234 new test cases** for the new `Matrix` methods and
   properties (1571 → 1805 passed). Coverage includes a stub-guard
-  test that greps ``__init__.pyi`` for every new C-level name and
-  in-cown coverage exercising each new method inside ``@when``.
+  test that greps `__init__.pyi` for every new C-level name and
+  in-cown coverage exercising each new method inside `@when`.
 - **Portable overflow regex + cross 2x3/3x2 contract pinning** —
-  the cross-product test for the doubly-valid ``2x3`` / ``3x2``
+  the cross-product test for the doubly-valid `2x3` / `3x2`
   shapes now pins the 2D-batch interpretation explicitly, locking
   the documented behaviour.
 
 **Internal**
 
-- **``scripts/bench_matrix.py``** — bench harness used to gate the
-  refactor: ``--json`` append mode, ``--report-median`` per-row
+- **`scripts/bench_matrix.py`** — bench harness used to gate the
+  refactor: `--json` append mode, `--report-median` per-row
   merge, 200 ms warmup, batch-size auto-tuning.
-- **``scripts/validate_wheel.py`` +
-  ``scripts/_vendored_warehouse_wheel.py``** — stdlib-only wheel
-  ``RECORD`` validator and a vendored slice of Warehouse's wheel
-  parser; used by the PR gate to catch ``RECORD`` regressions
+- **`scripts/validate_wheel.py` +
+  `scripts/_vendored_warehouse_wheel.py`** — stdlib-only wheel
+  `RECORD` validator and a vendored slice of Warehouse's wheel
+  parser; used by the PR gate to catch `RECORD` regressions
   before PyPI does.
 
 **CI / build**
 
-- **``cibuildwheel`` v3.4.0 → v3.4.1** and **``clang-format-action``**
+- **`cibuildwheel` v3.4.0 → v3.4.1** and **`clang-format-action`**
   pin normalised to the underlying commit SHA (Dependabot's
   preferred format). Both pins move in lock-step with the
   github-actions Dependabot group.
-- **``idna`` 3.16 → 3.17** in ``ci/constraints-docs.txt``. Five
-  other Dependabot proposals (``docutils`` 0.23, ``ruamel-yaml``
-  0.19, ``sphinx-tabs`` 3.4.7+, ``sphinx-toolbox`` 4.2, and
-  ``standard-imghdr`` 3.13) require Python ≥3.11 and so cannot
+- **`idna` 3.16 → 3.17** in `ci/constraints-docs.txt`. Five
+  other Dependabot proposals (`docutils` 0.23, `ruamel-yaml`
+  0.19, `sphinx-tabs` 3.4.7+, `sphinx-toolbox` 4.2, and
+  `standard-imghdr` 3.13) require Python ≥3.11 and so cannot
   enter a universal lock that still includes Python 3.10; a
-  comment above ``requires-python = ">=3.10"`` in
-  ``pyproject.toml`` lists them for the post-3.10-EOL bump.
-- **``flake8`` ``extend-exclude``** for ``.copilot/``, ``build/``,
-  ``sphinx/build/``, and the scratch ``.env*`` venvs so the walker
+  comment above `requires-python = ">=3.10"` in
+  `pyproject.toml` lists them for the post-3.10-EOL bump.
+- **`flake8` `extend-exclude`** for `.copilot/`, `build/`,
+  `sphinx/build/`, and the scratch `.env*` venvs so the walker
   no longer trips on generated or vendored Python files.
 
 ## 2026-05-28 - Version 0.7.0
 Cown-lifecycle correctness fixes — three use-after-free paths in the
-``CownCapsule`` pickle / acquire / noticeboard machinery now hold the
-inner ``BOCCown`` alive across the writer's wrapper drop — plus
+`CownCapsule` pickle / acquire / noticeboard machinery now hold the
+inner `BOCCown` alive across the writer's wrapper drop — plus
 supply-chain hardening: pinned and hash-verified Python dependencies,
 SHA-pinned GitHub Actions, dependabot coverage, vulnerability scanning,
 and PEP 770 SBOMs embedded in every wheel.
@@ -161,250 +434,250 @@ and PEP 770 SBOMs embedded in every wheel.
 **New Features**
 
 - **PEP 770 SBOMs in every wheel** — every wheel built by
-  ``.github/workflows/build_wheels.yml`` now embeds a
-  `CycloneDX 1.6 <https://cyclonedx.org/specification/overview/>`_
-  JSON SBOM under ``<dist>-<version>.dist-info/sboms/bocpy.cdx.json``.
+  `.github/workflows/build_wheels.yml` now embeds a
+  [CycloneDX 1.6](https://cyclonedx.org/specification/overview/)
+  JSON SBOM under `<dist>-<version>.dist-info/sboms/bocpy.cdx.json`.
   Generation runs inside cibuildwheel's repair step on every platform
-  (Linux ``auditwheel``, macOS ``delocate``, Windows direct injection)
-  via the new stdlib-only ``scripts/build_sbom.py``. The
-  ``inject`` subcommand rewrites the wheel's ``RECORD`` atomically
+  (Linux `auditwheel`, macOS `delocate`, Windows direct injection)
+  via the new stdlib-only `scripts/build_sbom.py`. The
+  `inject` subcommand rewrites the wheel's `RECORD` atomically
   (temp file + rename).
-- **SBOM verification in CI** — the new ``verify_sboms`` job in
-  ``build_wheels.yml`` re-downloads the extracted SBOM artifact and
-  runs two checks: ``scripts/validate_sbom.py`` (stdlib-only
+- **SBOM verification in CI** — the new `verify_sboms` job in
+  `build_wheels.yml` re-downloads the extracted SBOM artifact and
+  runs two checks: `scripts/validate_sbom.py` (stdlib-only
   structural validator pinning bocpy's wire format) and
-  `grype <https://github.com/anchore/grype>`_ (third-party SBOM
-  scanner) with ``--fail-on high``. A separate ``sboms`` artifact is
-  also uploaded by the ``merge`` job for downstream consumers.
-- **``bocpy.__version__``** — a runtime version attribute derived
-  from ``importlib.metadata.version("bocpy")``, with a
-  ``PackageNotFoundError`` fallback. Exported from ``bocpy.__all__``
-  and documented in ``__init__.pyi``. ``pyproject.toml`` remains the
+  [grype](https://github.com/anchore/grype) (third-party SBOM
+  scanner) with `--fail-on high`. A separate `sboms` artifact is
+  also uploaded by the `merge` job for downstream consumers.
+- **`bocpy.__version__`** — a runtime version attribute derived
+  from `importlib.metadata.version("bocpy")`, with a
+  `PackageNotFoundError` fallback. Exported from `bocpy.__all__`
+  and documented in `__init__.pyi`. `pyproject.toml` remains the
   single source of truth for the version.
-- **New documentation** — :doc:`sbom` walk-through covering the
+- **New documentation** — `sbom` walk-through covering the
   embedded SBOM format, extraction recipes, and verification commands.
-- **``wait(noticeboard=True)`` final-state capture** — :func:`wait`
-  now accepts a ``noticeboard`` keyword that returns the final
-  noticeboard contents as a plain ``dict`` at shutdown (after the
+- **`wait(noticeboard=True)` final-state capture** — `wait`
+  now accepts a `noticeboard` keyword that returns the final
+  noticeboard contents as a plain `dict` at shutdown (after the
   noticeboard thread exits, before the entries are freed). Useful
   for surfacing an early-stopping result, last error, or aggregated
   counter that a behavior deposited just before the runtime
-  quiesced, replacing the older ``send`` / ``receive`` handshake
-  that earlier examples used. Combined with ``stats=True`` it
-  returns a new :class:`WaitResult` ``NamedTuple`` (also exported
-  from ``bocpy.__all__``) carrying both snapshots. The
-  ``examples/prime_factor.py`` example was migrated to the new
+  quiesced, replacing the older `send` / `receive` handshake
+  that earlier examples used. Combined with `stats=True` it
+  returns a new `WaitResult` `NamedTuple` (also exported
+  from `bocpy.__all__`) carrying both snapshots. The
+  `examples/prime_factor.py` example was migrated to the new
   pattern.
 
 **Bug Fixes**
 
-- **Cown-in-cown use-after-free** — a ``Cown`` embedded inside
+- **Cown-in-cown use-after-free** — a `Cown` embedded inside
   another cown's value, a message-queue payload, or a noticeboard
   snapshot was previously freed when the writer's local wrapper
   dropped, because pickle bytes carry no refcount on their own.
-  ``CownCapsule_reduce`` now takes an inheriting ``COWN_INCREF`` that
-  ``_cown_capsule_from_pointer_inheriting`` consumes on unpickle, so
-  the inner ``BOCCown`` survives until the consumer drops its
+  `CownCapsule_reduce` now takes an inheriting `COWN_INCREF` that
+  `_cown_capsule_from_pointer_inheriting` consumes on unpickle, so
+  the inner `BOCCown` survives until the consumer drops its
   decoded wrapper. Affects every cross-cown reference shape — see
-  the new ``TestCownInCown`` class for the full container-shape fuzz.
-- **Acquire-failure poisoned-state** — when ``pickle.loads`` failed
-  partway through ``cown_acquire``, the cown was left in a
+  the new `TestCownInCown` class for the full container-shape fuzz.
+- **Acquire-failure poisoned-state** — when `pickle.loads` failed
+  partway through `cown_acquire`, the cown was left in a
   half-acquired state with the encoded bytes still in place. A retry
   would re-run pickle against bytes whose embedded inherited refs
   had already been partially consumed by pickle's error path,
-  risking dereferences of freed ``BOCCown*`` pointers. The cown's
-  ``xidata`` is now recycled on the failure path and a guard at the
-  top of ``cown_acquire`` rejects any future acquire with a
-  deterministic ``RuntimeError``; the worker recovery arm surfaces
+  risking dereferences of freed `BOCCown*` pointers. The cown's
+  `xidata` is now recycled on the failure path and a guard at the
+  top of `cown_acquire` rejects any future acquire with a
+  deterministic `RuntimeError`; the worker recovery arm surfaces
   it on the failing behavior's result cown.
 - **Noticeboard hidden-cown audit** — when a noticeboard value
-  reached a ``Cown`` via a route the pin walker cannot see — custom
-  ``__reduce__`` / ``__getstate__``, ``copyreg.dispatch_table``,
+  reached a `Cown` via a route the pin walker cannot see — custom
+  `__reduce__` / `__getstate__`, `copyreg.dispatch_table`,
   closure capture, module-level cache — the borrowing reconstructor
-  produced a token whose inner ``BOCCown`` was not held alive by
+  produced a token whose inner `BOCCown` was not held alive by
   the entry's pin set, leaving the next reader to UAF after the
   writer's wrapper dropped. A per-thread borrowing context
-  (``BOC_NB_CTX``) now audits every ``CownCapsule_reduce`` against
+  (`BOC_NB_CTX`) now audits every `CownCapsule_reduce` against
   the caller's pin set during the noticeboard write pickle and
-  fails the whole ``notice_write`` / ``notice_update`` closed if
+  fails the whole `notice_write` / `notice_update` closed if
   any cown is unaccounted for.
 - **`UnicodeDecodeError` on non-UTF-8 Windows locales** —
-  ``Behaviors.start`` read ``worker.py`` with ``open(path)``, which
-  picks up ``locale.getpreferredencoding(False)``. On cp1252
+  `Behaviors.start` read `worker.py` with `open(path)`, which
+  picks up `locale.getpreferredencoding(False)`. On cp1252
   (English Windows) the UTF-8 em-dashes in the worker source were
   silently mojibake-d; on cp949 (Korean Windows) the read failed
-  with ``UnicodeDecodeError: 'cp949' codec can't decode byte 0xe2``
-  and ``bocpy`` could not start at all (reported in
-  `#14 <https://github.com/microsoft/bocpy/issues/14>`_ by
-  `@Forthoney <https://github.com/Forthoney>`_). Fixed by passing
-  ``encoding="utf-8"`` explicitly in ``Behaviors.start``, and the
-  same fix was applied to every other ``open()`` site in the repo
+  with `UnicodeDecodeError: 'cp949' codec can't decode byte 0xe2`
+  and `bocpy` could not start at all (reported in
+  [#14](https://github.com/microsoft/bocpy/issues/14) by
+  [@Forthoney](https://github.com/Forthoney)). Fixed by passing
+  `encoding="utf-8"` explicitly in `Behaviors.start`, and the
+  same fix was applied to every other `open()` site in the repo
   that reads or writes text known to contain non-ASCII bytes
-  (``sphinx/source/conf.py``, ``examples/sketches.py`` x2,
-  ``export_module.py``).
-- **Silent worker-startup failures** — ``Behaviors.start_workers``
-  ran ``interpreters.create()`` and ``interpreters.run_string()``
+  (`sphinx/source/conf.py`, `examples/sketches.py` x2,
+  `export_module.py`).
+- **Silent worker-startup failures** — `Behaviors.start_workers`
+  ran `interpreters.create()` and `interpreters.run_string()`
   on the worker thread without a try/except, so a failure in either
-  killed the thread without ever replying on ``boc_behavior``. The
-  parent's bounded ``receive()`` then timed out with no diagnostic.
+  killed the thread without ever replying on `boc_behavior`. The
+  parent's bounded `receive()` then timed out with no diagnostic.
   Both calls are now wrapped, and every failure path sends a
-  formatted traceback over ``boc_behavior`` so the parent sees a
+  formatted traceback over `boc_behavior` so the parent sees a
   structured error instead of a timeout.
 - **Silent worker bootstrap import failures** — the generated
   bootstrap script that loads the user module into each worker
   sub-interpreter is now wrapped in a top-level try/except. Any
-  ``BaseException`` is formatted with the user module name and sent
-  over ``boc_behavior`` (falls back to ``sys.stderr`` if the
-  message-queue ``send`` itself raises), then re-raised so
-  ``run_string`` reports it as well. Module-import failures that
+  `BaseException` is formatted with the user module name and sent
+  over `boc_behavior` (falls back to `sys.stderr` if the
+  message-queue `send` itself raises), then re-raised so
+  `run_string` reports it as well. Module-import failures that
   previously surfaced only as a worker-startup timeout now arrive
   as a proper traceback.
-- **``boc_sched_worker_pop_slow`` skipped ``popped_local``** — the
+- **`boc_sched_worker_pop_slow` skipped `popped_local`** — the
   slow-path pending-fallback and WSQ-dequeue branches returned
-  work without bumping ``popped_local`` (the fast path always
+  work without bumping `popped_local` (the fast path always
   did), so the documented producer/consumer identity in
-  :c:type:`boc_sched_stats_t` was violated whenever the fairness
+  `boc_sched_stats_t` was violated whenever the fairness
   arm fired or a worker entered the slow path directly. Both
-  branches now increment ``popped_local`` and reset the batch
+  branches now increment `popped_local` and reset the batch
   budget, matching the fast path. The header's reconciliation
   paragraph was also tightened to a "near-identity" that explicitly
   accounts for fairness-token pops (which are re-enqueued via raw
-  ``boc_wsq_enqueue`` rather than ``boc_sched_dispatch``, leaving
+  `boc_wsq_enqueue` rather than `boc_sched_dispatch`, leaving
   consumer-side counters without a matching producer-side bump).
 
 **Supply Chain**
 
 - **Hashed and pinned Python dependencies** — every CI dependency is
-  resolved into a ``ci/constraints-<extra>.txt`` file via
-  ``uv pip compile --universal --generate-hashes`` and installed with
-  ``pip install --require-hashes``. Covers the ``test``, ``linting``,
-  ``docs``, and new ``audit`` extras. ``bocpy`` itself is then
-  installed via ``pip install -e . --no-deps`` so an editable build
+  resolved into a `ci/constraints-<extra>.txt` file via
+  `uv pip compile --universal --generate-hashes` and installed with
+  `pip install --require-hashes`. Covers the `test`, `linting`,
+  `docs`, and new `audit` extras. `bocpy` itself is then
+  installed via `pip install -e . --no-deps` so an editable build
   cannot smuggle in an unpinned transitive dependency.
-- **Vulnerability scanning** — new ``audit`` job in ``pr_gate.yml``
-  runs ``pip-audit --strict`` against every constraints file on every
-  PR. ``pip-audit`` itself is pinned via ``ci/constraints-audit.txt``
-  and self-checked. A new ``.github/workflows/nightly_audit.yml``
-  re-runs the audit nightly against ``main``.
-- **SHA-pinned GitHub Actions** — every ``uses:`` line in
-  ``.github/workflows/`` is now pinned to a full 40-char commit SHA
-  with a trailing ``# vX.Y.Z`` comment.
-- **Dependabot coverage** — new ``.github/dependabot.yml`` covers
-  three ecosystems (``pip`` rooted at ``/ci``, ``github-actions``
-  rooted at ``/``, ``pip`` rooted at
-  ``/templates/c_abi_consumer``), grouped weekly per ecosystem.
-- **Downstream template pinned** — ``templates/c_abi_consumer``
-  pins ``bocpy~=MAJOR.MINOR`` as both a build requirement and a
-  runtime dependency. The ``finalize-pr`` skill bumps it in
+- **Vulnerability scanning** — new `audit` job in `pr_gate.yml`
+  runs `pip-audit --strict` against every constraints file on every
+  PR. `pip-audit` itself is pinned via `ci/constraints-audit.txt`
+  and self-checked. A new `.github/workflows/nightly_audit.yml`
+  re-runs the audit nightly against `main`.
+- **SHA-pinned GitHub Actions** — every `uses:` line in
+  `.github/workflows/` is now pinned to a full 40-char commit SHA
+  with a trailing `# vX.Y.Z` comment.
+- **Dependabot coverage** — new `.github/dependabot.yml` covers
+  three ecosystems (`pip` rooted at `/ci`, `github-actions`
+  rooted at `/`, `pip` rooted at
+  `/templates/c_abi_consumer`), grouped weekly per ecosystem.
+- **Downstream template pinned** — `templates/c_abi_consumer`
+  pins `bocpy~=MAJOR.MINOR` as both a build requirement and a
+  runtime dependency. The `finalize-pr` skill bumps it in
   lock-step with the root version.
-- **New ``SUPPLY_CHAIN.md``** — top-level policy doc describing
+- **New `SUPPLY_CHAIN.md`** — top-level policy doc describing
   everything above with the exact regeneration commands.
 
 **Documentation**
 
-- **Cown pickle-leak note** — :class:`Cown` now documents that
-  ``pickle.dumps`` on a cown produces bytes that carry one strong
+- **Cown pickle-leak note** — `Cown` now documents that
+  `pickle.dumps` on a cown produces bytes that carry one strong
   reference per embedded cown; orphan bytes (never unpickled in the
   producing process) leak one strong ref per byte string. The bocpy
   runtime never produces orphan bytes; the leak surface only
-  applies to third-party code that calls ``pickle.dumps(cown)``
+  applies to third-party code that calls `pickle.dumps(cown)`
   directly.
-- **Noticeboard cown-lifetime guarantee** — :func:`notice_write` and
-  :func:`notice_update` now document that values may embed
-  :class:`Cown` references and that the noticeboard keeps each
+- **Noticeboard cown-lifetime guarantee** — `notice_write` and
+  `notice_update` now document that values may embed
+  `Cown` references and that the noticeboard keeps each
   embedded cown alive for as long as the entry remains. The new
-  paragraph in :doc:`noticeboard` mirrors this guarantee for
+  paragraph in `noticeboard` mirrors this guarantee for
   readers.
-- **Noticeboard final-state capture guide** — :doc:`noticeboard`
+- **Noticeboard final-state capture guide** — `noticeboard`
   gained a "Reading the Final State at Shutdown" section covering
-  the ``wait(noticeboard=True)`` contract, the combined
-  ``wait(stats=True, noticeboard=True)`` form returning
-  :class:`WaitResult`, the empty-dict fallbacks for the
+  the `wait(noticeboard=True)` contract, the combined
+  `wait(stats=True, noticeboard=True)` form returning
+  `WaitResult`, the empty-dict fallbacks for the
   never-started and never-written cases, and the recommendation
-  to use ``snap.get(key)`` since :func:`wait` quiesces as soon as
+  to use `snap.get(key)` since `wait` quiesces as soon as
   every behavior completes with no guarantee any particular write
   has landed. The early-stopping worked example in the same file
   was rewritten around the new API.
 
 **Tests**
 
-- **``TestCownInCown``** in ``test/test_boc.py`` — pins the
+- **`TestCownInCown`** in `test/test_boc.py` — pins the
   cown-in-cown UAF fix with three cases: an inner cown allocated
   inside a behavior and observed by a downstream behavior, a cown
   sent through the message queue and consumed by the receiver, and
   a 50-trial deterministic fuzz over seven container shapes
-  (``list`` / ``tuple`` / ``dict`` / ``@dataclass(slots=True)`` /
-  ``__dict__``-only / ``__slots__``-only / 2-level ``Cown[Cown[T]]``).
-- **``TestAcquireFailureTerminal``** in ``test/test_boc.py`` — pins
+  (`list` / `tuple` / `dict` / `@dataclass(slots=True)` /
+  `__dict__`-only / `__slots__`-only / 2-level `Cown[Cown[T]]`).
+- **`TestAcquireFailureTerminal`** in `test/test_boc.py` — pins
   the poisoned-state contract: after a deserialisation failure the
   cown stays permanently unavailable and every subsequent waiter
-  receives the deterministic ``RuntimeError`` on its result cown.
+  receives the deterministic `RuntimeError` on its result cown.
 - **Noticeboard hidden-cown regressions** in
-  ``test/test_noticeboard.py`` — exercises ``__reduce__`` and
-  ``copyreg.dispatch_table`` reductions that hide a cown from the
+  `test/test_noticeboard.py` — exercises `__reduce__` and
+  `copyreg.dispatch_table` reductions that hide a cown from the
   pin walker, and verifies the audit rejects the write closed
   rather than leaving an unpinned borrowing token in the entry.
-  A complementary ``_VisibleCownPair`` test guards against the
+  A complementary `_VisibleCownPair` test guards against the
   over-eager-rejection regression.
-- **``test/test_version.py``** — covers ``bocpy.__version__``:
-  pyproject parity, PEP 440 shape, ``__all__`` export, and the
-  ``importlib.metadata`` fallback path (subprocess test that
+- **`test/test_version.py`** — covers `bocpy.__version__`:
+  pyproject parity, PEP 440 shape, `__all__` export, and the
+  `importlib.metadata` fallback path (subprocess test that
   verifies the WARNING is emitted when the metadata lookup raises).
-- **``test/test_build_sbom.py`` and ``test/test_validate_sbom.py``**
+- **`test/test_build_sbom.py` and `test/test_validate_sbom.py`**
   — full coverage of the SBOM generator and validator: CycloneDX
   1.6 shape, deterministic UUIDv5 serialNumber,
-  ``SOURCE_DATE_EPOCH`` timestamp, per-entry ZIP-attribute
-  preservation (``external_attr`` / ``create_system`` /
-  ``compress_type`` / ``date_time``) across symlink and
-  ``ZIP_STORED`` entries, atomic ``RECORD`` rewrite, and the CLI
-  ``generate`` / ``inject`` / ``validate`` modes.
-- **``TestWaitNoticeboardCapture``** in ``test/test_noticeboard.py``
-  — pins the ``wait(noticeboard=True)`` contract: returned dict is a
-  plain mutable ``dict``, empty-runtime / empty-noticeboard fallbacks
-  to ``{}``, single-flag back-compat (``wait()`` stays ``None``,
-  ``wait(stats=True)`` stays ``list``), combined-flag
-  :class:`WaitResult` shape, last-write-wins, delete propagation
+  `SOURCE_DATE_EPOCH` timestamp, per-entry ZIP-attribute
+  preservation (`external_attr` / `create_system` /
+  `compress_type` / `date_time`) across symlink and
+  `ZIP_STORED` entries, atomic `RECORD` rewrite, and the CLI
+  `generate` / `inject` / `validate` modes.
+- **`TestWaitNoticeboardCapture`** in `test/test_noticeboard.py`
+  — pins the `wait(noticeboard=True)` contract: returned dict is a
+  plain mutable `dict`, empty-runtime / empty-noticeboard fallbacks
+  to `{}`, single-flag back-compat (`wait()` stays `None`,
+  `wait(stats=True)` stays `list`), combined-flag
+  `WaitResult` shape, last-write-wins, delete propagation
   through a chained behavior, fresh-session isolation, and the
-  single-shot guarantee that an explicit ``stop()`` followed by
-  ``wait(noticeboard=True)`` preserves the snapshot rather than
+  single-shot guarantee that an explicit `stop()` followed by
+  `wait(noticeboard=True)` preserves the snapshot rather than
   re-snapshotting the now-empty noticeboard. The existing
-  scheduler-stats tests in ``test/test_scheduler_stats.py`` were
+  scheduler-stats tests in `test/test_scheduler_stats.py` were
   simplified to use the cown-chain barrier directly rather than a
-  ``send``/``receive`` handshake, now that the same change is
-  exercised end-to-end by the new ``wait(noticeboard=True)`` tests.
+  `send`/`receive` handshake, now that the same change is
+  exercised end-to-end by the new `wait(noticeboard=True)` tests.
 
 **Internal**
 
-- ``flake8`` now lints ``.pyi`` stubs (the default ``--filename``
+- `flake8` now lints `.pyi` stubs (the default `--filename`
   glob silently skipped them). Pre-existing defects in
-  ``__init__.pyi``, ``_core.pyi``, and ``test_boc.py`` cleaned up in
-  the same pass. The workflow also lints the new ``scripts/``
+  `__init__.pyi`, `_core.pyi`, and `test_boc.py` cleaned up in
+  the same pass. The workflow also lints the new `scripts/`
   directory.
 - **`flake8-encodings` added to the `[linting]` extra** — pins the
   Windows-locale class of bug above as a permanent regression gate.
-  Any future ``open()`` call without an explicit ``encoding=``
-  (or with ``encoding=None``) now fails the PR-gate lint job. The
-  plugin and its transitive dependencies (``flake8-helper``,
-  ``astatine``, ``domdf-python-tools``, ``natsort``) are pinned and
-  hash-verified in ``ci/constraints-linting.txt`` like every other
+  Any future `open()` call without an explicit `encoding=`
+  (or with `encoding=None`) now fails the PR-gate lint job. The
+  plugin and its transitive dependencies (`flake8-helper`,
+  `astatine`, `domdf-python-tools`, `natsort`) are pinned and
+  hash-verified in `ci/constraints-linting.txt` like every other
   CI dependency.
-- **Defensive ``receive()`` timeouts on every lifecycle path** —
-  ``Behaviors.start_workers``, ``stop_workers``, ``_abort_workers``,
+- **Defensive `receive()` timeouts on every lifecycle path** —
+  `Behaviors.start_workers`, `stop_workers`, `_abort_workers`,
   and the noticeboard mutator loop now pass a bounded timeout to
-  every ``_core.receive()`` they own. A wedged worker therefore
-  fails fast with a deterministic ``RuntimeError`` instead of
+  every `_core.receive()` they own. A wedged worker therefore
+  fails fast with a deterministic `RuntimeError` instead of
   hanging the parent forever. Defence in depth against the
   sub-interpreter wedge observed on macOS arm64 + Python 3.12/3.13.
-- **No ``unittest.mock`` in test files that schedule ``@when``** —
+- **No `unittest.mock` in test files that schedule `@when`** —
   the transpiler exports the whole test module for import in every
-  worker sub-interpreter, so a top-level ``from unittest import
-  mock`` triggers an ``import asyncio`` in every worker. On macOS
+  worker sub-interpreter, so a top-level `from unittest import
+  mock` triggers an `import asyncio` in every worker. On macOS
   arm64 + Python 3.12/3.13 this can deadlock during PEP 684
   per-interpreter init. Replaced by a small in-house
-  ``test/mockreplacement.py`` (``patch_attr`` context manager +
-  ``Recorder`` / ``RecorderMethod`` stubs) imported lazily inside
+  `test/mockreplacement.py` (`patch_attr` context manager +
+  `Recorder` / `RecorderMethod` stubs) imported lazily inside
   the few tests that need it. The pitfall is documented in the
-  ``testing-with-boc`` skill.
+  `testing-with-boc` skill.
 
 ## 2026-05-10 - Version 0.6.0
 Public C ABI for downstream extensions, enabling C-level participation
@@ -412,38 +685,38 @@ in behavior-oriented concurrency across worker sub-interpreters.
 
 **New Features**
 
-- **Decorator composition with ``@when``** — decorators stacked below
-  ``@when`` are now preserved on the generated behavior function and
+- **Decorator composition with `@when`** — decorators stacked below
+  `@when` are now preserved on the generated behavior function and
   compose with the behavior body on the worker.  Decorators placed
-  above ``@when`` raise a ``SyntaxError`` at transpile time with
-  actionable guidance.  ``async def`` functions with ``@when`` are
+  above `@when` raise a `SyntaxError` at transpile time with
+  actionable guidance.  `async def` functions with `@when` are
   also explicitly rejected.
 - **Public C ABI (`<bocpy/bocpy.h>`)** — downstream C extensions can
   now link against bocpy to register custom Python types as
   cross-interpreter shareable so `Cown` can carry instances of
   them across worker interpreters. The header is C-only, version-gated
-  via the ``BOCPY_ABI`` macro, and bumped on any incompatible change
-  to ``bocpy.h`` or ``xidata.h``. Wheels remain CPython-version-tagged
+  via the `BOCPY_ABI` macro, and bumped on any incompatible change
+  to `bocpy.h` or `xidata.h`. Wheels remain CPython-version-tagged
   so a runtime ABI mismatch cannot occur.
 - **`bocpy.get_include()` / `bocpy.get_sources()`** — Python-level
-  helpers that downstream ``setup.py`` files use to locate the bocpy
+  helpers that downstream `setup.py` files use to locate the bocpy
   headers and the small set of C sources that must be compiled into
   the consuming extension.
 - **`templates/c_abi_consumer/`** — a ready-to-copy template for
   building a C extension against the bocpy ABI, including a
-  ``setup.py``, a probe extension exercising the public surface, and
-  a pytest suite (``test_public_c_abi.py``) that validates the ABI
+  `setup.py`, a probe extension exercising the public surface, and
+  a pytest suite (`test_public_c_abi.py`) that validates the ABI
   end-to-end.
 - **C source reorganisation** — the per-subsystem translation units
-  introduced in 0.5.0 have been renamed with a ``boc_`` prefix
-  (``boc_compat.[ch]``, ``boc_sched.[ch]``, ``boc_tags.[ch]``,
-  ``boc_terminator.[ch]``, ``boc_noticeboard.[ch]``, ``boc_cown.h``)
-  to give the public ABI a stable, namespaced identity. ``xidata.h``
-  has moved under ``include/bocpy/`` alongside ``bocpy.h``.
+  introduced in 0.5.0 have been renamed with a `boc_` prefix
+  (`boc_compat.[ch]`, `boc_sched.[ch]`, `boc_tags.[ch]`,
+  `boc_terminator.[ch]`, `boc_noticeboard.[ch]`, `boc_cown.h`)
+  to give the public ABI a stable, namespaced identity. `xidata.h`
+  has moved under `include/bocpy/` alongside `bocpy.h`.
 
 **Documentation**
 
-- New :doc:`c_abi`, :doc:`messaging`, and :doc:`noticeboard` pages
+- New `c_abi`, `messaging`, and `noticeboard` pages
   in the Sphinx site; the API reference has been expanded to cover
   the public ABI surface.
 
@@ -453,7 +726,7 @@ in behavior-oriented concurrency across worker sub-interpreters.
   counter introduced in 0.4.0 has been removed. It exposed an
   implementation detail of the snapshot cache that did not survive
   the C ABI review and had no use case that was not better served
-  by ``notice_sync`` plus an explicit ``noticeboard()`` read.
+  by `notice_sync` plus an explicit `noticeboard()` read.
 
 ## 2026-04-29 - Version 0.5.0
 Verona-RT-style work-stealing scheduler, C source split into per-subsystem

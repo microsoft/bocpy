@@ -23,18 +23,27 @@ execute asynchronously on worker interpreters.
 | Concept | Description |
 |---------|-------------|
 | `Cown(value)` | A concurrently-owned wrapper. Behaviors receive exclusive temporal access to the cown's `.value`. |
-| `@when(*cowns)` | Decorator that schedules the function as a behavior. The decorator replaces the function with a `Cown` holding the return value. **The decorated function must have exactly as many parameters as there are arguments to `@when`.** |
+| `@when(*cowns)` | Decorator that schedules the function as a behavior. The decorator replaces the function with a `Cown` holding the return value. The first N parameters bind to the N cowns; any trailing parameters are auto-captured from the caller's frame (see below). |
 | `send(tag, contents)` | Sends a cross-interpreter message with the given tag. |
 | `receive(tags, timeout)` | Blocks until a message with a matching tag arrives (or times out). Returns `(TIMEOUT, None)` on timeout. |
 | `TIMEOUT` | Sentinel string returned as the tag by `receive` when a timeout elapses. |
 | `wait(timeout)` | Blocks until all scheduled behaviors have completed. |
 
-### Critical rule: parameter count must match `@when` argument count
+### Cown count, parameter count, and auto-captured extras
 
-The number of parameters on the decorated function **must exactly equal** the
-number of arguments passed to `@when`. A mismatch causes unspecified behavior
-that can crash the worker interpreter. Because the behavior never completes, the
-test will hang forever unless `receive` is called with a timeout.
+The first `N` parameters of the decorated function bind positionally to the
+`N` arguments of `@when`. Any **additional** trailing parameters are treated
+as captures of names from the caller's scope:
+
+* `def b(c, factor)` — captures `factor` by the parameter's own name.
+* `def b(c, i=i)` — captures `i` (the canonical loop-snapshot idiom).
+* `def b(c, x=y)` — captures `y` and binds it into param `x`.
+
+Defaults must be plain names; computed defaults (`def b(c, k=foo())`) and
+defaults on cown positions (`def b(c=c)`) raise `SyntaxError` at export
+time. Free variables referenced in the body (but not in the signature) are
+also auto-captured, so the simplest spelling is usually to omit the extras
+entirely and just reference them in the body.
 
 ```python
 # CORRECT — 1 @when arg, 1 function param
@@ -42,54 +51,60 @@ test will hang forever unless `receive` is called with a timeout.
 def good(x):
     return x.value * 2
 
-# WRONG — 1 @when arg, 2 function params (default args count!)
-@when(x)
-def bad(x, factor=2):       # will crash — factor is an extra param
-    return x.value * factor
-
-# FIX — capture extra values via closure, not default args
+# ALSO CORRECT — extra params beyond the cown count are auto-captured
+# from the caller's frame by name. Plain extras use the param's own
+# name; defaults of the form ``i=i`` or ``x=y`` use the default's name.
 factor = 2
 @when(x)
-def fixed(x):               # 1 param matches 1 @when arg
-    return x.value * factor  # factor captured from enclosing scope
+def with_extra(x, factor):              # ``factor`` captured by name
+    return x.value * factor
+
+# FIX — for older code: capture extra values via closure
+factor = 2
+@when(x)
+def fixed(x):                           # 1 param matches 1 @when arg
+    return x.value * factor             # factor captured from enclosing scope
 ```
 
-### Do not use the `def _(c, x=x)` loop-capture idiom
+### The `def _(c, i=i)` loop-capture idiom is supported
 
-A common Python idiom for snapshotting a loop variable is to bind it as a
-default argument:
+The canonical Python idiom for snapshotting a loop variable as a default
+argument works transparently:
 
 ```python
 for i, c in enumerate(cowns):
     @when(c)
-    def _(c, i=i):          # unnecessary AND breaks @when
+    def _(c, i=i):                      # ``i`` captured at schedule time
         send("done", i)
 ```
 
-**You don't need this with `@when`.** The transpiler rewrites the call site as
-`whencall('__behavior__N', (c,), (i,))`, snapshotting captures into a tuple at
-schedule time. There is no late-binding hazard to defend against — just
-reference the loop variable directly:
+The transpiler hoists positional parameters beyond the cown count into
+captures: bare extras (`def b(c, factor)`) capture by the parameter's own
+name; defaults (`def b(c, i=i)` or the rename form `def b(c, x=y)`) capture by
+the default expression's name. The default expression must be a plain
+`Name`; computed defaults (`def b(c, k=foo())`) and defaults on cown
+positions (`def b(c=c)`) raise `SyntaxError` at export time.
+
+Because the transpiler already snapshots loop variables into a tuple at
+schedule time, you can also just reference the loop variable directly without
+the `i=i` idiom — both spellings work:
 
 ```python
 for i, c in enumerate(cowns):
     @when(c)
     def _(c):
-        send("done", i)     # i is captured by value at schedule time
+        send("done", i)                 # i is captured by value at schedule time
 ```
 
-Adding `i=i` to the signature actively breaks the behavior. The transpiler
-treats every name in the signature as a behavior parameter and discards the
-default, so the worker sees a function with an extra positional arg that the
-runtime never supplies. See the "Inspecting Transpiler Output" section of
-`.github/copilot-instructions.md` for how to use `export_module.py` to
-confirm exactly which names are parameters and which are captures.
+See the "Inspecting Transpiler Output" section of
+`.github/copilot-instructions.md` for how to use `export_module.py` to confirm
+exactly which names are parameters and which are captures.
 
-If you do want a fresh scope per iteration (e.g. to avoid sharing mutable
-state between iterations), use a helper function:
+If you want a fresh scope per iteration (e.g. to avoid sharing mutable state
+between iterations), use a helper function:
 
 ```python
-def _schedule(c, i):                # fresh scope per iteration
+def _schedule(c, i):                    # fresh scope per iteration
     @when(c)
     def _(c):
         send("done", i)
