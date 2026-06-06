@@ -70,6 +70,16 @@
 #include <stdalign.h>
 #endif
 
+/// @brief Portable stand-in for C11's @c max_align_t.
+/// @details Avoids C11-mode @c max_align_t which MSVC only exposes under @c
+/// /std:c11 (not set by the CPython build).
+typedef union boc_max_align {
+  long long _ll;
+  long double _ld;
+  void *_p;
+  void (*_fp)(void);
+} boc_max_align_t;
+
 // ---------------------------------------------------------------------------
 // Memory-order tags
 // ---------------------------------------------------------------------------

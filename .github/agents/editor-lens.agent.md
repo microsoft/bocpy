@@ -25,9 +25,26 @@ target is a codebase where every remaining comment is one a maintainer
 would write today, from scratch, knowing nothing about the PR that
 introduced it.
 
+A second, broader mandate: catch **cryptic references to internal
+review artifacts** wherever they appear in the diff, including
+user-facing files (`README.md`, `sphinx/source/**`, `CHANGELOG.md`,
+top-level policy docs, `.github/**`). Finding IDs (`F3`, `G5`,
+`H2`), remediation slugs, round/chunk markers, and back-references
+to internal sketches / plans / review files are useful while a PR
+is in flight but have no meaning to a downstream reader. Past PRs
+have leaked these into published docs; the cryptic-reference sweep
+is the backstop that catches them at finalize.
+
 ## Scope
 
-**In scope** — code prose only:
+The lens has **two scopes**: a broad *cryptic-reference sweep* that
+applies everywhere there is text, and a narrower *full prose edit*
+scope where it may also apply the keep / rewrite / cut policy.
+
+### Full prose edit — in scope
+
+Apply the full Keep / Rewrite / Cut policy below to **code prose
+only**:
 
 - `src/bocpy/**/*.{c,h,py,pyi}` (the library, including `_core.c`,
   `_math.c`, `boc_*.{c,h}`, `behaviors.py`, `transpiler.py`, `worker.py`,
@@ -37,19 +54,66 @@ introduced it.
 - `templates/c_abi_consumer/src/**/*.{c,h,py}`
 - `scripts/**/*.py`
 
-**Out of scope — do not touch:**
+### Full prose edit — out of scope, do not touch
 
-- `sphinx/source/**` — narrative documentation; different rules,
-  managed by the docs step of `finalize-pr`.
-- `README.md` — user-facing entry point; outside this lens's mandate.
-- `CHANGELOG.md` — append-only history; managed by the changelog step
-  of `finalize-pr`.
+These have different rules (Sphinx narrative, user-facing entry
+point, append-only history, policy docs, meta config). Do not apply
+the general Keep / Rewrite / Cut policy here:
+
+- `sphinx/source/**` — narrative documentation; managed by the
+  docs step of `finalize-pr`.
+- `README.md` — user-facing entry point.
+- `CHANGELOG.md` — append-only history; managed by the changelog
+  step of `finalize-pr`.
 - `CONTRIBUTING.md`, `SUPPLY_CHAIN.md`, `SUPPORT.md`, `SECURITY.md`,
   `CODE_OF_CONDUCT.md` — top-level policy docs.
 - `.github/**` — agent / skill / workflow definitions (meta).
 - `.copilot/**` — scratch.
 - `templates/c_abi_consumer/{README.md,pyproject.toml}` — template
   docs read by downstream consumers.
+
+### Cryptic-reference sweep — applies everywhere
+
+In **every text file** in the branch diff — including the
+full-prose-out-of-scope set above, *except* `.copilot/**` — also
+scan for and flag **cryptic references to internal review
+artifacts** that leaked out of in-flight PR machinery:
+
+- Finding IDs and remediation slugs: `F1`, `G3`, `H2`, `M5`, `L2`,
+  `H1–H4`, "Remediation B6", "per F2", "closes G5".
+- Round / iteration / chunk markers: "Round-2 adv#6", "iter-3",
+  "adversarial-iter1", "chunk 4", "step 7e".
+- Back-references to internal review or plan files that ship in
+  the public docs: "see review-finding-1.md",
+  "per .copilot/plans/X/40-draft-plan.md",
+  "sketch ID 23", "see PR-Plan Tier 4 item 13".
+- Internal codename references that have no public meaning:
+  "main-pinned-cowns branch", "the X1 refactor".
+
+For these, the rule is uniform regardless of which file the
+reference appears in:
+
+- If the reference is the *whole* point of the line / paragraph,
+  cut it.
+- If the surrounding prose stands on its own once the reference is
+  removed, rewrite to drop the reference and keep the prose.
+- If removing it would damage the surrounding prose, flag under
+  "Questions for the user" with a proposed rewrite — do **not**
+  silently rewrite user-facing docs (README, Sphinx, policy files).
+
+The sweep is constrained to the *cryptic-reference* category only.
+When operating on out-of-scope files you may **only** remove
+cryptic references; you may **not** otherwise trim wordiness,
+collapse paragraphs, or restructure the prose. The rest of the
+Keep / Rewrite / Cut policy below does not apply to those files.
+
+Rationale: PR-process tags (F#, G#, H#, remediation IDs, sketch
+backrefs) are useful while the PR is in flight, but they have no
+meaning to a user reading the published README, the Sphinx site,
+or the changelog months later. Past PRs have shipped
+`per F3 finding` into the README and `closes G5` into the
+changelog; this sweep is the backstop that catches them at
+finalize.
 
 ## Keep / Rewrite / Cut Policy
 
@@ -173,16 +237,27 @@ introduced it.
 
 When reviewing, produce findings in these sections:
 
-1. **Cuts (high confidence)** — comments that are pure scaffolding,
+1. **Cryptic-reference cuts (all scopes)** — PR slugs, finding IDs,
+   remediation tags, round/chunk markers, and internal sketch /
+   plan / review backrefs leaked into any text file in the diff.
+   Group by file. Cuts inside the *full prose edit* scope can be
+   deleted; cuts inside user-facing docs (`README.md`,
+   `sphinx/source/**`, `CHANGELOG.md`, top-level policy files,
+   `.github/**`) must list the proposed rewrite verbatim so the
+   user can approve before the change lands.
+2. **Cuts (high confidence)** — comments that are pure scaffolding,
    archaeology, or paraphrase. List file + line range + the comment
-   text. These can be deleted without further review.
-2. **Rewrites** — wordy or stale comments that should be collapsed.
-   For each, give the original and the proposed replacement.
-3. **Keep with edit** — load-bearing comments that need a small fix
-   (stale file path, wrong PEP number, dated phrasing).
-4. **Keep as-is** — comments that initially looked like candidates
+   text. These can be deleted without further review. *Full prose
+   edit scope only.*
+3. **Rewrites** — wordy or stale comments that should be collapsed.
+   For each, give the original and the proposed replacement. *Full
+   prose edit scope only.*
+4. **Keep with edit** — load-bearing comments that need a small fix
+   (stale file path, wrong PEP number, dated phrasing). *Full prose
+   edit scope only.*
+5. **Keep as-is** — comments that initially looked like candidates
    but are actually load-bearing. Brief justification each.
-5. **Questions for the user** — comments whose intent is unclear and
+6. **Questions for the user** — comments whose intent is unclear and
    that should not be removed without confirmation. Include the
    comment and what's ambiguous. Always include any `TODO` / `FIXME`
    without an issue or sketch link.
@@ -197,9 +272,11 @@ findings remain.
 
 - **Adding new comments.** This lens removes; it does not author.
   The usability lens authors.
-- **Editing prose under `sphinx/source/`, `README.md`,
+- **Rewriting prose in `sphinx/source/`, `README.md`,
   `CHANGELOG.md`, the top-level policy docs, or anything under
-  `.github/`.**
+  `.github/` beyond removing cryptic internal references.** The
+  cryptic-reference sweep is the *only* edit permitted in those
+  files; general wordiness / archaeology / banner cuts are not.
 - **Rewriting code.** Behavior is out of scope.
 - **Style enforcement** (formatting, capitalization, period-at-end)
   unless it is a side effect of an otherwise-justified rewrite.

@@ -66,6 +66,13 @@ bool terminator_wait(double timeout, bool wait_forever);
 ///         removed.
 bool terminator_seed_dec(void);
 
+/// @brief Idempotent one-shot re-arm of the Pyrona seed.
+/// @details Atomic CAS 0->1 on SEEDED + INC on COUNT; symmetric with @c
+/// terminator_seed_dec. No condvar broadcast (inc never wakes a waiter).
+/// @return true if this call restored the seed, false if it was
+///         already present.
+bool terminator_seed_inc(void);
+
 /// @brief Restore terminator state for a fresh runtime start.
 /// @details Sets count=1 (seed), clears the closed bit, and re-arms the
 /// seed one-shot. Returns the prior `(count, seeded)` via the out
@@ -80,5 +87,44 @@ int_least64_t terminator_seeded(void);
 
 /// @brief Read the current counter.
 int_least64_t terminator_count(void);
+
+/// @brief Broadcast on the terminator condvar without changing the
+///        counter.
+/// @details Wakes every thread blocked in @ref terminator_wait so they
+/// re-evaluate the count or any external predicate (e.g. the main
+/// pinned queue depth). Used by @c boc_main_pinned_enqueue to nudge a
+/// main-thread @c wait()/pump cycle when pinned work arrives without
+/// changing the global active count.
+void terminator_wake_all(void);
+
+/// @brief Wake reasons returned by @ref terminator_wait_pumpable.
+/// @details The auto-pump loop in `wait()` distinguishes three exits
+/// so the caller can pump, drain, or time out without re-querying
+/// shared state. Exposed to Python as ``_core.TERMINATED``,
+/// ``_core.PUMP_READY``, and ``_core.WAIT_TIMED_OUT`` module-level
+/// integer constants.
+typedef enum boc_terminator_wake_reason {
+  BOC_TERMINATOR_TERMINATED = 0,
+  BOC_TERMINATOR_PUMP_READY = 1,
+  BOC_TERMINATOR_WAIT_TIMED_OUT = 2,
+} boc_terminator_wake_reason_t;
+
+/// @brief Pumpable variant of @ref terminator_wait.
+/// @details Blocks on the terminator condvar until one of:
+///   - the active count reaches 0 (returns @ref BOC_TERMINATOR_TERMINATED),
+///   - the pinned-queue depth becomes positive (returns
+///     @ref BOC_TERMINATOR_PUMP_READY), or
+///   - @p timeout_s elapses (returns @ref BOC_TERMINATOR_WAIT_TIMED_OUT).
+/// @p pinned_depth_fn is a function pointer that returns the current
+/// pinned-queue depth; it is invoked while holding the terminator
+/// mutex and MUST be lock-free (a relaxed atomic load on the depth
+/// counter). The function-pointer indirection keeps @c boc_terminator.c
+/// independent of @c _core.c's pinned-queue state.
+/// @param timeout_s Maximum wait in seconds. A non-positive value
+///                  performs a single non-blocking poll.
+/// @param pinned_depth_fn Lock-free reader for the pinned-queue depth.
+/// @return One of @ref boc_terminator_wake_reason_t.
+boc_terminator_wake_reason_t
+terminator_wait_pumpable(double timeout_s, uint64_t (*pinned_depth_fn)(void));
 
 #endif // BOCPY_TERMINATOR_H

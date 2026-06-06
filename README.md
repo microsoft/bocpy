@@ -250,6 +250,43 @@ You can view the full example
 The BOC runtime ensures that this operates without deadlock, by
 construction.
 
+### Talking to main-thread objects
+
+Some values can't survive an XIData round-trip — pyglet shapes, Tk widgets,
+open file handles, ctypes pointers into a library loaded by `__main__`, a
+GPU context. Wrap those in a `PinnedCown`. Behaviors whose request set
+contains any pinned cown run on the main thread, drained by `pump()` from
+your event loop (or implicitly by `wait()`).
+
+Keep dispatch coarse — one pinned `@when` per frame, not per item — so the
+single-consumer main thread doesn't serialise your worker parallelism. The
+`pump()` call drains whatever pinned behaviors are queued and returns
+immediately when the queue is empty (it never blocks), so it is safe to
+call from a tight render-loop tick. Hosts that want a starvation warning
+when the queue stays non-empty can enable it explicitly with
+`set_pump_watchdog()`; with no call, the runtime stays silent.
+
+```python
+from bocpy import Cown, PinnedCown, pump, start, when
+
+start()
+canvas = PinnedCown(MyCanvas())  # main-thread-only handle
+
+def update(dt):
+    pump()                                     # drains prior frame's write-back; returns immediately if nothing is queued
+    results = [worker_compute(i) for i in range(n)]  # per-item worker @whens
+
+    @when(*results, canvas)                    # one pinned behavior per frame
+    def _writeback(*args):
+        *cells, canvas = args
+        for cell in cells:
+            canvas.value.draw(cell.value)
+```
+
+See the [Pinned Cowns guide](https://microsoft.github.io/bocpy/pinned_cowns.html)
+for the coarse-grained dispatch pattern, event-loop integration recipes
+(pyglet, Tk, asyncio), and the starvation watchdog.
+
 ### Examples
 
 We provide a few examples to show different ways of using BOC in a program:
@@ -263,7 +300,9 @@ We provide a few examples to show different ways of using BOC in a program:
 4. [`bocpy-cooking-boc`](https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/cooking_boc.py): The example from
    the [BOC tutorial](https://microsoft.github.io/bocpy/).
 5. [`bocpy-boids`](https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/boids.py): An agent-based bird flocking
-   example demonstrating the `Matrix` class to do distributed computation over cores.
+   example demonstrating the `Matrix` class for parallel per-cell physics on
+   workers, with one `PinnedCown`-driven `@when` per frame batching the
+   pyglet-visible write-back (the coarse-grained pinned-dispatch pattern).
    Note: you'll need to install `pyglet` first in order to run the `bocpy-boids` example.
 6. [`bocpy-primes`](https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/primes.py)
    and [`bocpy-prime-factor`](https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/prime_factor.py):
@@ -313,6 +352,18 @@ read a frozen snapshot via `noticeboard()` / `notice_read()`. The
 [`bocpy-prime-factor`](https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/prime_factor.py)
 example uses it to coordinate early termination across worker behaviors.
 
+For values that can't survive an XIData round-trip — UI handles, GPU
+contexts, file descriptors — the library provides `PinnedCown`, a cown whose
+value lives permanently in the main interpreter. Behaviors against a pinned
+cown run on the main thread, drained by `pump()` from your event loop or
+implicitly by `wait()`. The full surface is `PinnedCown`, `pump`,
+`PumpResult`, `set_pump_watchdog`, and `set_wait_pump_poll`; the
+[`bocpy-boids`](https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/boids.py)
+example drives a pyglet window through one pinned `@when` per frame. See
+the [Pinned Cowns guide](https://microsoft.github.io/bocpy/pinned_cowns.html)
+for the coarse-grained dispatch pattern, watchdog, and free-threaded
+support trajectory.
+
 The library also includes lower-level Erlang-style messaging primitives
 (`send` / `receive`) for channel-based communication patterns; see the
 [API documentation](https://microsoft.github.io/bocpy/messaging.html) for
@@ -328,6 +379,22 @@ spin up a fresh runtime automatically.
 ```python
 wait()          # block indefinitely
 wait(timeout=5) # raise TimeoutError if not done in 5 s
+```
+
+For a synchronization checkpoint that does **not** tear the runtime
+down — e.g. a parallel search that inspects a best-so-far cown
+between rounds and then continues — use `quiesce()` instead. It
+blocks until every in-flight behavior completes, optionally returns
+a per-worker stats or noticeboard snapshot, and leaves the worker
+pool and the noticeboard thread running so the next `@when` call
+dispatches immediately.
+
+```python
+from bocpy import quiesce
+
+snap = quiesce(noticeboard=True)  # dict[str, Any]
+print("best so far:", snap.get("best"))
+# ... schedule the next round of @when calls ...
 ```
 
 ### Additional Info

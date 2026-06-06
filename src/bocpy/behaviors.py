@@ -12,12 +12,14 @@ to block on a mutex.
 """
 
 import inspect
+import linecache
 import logging
 import os
 import sys
 from textwrap import dedent
 import threading
 import time
+import types
 from types import MappingProxyType
 from typing import Any, Callable, Generic, Mapping, NamedTuple, Optional, TypeVar, Union
 
@@ -81,6 +83,22 @@ WORKER_COUNT: int = _default_worker_count()
 # pathological I/O or a wedged sub-interpreter. Promoting a wedge to a
 # loud failure here means CI fails in minutes instead of hours.
 _LIFECYCLE_RECEIVE_TIMEOUT = 120.0
+
+# Self-defence cap on the alternating pump / orphan drain loop in
+# `stop_workers`. A pathological producer that keeps re-feeding
+# MAIN_PINNED_QUEUE between rounds would otherwise wedge teardown
+# forever; on overflow we log and give up rather than spin.
+_MAX_STOP_DRAIN_ROUNDS = 64
+
+# Upper bound on any millisecond-valued pump argument
+# (`deadline_ms`, `warn_ms`). The C side converts ms to ns via
+# `value * 1_000_000`; without a guard, a caller passing
+# `2**63` quietly wraps to a small or negative deadline. The bound
+# corresponds to the largest ms that fits in an int64 once scaled by
+# 1_000_000 — ~9.2e12 ms (~292 years), enough that no real program
+# should hit it but small enough to reject programmer-error inputs
+# like `sys.maxsize` cleanly.
+_MAX_PUMP_MS = (1 << 63) // 1_000_000 - 1
 
 T = TypeVar("T")
 
@@ -214,6 +232,364 @@ class Cown(Generic[T]):
         return repr(self.impl)
 
 
+class PinnedCown(Cown[T]):
+    """A cown whose value never leaves the main interpreter.
+
+    Behaviors whose request set contains *any* PinnedCown run on the
+    main interpreter, scheduled onto a pump queue that the runtime
+    drains under :func:`wait` and that hosts may drive explicitly via
+    :func:`bocpy.pump`.
+
+    A regular :class:`Cown` stores its value as cross-interpreter
+    data: every time a worker acquires the cown the value is
+    unpickled into the worker's interpreter, mutated, and re-pickled
+    on release. That round-trip is the reason a cown can be acquired
+    by any worker -- but it also means the value must be picklable
+    and that **the same Python object is never observed twice** in
+    a worker.
+
+    Many useful values cannot survive that round-trip: pyglet shapes,
+    Tk widgets, open file handles, ctypes pointers into a library
+    loaded by ``__main__``, an asyncio event loop, a GPU context.
+    Their ``__reduce__`` either raises or silently reconstructs a
+    broken object on the other side.
+
+    A :class:`PinnedCown` holds its value as a plain
+    :c:type:`PyObject` reference in the main interpreter. The value
+    never goes through ``XIData``; the same Python object is
+    observed on every acquire. The trade-off: every behavior whose
+    request set contains a pinned cown runs **on the main thread**,
+    drained by :func:`pump` (called from your event loop) or
+    implicitly by :func:`wait`.
+
+    Pattern: coarse-grained pinned dispatch
+        The pinned arm is single-consumer (the main thread). If you
+        schedule a pinned behavior per item, those behaviors
+        serialise on the main thread and you lose worker
+        parallelism. Schedule pinned behaviors coarsely -- one per
+        logical frame or batch, not per item. Do per-item
+        computation on workers against per-item :class:`Cown`
+        slices, then dispatch **one** pinned ``@when`` per frame
+        that captures all of them together with the main-thread
+        canvas / handle and performs the batched write-back.
+
+    Thread affinity
+        Pinned cowns may only be constructed from the **main
+        interpreter**. Constructing one from a worker raises
+        :class:`RuntimeError`; the value would have no home
+        interpreter to live in. :func:`pump` likewise requires the
+        main interpreter -- any thread within it on classic CPython;
+        on free-threaded builds (``Py_GIL_DISABLED``) a single
+        thread at a time, enforced by a CAS on pump entry that
+        raises :class:`RuntimeError` if a second thread tries to
+        pump concurrently. The CAS is cleared on **every** exit
+        path, including ``BaseException`` propagation from a
+        pinned body.
+
+    Mixed request sets
+        A behavior may freely combine pinned and unpinned cowns;
+        the 2PL acquisition order is unchanged. As soon as the
+        request set contains any pinned cown, the body runs on the
+        main thread. Unpinned cowns in the set still travel through
+        XIData into the main interpreter for the body's duration.
+
+    Exception model
+        Body exceptions follow the same rules as worker behaviors:
+        captured on the result :class:`Cown` and surfaced through
+        ``cown.exception``. The default :func:`pump` does **not**
+        re-raise; pass ``raise_on_error=True`` to opt into
+        fail-fast propagation.
+
+    Nested pumping
+        Calling :func:`pump` from inside a pinned-behavior body
+        raises :class:`RuntimeError` (v1).
+
+    Handle vs. value
+        A :class:`PinnedCown` *handle* (the Python wrapper object
+        and its C capsule) is a normal cross-interpreter shareable.
+        It travels via the same XIData mechanism as a regular
+        :class:`Cown` and may be:
+
+        - shipped as a captured variable to a worker behavior,
+        - embedded in any value graph stored in a regular
+          :class:`Cown` (``Cown(PinnedCown(x))`` is supported),
+        - placed in a noticeboard entry via :func:`notice_write`
+          or :func:`notice_update`.
+
+        What never crosses interpreter boundaries is the *value*
+        ``x``. A worker that ends up holding a pinned-cown handle
+        can do exactly one useful thing with it: schedule pinned
+        behaviors against it (which the runtime auto-routes to
+        the main pump queue). Any attempt to acquire the value
+        from a worker is rejected by the C-level owner CAS -- the
+        value's owner is permanently the main interpreter.
+
+    Restrictions
+        - Constructible only on the main interpreter (see
+          *Thread affinity* above).
+        - The pinning interpreter is the main interpreter, by
+          design. There is one pinned queue per process and one
+          consumer of that queue (the main pumper); pinned cowns do
+          not split across interpreters.
+    """
+
+    def __init__(self, value: T):
+        """Create a pinned cown wrapping *value*.
+
+        :param value: The initial value to wrap. Stored as a plain
+            :c:type:`PyObject` reference in the main interpreter --
+            no pickling, no XIData round-trip.
+        :raises RuntimeError: If called from a non-main interpreter.
+        """
+        # Skip super().__init__: the value must not go through XIData.
+        # Thread affinity lives entirely in C: PinnedCownCapsule refuses
+        # non-main construction, and pump's CAS enforces single-pumper
+        # on free-threaded builds. The capsule sets owner = main
+        # interpreter id permanently, which makes worker cown_acquire
+        # structurally fail.
+        self.impl = _core.PinnedCownCapsule(value)
+
+
+class PumpResult(NamedTuple):
+    """Result of a :func:`pump` call.
+
+    :ivar executed: Pinned behaviors whose lifecycle ran to
+        completion this call. Counts the iteration even if the body
+        raised or the acquire failed (the MCS chain still drained).
+    :ivar deadline_reached: ``True`` iff the loop exited because
+        ``deadline_ms`` tripped before the queue drained and before
+        ``max_behaviors`` capped. ``False`` on drain, on
+        ``max_behaviors`` cap, or when ``deadline_ms`` is ``None``.
+    :ivar raised: Pinned behaviors whose body raised an
+        :class:`Exception` captured to the result cown's
+        ``.exception``. Cleanup-path failures (acquire, release,
+        noticeboard cache-clear) do **not** count: they are logged
+        via ``PyErr_WriteUnraisable`` and the iteration is still
+        counted in ``executed``. On :class:`BaseException`
+        propagation, :func:`pump` raises and no
+        :class:`PumpResult` is returned.
+    """
+
+    executed: int
+    deadline_reached: bool
+    raised: int
+
+
+def _validate_pump_bound(name: str, value: Optional[int], *,
+                         ms: bool = False) -> Optional[int]:
+    """Validate a `pump()` bound argument.
+
+    ``None`` is accepted as "unbounded". Otherwise the value must be
+    a positive :class:`int` and must not be a :class:`bool` (the
+    bool-as-int trap silently turns ``True`` into ``1`` and ``False``
+    into ``0``, masking caller bugs). ``0`` is rejected: an explicit
+    zero bound carries no information the caller cannot express with
+    a one-line ``if budget:`` guard at the call site, and admitting
+    it forces a short-circuit branch that bypasses other entry-side
+    checks. ``ms=True`` additionally caps the value at
+    ``_MAX_PUMP_MS`` so the C side's ``value * 1_000_000`` ns
+    conversion cannot wrap past int64. The cap is keyed off the
+    explicit kwarg rather than a name-string heuristic so a future
+    caller that passes a non-``_ms`` name does not silently lose the
+    overflow protection.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(
+            f"{name} must be None or a positive int, "
+            f"got {type(value).__name__}"
+        )
+    if value <= 0:
+        raise TypeError(
+            f"{name} must be None or a positive int, got {value}"
+        )
+    if ms and value > _MAX_PUMP_MS:
+        raise OverflowError(
+            f"{name}={value} exceeds the maximum supported "
+            f"millisecond value ({_MAX_PUMP_MS}); the C side would "
+            f"overflow when scaling to nanoseconds"
+        )
+    return value
+
+
+def pump(deadline_ms: Optional[int] = None,
+         max_behaviors: Optional[int] = None,
+         raise_on_error: bool = False) -> PumpResult:
+    """Run pinned behaviors that are ready, then return.
+
+    Drains the main-thread queue of behaviors whose request sets
+    contain at least one :class:`PinnedCown`. Each behavior runs to
+    completion before the next starts. The pump is non-preemptive:
+    ``deadline_ms`` gates *starting* the next behavior, not
+    interrupting one already running.
+
+    Call :func:`pump` from your event loop's idle / on-tick hook.
+    Script-mode programs need not call it explicitly -- :func:`wait`
+    pumps internally when any :class:`PinnedCown` exists in the
+    process.
+
+    Bounding
+        - ``deadline_ms``: wall-clock budget. ``None`` drains to
+          empty; otherwise a positive :class:`int`.
+        - ``max_behaviors``: hard count. ``None`` drains to empty;
+          otherwise a positive :class:`int`.
+
+        ``0`` is rejected for both bounds (use ``if budget:`` at
+        the call site instead of relying on the pump to no-op).
+
+    Exception model
+        By default body exceptions land on the result cown; pump
+        continues. With ``raise_on_error=True``, the first body
+        exception re-raises on the pump thread after the queue
+        finishes draining. :class:`BaseException`
+        (``KeyboardInterrupt``, ``SystemExit``, ``GeneratorExit``)
+        propagates immediately after the offending behavior's
+        per-iteration cleanup completes; any behaviors still queued
+        are left in place for the next :func:`pump` call.
+
+    Thread affinity
+        :func:`pump` must run on the **main interpreter**. Calling
+        from a worker interpreter raises :class:`RuntimeError`
+        immediately. On free-threaded builds (``Py_GIL_DISABLED``)
+        only one thread may pump at a time: a concurrent call from
+        a different thread raises :class:`RuntimeError`. Calling
+        :func:`pump` when no :class:`PinnedCown` exists is a no-op
+        returning ``PumpResult(0, False, 0)``.
+
+    Reentrance
+        Not reentrant. Calling from inside a pinned-behavior body
+        raises :class:`RuntimeError` (v1).
+
+    :param deadline_ms: Wall-clock budget in milliseconds.
+        ``None`` for unbounded; otherwise a positive :class:`int`.
+        Must not be :class:`bool`.
+    :type deadline_ms: Optional[int]
+    :param max_behaviors: Maximum behaviors to start this call.
+        ``None`` for unbounded; otherwise a positive :class:`int`.
+        Must not be :class:`bool`.
+    :type max_behaviors: Optional[int]
+    :param raise_on_error: Re-raise the first body exception after
+        drain.
+    :type raise_on_error: bool
+    :return: :class:`PumpResult` (``executed``,
+        ``deadline_reached``, ``raised``). On
+        :class:`BaseException` propagation, :func:`pump` raises and
+        no :class:`PumpResult` is returned.
+    :rtype: PumpResult
+    :raises TypeError: if ``deadline_ms`` or ``max_behaviors`` is
+        not ``None``, a positive :class:`int`, or is :class:`bool`.
+    :raises RuntimeError: wrong interpreter, concurrent pump on
+        free-threaded, nested pump, no live runtime
+        (:func:`start` has not been called), or watchdog raise
+        threshold tripped.
+    """
+    deadline_ms = _validate_pump_bound("deadline_ms", deadline_ms, ms=True)
+    max_behaviors = _validate_pump_bound("max_behaviors", max_behaviors)
+
+    # Pinned behaviors look up their `__behavior__N` thunk on the
+    # runtime's export_module (same shape contract as the worker
+    # bootstrap's `boc_export`). A NULL export here means the runtime
+    # is not initialised -- pinned schedules cannot work in that
+    # state, so fail loud rather than letting every behavior fall
+    # over with `AttributeError` on thunk lookup.
+    boc_export = None
+    if BEHAVIORS is not None:
+        boc_export = getattr(BEHAVIORS, "export_module", None)
+    if boc_export is None:
+        raise RuntimeError(
+            "pump() requires a live bocpy runtime: call bocpy.start() "
+            "(or schedule a @when, which auto-starts) before pump(). "
+            "If the runtime was already stopped, restart it before "
+            "draining pinned work."
+        )
+    return PumpResult(*_core.main_pump_bounded(
+        deadline_ms, max_behaviors, raise_on_error, boc_export,
+    ))
+
+
+def set_pump_watchdog(warn_ms: Optional[int] = 1000,
+                      on_starve: Optional[
+                          Callable[[int, str], None]] = None) -> None:
+    """Configure the pinned-queue starvation watchdog.
+
+    **The watchdog is disabled until this function is called.** No
+    call means no warnings, regardless of how long the pinned queue
+    has been non-empty. ``warn_ms=1000`` is the kwarg default that
+    applies *if and when* you opt in, not the runtime default.
+
+    Warn-side sampling fires from :func:`pump` on entry (so
+    :func:`wait`'s auto-pump loop counts). The threshold gates on
+    **queue-non-empty time**: a program that runs only unpinned work
+    indefinitely never trips it.
+
+    - ``warn_ms`` (kwarg default 1000): logs a warning carrying the
+      queue's non-empty duration (ms) and current depth. Pass
+      ``None`` to disable. Must be a positive int when set.
+    - ``on_starve``: optional callable ``(severity, message)`` to
+      replace the default logger. Use this to escalate (for
+      example ``on_starve=lambda s, m: pytest.fail(m)`` in tests, or
+      a counter / alert hook in production).
+
+    :param warn_ms: Warn-after threshold in milliseconds, or
+        ``None`` to disable warnings.
+    :type warn_ms: Optional[int]
+    :param on_starve: Optional ``(severity, message)`` callback that
+        replaces the default logger sink.
+    :type on_starve: Optional[Callable[[int, str], None]]
+    :raises TypeError: if ``warn_ms`` is not ``None`` or a positive
+        :class:`int`, or ``on_starve`` is not callable.
+    :raises OverflowError: if ``warn_ms`` exceeds the maximum
+        representable nanosecond value.
+    """
+    # Validate before crossing the C boundary so callers get a clear
+    # TypeError with the offending arg rather than a generic C-side
+    # parse failure.
+    if warn_ms is not None:
+        if (not isinstance(warn_ms, int) or isinstance(warn_ms, bool)
+                or warn_ms <= 0):
+            # Reject 0 alongside negatives. The C side treats 0 as
+            # the disable sentinel, which would silently turn the
+            # watchdog off and surprise the caller; require explicit
+            # ``None`` to disable.
+            raise TypeError(
+                f"warn_ms must be a positive int or None to disable, "
+                f"got {warn_ms!r}")
+        if warn_ms > _MAX_PUMP_MS:
+            raise OverflowError(
+                f"warn_ms={warn_ms} exceeds the maximum supported "
+                f"millisecond value ({_MAX_PUMP_MS}); the C side "
+                f"would overflow when scaling to nanoseconds")
+    if on_starve is not None and not callable(on_starve):
+        raise TypeError(
+            f"on_starve must be a callable or None, got {on_starve!r}")
+    _core.set_pump_watchdog(warn_ms=warn_ms, on_starve=on_starve)
+
+
+def set_wait_pump_poll(ms: int = 50) -> None:
+    """Set the poll cadence for :func:`wait`'s auto-pump loop.
+
+    Default cadence is **50 ms** — the upper bound on how long the
+    auto-pump loop will park between checks when no broadcast wakes
+    it. The setting is process-global and may be changed at any
+    time; the active :func:`wait` loop picks up the new value on
+    its next iteration.
+
+    :param ms: Poll cadence in milliseconds. Must be positive.
+    :type ms: int
+    """
+    if not isinstance(ms, int) or isinstance(ms, bool) or ms <= 0:
+        raise TypeError(f"ms must be a positive int, got {ms!r}")
+    global _WAIT_PUMP_POLL_MS
+    _WAIT_PUMP_POLL_MS = ms
+
+
+# Re-read on every iteration of the wait() auto-pump loop so a
+# mid-wait `set_wait_pump_poll(...)` change is honoured without
+# restarting the wait.
+_WAIT_PUMP_POLL_MS = 50
+
+
 WORKER_MAIN_END = "# END boc_export"
 
 
@@ -232,6 +608,11 @@ class Behaviors:
         self.classes = set()
         self.worker_threads = []
         self.behavior_lookup: Mapping[int, BehaviorInfo] = {}
+        # Main-side namespace holding the transpiled ``__behavior__N``
+        # thunks. :func:`pump` reads this so pinned-behavior bodies
+        # scheduled via ``@when`` resolve on main the same way they
+        # resolve on workers. Populated by :meth:`start`.
+        self.export_module: Optional[types.ModuleType] = None
         self.logger = logging.getLogger("behaviors")
         self.logger.debug("behaviors init")
         # The runtime has no central scheduler thread. Caller threads do 2PL
@@ -278,6 +659,19 @@ class Behaviors:
         self._final_noticeboard: Optional[dict[str, Any]] = None
         self.final_cowns: tuple[Cown, ...] = ()
         self.bid = 0
+        # Set by :meth:`start` to the synthetic linecache key for the
+        # main-side transpiled export, so :meth:`stop` (and the
+        # abort path) can pop the entry symmetrically.
+        self._main_export_file: Optional[str] = None
+        # Set by :meth:`start` to the prior value of
+        # ``sys.modules['__bocmain__']`` (None if no entry existed)
+        # so :meth:`stop` can restore it instead of unconditionally
+        # popping a slot we never owned.
+        self._installed_bocmain = False
+        self._prior_bocmain: Optional[types.ModuleType] = None
+        # (name, path) of the module pinned by start(); used to detect
+        # mismatched re-start requests.
+        self._started_module: Optional[tuple[str, str]] = None
 
     def lookup_behavior(self, line_number: int,  max_decorator_stack=32) -> BehaviorInfo:
         """Resolve behavior info from a source line number.
@@ -489,15 +883,57 @@ class Behaviors:
                 _core.send("boc_cleanup", True)
 
             self.teardown_workers()
-            # Drain any behaviours that were dispatched but never
-            # consumed (warned path of stop(), or any race where a
-            # late behaviour landed in a per-task queue between
-            # request_stop_all and the worker's pop_slow returning
-            # NULL). MUST run BEFORE scheduler_runtime_stop, which
-            # frees the worker array and the per-task queues with it.
-            # release_all on a drained behaviour may dispatch its
-            # successor; loop until the queues stay empty.
-            self._stop_drain_errors = self._drain_orphan_behaviors()
+            # Alternate `main_pump_drain_all` and
+            # `_drain_orphan_behaviors` until both report empty in
+            # the same iteration. `release_all` inside the orphan
+            # drain dispatches successors through
+            # `boc_sched_dispatch`, whose pinned fast path routes
+            # pinned-bearing successors onto MAIN_PINNED_QUEUE; a
+            # single pump-then-orphan ordering would leave those
+            # successors enqueued and their terminator_inc holds
+            # undecremented, wedging the next `start()`. The cap is
+            # a self-defence against a runaway producer that keeps
+            # re-feeding the queues: log + give up rather than spin
+            # forever. Main-interp only; skip the pump-side drain
+            # on sub-interpreter shutdown paths where the pinned
+            # queue is provably empty (only main can enqueue).
+            accumulated_drain_errors = []
+            try:
+                if _core.is_primary():
+                    for _round in range(_MAX_STOP_DRAIN_ROUNDS):
+                        try:
+                            pump_drained = _core.main_pump_drain_all()
+                        except Exception as drain_ex:
+                            self.logger.exception(drain_ex)
+                            pump_drained = 0
+                        errors_this_round, orphan_drained = (
+                            self._drain_orphan_behaviors()
+                        )
+                        accumulated_drain_errors.extend(errors_this_round)
+                        if pump_drained == 0 and orphan_drained == 0:
+                            break
+                    else:
+                        try:
+                            depth = _core.main_pump_queue_depth()
+                        except Exception:
+                            depth = -1
+                        self.logger.error(
+                            "stop_workers(): drain loop did not converge "
+                            "within %d rounds; main_pump_queue_depth=%d "
+                            "at give-up. Pinned-cown leak likely.",
+                            _MAX_STOP_DRAIN_ROUNDS, depth,
+                        )
+                else:
+                    errors_this_round, _ = self._drain_orphan_behaviors()
+                    accumulated_drain_errors.extend(errors_this_round)
+            finally:
+                # KeyboardInterrupt/SystemExit re-raised mid-drain must
+                # not erase already-captured release_all failures.
+                # extend (not assign) because _drain_orphan_behaviors
+                # also pushes its in-flight errors before the re-raise.
+                if accumulated_drain_errors:
+                    self._stop_drain_errors.extend(
+                        accumulated_drain_errors)
         finally:
             try:
                 # Snapshot the per-worker scheduler counters before
@@ -688,6 +1124,34 @@ class Behaviors:
 
         self.behavior_lookup = export.behaviors
 
+        # Compile the transpiled source into a fresh module on the
+        # main interpreter so :func:`pump` can resolve
+        # ``__behavior__N`` thunks the same way workers do. Workers
+        # bootstrap their own copy inside a sub-interpreter
+        # (``_bocpy_mod`` in the worker_script below); main needs an
+        # equivalent namespace because pinned-behavior bodies execute
+        # under ``main_pump_bounded`` on the main interpreter and
+        # ``behavior_execute_impl`` looks up the thunk via
+        # ``PyObject_GetAttrString(boc_export, ...)``. Without this
+        # the lookup falls back to ``sys.modules["__main__"]`` (which
+        # under pytest is the test runner, not the test module) and
+        # every pinned ``@when`` body fails with ``AttributeError``.
+        main_export_name = f"__bocpy_main_export__{module_name}"
+        main_export_file = f"<bocpy:main:{module_name}>"
+        main_export = types.ModuleType(main_export_name)
+        main_export.__file__ = main_export_file
+        linecache.cache[main_export_file] = (
+            len(export.code), None,
+            export.code.splitlines(keepends=True),
+            main_export_file,
+        )
+        self._main_export_file = main_export_file
+        exec(
+            compile(export.code, main_export_file, "exec"),
+            main_export.__dict__,
+        )
+        self.export_module = main_export
+
         # Embed the transpiled source as a Python string literal
         # (via ``repr()``) into the worker bootstrap. Each worker
         # compiles and exec's the literal into a fresh
@@ -752,6 +1216,8 @@ class Behaviors:
         ]
 
         if module_name == "__main__":
+            self._prior_bocmain = sys.modules.get("__bocmain__")
+            self._installed_bocmain = True
             sys.modules["__bocmain__"] = sys.modules["__main__"]
             for cls in export.classes:
                 bootstrap.append(f'\n\nclass {cls}(sys.modules["__bocmain__"].{cls}):')
@@ -844,8 +1310,30 @@ class Behaviors:
             # Drop the __bocmain__ alias if we installed one, so a
             # follow-up start() observes a clean sys.modules. Same
             # rationale as in the successful stop() path.
-            sys.modules.pop("__bocmain__", None)
+            self._restore_main_aliases()
             raise
+
+    def _restore_main_aliases(self):
+        # Symmetric cleanup of the main-side state ``start()`` may
+        # have installed: the synthetic ``linecache`` entry that
+        # backs tracebacks for the transpiled export, and the
+        # ``__bocmain__`` alias used by worker bootstrap to subclass
+        # user classes defined in ``__main__``. Restoring the prior
+        # ``__bocmain__`` (instead of unconditionally popping it)
+        # preserves an alias the host had set before the runtime
+        # started.
+        mef = self._main_export_file
+        if mef is not None:
+            linecache.cache.pop(mef, None)
+            self._main_export_file = None
+        if self._installed_bocmain:
+            prior = self._prior_bocmain
+            if prior is None:
+                sys.modules.pop("__bocmain__", None)
+            else:
+                sys.modules["__bocmain__"] = prior
+            self._installed_bocmain = False
+            self._prior_bocmain = None
 
     def _abort_workers(self):
         """Tear down the worker pool after a partial-startup failure.
@@ -898,10 +1386,115 @@ class Behaviors:
         except Exception as ex:
             self.logger.exception(ex)
 
+    def cycle_noticeboard(self, timeout: Optional[float] = None) -> dict[str, Any]:
+        """Capture a noticeboard snapshot by cycling the mutator thread (sentinel -> join -> snapshot -> restart).
+
+        :param timeout: Upper bound on the join. ``None`` waits forever.
+        :type timeout: Optional[float]
+        :returns: The noticeboard contents as a plain ``dict``.
+        :raises TimeoutError: If the noticeboard thread does not exit within ``timeout``.
+        """
+        if self.noticeboard is None or not self.noticeboard.is_alive():
+            _core.noticeboard_cache_clear()
+            return dict(_core.noticeboard_snapshot())
+
+        _core.send("boc_noticeboard", "shutdown")
+        self.noticeboard.join(timeout)
+        if self.noticeboard.is_alive():
+            raise TimeoutError(
+                "cycle_noticeboard: noticeboard thread did not exit "
+                f"within timeout={timeout!r}; the in-flight mutation has "
+                "not finished. Retry once it has."
+            )
+
+        _core.clear_noticeboard_thread()
+        try:
+            _core.noticeboard_cache_clear()
+            snap = dict(_core.noticeboard_snapshot())
+        finally:
+            # Restart unconditionally so a failed snapshot does not strand the runtime.
+            self.start_noticeboard()
+        return snap
+
+    def quiesce(self, timeout: Optional[float] = None) -> bool:
+        """Wait for terminator quiescence without tearing down workers; re-arms the Pyrona seed on exit.
+
+        :param timeout: Upper bound on the wait. ``None`` waits forever.
+        :type timeout: Optional[float]
+        :returns: ``True`` on quiescence, ``False`` on timeout.
+        """
+        if not _core.is_primary():
+            raise RuntimeError(
+                "Behaviors.quiesce() must be called from the primary "
+                "interpreter."
+            )
+        # Track whether seed_dec actually dropped the seed so we only re-arm it ourselves.
+        seed_dropped = _core.terminator_seed_dec()
+        try:
+            return self._wait_for_quiescence(timeout)
+        finally:
+            if seed_dropped:
+                # Re-arm so a future stop()/quiesce() can drop the seed again; CAS 0->1 is idempotent.
+                _core.terminator_seed_inc()
+
     def __enter__(self):
         """Enter context by starting the runtime."""
         self.start()
         return self
+
+    def _auto_pump_loop(self, timeout: Optional[float]) -> bool:
+        """Pump the pinned queue while waiting for terminator quiescence.
+
+        Used by :meth:`stop` whenever live ``PinnedCown`` handles
+        exist. On each iteration: block on
+        ``terminator_wait_pumpable`` for the current
+        ``_WAIT_PUMP_POLL_MS`` budget (re-read every iteration so a
+        mid-wait ``set_wait_pump_poll`` change is honoured);
+        if it wakes with ``PUMP_READY``, drain up to 64 behaviors via
+        ``main_pump_bounded`` with ``raise_on_error=False`` so body
+        exceptions surface on result cowns instead of aborting the
+        wait. Returns ``True`` on terminator quiescence, ``False`` on
+        deadline expiry — matching ``_core.terminator_wait``'s bool
+        contract.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while _core.terminator_count() > 0:
+            poll_s = _WAIT_PUMP_POLL_MS / 1000.0
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                poll_s = min(poll_s, remaining)
+            outcome = _core.terminator_wait_pumpable(poll_s)
+            if outcome == _core.TERMINATED:
+                return True
+            if outcome == _core.PUMP_READY:
+                _core.main_pump_bounded(
+                    None, 64, False, self.export_module,
+                )
+            # WAIT_TIMED_OUT: fall through to the deadline check at
+            # the top of the next iteration.
+        return True
+
+    def _wait_for_quiescence(self, timeout: Optional[float]) -> bool:
+        """Wait for terminator quiescence, auto-pumping if pinned.
+
+        Picks between the byte-equivalent fast path
+        (``_core.terminator_wait``) and the auto-pump loop based on
+        the live pinned-cown count. Refuses to run from a non-primary
+        interpreter when pinned cowns exist — the pinned queue is
+        single-consumer by design.
+        """
+        if _core.pinned_cown_count() == 0:
+            return _core.terminator_wait(timeout)
+        if not _core.is_primary():
+            raise RuntimeError(
+                f"wait() with pinned cowns must run on the main "
+                f"interpreter (called from a non-main interpreter; "
+                f"{_core.pinned_cown_count()} pinned cown(s) live). "
+                f"Call wait() from the original main thread."
+            )
+        return self._auto_pump_loop(timeout)
 
     def stop(self, timeout: Optional[float] = None):
         """Quiesce all behaviors and tear the runtime down.
@@ -980,7 +1573,7 @@ class Behaviors:
         # complete.
         if not self._workers_stopped:
             _core.terminator_seed_dec()
-            _core.terminator_wait(_remaining())
+            self._wait_for_quiescence(_remaining())
 
             # Post-wait reconciliation. If wait() timed out the count is
             # still > 0 -- skip the assertion in that case so a partial
@@ -1109,7 +1702,7 @@ class Behaviors:
         # subsequent bocpy.start() observes a clean sys.modules
         # (and so the main module isn't pinned in sys.modules under
         # an alias after the runtime has shut down).
-        sys.modules.pop("__bocmain__", None)
+        self._restore_main_aliases()
         if drain_errors:
             # Surface the first failure so the caller sees the leak at
             # the failure site rather than later as a mysterious
@@ -1148,13 +1741,18 @@ class Behaviors:
         so the loop drains again until
         ``scheduler_drain_all_queues`` returns an empty list.
 
-        :returns: A list of exceptions captured from
-            ``release_all`` failures, or ``[]`` on a clean
-            drain. ``stop()`` re-raises if non-empty so a release-side
-            leak is visible at the failure site rather than later as a
-            mysterious deadlock on the affected cowns.
+        :returns: A ``(errors, drained_count)`` tuple. ``errors`` is
+            a list of exceptions captured from ``release_all``
+            failures, or ``[]`` on a clean drain. ``drained_count``
+            is the total number of capsules processed by this call;
+            ``stop_workers`` uses it to detect when the alternating
+            pump / orphan drain loop has converged. ``stop()``
+            re-raises if ``errors`` is non-empty so a release-side
+            leak is visible at the failure site rather than later as
+            a mysterious deadlock on the affected cowns.
         """
         errors = []
+        drained_count = 0
         # KeyboardInterrupt / SystemExit raised mid-drain must not
         # abort the drain partway -- the orphaned behaviors would
         # leak their MCS chains and terminator holds, so the next
@@ -1166,9 +1764,32 @@ class Behaviors:
             capsules = _core.scheduler_drain_all_queues()
             if not capsules:
                 if deferred_base_exc is not None:
+                    if errors:
+                        # Stash current-round errors so a
+                        # KeyboardInterrupt unwinding past stop() does
+                        # not silently erase release_all failures.
+                        self._stop_drain_errors.extend(errors)
+                        note = (
+                            f"_drain_orphan_behaviors deferred "
+                            f"{len(errors)} release_all error(s); "
+                            "see Behaviors._stop_drain_errors"
+                        )
+                        # add_note is PEP 678 (3.11+); fall back to writing __notes__ directly on 3.10.
+                        add_note = getattr(
+                            deferred_base_exc, "add_note", None)
+                        if add_note is not None:
+                            add_note(note)
+                        else:
+                            existing = getattr(
+                                deferred_base_exc, "__notes__", None)
+                            if existing is None:
+                                deferred_base_exc.__notes__ = [note]
+                            else:
+                                existing.append(note)
                     raise deferred_base_exc
-                return errors
+                return errors, drained_count
             for payload in capsules:
+                drained_count += 1
                 self.logger.warning(
                     "behavior dropped during stop(); the runtime was "
                     "torn down before this behavior could acquire its cowns"
@@ -1271,8 +1892,13 @@ def start(worker_count: Optional[int] = None,
           module: Optional[tuple[str, str]] = None):
     """Start the behavior runtime: worker pool plus noticeboard thread.
 
-    The runtime distributes scheduling (2PL link/release) across caller
-    and worker threads; there is no central scheduler thread.
+    Idempotent: bare ``start()`` on a running runtime is a silent no-op; mismatched ``worker_count``/``module`` raise.
+
+    The runtime distributes scheduling (2PL link/release) across
+    caller and worker threads; there is no central scheduler thread.
+
+    The runtime distributes scheduling (2PL link/release) across
+    caller and worker threads; there is no central scheduler thread.
 
     :param worker_count: The number of worker interpreters to start.  If
         None, defaults to the number of available cores minus one.
@@ -1280,20 +1906,42 @@ def start(worker_count: Optional[int] = None,
     :param module: A tuple of the target module name and file path to export
         for worker import.  If None, the caller's module will be used.
     :type module: Optional[tuple[str, str]]
+    :raises RuntimeError: If called from a non-primary interpreter,
+        or if the runtime is already up under a different
+        ``worker_count`` / ``module`` than the one supplied.
     """
     global BEHAVIORS
-    if BEHAVIORS is not None:
-        raise RuntimeError("Behavior runtime already started")
-
-    if worker_count is None:
-        worker_count = WORKER_COUNT
 
     if not _core.is_primary():
         raise RuntimeError("start() can only be called from the main interpreter")
 
+    # Idempotent: bare start() no-ops; mismatched explicit args raise.
+    if BEHAVIORS is not None:
+        if worker_count is not None and worker_count != BEHAVIORS.num_workers:
+            raise RuntimeError(
+                f"bocpy.start(worker_count={worker_count}) was called "
+                f"but the runtime is already up with worker_count="
+                f"{BEHAVIORS.num_workers}. Call wait() (or stop()) to "
+                f"tear the existing runtime down before starting a new "
+                f"one with a different worker_count."
+            )
+        if module is not None and module != BEHAVIORS._started_module:
+            raise RuntimeError(
+                f"bocpy.start(module={module!r}) was called but the "
+                f"runtime is already up with module="
+                f"{BEHAVIORS._started_module!r}. Call wait() (or "
+                f"stop()) to tear the existing runtime down before "
+                f"starting a new one with a different module."
+            )
+        return
+
+    if worker_count is None:
+        worker_count = WORKER_COUNT
+
     if module is None:
         module = get_caller_module()
     BEHAVIORS = Behaviors(worker_count)
+    BEHAVIORS._started_module = module
     try:
         BEHAVIORS.start(module)
     except BaseException:
@@ -1319,9 +1967,11 @@ def when(*cowns):
     result of executing the behavior. This Cown can be used for further
     coordination.
 
-    Note: the transpiler matches ``@when`` by literal name. Aliasing
-    the import (``from bocpy import when as boc_when``) is not
-    supported -- the rewrite will not fire and the worker will fail.
+    The transpiler recognises module-level aliases for the decorator,
+    so ``from bocpy import when as boc_when`` and ``@boc_when(...)``,
+    as well as ``import bocpy [as alias]`` followed by
+    ``@bocpy.when(...)`` / ``@alias.when(...)``, are all supported.
+    Aliases declared inside a function body are not tracked.
     """
 
     def when_factory(func):
@@ -1369,14 +2019,62 @@ def when(*cowns):
     return when_factory
 
 
+def quiesce(timeout: Optional[float] = None, *,
+            stats: bool = False, noticeboard: bool = False):
+    """Block until in-flight behaviors complete without tearing down the runtime.
+
+    :param timeout: Upper bound (seconds). ``None`` waits forever.
+    :type timeout: Optional[float]
+    :param stats: If True, capture per-worker scheduler stats.
+    :type stats: bool
+    :param noticeboard: If True, capture a noticeboard snapshot via a thread cycle.
+    :type noticeboard: bool
+    :raises TimeoutError: If quiescence is not reached within ``timeout``.
+    :raises RuntimeError: If called from a non-primary interpreter while pinned cowns are live.
+    """
+    def _format(stats_snap, nb_snap):
+        if stats and noticeboard:
+            return WaitResult(stats=stats_snap, noticeboard=nb_snap)
+        if stats:
+            return stats_snap
+        if noticeboard:
+            return nb_snap
+        return None
+
+    if BEHAVIORS is None:
+        return _format([], {})
+
+    if timeout is None:
+        deadline = None
+    else:
+        deadline = time.monotonic() + timeout
+
+    def _remaining() -> Optional[float]:
+        if deadline is None:
+            return None
+        return max(0.0, deadline - time.monotonic())
+
+    if not BEHAVIORS.quiesce(_remaining()):
+        raise TimeoutError(
+            f"quiesce(): runtime did not reach quiescence within "
+            f"timeout={timeout!r}"
+        )
+    # Sample stats post-quiescence so the per-worker counts are stable.
+    stats_snap = list(_core.scheduler_stats()) if stats else None
+    nb_snap = BEHAVIORS.cycle_noticeboard(_remaining()) if noticeboard else None
+    return _format(stats_snap, nb_snap)
+
+
 def wait(timeout: Optional[float] = None, *,
          stats: bool = False, noticeboard: bool = False):
     """Block until all behaviors complete, with optional timeout.
 
     When ``stats=True``, captures the per-worker
-    :func:`_core.scheduler_stats` snapshot at shutdown. When
-    ``noticeboard=True``, captures the final noticeboard contents
-    as a plain ``dict`` at shutdown. See the stub in
+    :func:`_core.scheduler_stats` snapshot. When
+    ``noticeboard=True``, captures the noticeboard contents as a
+    plain ``dict`` at the quiescence point (NOT after teardown — the
+    two are equivalent in single-caller programs but the quiescence
+    snapshot is the documented one). See the stub in
     ``__init__.pyi`` for the full contract.
 
     Return value:
@@ -1385,6 +2083,10 @@ def wait(timeout: Optional[float] = None, *,
     - ``stats=True`` only: ``list[dict]`` (or ``[]``).
     - ``noticeboard=True`` only: ``dict[str, Any]`` (or ``{}``).
     - both flags: :class:`WaitResult`.
+
+    Internally a thin wrapper around :func:`quiesce` +
+    :meth:`Behaviors.stop`; quiescence timeout warns rather than
+    raising.
     """
     global BEHAVIORS
 
@@ -1397,30 +2099,74 @@ def wait(timeout: Optional[float] = None, *,
             return nb_snap
         return None
 
-    if BEHAVIORS:
-        # Clear BEHAVIORS only if stop() drove the runtime all the
-        # way through teardown (workers joined, noticeboard exited,
-        # C-level noticeboard slot released). On stop()'s
-        # noticeboard-join-timeout path the runtime is intentionally
-        # left running so the caller can diagnose the leak and
-        # retry; nulling the global handle there would strand the
-        # live workers / noticeboard thread with no Python-side
-        # reference.
-        try:
-            BEHAVIORS.stop(timeout)
-        except BaseException:
-            if BEHAVIORS._teardown_complete:
-                stats_snap = BEHAVIORS._final_stats if BEHAVIORS._final_stats is not None else []
-                nb_snap = BEHAVIORS._final_noticeboard if BEHAVIORS._final_noticeboard is not None else {}
-                BEHAVIORS = None
-                if stats or noticeboard:
-                    return _format(stats_snap, nb_snap)
-            raise
+    if BEHAVIORS is None:
+        return _format([], {})
+
+    if BEHAVIORS._teardown_complete:
+        # Idempotent: prior stop() already stashed final snapshots;
+        # return them rather than running on an empty runtime.
         stats_snap = BEHAVIORS._final_stats if BEHAVIORS._final_stats is not None else []
         nb_snap = BEHAVIORS._final_noticeboard if BEHAVIORS._final_noticeboard is not None else {}
         BEHAVIORS = None
         return _format(stats_snap, nb_snap)
-    return _format([], {})
+
+    if timeout is None:
+        deadline = None
+    else:
+        deadline = time.monotonic() + timeout
+
+    def _remaining() -> Optional[float]:
+        if deadline is None:
+            return None
+        return max(0.0, deadline - time.monotonic())
+
+    # quiesce() first for a pre-teardown snapshot; on TimeoutError fall
+    # back to stop()'s post-teardown one (historical warn-and-tear-down).
+    quiesce_snapshots = None
+    quiesce_timed_out = False
+    try:
+        quiesce_snapshots = quiesce(
+            _remaining(), stats=stats, noticeboard=noticeboard,
+        )
+    except TimeoutError as ex:
+        quiesce_timed_out = True
+        BEHAVIORS.logger.warning(
+            "wait(): quiesce() timed out (%s); proceeding to stop().", ex,
+        )
+
+    # Clear BEHAVIORS only if stop() drove the runtime all the
+    # way through teardown (workers joined, noticeboard exited,
+    # C-level noticeboard slot released). On stop()'s
+    # noticeboard-join-timeout path the runtime is intentionally
+    # left running so the caller can diagnose the leak and
+    # retry; nulling the global handle there would strand the
+    # live workers / noticeboard thread with no Python-side
+    # reference.
+    try:
+        BEHAVIORS.stop(_remaining())
+    except BaseException:
+        if BEHAVIORS._teardown_complete:
+            if quiesce_snapshots is not None:
+                BEHAVIORS = None
+                if stats or noticeboard:
+                    return quiesce_snapshots
+                return None
+            stats_snap = BEHAVIORS._final_stats if BEHAVIORS._final_stats is not None else []
+            nb_snap = BEHAVIORS._final_noticeboard if BEHAVIORS._final_noticeboard is not None else {}
+            BEHAVIORS = None
+            if stats or noticeboard:
+                return _format(stats_snap, nb_snap)
+        raise
+
+    if quiesce_snapshots is not None and not quiesce_timed_out:
+        BEHAVIORS = None
+        return quiesce_snapshots
+
+    # Quiesce timed out: return stop()'s post-teardown snapshot instead of an empty result.
+    stats_snap = BEHAVIORS._final_stats if BEHAVIORS._final_stats is not None else []
+    nb_snap = BEHAVIORS._final_noticeboard if BEHAVIORS._final_noticeboard is not None else {}
+    BEHAVIORS = None
+    return _format(stats_snap, nb_snap)
 
 
 def _validate_noticeboard_key(key: str) -> None:
@@ -1656,15 +2402,29 @@ def notice_delete(key: str) -> None:
 def noticeboard() -> Mapping[str, Any]:
     """Return a cached snapshot of the noticeboard.
 
-    Must be called from within a ``@when`` behavior. The first call within a
-    behavior captures all entries under mutex and caches the data.
-    Subsequent calls in the same behavior return a view of the same
-    cached data.
+    The noticeboard is a behavior-scope read surface. The supported
+    use is from inside a ``@when`` body: the first call captures all
+    entries under mutex and caches them, and every subsequent call
+    in the same behavior returns the same cached view.
 
     The returned mapping is read-only.
 
-    Calling from outside a behavior (e.g. the main thread) will return a
-    snapshot that is never refreshed for that thread.
+    The only supported way to read the noticeboard from the main
+    thread is to ask :func:`wait` for it via ``wait(noticeboard=True)``
+    (or ``wait(stats=True, noticeboard=True)``); that snapshot is taken
+    on the main thread between joining the noticeboard mutator thread
+    and clearing the C-side entries.
+
+    Calling :func:`noticeboard` or :func:`notice_read` from any other
+    main-thread context (outside a behavior, outside
+    ``wait(noticeboard=True)``) is **undefined behavior**: the cached
+    proxy is never re-anchored on a behavior boundary, so subsequent
+    calls may observe either a stale snapshot or partially-applied
+    writes.
+
+    Seeding the noticeboard with :func:`notice_write` from the main
+    thread *before* scheduling behaviors is fine and is the
+    recommended pattern for installing read-mostly configuration.
 
     :return: A read-only mapping of keys to their stored values.
     :rtype: Mapping[str, Any]
@@ -1675,11 +2435,11 @@ def noticeboard() -> Mapping[str, Any]:
 def notice_read(key: str, default: Any = None) -> Any:
     """Read a single key from the noticeboard.
 
-    Must be called from within a ``@when`` behavior. Convenience wrapper
-    that takes a snapshot and returns one value.
-
-    Calling from outside a behavior (e.g. the main thread) will return a
-    snapshot that is never refreshed for that thread.
+    Convenience wrapper over :func:`noticeboard` that takes a snapshot
+    and returns one value. The same supported-usage contract applies:
+    call from inside a ``@when`` behavior, or read the final state on
+    main via ``wait(noticeboard=True)``. Calling :func:`notice_read`
+    from any other main-thread context is **undefined behavior**.
 
     :param key: The noticeboard key to read.
     :type key: str

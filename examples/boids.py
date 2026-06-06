@@ -6,7 +6,7 @@ import colorsys
 import math
 from typing import Mapping, NamedTuple
 
-from bocpy import Cown, Matrix, receive, send, start, wait, when
+from bocpy import Cown, Matrix, PinnedCown, pump, start, wait, when
 
 
 class BoundingBox(NamedTuple("BoundingBox", [("left", int), ("top", int), ("right", int), ("bottom", int)])):
@@ -118,9 +118,8 @@ def limit_speed(velocity: Matrix, speed_limit=15):
     :param velocity: A 1 x 2 velocity vector (modified in place).
     :param speed_limit: The maximum speed for a boid
     """
-    speed = velocity.magnitude()
-    if speed > speed_limit:
-        velocity /= speed
+    if velocity.magnitude_squared() > speed_limit * speed_limit:
+        velocity.normalize(in_place=True)
         velocity *= speed_limit
 
 
@@ -169,6 +168,8 @@ class CellData(NamedTuple("CellData", [("cell", Cell), ("boids", tuple[int]),
         :param cell_data: The full grid mapping, used to locate neighbor cells.
         :param width: The simulation area width.
         :param height: The simulation area height.
+        :return: A ``Cown`` holding ``(pos_slice, vel_slice)`` for the
+            frame-end pinned writeback to consume.
         """
         row, column = self.cell
         boids = self.boids
@@ -189,18 +190,18 @@ class CellData(NamedTuple("CellData", [("cell", Cell), ("boids", tuple[int]),
         num_boids = len(boids)
         if num_boids == 1:
             @when(self.positions, self.velocities)
-            def _(positions: Cown[Matrix], velocities: Cown[Matrix]):
+            def single_cell(positions: Cown[Matrix], velocities: Cown[Matrix]):
                 pos = positions.value
                 vel = velocities.value
                 limit_speed(vel)
                 vel += keep_within_bounds(pos, width, height)
                 pos += vel
-                send("update", (row, column, pos.copy(), vel.copy()))
+                return pos.copy(), vel.copy()
 
-            return
+            return single_cell
 
         @when(positions, velocities)
-        def _(positions: list[Cown[Matrix]], velocities: list[Cown[Matrix]]):
+        def multi_cell(positions: list[Cown[Matrix]], velocities: list[Cown[Matrix]]):
             batch_positions = Matrix.concat([c.value for c in positions])
             batch_velocities = Matrix.concat([c.value for c in velocities])
 
@@ -219,9 +220,9 @@ class CellData(NamedTuple("CellData", [("cell", Cell), ("boids", tuple[int]),
                 vcell[i] = batch_velocities[i] = vel
                 pcell[i] = batch_positions[i] = pos + vel
 
-            pos_update = batch_positions[:num_boids]
-            vel_update = batch_velocities[:num_boids]
-            send("update", (row, column, pos_update, vel_update))
+            return batch_positions[:num_boids], batch_velocities[:num_boids]
+
+        return multi_cell
 
 
 class Simulation:
@@ -237,7 +238,16 @@ class Simulation:
         """
         self.spacing = spacing
         self.num_boids = num_boids
-        self.positions, self.velocities = init_boids(num_boids, width, height)
+        positions, velocities = init_boids(num_boids, width, height)
+        # The per-frame writeback runs on the main thread against
+        # these matrices; per-cell physics runs on workers against
+        # cell-local cowns. ``self.positions`` / ``self.velocities``
+        # alias the same matrix objects for direct main-thread reads
+        # (spatial hashing, drawing).
+        self.positions_cown = PinnedCown(positions)
+        self.velocities_cown = PinnedCown(velocities)
+        self.positions = positions
+        self.velocities = velocities
         self.num_cells = 2 * num_boids
         self.cell_start = [0 for _ in range(self.num_cells + 1)]
         self.cell_entries = [0 for _ in range(self.num_cells)]
@@ -328,17 +338,24 @@ class Simulation:
         for cell in self.grid_cells:
             self.cell_data[cell] = self.build_cell_data(self.positions, self.velocities, cell.row, cell.column)
 
-        self.num_behaviors = 0
-        for value in self.cell_data.values():
-            value.update(self.cell_data, width, height)
-            self.num_behaviors += 1
+        cells = list(self.cell_data.values())
+        boid_indices = [cd.boids for cd in cells]
+        results = [cd.update(self.cell_data, width, height) for cd in cells]
+        self.num_behaviors = len(cells)
 
-        for _ in range(self.num_behaviors):
-            _, (row, column, positions, velocities) = receive("update")
-            boids = self.cell_data[Cell(row, column)].boids
-            for b, pos, vel in zip(boids, positions, velocities):
-                self.positions[b] = pos
-                self.velocities[b] = vel
+        # One pinned dispatch per frame -- coarse-grained writeback.
+        # Workers compute per-cell physics in parallel; this single
+        # main-thread behavior batches the global-matrix update once all
+        # cell results are ready.
+        @when(results, self.positions_cown, self.velocities_cown)
+        def _writeback(per_cell, all_pos, all_vel):
+            pos_mat = all_pos.value
+            vel_mat = all_vel.value
+            for boids, result in zip(boid_indices, per_cell):
+                pos_slice, vel_slice = result.value
+                for b, p, v in zip(boids, pos_slice, vel_slice):
+                    pos_mat[b] = p
+                    vel_mat[b] = v
 
         self.cell_data.clear()
 
@@ -375,6 +392,7 @@ def main():
             self.samples = deque()
             self.fps_samples = deque()
             self.show_overlay = show_overlay
+            self.pending_updates = 0
 
             if show_overlay:
                 self.num_boids_label = pyglet.text.Label(
@@ -428,11 +446,19 @@ def main():
             :param delta_time: Seconds elapsed since the last frame.
             """
             self.elapsed += delta_time
+            self.total_elapsed += delta_time
+            result = pump()
+            self.pending_updates -= result.executed
+            if self.pending_updates > 0:
+                # avoid creating extra work until the previous
+                # update has been applied
+                return
+
+            self.pending_updates += 1
             self.simulation.step(self.width, self.height)
             self.num_behaviors += self.simulation.num_behaviors
             self.num_frames += 1
             self.total_behaviors += self.simulation.num_behaviors
-            self.total_elapsed += delta_time
 
             if self.elapsed > 1:
                 self.samples.append(self.num_behaviors / self.elapsed)
@@ -453,10 +479,10 @@ def main():
 
             positions = self.simulation.positions
             velocities = self.simulation.velocities
+            angles = velocities.angle()
             for b, t in enumerate(self.triangles):
                 pos = positions[b]
-                vel = velocities[b]
-                angle = math.atan2(vel.y, vel.x)
+                angle = angles[b, 0]
                 r, g, b = colorsys.hsv_to_rgb(((angle + math.pi) / (2 * math.pi)), 1, 1)
                 r = int(r * 255)
                 g = int(g * 255)

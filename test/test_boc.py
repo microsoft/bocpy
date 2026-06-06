@@ -1042,10 +1042,8 @@ class TestBehaviorCapsuleArgsSize:
         """BehaviorCapsule with empty args list must construct cleanly."""
         from bocpy import start as _start_runtime
         from bocpy._core import BehaviorCapsule
-        try:
-            _start_runtime()
-        except RuntimeError:
-            pass  # Runtime already started by a prior test.
+        # start() is idempotent; no try/except needed on re-entry.
+        _start_runtime()
 
         result = Cown(None)
         # Empty args list — args_size == 0. The
@@ -1063,10 +1061,8 @@ class TestBehaviorCapsuleArgsSize:
         """BehaviorCapsule with many args constructs and group_ids works."""
         from bocpy import start as _start_runtime
         from bocpy._core import BehaviorCapsule
-        try:
-            _start_runtime()
-        except RuntimeError:
-            pass  # Runtime already started by a prior test.
+        # start() is idempotent; no try/except needed on re-entry.
+        _start_runtime()
 
         result = Cown(None)
         # 32 distinct cowns with distinct group_ids. Exercises the
@@ -1733,5 +1729,35 @@ class TestDecoratorComposition:
             @when(inner)
             def _(result):
                 send("assert", (result.value, 8))
+
+        receive_asserts()
+
+
+class TestLoopDefaultCapture:
+    """``def b(c, i=i)`` — canonical Python loop-snapshot idiom for @when."""
+
+    @classmethod
+    def teardown_class(cls):
+        """Ensure runtime is drained after suite."""
+        wait()
+
+    def test_loop_default_captures_per_iteration_value(self):
+        """``i=i`` captures the loop value at schedule time, not at execution."""
+        c = Cown(0)
+        for i in range(4):
+            @when(c)
+            def _(c, i=i):
+                send("assert", (i, i))
+
+        receive_asserts(4)
+
+    def test_rename_default_binds_into_param(self):
+        """``def b(c, x=y)`` — capture ``y`` from caller, bind into ``x``."""
+        c = Cown(0)
+        y = 99
+
+        @when(c)
+        def _(c, x=y):
+            send("assert", (x, 99))
 
         receive_asserts()

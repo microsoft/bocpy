@@ -34,16 +34,18 @@
 //
 // The queue is intrusive: each node carries an `_Atomic` link
 // (`boc_bq_node_t::next_in_queue`). Production users embed a
-// `boc_bq_node_t` field (`BOCBehavior::bq_node`) and pass its address
-// to the enqueue/dequeue API; the queue never dereferences anything
-// other than the link, so larger user-defined payloads are reached
-// via container_of-style arithmetic at the call site.
+// `boc_bq_node_t` field (see `boc_behavior_prehdr_t::bq_node` below
+// for the BOCBehavior case) and pass its address to the
+// enqueue/dequeue API; the queue never dereferences anything other
+// than the link, so larger user-defined payloads are reached via
+// container_of-style arithmetic at the call site.
 
 /// @brief Verona-style intrusive link node.
-/// @details Embedded at a struct-end position inside @c BOCBehavior
-/// (see `_core.c`). The queue treats nodes as opaque: the only field
-/// it reads or writes is @c next_in_queue. Test code may allocate
-/// bare @c boc_bq_node_t instances.
+/// @details Embedded at offset 0 of @c boc_behavior_prehdr_t (see
+/// below); the prehdr sits immediately before each @c BOCBehavior.
+/// The queue treats nodes as opaque: the only field it reads or
+/// writes is @c next_in_queue. Test code may allocate bare
+/// @c boc_bq_node_t instances.
 typedef struct boc_bq_node {
   /// @brief Intrusive forward link, payload type
   /// `struct boc_bq_node *` stored in a `boc_atomic_ptr_t` slot for
@@ -188,6 +190,90 @@ boc_bq_node_t *boc_bq_segment_take_one(boc_bq_segment_t *s);
 /// @param q The queue (must be non-NULL).
 /// @return @c true if the queue currently appears empty.
 bool boc_bq_is_empty(boc_bq_t *q);
+
+// ---------------------------------------------------------------------------
+// Scheduler-visible behaviour pre-header (`boc_behavior_prehdr_t`)
+// ---------------------------------------------------------------------------
+//
+// Pre-header sitting immediately *before* each BOCBehavior
+// allocation (CPython `_PyGC_Head` / `_Py_AS_GC()` style). Holds
+// the fields the scheduler needs to inspect without including
+// BOCBehavior's private definition: the intrusive queue link and
+// the OR-fold pinned byte set by `BehaviorCapsule_init` from the
+// per-arg cown classification (`is_pinned`).
+//
+// Why a pre-header instead of fields on BOCBehavior. The dispatch
+// path in `boc_sched.c` receives a `boc_bq_node_t *` and must read
+// the pinned byte to route pinned behaviours onto the main-thread
+// queue. BOCBehavior's struct definition is private to `_core.c`,
+// so the alternatives are (a) leak the full struct via this header,
+// (b) call through a function pointer on the hot path, or (c)
+// hard-code an `offsetof(BOCBehavior, pinned)` magic number in
+// `boc_sched.c` and protect it with `static_assert` mirrors. The
+// pre-header avoids all three: the scheduler reads `pinned` via a
+// normal struct field access, and `bq_node` at offset 0 makes the
+// container_of cast trivial and impossible to drift.
+//
+// `_core.c` owns allocation: `behavior_new` calls
+// `PyMem_RawMalloc(sizeof(prehdr) + sizeof(BOCBehavior))`, zeroes
+// the prehdr, and returns the pointer past it. Recovery on the free
+// path uses `BOC_BEHAVIOR_PREHDR(b)` to walk back.
+
+/// @brief Scheduler-visible pre-header attached to every behaviour.
+/// @details Allocated in front of each @c BOCBehavior; sits in the
+/// same cache line as the intrusive link the scheduler dereferences
+/// on dispatch. The @c bq_node MUST stay at offset 0 so the cast
+/// from @c boc_bq_node_t* to @c boc_behavior_prehdr_t* IS the
+/// container_of arithmetic (no compile-time offset constant needed).
+typedef struct boc_behavior_prehdr {
+  /// @brief Intrusive link node (offset 0; load-bearing).
+  /// @details Literal @c alignas(8) (not @c alignof(boc_max_align_t)) because
+  /// 32-bit MSVC's @c __declspec(align) only accepts integer literals; 8
+  /// satisfies the trailing-fields alignment assert on every supported target.
+  alignas(8) boc_bq_node_t bq_node;
+  /// @brief OR-fold of @c BOCCown::is_pinned over the behaviour's
+  /// request set. Set by `BehaviorCapsule_init`; read by
+  /// `boc_sched_dispatch` to route the behaviour onto the main-thread
+  /// pinned queue.
+  uint8_t pinned;
+  /// @brief Room to grow for future scheduler-visible fields without
+  /// reallocating the prehdr footprint.
+  uint8_t _reserved[7];
+} boc_behavior_prehdr_t;
+
+static_assert(offsetof(boc_behavior_prehdr_t, bq_node) == 0,
+              "boc_behavior_prehdr_t.bq_node must be at offset 0 so the "
+              "container_of cast in boc_sched_dispatch is a no-op");
+static_assert(sizeof(boc_behavior_prehdr_t) % alignof(boc_max_align_t) == 0,
+              "sizeof(boc_behavior_prehdr_t) must be a multiple of "
+              "alignof(boc_max_align_t) so (prehdr + 1) is properly aligned "
+              "for the trailing BOCBehavior fields");
+
+/// @brief Recover the prehdr from a BOCBehavior pointer.
+/// @details Inverse of the "return the pointer past the prehdr"
+/// allocation pattern in `behavior_new`. Cast-only; no field access.
+#define BOC_BEHAVIOR_PREHDR(b) (((boc_behavior_prehdr_t *)(b)) - 1)
+
+/// @brief Read the OR-fold pinned byte from an intrusive queue node.
+/// @details The cast is the container_of: @c bq_node is at offset 0
+/// of @c boc_behavior_prehdr_t by construction (see the struct
+/// definition above). Used by `boc_sched_dispatch`'s leading branch.
+/// @param n The intrusive link node (must point into a prehdr).
+/// @return Non-zero iff the owning behaviour has at least one pinned
+///         cown in its request set.
+static inline uint8_t boc_behavior_node_is_pinned(const boc_bq_node_t *n) {
+  return ((const boc_behavior_prehdr_t *)n)->pinned;
+}
+
+/// @brief Enqueue a pinned-bearing behaviour on the main-pinned queue.
+/// @details Defined in `_core.c` (it owns @c MAIN_PINNED_QUEUE plus
+/// the depth/timestamp counters and the terminator wake). Called by
+/// @ref boc_sched_dispatch when @ref boc_behavior_node_is_pinned
+/// returns non-zero.
+/// @param n The prehdr's @c bq_node.
+/// @return 0 (infallible; mirrors @ref boc_sched_dispatch's success
+///         contract).
+int boc_main_pinned_enqueue(boc_bq_node_t *n);
 
 // ---------------------------------------------------------------------------
 // Verona work-stealing queue cursors (`boc_wsq_*`)

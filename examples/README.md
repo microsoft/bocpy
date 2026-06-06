@@ -34,16 +34,22 @@ while the ordering required for correct computation is automatically maintained.
 
 ## [Boids](boids.py)
 The [boids](https://en.wikipedia.org/wiki/Boids) agent-based simulation of flocking
-birds provides fertile ground for exploring many interesting aspects of BOC. First, 
-the threadsafe and BOC-enlightened
+birds provides fertile ground for exploring many interesting aspects of BOC. The
+threadsafe and BOC-enlightened
 [`Matrix`](http://microsoft.github.io/bocpy/sphinx/api.html#bocpy.Matrix) class is used
-quite extensively to store boid positions and velocities and to compute the changing 
-positions. Boid updates are computed on grid cells, such that for each grid cell to
-change it requires unique access to that cell and up to 8 of its neighbors. As the
-demonstrator runs at framerate for hundreds of boids, the resulting simulation creates
-tens of thousands of behaviors and cowns every second. Lots of thanks to
-[Ben Eater's Boids repo](https://github.com/beneater/boids.git), which proved
-a helpful starting point.
+to store boid positions and velocities and to compute the changing positions. Boid
+updates are computed on grid cells, such that for each grid cell to change requires
+unique access to that cell and up to 8 of its neighbors. As the demonstrator runs at
+framerate for hundreds of boids, the resulting simulation creates tens of thousands
+of behaviors and cowns every second.
+
+The simulation also demonstrates the
+[`PinnedCown`](http://microsoft.github.io/bocpy/sphinx/api.html#bocpy.PinnedCown)
+pattern: positions and velocities are exposed to the pyglet render loop via main-thread
+aliases (read directly between frames) while a single pinned `@when` per frame
+performs the write-back, dispatched by `pump()` inside the pyglet update tick. Lots
+of thanks to [Ben Eater's Boids repo](https://github.com/beneater/boids.git), which
+proved a helpful starting point.
 
 ## [Prime Factor](prime_factor.py)
 This example generates a semiprime (a product of two primes) and then factors it
@@ -53,3 +59,27 @@ for a result before doing a batch of trial divisions. When any lane finds a
 factor it writes to the noticeboard, and the remaining lanes see the result on
 their next check and stop early. Demonstrates the "behavior loop" pattern and
 cross-behavior coordination via the noticeboard.
+
+## [Benchmark](benchmark.py)
+`benchmark.py` is the workhorse used to track BOC runtime overhead across releases.
+The default run measures end-to-end throughput on a matmul-fanout workload; the
+key knobs are summarised below.
+
+- `--null-payload` — skip the matmul inner loop so the reported throughput
+  reflects pure scheduler / messaging overhead with the application work
+  removed. Useful when chasing scheduler regressions.
+- `--pinned-spinner` — during the measurement window, drive a tail-recursing
+  `@when` on a `PinnedCown` via `pump(max_behaviors=1)` so the C-level
+  pinned-queue 0&rarr;1 wakeup path is loaded *alongside* the worker `@when`
+  stream. Used to verify worker-throughput regression under high-rate pinned
+  dispatch.
+- `--pinned-spinner-sleep-s` (default `0.001`, i.e. ~1 kHz) — per-iteration
+  sleep inside the pinned-spinner body. Controls the dispatch rate.
+- `--repeats`, `--output`, `--table` / `--no-table`, `--quiet` — repeat-count,
+  results-file path, and reporting toggles for batch runs.
+- `--emit-scheduler-stats` — capture per-worker `scheduler_stats()` and
+  `queue_stats()` snapshots after each repeat and embed them in the result
+  JSON.
+
+See [`scripts/bench_matrix.py`](../scripts/bench_matrix.py) for the
+matrix-arithmetic micro-bench used to guard `_math.c` performance.

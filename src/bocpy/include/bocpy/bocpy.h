@@ -86,4 +86,19 @@ static inline int_least64_t bocpy_interpid(void) {
   return (int_least64_t)PyInterpreterState_GetID(PyInterpreterState_Get());
 }
 
+/// @brief Return the *main* interpreter's ID as `int_least64_t`.
+///
+/// Convenience wrapper over
+/// `PyInterpreterState_GetID(PyInterpreterState_Main())`, pre-typed to match
+/// @ref bocpy_interpid for owner-field equality checks. Used by
+/// main-pinned-cown call sites to assert that the running interpreter is the
+/// permanent owner of a pinned cown's value. `PyInterpreterState_Main()`
+/// returns the process's main interpreter regardless of which interpreter the
+/// caller is currently attached to, so this helper is safe to call from a
+/// worker sub-interpreter for diagnostic/assert use (under the GIL or
+/// equivalent attachment, same as @ref bocpy_interpid).
+static inline int_least64_t bocpy_main_interpid(void) {
+  return (int_least64_t)PyInterpreterState_GetID(PyInterpreterState_Main());
+}
+
 #endif // BOCPY_H

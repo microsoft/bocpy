@@ -85,6 +85,13 @@ behavior once its cowns are free.  The two transfers serialise on the
 ``Alice``/``Bob`` cowns, so their effects are interleaved in a deadlock-free,
 data-race-free order chosen by the runtime.
 
+For a non-tearing-down synchronization point — e.g. a parallel search that
+needs to inspect a best-so-far cown between rounds before continuing — use
+:func:`quiesce` instead of :func:`wait`. It blocks until the runtime is
+quiescent, optionally returns a stats or noticeboard snapshot, and leaves
+the worker pool and the noticeboard thread running so the next ``@when``
+call dispatches immediately.
+
 For cross-behavior shared state see :ref:`noticeboard`. For lower-level
 Erlang-style ``send`` / ``receive`` channels see :ref:`messaging`.
 
@@ -93,6 +100,7 @@ Erlang-style ``send`` / ``receive`` channels see :ref:`messaging`.
    :caption: Contents:
 
    api
+   pinned_cowns
    noticeboard
    messaging
    c_abi

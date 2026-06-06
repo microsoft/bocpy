@@ -33,8 +33,8 @@ import time
 from typing import Optional
 
 from bocpy import _core
-from bocpy import (Cown, Matrix, notice_write, noticeboard, receive, send,
-                   start, wait, when)
+from bocpy import (Cown, Matrix, notice_write, noticeboard, PinnedCown,
+                   pump, start, wait, when)
 
 # Sentinels for the parent/child JSON protocol.  Uppercase so the
 # transpiler keeps them as module-level constants in the worker export.
@@ -175,6 +175,8 @@ class BenchConfig:
     payload_cols: int = 16
     repeats: int = 1
     null_payload: bool = False
+    pinned_spinner: bool = False
+    pinned_spinner_sleep_s: float = 0.001
 
 
 @dataclass
@@ -192,6 +194,10 @@ class RepeatResult:
     # per-window scheduler-stats delta (see
     # ``compute_derived_metrics``).
     derived: Optional[dict] = None
+    # Count of pinned spinner @when dispatches that fired during the
+    # run (0 when ``pinned_spinner`` was off). Lifted out of the
+    # noticeboard at shutdown.
+    pinned_dispatches: int = 0
 
 
 @dataclass
@@ -324,39 +330,60 @@ def build_workload(cfg: BenchConfig):
 
 
 def schedule_snap(state_cowns: list) -> None:
-    """Schedule the final snapshot + publish behaviors.
+    """Schedule the final snapshot behavior.
 
-    See the module docstring for the snap ordering invariant.  This
-    helper is structured so that the bare ``snap`` and ``_publish``
-    return-cown locals fall out of scope at its return boundary,
-    satisfying the no-bare-Cowns-in-main rule before ``wait()`` runs.
+    The snap behavior writes the total count to the noticeboard under
+    ``"final_count"`` rather than sending a message; the parent lifts
+    the value back via ``wait(noticeboard=True)``. The bare ``snap``
+    return-cown local falls out of scope at this function's return
+    boundary, satisfying the no-bare-Cowns-in-main rule before
+    ``wait()`` runs.
 
     :param state_cowns: Every chain's state cown.
     """
     @when(state_cowns)
     def snap(states):
-        return sum(s.value.count for s in states)
+        notice_write("final_count", sum(s.value.count for s in states))
+        notice_write("final_count_ts_ns", time.perf_counter_ns())
 
     notice_write("cr_stop", True)
 
-    @when(snap)
-    def _publish(s):
-        send("snap", s.value)
+
+# The pinned cown wraps a one-slot list: ``[count]``. Counting inside
+# the cown's own value keeps the hot per-dispatch path off the
+# noticeboard, so NB_VERSION is not bumped on every spinner iteration
+# (which would invalidate every worker's cached snapshot and skew the
+# worker-throughput measurement). The spinner publishes the final
+# count to the noticeboard exactly once -- on the iteration where it
+# observes ``cr_stop`` and breaks the tail-recursion.
+_PINNED_COUNT = 0
 
 
-def emit_chain_snapshot(state_cown: Cown, tag: str) -> None:
-    """Send a chain's ``(count, head_idx)`` over the queue under ``tag``.
+def schedule_pinned_spinner(spin_cown: "PinnedCown",
+                            sleep_s: float) -> None:
+    """Schedule the next pinned-spinner @when on ``spin_cown``.
 
-    Used by tests that need to inspect chain progress directly.  The
-    helper lives in this module so the ``@when`` decorator runs through
-    the transpiler that registered ``schedule_step``.
+    The body increments ``p[_PINNED_COUNT]`` (exclusive access to the
+    cown's value while the behavior runs) and either re-schedules
+    itself or, on the iteration that sees ``cr_stop`` set, writes the
+    final count to the noticeboard under ``"pinned_dispatches"`` --
+    exactly one ``NB_VERSION`` bump per run instead of one per
+    dispatch. The sleep lives inside the body so the spinner
+    self-paces under a ``pump()`` / ``wait()`` auto-pump loop.
 
-    :param state_cown: The chain's state cown.
-    :param tag: The tag to ``send`` the snapshot under.
+    :param spin_cown: The :class:`PinnedCown` the spinner runs on.
+        Its value must be a one-element list ``[count]``.
+    :param sleep_s: Per-iteration sleep, in seconds, controlling the
+        dispatch rate (e.g. ``0.001`` for ~1 kHz).
     """
-    @when(state_cown)
-    def _emit(s):
-        send(tag, (s.value.count, s.value.head_idx))
+    @when(spin_cown)
+    def _spinner(p):
+        p.value[_PINNED_COUNT] += 1
+        if not noticeboard().get("cr_stop", False):
+            time.sleep(sleep_s)
+            schedule_pinned_spinner(spin_cown, sleep_s)
+        else:
+            notice_write("pinned_dispatches", p.value[_PINNED_COUNT])
 
 
 # ---------------------------------------------------------------------------
@@ -415,16 +442,25 @@ def run_single_point_body(cfg: BenchConfig, repeat_index: int) -> RepeatResult:
         from bocpy import _core
         sched_stats_warm = _core.scheduler_stats()
         wall_clock_ns_start = time.time_ns()
-        t_measure_start = time.perf_counter()
-        time.sleep(cfg.duration)
+        t_measure_start_ns = time.perf_counter_ns()
+
+        # Measurement window. When ``--pinned-spinner`` is set, drive
+        # a tail-recursing @when on a PinnedCown by hand from this
+        # thread via ``pump(max_behaviors=1)``. The spinner's per-body
+        # ``time.sleep(sleep_s)`` self-paces the dispatch rate. The
+        # point is to load the C-level pinned-queue 0->1 wakeup path
+        # (single terminator cv broadcast per pump) and measure
+        # worker-throughput regression under that load.
+        if cfg.pinned_spinner:
+            pinned = PinnedCown([0])
+            schedule_pinned_spinner(pinned, cfg.pinned_spinner_sleep_s)
+            deadline_ns = t_measure_start_ns + int(cfg.duration * 1e9)
+            while time.perf_counter_ns() < deadline_ns:
+                pump(max_behaviors=1)
+        else:
+            time.sleep(cfg.duration)
 
         schedule_snap(state_cowns)
-        msg = receive(["snap"], 60.0 + cfg.duration)
-        t_snap_received = time.perf_counter()
-        if msg is None or msg[0] != "snap":
-            raise RuntimeError("snap behavior did not publish in time")
-        _, total = msg
-        elapsed_s = t_snap_received - t_measure_start
 
         # Snapshot tagged-queue counters BEFORE wait() tears the
         # runtime down. Per-tag assignments are rebound on the next
@@ -433,27 +469,45 @@ def run_single_point_body(cfg: BenchConfig, repeat_index: int) -> RepeatResult:
             _core.queue_stats() if hasattr(_core, "queue_stats") else None
         )
     finally:
-        # Drop bare-Cown locals before wait().
+        # Drop bare-Cown locals before wait(). ``pinned`` (when set)
+        # is intentionally left in scope: ``wait()`` auto-pumps any
+        # remaining pinned bodies on this thread, the spinner
+        # observes ``cr_stop`` from snap, publishes its final count,
+        # and stops re-scheduling so the queue drains.
         del rings
         del state_cowns
-        # ``wait(stats=True)`` returns the per-worker scheduler_stats
-        # snapshot captured AFTER all behaviors completed but BEFORE
-        # the per-worker array is freed -- the only correct moment
-        # for a session-final snapshot.
-        sched_stats_end = wait(stats=True)
+        # ``wait(stats=True, noticeboard=True)`` returns a WaitResult
+        # carrying both the per-worker scheduler_stats snapshot and
+        # the final noticeboard contents. Both are captured AFTER all
+        # behaviors completed but BEFORE the per-worker array and the
+        # noticeboard entries are freed -- the only correct moment.
+        wait_result = wait(stats=True, noticeboard=True)
+        sched_stats_end = wait_result.stats
+        nb_snap = wait_result.noticeboard
 
+    total = int(nb_snap.get("final_count", 0))
+    pinned_dispatches = int(nb_snap.get("pinned_dispatches", 0))
+    # Use the snap behavior's own write-time so the elapsed_s
+    # numerator denominator pairing matches: ``total`` is the count
+    # snap observed at that instant, ``t_measure_start`` is when the
+    # chains began contributing to it.
+    snap_ts_ns = nb_snap.get("final_count_ts_ns")
+    if snap_ts_ns is None:
+        raise RuntimeError("snap behavior did not publish final_count_ts_ns")
+    elapsed_s = max(0.0, (int(snap_ts_ns) - t_measure_start_ns) / 1e9)
     sched_stats_delta = _delta_scheduler_stats(sched_stats_warm,
                                                sched_stats_end)
     throughput = total / elapsed_s if elapsed_s > 0 else 0.0
     return RepeatResult(repeat_index=repeat_index,
-                        completed_behaviors=int(total),
+                        completed_behaviors=total,
                         elapsed_s=elapsed_s,
                         throughput=throughput,
                         wall_clock_ns_start=wall_clock_ns_start,
                         scheduler_stats=sched_stats_delta,
                         queue_stats=queue_stats_snap,
                         derived=compute_derived_metrics(sched_stats_delta,
-                                                        int(total)))
+                                                        total),
+                        pinned_dispatches=pinned_dispatches)
 
 
 # ---------------------------------------------------------------------------
@@ -586,6 +640,10 @@ def cfg_to_argv(cfg: BenchConfig) -> list:
         args += ["--chains-per-ring", str(cfg.chains_per_ring)]
     if cfg.null_payload:
         args += ["--null-payload"]
+    if cfg.pinned_spinner:
+        args += ["--pinned-spinner",
+                 "--pinned-spinner-sleep-s",
+                 str(cfg.pinned_spinner_sleep_s)]
     return args
 
 
@@ -645,7 +703,8 @@ def run_in_subprocess(cfg: BenchConfig, repeat_index: int,
         wall_clock_ns_start=int(payload["wall_clock_ns_start"]),
         scheduler_stats=payload.get("scheduler_stats"),
         queue_stats=payload.get("queue_stats"),
-        derived=payload.get("derived"))
+        derived=payload.get("derived"),
+        pinned_dispatches=int(payload.get("pinned_dispatches", 0)))
 
 
 def _extract_sentinel_payload(stdout: str) -> Optional[dict]:
@@ -1128,6 +1187,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="Skip the matmul inner loop in each behavior. "
                         "Throughput then reflects pure BOC runtime "
                         "overhead with the application work removed.")
+    p.add_argument("--pinned-spinner", dest="pinned_spinner",
+                   action="store_true", default=False,
+                   help="During the measurement window, drive a "
+                        "tail-recursing @when on a PinnedCown via "
+                        "pump(max_behaviors=1) so the C-level "
+                        "pinned-queue 0->1 wakeup path is loaded "
+                        "alongside the worker @when stream. Use to "
+                        "verify worker-throughput regression under "
+                        "high-rate pinned dispatch.")
+    p.add_argument("--pinned-spinner-sleep-s",
+                   dest="pinned_spinner_sleep_s",
+                   type=float, default=0.001,
+                   help="Per-iteration sleep inside the pinned "
+                        "spinner body, in seconds. Controls the "
+                        "dispatch rate (default 1e-3 = ~1 kHz).")
     p.add_argument("--output", default=None)
     p.add_argument("--table", dest="table", action="store_true", default=None)
     p.add_argument("--no-table", dest="table", action="store_false")
@@ -1169,6 +1243,8 @@ def args_to_base_cfg(args) -> BenchConfig:
         payload_cols=args.payload_cols,
         repeats=args.repeats,
         null_payload=args.null_payload,
+        pinned_spinner=args.pinned_spinner,
+        pinned_spinner_sleep_s=args.pinned_spinner_sleep_s,
     )
 
 
@@ -1195,6 +1271,7 @@ def child_main(args) -> int:
         "elapsed_s": rep.elapsed_s,
         "throughput": rep.throughput,
         "wall_clock_ns_start": rep.wall_clock_ns_start,
+        "pinned_dispatches": rep.pinned_dispatches,
     }
     if args.emit_scheduler_stats:
         # Read from the snapshot taken INSIDE run_single_point_body,

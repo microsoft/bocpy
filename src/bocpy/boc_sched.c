@@ -936,6 +936,40 @@ boc_bq_node_t *boc_sched_worker_pop_fast(boc_sched_worker_t *self) {
 
 int boc_sched_dispatch(boc_bq_node_t *n) {
   boc_sched_worker_t *self = current_worker;
+
+  // Off-worker runtime-down gate. Must run BEFORE the pinned fast
+  // path so a pinned `@when` racing teardown is rejected the same
+  // way as an unpinned one — otherwise the pinned arm would drop
+  // the node onto MAIN_PINNED_QUEUE post-`terminator_close` with
+  // no rollback, leaking an undecremented `terminator_inc` and
+  // wedging the next `wait()`. Workers releasing successors of
+  // already-acquired behaviours skip this check (they bypass
+  // `self == NULL`) so mid-run dispatch is unaffected.
+  if (self == NULL) {
+    Py_ssize_t wc =
+        (Py_ssize_t)boc_atomic_load_u64_explicit(&WORKER_COUNT, BOC_MO_ACQUIRE);
+    if (wc == 0) {
+      PyErr_SetString(
+          PyExc_RuntimeError,
+          "cannot schedule behavior: bocpy runtime is not running. "
+          "Call bocpy.start() before scheduling, or avoid scheduling "
+          "after wait() / stop() has shut the runtime down.");
+      return -1;
+    }
+  }
+
+  // Pinned-routing fast path. The OR-fold pinned byte was set by
+  // `BehaviorCapsule_init` from the per-arg `BOCCown::is_pinned`
+  // classification. Read it via the scheduler-public prehdr accessor
+  // (no knowledge of BOCBehavior layout required) and divert pinned
+  // behaviours onto the process-global main-pinned queue. The cold
+  // path transfers entirely to `boc_main_pinned_enqueue` (defined
+  // in `_core.c`); the worker-dispatch arms below run only when the
+  // behaviour has no pinned cowns.
+  if (boc_behavior_node_is_pinned(n)) {
+    return boc_main_pinned_enqueue(n);
+  }
+
   boc_sched_worker_t *target;
 
   if (self != NULL) {
@@ -968,37 +1002,14 @@ int boc_sched_dispatch(boc_bq_node_t *n) {
   } else {
     // Off-worker arm: round-robin over the worker ring.
     //
-    // Acquire-load WORKER_COUNT and INCARNATION so we observe the
-    // RELEASE-stores from `boc_sched_shutdown` BEFORE we could
-    // observe a freed WORKERS[] slot. Without this acquire, an
-    // off-worker producer running concurrently with shutdown
-    // could read a stale WORKER_COUNT > 0 and dereference
-    // WORKERS[0] after it had been freed.
-    Py_ssize_t wc =
-        (Py_ssize_t)boc_atomic_load_u64_explicit(&WORKER_COUNT, BOC_MO_ACQUIRE);
-    // Re-seed `rr_nonlocal` whenever the scheduler incarnation
-    // changes so a `start()`/`wait()`/`start()` cycle with a
-    // different worker count cannot land on a stale pointer.
+    // The runtime-down gate at the top of `boc_sched_dispatch`
+    // already rejected the case where `WORKER_COUNT == 0`, so by
+    // the time we get here at least one worker slot is live.
+    // INCARNATION still needs an acquire load so a stale
+    // `rr_nonlocal` from a prior incarnation is refreshed before
+    // we dereference it.
     size_t inc_now =
         (size_t)boc_atomic_load_u64_explicit(&INCARNATION, BOC_MO_ACQUIRE);
-    // Check WORKER_COUNT FIRST so the runtime-down sentinel is
-    // honoured even when the cached `rr_nonlocal` is non-NULL but
-    // points into the prior incarnation's freed array (the
-    // shutdown-then-restart-with-different-count race).
-    if (wc == 0) {
-      // No runtime up — surface as a Python exception. Prior
-      // behaviour was a silent drop, which left whencall's
-      // `terminator_inc` un-rolled-back: the next `wait()` would
-      // hang because the caller's hold was never released. The
-      // caller (`whencall` in `behaviors.py`) catches this and
-      // calls `terminator_dec` to roll back its hold.
-      PyErr_SetString(
-          PyExc_RuntimeError,
-          "cannot schedule behavior: bocpy runtime is not running. "
-          "Call bocpy.start() before scheduling, or avoid scheduling "
-          "after wait() / stop() has shut the runtime down.");
-      return -1;
-    }
     if (rr_nonlocal == NULL || rr_incarnation != inc_now) {
       rr_nonlocal = &WORKERS[0];
       rr_incarnation = inc_now;

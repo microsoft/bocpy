@@ -159,6 +159,18 @@ pattern so downstream code does not have to redefine them:
        called with the GIL held (or while attached to an interpreter
        on free-threaded builds) — same contract as the underlying
        ``PyInterpreterState_GetID(PyInterpreterState_Get())``.
+   * - ``bocpy_main_interpid()``
+     - ``static inline int_least64_t``: returns the *main*
+       interpreter's ID, pre-typed to match ``bocpy_interpid()`` for
+       owner-field equality checks. Wraps
+       ``PyInterpreterState_GetID(PyInterpreterState_Main())``, which
+       returns the process's main interpreter regardless of which
+       interpreter the caller is currently attached to, so this
+       helper is safe to call from a worker sub-interpreter for
+       diagnostic / assert use (under the GIL or equivalent
+       attachment, same as ``bocpy_interpid()``). Used by bocpy's
+       own main-pinned-cown call sites to assert that the running
+       interpreter is the permanent owner of a pinned cown's value.
 
 The two are designed to be used together: producer-side, CAS the
 owner from ``bocpy_interpid()`` to ``BOCPY_NO_OWNER`` before calling
