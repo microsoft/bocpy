@@ -1139,8 +1139,7 @@ class TestWhenResultAssignment:
         )
 
     def test_result_is_ast_assign_not_expr(self):
-        """The whencall node returned by visit_FunctionDef must be an
-        ast.Assign, not an ast.Expr wrapping an ast.Assign.
+        """The whencall node returned by visit_FunctionDef must be an ast.Assign, not an ast.Expr wrapping an ast.Assign.
 
         visit_Module filters out all ast.Expr nodes; an ast.Expr return
         would silently drop the assignment.
