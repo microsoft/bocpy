@@ -1105,8 +1105,7 @@ class TestWhenAlias:
 # Regression: @when result assignment must not be dropped
 
 class TestWhenResultAssignment:
-    """@when-decorated functions must produce a name = whencall(...) assignment
-    in the exported module.
+    """@when-decorated functions must produce a name = whencall(...) assignment.
 
     Regression: WhenTransformer.visit_FunctionDef was returning
     ``ast.Expr(ast.Assign(...))``, an ast.Assign statement incorrectly
@@ -1225,4 +1224,3 @@ class TestWhenResultAssignment:
         raise AssertionError(
             "no assignment for 'my_task' found in exported AST"
         )
-    
