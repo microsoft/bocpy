@@ -1100,3 +1100,129 @@ class TestWhenAlias:
         names = [info.name for info in result.behaviors.values()]
         assert names == ["__behavior__0"]
         assert "from bocpy import whencall" in result.code
+
+
+# Regression: @when result assignment must not be dropped
+
+class TestWhenResultAssignment:
+    """@when-decorated functions must produce a name = whencall(...) assignment
+    in the exported module.
+
+    Regression: WhenTransformer.visit_FunctionDef was returning
+    ``ast.Expr(ast.Assign(...))``, an ast.Assign statement incorrectly
+    wrapped in ast.Expr. visit_Module filters out every ast.Expr node (to
+    drop bare expression-statement whencall results), so the wrapping caused
+    every @when result assignment to be silently dropped from the exported
+    module. Any code that read .value, checked .exception, or chained
+    behaviors on the result was operating on None with no error at schedule
+    time.
+    """
+
+    @staticmethod
+    def _export(source, path="/tmp/test.py"):
+        tree = ast.parse(textwrap.dedent(source))
+        return export_module(tree, path)
+
+    def test_result_assigned_in_exported_code(self):
+        """The behavior name must appear as an assignment target in the export."""
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            x = Cown(1)
+
+            @when(x)
+            def my_task(x):
+                return x.value
+        """)
+        assert "my_task = whencall(" in result.code, (
+            "result assignment was dropped from exported module;\n"
+            f"generated code:\n{result.code}"
+        )
+
+    def test_result_is_ast_assign_not_expr(self):
+        """The whencall node returned by visit_FunctionDef must be an
+        ast.Assign, not an ast.Expr wrapping an ast.Assign.
+
+        visit_Module filters out all ast.Expr nodes; an ast.Expr return
+        would silently drop the assignment.
+        """
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            x = Cown(1)
+
+            @when(x)
+            def my_task(x):
+                return x.value
+        """)
+        gen_tree = ast.parse(result.code)
+        assigns = [
+            node for node in ast.walk(gen_tree)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(t, ast.Name) and t.id == "my_task"
+                for t in node.targets
+            )
+        ]
+        assert assigns, (
+            "no ast.Assign for 'my_task' found in exported AST; "
+            "the assignment was likely wrapped in ast.Expr and dropped.\n"
+            f"generated code:\n{result.code}"
+        )
+
+    def test_multiple_behaviors_all_assigned(self):
+        """Every @when function in the module must be assigned, not just the first."""
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            x = Cown(1)
+            y = Cown(2)
+
+            @when(x)
+            def task_a(x):
+                return x.value
+
+            @when(y)
+            def task_b(y):
+                return y.value
+        """)
+        assert "task_a = whencall(" in result.code, (
+            "'task_a' assignment missing from export;\n"
+            f"generated code:\n{result.code}"
+        )
+        assert "task_b = whencall(" in result.code, (
+            "'task_b' assignment missing from export;\n"
+            f"generated code:\n{result.code}"
+        )
+
+    def test_assignment_store_context(self):
+        """The assignment target must use ast.Store context, not ast.Load."""
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            x = Cown(1)
+
+            @when(x)
+            def my_task(x):
+                return x.value
+        """)
+        gen_tree = ast.parse(result.code)
+        for node in ast.walk(gen_tree):
+            if (
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(t, ast.Name) and t.id == "my_task"
+                    for t in node.targets
+                )
+            ):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == "my_task":
+                        assert isinstance(target.ctx, ast.Store), (
+                            f"assignment target 'my_task' has ctx "
+                            f"{type(target.ctx).__name__!r}, expected Store"
+                        )
+                return
+        raise AssertionError(
+            "no assignment for 'my_task' found in exported AST"
+        )
+    
