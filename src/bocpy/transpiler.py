@@ -607,8 +607,13 @@ class WhenTransformer(ast.NodeTransformer):
 
         when_call = ast.Call(func=ast.Name(id="whencall"), args=args, keywords=[])
         ast.copy_location(when_call, node)
-        ast.fix_missing_locations(when_call)
-        return ast.Expr(ast.Assign([ast.Name(id=node.name)], when_call))
+        assign = ast.Assign(
+            targets=[ast.Name(id=node.name, ctx=ast.Store())],
+            value=when_call,
+        )
+        ast.copy_location(assign, node)
+        ast.fix_missing_locations(assign)
+        return assign
 
     visit_AsyncFunctionDef = visit_FunctionDef  # noqa: N815
 
