@@ -239,11 +239,6 @@ class Simulation:
         self.spacing = spacing
         self.num_boids = num_boids
         positions, velocities = init_boids(num_boids, width, height)
-        # The per-frame writeback runs on the main thread against
-        # these matrices; per-cell physics runs on workers against
-        # cell-local cowns. ``self.positions`` / ``self.velocities``
-        # alias the same matrix objects for direct main-thread reads
-        # (spatial hashing, drawing).
         self.positions_cown = PinnedCown(positions)
         self.velocities_cown = PinnedCown(velocities)
         self.positions = positions
@@ -261,13 +256,11 @@ class Simulation:
 
         :param positions: An *N* x 2 matrix of boid positions.
         """
-        # clear cell start
         for i in range(self.num_cells + 1):
             self.cell_start[i] = 0
 
         self.grid_cells.clear()
 
-        # first we count how many entries are in each cell
         for i, pos in enumerate(positions):
             r = int_coord(pos.y, self.spacing)
             c = int_coord(pos.x, self.spacing)
@@ -277,7 +270,6 @@ class Simulation:
             self.hash_values[i] = h
             self.cell_start[h] += 1
 
-        # perform the cumulative sum
         start = 0
         for i in range(self.num_cells):
             start += self.cell_start[i]
@@ -285,12 +277,8 @@ class Simulation:
 
         self.cell_start[-1] = start
 
-        # populate the cell entries
         for i in range(self.num_boids):
             h = self.hash_values[i]
-            # the effect is that we fill from the back. Once all
-            # nodes have been placed, the start will be at the
-            # beginning of the cell entries.
             self.cell_start[h] -= 1
             self.cell_entries[self.cell_start[h]] = i
 
@@ -343,10 +331,6 @@ class Simulation:
         results = [cd.update(self.cell_data, width, height) for cd in cells]
         self.num_behaviors = len(cells)
 
-        # One pinned dispatch per frame -- coarse-grained writeback.
-        # Workers compute per-cell physics in parallel; this single
-        # main-thread behavior batches the global-matrix update once all
-        # cell results are ready.
         @when(results, self.positions_cown, self.velocities_cown)
         def _writeback(per_cell, all_pos, all_vel):
             pos_mat = all_pos.value
@@ -450,8 +434,6 @@ def main():
             result = pump()
             self.pending_updates -= result.executed
             if self.pending_updates > 0:
-                # avoid creating extra work until the previous
-                # update has been applied
                 return
 
             self.pending_updates += 1
@@ -517,8 +499,6 @@ def main():
                              "triangle size (default: 1.0).")
     args = parser.parse_args()
 
-    # Validate at the boundary; downstream code (Matrix sizing, hash modulo,
-    # 1.0/fps) assumes positive values and would crash or silently misbehave.
     if args.boids <= 0:
         parser.error("--boids must be positive")
     if args.width <= 0 or args.height <= 0:
@@ -532,25 +512,14 @@ def main():
     if args.scale <= 0:
         parser.error("--scale must be positive")
 
-    # Start the BOC runtime explicitly so --workers takes effect for every
-    # mode.
     start(worker_count=args.workers)
 
     if args.mode == "video":
         import subprocess
 
-        # Create the window first so we can query the actual framebuffer
-        # dimensions (which may differ from logical size on HiDPI displays).
-        # The overlay (boid count / behavior rate) is suppressed in video
-        # mode so the rendered output stays clean.
         boids = Boids(args.width, args.height, args.boids,
                       show_overlay=False, scale=args.scale)
 
-        # Allow graceful close: override on_close to set a flag and return
-        # True so pyglet does not destroy the window mid-frame. The loop
-        # below honors the flag; the finally block tears the window down.
-        # Use a bocpy-prefixed attribute name to avoid colliding with any
-        # underscore-prefixed pyglet internals.
         boids.bocpy_video_closing = False
 
         def _on_close():
@@ -559,7 +528,6 @@ def main():
 
         boids.on_close = _on_close
 
-        # Determine the real framebuffer size (HiDPI-correct).
         boids.switch_to()
         boids.dispatch_events()
         boids.clear()
@@ -572,8 +540,6 @@ def main():
                   f"(window requested {args.width}x{args.height}); "
                   f"encoding at framebuffer resolution.")
 
-        # Validate frame count BEFORE spawning ffmpeg so we don't leak the
-        # subprocess if the duration/fps combination produces no frames.
         num_frames = int(args.duration * args.fps)
         if num_frames == 0:
             print(f"error: --duration {args.duration} is too short for "
@@ -604,8 +570,6 @@ def main():
             wait()
             return
         except OSError as exc:
-            # Other startup failures (read-only output dir, ENOMEM, etc.)
-            # also need cleanup to avoid leaking the window/runtime.
             print(f"error: failed to start ffmpeg: {exc}")
             boids.close()
             wait()
@@ -632,9 +596,6 @@ def main():
                     boids.behaviors_label.draw()
 
                 buf = pyglet.image.get_buffer_manager().get_color_buffer()
-                # Defensive: framebuffer size must remain stable for the
-                # encoder. If it changes (window manager fiddling, monitor
-                # move) we abort rather than emit garbled frames.
                 if (buf.width, buf.height) != (fb_width, fb_height):
                     print(f"error: framebuffer size changed mid-record "
                           f"({fb_width}x{fb_height} -> "
@@ -668,8 +629,6 @@ def main():
                     except subprocess.TimeoutExpired:
                         pass
             finally:
-                # Always release the pyglet window and BOC runtime, even if
-                # ffmpeg cleanup raised something unexpected.
                 try:
                     boids.close()
                 finally:
@@ -677,9 +636,6 @@ def main():
 
         if ff.returncode != 0:
             if ff.returncode is None:
-                # We tried to kill ffmpeg but it never reaped within 5s after
-                # SIGKILL. The output file (if any) is almost certainly
-                # truncated and missing the libx264 moov atom.
                 print("error: ffmpeg was killed and did not exit; "
                       "output file is likely truncated.")
             else:
@@ -688,9 +644,6 @@ def main():
                 print(ff_stderr.decode("utf-8", errors="replace"), end="")
             return
 
-        # Successful render: report the average behavior rate over the
-        # entire run, computed from cumulative counters (not the rolling
-        # 1s window used for the on-screen overlay).
         if boids.total_elapsed > 0:
             avg_rate = boids.total_behaviors / boids.total_elapsed
             print(f"behavior/s (avg over {boids.total_elapsed:.1f}s of "

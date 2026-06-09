@@ -43,16 +43,6 @@
 #include <stdint.h>
 #include <time.h>
 
-// ---------------------------------------------------------------------------
-// Cross-platform alignas / alignof shim
-// ---------------------------------------------------------------------------
-//
-// Portable C11-style alignment macros. MSVC's `<stdalign.h>` only
-// defines `alignas` / `alignof` when the compiler is invoked in C11
-// mode (`/std:c11` or later); the Python build does not pass that
-// flag, so we map directly to the underlying `__declspec(align(...))`
-// / `__alignof` intrinsics on MSVC and fall back to `<stdalign.h>`
-// elsewhere. C++ TUs always get the standard header.
 #if defined(__cplusplus)
 #include <stdalign.h>
 #elif defined(_MSC_VER)
@@ -80,17 +70,6 @@ typedef union boc_max_align {
   void (*_fp)(void);
 } boc_max_align_t;
 
-// ---------------------------------------------------------------------------
-// Memory-order tags
-// ---------------------------------------------------------------------------
-//
-// Used by the typed `boc_atomic_*_explicit` API below. Defined here
-// (above the platform fork) because both arms reference these tags.
-// Distinct integer constants so the MSVC dispatch can `switch` on
-// them; on POSIX they are mapped to `memory_order_*` by the
-// `boc_mo_to_std` helper inside the POSIX arm. Skip 1 to leave room
-// for `consume`.
-
 typedef enum {
   BOC_MO_RELAXED = 0,
   BOC_MO_ACQUIRE = 2,
@@ -99,15 +78,7 @@ typedef enum {
   BOC_MO_SEQ_CST = 5,
 } boc_memory_order_t;
 
-// ===========================================================================
-// Platform fork: Windows / Apple / other POSIX (Linux).
-// ===========================================================================
-
 #ifdef _WIN32
-
-// ---------------------------------------------------------------------------
-// Windows: headers, thread_local, yield
-// ---------------------------------------------------------------------------
 
 #define WIN32_LEAN_AND_MEAN
 #include <process.h>
@@ -115,10 +86,6 @@ typedef enum {
 
 #define thread_local __declspec(thread)
 #define boc_yield() SwitchToThread()
-
-// ---------------------------------------------------------------------------
-// Windows: legacy `atomic_*` polyfill on int_least64_t / intptr_t
-// ---------------------------------------------------------------------------
 
 typedef volatile int_least64_t atomic_int_least64_t;
 typedef volatile intptr_t atomic_intptr_t;
@@ -132,19 +99,6 @@ int_least64_t atomic_load(atomic_int_least64_t *ptr);
 int_least64_t atomic_exchange(atomic_int_least64_t *ptr, int_least64_t value);
 void atomic_store(atomic_int_least64_t *ptr, int_least64_t value);
 
-// ----- atomic_intptr_t siblings ---------------------------------------------
-// The MSVC polyfill defines `atomic_intptr_t` and `atomic_int_least64_t` as
-// distinct typedefs; the plain `atomic_load` / `atomic_store` / etc. above
-// only accept `atomic_int_least64_t *`. Without these siblings, code that
-// touches an `atomic_intptr_t` field (e.g. BOCRequest::next, BOCCown::last,
-// BOCRecycleQueue::head, BOCQueue::tag, NB_NOTICEBOARD_TID) would silently
-// pass a mistyped pointer to the int64 polyfill on Windows. On POSIX C11 the
-// same names are aliased to the generic atomic_* macros (which already
-// dispatch on type via _Generic), so user code below is platform-uniform.
-//
-// All Interlocked*Pointer intrinsics on x86/x64 are full barriers; the
-// pointer-width matches `intptr_t` on both Win32 and Win64 (CPython itself
-// requires a sane intptr_t == void* relationship).
 static inline intptr_t atomic_load_intptr(atomic_intptr_t *ptr) { return *ptr; }
 
 static inline void atomic_store_intptr(atomic_intptr_t *ptr, intptr_t value) {
@@ -169,14 +123,6 @@ static inline bool atomic_compare_exchange_strong_intptr(atomic_intptr_t *ptr,
   return false;
 }
 
-// All Interlocked* intrinsics on x86/x64 are full barriers, so the
-// memory_order argument is accepted but ignored.
-// Note: atomic_load_explicit uses a plain volatile read on x64 (TSO
-// provides acquire semantics). On x86 (32-bit), 64-bit volatile reads
-// are not atomic, but the legacy atomic_int_least64_t polyfill here is
-// only used for waiter counts and state fields where torn reads are
-// benign (protected by mutex re-checks). The typed boc_atomic_*_u64
-// API above uses _InterlockedCompareExchange64 for true atomicity.
 #if defined(_M_IX86)
 #define atomic_load_explicit(ptr, order)                                       \
   ((int_least64_t)InterlockedCompareExchange64((ptr), 0, 0))
@@ -192,10 +138,6 @@ static inline bool atomic_compare_exchange_strong_intptr(atomic_intptr_t *ptr,
   InterlockedExchangeAdd64((ptr), -(val))
 #endif
 #define memory_order_seq_cst 0
-
-// ---------------------------------------------------------------------------
-// Windows: BOCMutex / BOCCond on SRWLOCK + CONDITION_VARIABLE
-// ---------------------------------------------------------------------------
 
 typedef SRWLOCK BOCMutex;
 typedef CONDITION_VARIABLE BOCCond;
@@ -225,9 +167,6 @@ static inline void cnd_wait(BOCCond *c, BOCMutex *m) {
 /// @param m The mutex (must be held by caller)
 /// @return true if signalled (or spurious wake), false if the timeout expired
 static inline bool cnd_timedwait_s(BOCCond *c, BOCMutex *m, double seconds) {
-  // Negated form catches NaN (every comparison with NaN is false),
-  // which a bare `seconds < 0` test does not. Defence in depth
-  // for the public boundary helper `boc_validate_finite_timeout`.
   if (!(seconds >= 0.0))
     seconds = 0.0;
   DWORD ms = (DWORD)(seconds * 1000.0);
@@ -240,30 +179,10 @@ static inline bool cnd_timedwait_s(BOCCond *c, BOCMutex *m, double seconds) {
 
 void thrd_sleep(const struct timespec *duration, struct timespec *remaining);
 
-// ---------------------------------------------------------------------------
-// Windows: typed `boc_atomic_*_explicit` storage typedefs
-// ---------------------------------------------------------------------------
-//
-// `volatile T` storage with distinct typedefs per width so the
-// dispatch picks the right Interlocked* family. Note these are ordinary
-// `volatile`, NOT C11 `_Atomic` — MSVC's `_Atomic` is gated behind
-// `<stdatomic.h>` (VS 2022 17.5+) which is above bocpy's VS 2019 floor.
-
 typedef volatile uint64_t boc_atomic_u64_t;
 typedef volatile uint32_t boc_atomic_u32_t;
-typedef volatile uint8_t boc_atomic_bool_t; // sizeof(bool) == 1
+typedef volatile uint8_t boc_atomic_bool_t;
 typedef void *volatile boc_atomic_ptr_t;
-
-// ---------------------------------------------------------------------------
-// Windows: typed `boc_atomic_*_explicit` implementations
-// ---------------------------------------------------------------------------
-//
-// Switch on order, dispatch to Interlocked*. On x86/x64 every
-// Interlocked* intrinsic is a full barrier, so all orderings collapse
-// to the unsuffixed form (which is correct for any requested
-// ordering). On ARM64 we pick the matching `_acq`/`_rel`/`_nf`
-// variant. `BOC_MO_ACQ_REL` and `BOC_MO_SEQ_CST` use the unsuffixed
-// (full barrier) form on every target.
 
 #if defined(_M_ARM64)
 #define BOC_IL_LOAD64_ACQ(p)                                                   \
@@ -280,8 +199,6 @@ typedef void *volatile boc_atomic_ptr_t;
   __stlr8((unsigned __int8 volatile *)(p), (unsigned __int8)(v))
 #endif
 
-// ---- u64 -------------------------------------------------------------------
-
 static inline uint64_t boc_atomic_load_u64_explicit(boc_atomic_u64_t *p,
                                                     boc_memory_order_t order) {
 #if defined(_M_ARM64)
@@ -294,10 +211,6 @@ static inline uint64_t boc_atomic_load_u64_explicit(boc_atomic_u64_t *p,
     return BOC_IL_LOAD64_ACQ(p);
   }
 #elif defined(_M_IX86)
-  // On x86, a 64-bit volatile read is not atomic (two 32-bit loads).
-  // Use _InterlockedCompareExchange64(p, 0, 0) which atomically reads
-  // the value without modifying it (CAS that "replaces" 0 with 0 if
-  // matched; either way returns the current value).
   (void)order;
   return (uint64_t)_InterlockedCompareExchange64((volatile __int64 *)p, 0, 0);
 #else
@@ -322,8 +235,6 @@ static inline void boc_atomic_store_u64_explicit(boc_atomic_u64_t *p,
     return;
   }
 #elif defined(_M_IX86)
-  // On x86, a 64-bit volatile write is not atomic. Use an exchange
-  // via CAS loop to atomically store the value.
   (void)order;
   __int64 old = *((volatile __int64 *)p);
   for (;;) {
@@ -357,8 +268,6 @@ boc_atomic_exchange_u64_explicit(boc_atomic_u64_t *p, uint64_t v,
     return (uint64_t)_InterlockedExchange64((volatile __int64 *)p, (__int64)v);
   }
 #elif defined(_M_IX86)
-  // x86 lacks _InterlockedExchange64; emulate with a CAS loop using
-  // _InterlockedCompareExchange64 (which is available on x86).
   (void)order;
   __int64 old = *((volatile __int64 *)p);
   for (;;) {
@@ -429,7 +338,6 @@ boc_atomic_fetch_add_u64_explicit(boc_atomic_u64_t *p, uint64_t v,
                                                (__int64)v);
   }
 #elif defined(_M_IX86)
-  // x86 lacks _InterlockedExchangeAdd64; emulate with a CAS loop.
   (void)order;
   __int64 old = *((volatile __int64 *)p);
   for (;;) {
@@ -451,8 +359,6 @@ boc_atomic_fetch_sub_u64_explicit(boc_atomic_u64_t *p, uint64_t v,
                                   boc_memory_order_t order) {
   return boc_atomic_fetch_add_u64_explicit(p, (uint64_t)(-(int64_t)v), order);
 }
-
-// ---- u32 -------------------------------------------------------------------
 
 static inline uint32_t boc_atomic_load_u32_explicit(boc_atomic_u32_t *p,
                                                     boc_memory_order_t order) {
@@ -574,13 +480,6 @@ boc_atomic_fetch_sub_u32_explicit(boc_atomic_u32_t *p, uint32_t v,
   return boc_atomic_fetch_add_u32_explicit(p, (uint32_t)(-(int32_t)v), order);
 }
 
-// ---- bool (uint8_t storage) ------------------------------------------------
-// MSVC has no Interlocked*8 with order suffixes pre-VS-2022; we use the
-// unsuffixed Interlocked*8 (full barrier) for exchange/cas, which satisfies
-// any requested ordering. Plain volatile load/store on a 1-byte slot is
-// atomic on every supported MSVC target (ARM64 included; the architecture
-// guarantees aligned single-byte access atomicity).
-
 static inline bool boc_atomic_load_bool_explicit(boc_atomic_bool_t *p,
                                                  boc_memory_order_t order) {
 #if defined(_M_ARM64)
@@ -639,13 +538,8 @@ static inline bool boc_atomic_compare_exchange_strong_bool_explicit(
   return false;
 }
 
-// ---- ptr -------------------------------------------------------------------
-
 static inline void *boc_atomic_load_ptr_explicit(boc_atomic_ptr_t *p,
                                                  boc_memory_order_t order) {
-  // InterlockedCompareExchangePointerNoFence is the cleanest way to express
-  // a relaxed atomic pointer load, but a plain volatile read suffices on
-  // every supported target (pointer width matches the natural word size).
   (void)order;
   return (void *)*p;
 }
@@ -685,22 +579,12 @@ static inline bool boc_atomic_compare_exchange_strong_ptr_explicit(
   return false;
 }
 
-// Standalone memory fence. `MemoryBarrier()` is a full hardware
-// barrier on every supported MSVC target (x86, x64, ARM64) and
-// matches the strongest standalone fence we ever need from this
-// helper. Mapping every `BOC_MO_*` to a full barrier is correct
-// (over-strong is safe; under-strong is not) and keeps the
-// implementation a one-liner.
 static inline void boc_atomic_thread_fence_explicit(boc_memory_order_t o) {
   (void)o;
   MemoryBarrier();
 }
 
 #else // _WIN32
-
-// ---------------------------------------------------------------------------
-// POSIX (Apple + Linux): shared headers, thread_local, yield, intptr aliases
-// ---------------------------------------------------------------------------
 
 #include <errno.h>
 #include <sched.h>
@@ -710,11 +594,6 @@ static inline void boc_atomic_thread_fence_explicit(boc_memory_order_t o) {
 #define thread_local _Thread_local
 #define boc_yield() sched_yield()
 
-// On POSIX the C11 atomic_* macros dispatch on type via _Generic, so the
-// `atomic_load(&intptr_var)` form Just Works. The `_intptr` siblings are
-// aliased to the generic forms purely so the source reads the same on
-// every platform; on Windows they expand to dedicated InterlockedXxxPointer
-// shims (see polyfill block above).
 #define atomic_load_intptr(ptr) atomic_load(ptr)
 #define atomic_store_intptr(ptr, val) atomic_store((ptr), (val))
 #define atomic_exchange_intptr(ptr, val) atomic_exchange((ptr), (val))
@@ -722,10 +601,6 @@ static inline void boc_atomic_thread_fence_explicit(boc_memory_order_t o) {
   atomic_compare_exchange_strong((ptr), (expected), (desired))
 
 #ifdef __APPLE__
-
-// ---------------------------------------------------------------------------
-// Apple: pthread-based BOCMutex / BOCCond
-// ---------------------------------------------------------------------------
 
 #include <pthread.h>
 #define thrd_sleep nanosleep
@@ -758,9 +633,6 @@ static inline void cnd_wait(BOCCond *c, BOCMutex *m) {
 /// @param m The mutex (must be held by caller)
 /// @return true if signalled (or spurious wake), false if the timeout expired
 static inline bool cnd_timedwait_s(BOCCond *c, BOCMutex *m, double seconds) {
-  // Negated form catches NaN (every comparison with NaN is false),
-  // which a bare `seconds < 0` test does not. Defence in depth
-  // for the public boundary helper `boc_validate_finite_timeout`.
   if (!(seconds >= 0.0))
     seconds = 0.0;
   struct timespec ts;
@@ -778,10 +650,6 @@ static inline bool cnd_timedwait_s(BOCCond *c, BOCMutex *m, double seconds) {
 
 #else // __APPLE__
 
-// ---------------------------------------------------------------------------
-// Linux (and other non-Apple POSIX): C11 <threads.h>-based BOCMutex / BOCCond
-// ---------------------------------------------------------------------------
-
 #include <threads.h>
 
 typedef mtx_t BOCMutex;
@@ -794,9 +662,6 @@ static inline void boc_mtx_init(BOCMutex *m) { mtx_init(m, mtx_plain); }
 /// @param m The mutex (must be held by caller)
 /// @return true if signalled (or spurious wake), false if the timeout expired
 static inline bool cnd_timedwait_s(BOCCond *c, BOCMutex *m, double seconds) {
-  // Negated form catches NaN (every comparison with NaN is false),
-  // which a bare `seconds < 0` test does not. Defence in depth
-  // for the public boundary helper `boc_validate_finite_timeout`.
   if (!(seconds >= 0.0))
     seconds = 0.0;
   struct timespec ts;
@@ -813,13 +678,6 @@ static inline bool cnd_timedwait_s(BOCCond *c, BOCMutex *m, double seconds) {
 }
 
 #endif // __APPLE__
-
-// ---------------------------------------------------------------------------
-// POSIX: typed `boc_atomic_*_explicit` API on top of <stdatomic.h>
-// ---------------------------------------------------------------------------
-//
-// The compiler folds these wrappers away. Legacy `atomic_*` callers
-// are unaffected; the new API is purely additive.
 
 typedef _Atomic uint64_t boc_atomic_u64_t;
 typedef _Atomic uint32_t boc_atomic_u32_t;
@@ -866,8 +724,6 @@ BOC_ATOMIC_OPS_(u64, uint64_t, boc_atomic_u64_t)
 BOC_ATOMIC_OPS_(u32, uint32_t, boc_atomic_u32_t)
 BOC_ATOMIC_OPS_(bool, bool, boc_atomic_bool_t)
 
-// `ptr` carries `void *` payload but the underlying storage is
-// `_Atomic(void *)`; cast at the API edge to keep call sites clean.
 static inline void *boc_atomic_load_ptr_explicit(boc_atomic_ptr_t *p,
                                                  boc_memory_order_t o) {
   return atomic_load_explicit(p, boc_mo_to_std(o));
@@ -904,18 +760,11 @@ BOC_ATOMIC_FETCH_OPS_(u32, uint32_t, boc_atomic_u32_t)
 #undef BOC_ATOMIC_OPS_
 #undef BOC_ATOMIC_FETCH_OPS_
 
-// Standalone memory fence. POSIX delegates to `atomic_thread_fence`
-// from `<stdatomic.h>`; the helper exists so MSVC can express the
-// same operation via `MemoryBarrier()` without C11 atomics.
 static inline void boc_atomic_thread_fence_explicit(boc_memory_order_t o) {
   atomic_thread_fence(boc_mo_to_std(o));
 }
 
 #endif // _WIN32
-
-// ===========================================================================
-// Cross-platform monotonic time / sleep helpers
-// ===========================================================================
 
 /// @brief Returns the current time as double-precision seconds.
 /// @return the current time
@@ -969,51 +818,18 @@ uint64_t boc_now_ns(void);
 /// @param ns Nanoseconds to sleep. Zero is a no-op return.
 void boc_sleep_ns(uint64_t ns);
 
-// ===========================================================================
-// Cross-platform timeout-validation helper
-// ===========================================================================
-//
-// Public boundary helper for the @c terminator_wait / @c notice_sync_wait
-// entry points. Centralising the NaN/Inf/negative classification here
-// keeps the policy in one place: NaN is a programmer error and surfaces
-// as @c ValueError; +Inf is "wait forever"; negative is clamped to 0
-// (no-wait, returns immediately). Without this, NaN passed straight
-// to @c cnd_timedwait_s would compute @c DWORD ms via @c (DWORD)(NaN *
-// 1000.0) — undefined behaviour on Windows and a wedged-forever wait
-// on POSIX.
-//
-// Returns 0 on success (with @p *wait_forever set); -1 on failure with
-// a Python exception set.
-
 static inline int boc_validate_finite_timeout(double seconds,
                                               double *out_seconds,
                                               bool *out_wait_forever) {
-  // NaN: a comparison with NaN is always false, so `seconds == seconds`
-  // is the canonical portable NaN check (no math.h dependency).
   if (seconds != seconds) {
     PyErr_SetString(PyExc_ValueError, "timeout must not be NaN");
     return -1;
   }
-  // +Inf or any value that the cnd_timedwait clamp would treat as
-  // "wait forever" maps to wait_forever=true. Use a finite sentinel
-  // (DBL_MAX) rather than HUGE_VAL to keep the helper free of math.h
-  // — the operational meaning is identical.
-  //
-  // We clamp at 1e9 seconds (~31.7 years) rather than DBL_MAX so
-  // any caller-supplied value that would overflow `time_t` (signed
-  // 32-bit on some platforms: ~68 years) or the `DWORD` millisecond
-  // arg to Win32 `SleepConditionVariableSRW` (max ~49 days) also
-  // routes through the wait-forever path. Operationally a 31-year
-  // wait is indistinguishable from "wait forever" for any realistic
-  // bocpy caller, and the clamp is the only safe way to avoid
-  // platform-dependent overflow into a sub-second wait or UB.
   if (seconds > 1e9) {
     *out_seconds = 0.0;
     *out_wait_forever = true;
     return 0;
   }
-  // Negative: caller asked for "no wait". Clamp to 0 and return; the
-  // wait helpers will short-circuit with a timeout immediately.
   if (seconds < 0.0) {
     *out_seconds = 0.0;
     *out_wait_forever = false;

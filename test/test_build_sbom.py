@@ -24,10 +24,6 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 DIST = "bocpy"
 VERSION = "0.6.0"
 DIST_INFO = f"{DIST}-{VERSION}.dist-info"
@@ -87,11 +83,6 @@ def _read_record_rows(wheel_path: Path) -> list[tuple[str, str, str]]:
     return rows
 
 
-# ---------------------------------------------------------------------------
-# Pure-function tests
-# ---------------------------------------------------------------------------
-
-
 def test_build_sbom_document_minimal_shape():
     """A no-extras document carries the required CycloneDX fields."""
     doc = build_sbom.build_sbom_document(
@@ -116,9 +107,8 @@ def test_build_sbom_document_minimal_shape():
     assert root["purl"] == "pkg:pypi/bocpy@0.6.0"
     assert root["bom-ref"] == "pkg:pypi/bocpy@0.6.0"
     assert root["licenses"] == [{"license": {"id": "MIT"}}]
-    assert "properties" not in root  # no git sha, no wheel filename
+    assert "properties" not in root
 
-    # bocpy has zero third-party runtime deps.
     assert doc["components"] == []
     assert doc["dependencies"] == [
         {"ref": "pkg:pypi/bocpy@0.6.0", "dependsOn": []}
@@ -160,15 +150,7 @@ def test_build_sbom_document_serialises_to_stable_json():
     )
     serialised = json.dumps(doc, indent=2, sort_keys=True)
     reloaded = json.loads(serialised)
-    # ``serialNumber`` is deterministic for a fixed input set (see
-    # the determinism tests below); JSON round-trip should therefore
-    # be lossless for every field including the serial.
     assert doc == reloaded
-
-
-# ---------------------------------------------------------------------------
-# Wheel-injection round-trip
-# ---------------------------------------------------------------------------
 
 
 def test_inject_sbom_round_trip(tmp_path: Path) -> None:
@@ -197,21 +179,15 @@ def test_inject_sbom_round_trip(tmp_path: Path) -> None:
     with zipfile.ZipFile(wheel_path, "r") as wheel:
         names = wheel.namelist()
         assert sbom_arc in names
-        # Original payload entries are still present and untouched.
         assert f"{DIST}/__init__.py" in names
         assert f"{DIST}/_core.so" in names
         assert wheel.read(f"{DIST}/_core.so") == PROBE_PAYLOAD
-        # The injected SBOM is exactly the bytes we passed in.
         assert wheel.read(sbom_arc) == sbom_bytes
 
-    # RECORD covers every data entry (including the new SBOM) and has
-    # an empty row for itself.
     rows = _read_record_rows(wheel_path)
     paths = [r[0] for r in rows]
     assert sbom_arc in paths
-    # The very last row is the empty-hash entry for RECORD itself.
     assert rows[-1] == (f"{DIST_INFO}/RECORD", "", "")
-    # Verify every other row's hash matches the actual archive bytes.
     with zipfile.ZipFile(wheel_path, "r") as wheel:
         for path, hash_spec, size in rows[:-1]:
             data = wheel.read(path)
@@ -231,14 +207,11 @@ def test_inject_sbom_replaces_existing_sbom(tmp_path: Path) -> None:
     wheel_path = tmp_path / f"{DIST}-{VERSION}-cp314-cp314-linux_x86_64.whl"
     _build_probe_wheel(wheel_path)
 
-    # First injection.
     build_sbom.inject_sbom_into_wheel(wheel_path, b'{"first": true}\n')
-    # Second injection with different bytes.
     build_sbom.inject_sbom_into_wheel(wheel_path, b'{"second": true}\n')
 
     with zipfile.ZipFile(wheel_path, "r") as wheel:
         sbom_arc = f"{DIST_INFO}/sboms/bocpy.cdx.json"
-        # No duplicates.
         assert wheel.namelist().count(sbom_arc) == 1
         assert wheel.read(sbom_arc) == b'{"second": true}\n'
 
@@ -258,7 +231,6 @@ def test_inject_sbom_does_not_leave_tmp_on_failure(
     wheel_path = tmp_path / f"{DIST}-{VERSION}-cp314-cp314-linux_x86_64.whl"
     _build_probe_wheel(wheel_path)
 
-    # Force ``shutil.move`` to blow up after the new wheel is written.
     def _boom(src: str, dst: str) -> str:
         raise OSError("disk full")
 
@@ -271,11 +243,6 @@ def test_inject_sbom_does_not_leave_tmp_on_failure(
     assert leftover == [], f"tmp files leaked: {leftover}"
 
 
-# ---------------------------------------------------------------------------
-# pyproject.toml metadata smoke
-# ---------------------------------------------------------------------------
-
-
 def test_read_pyproject_metadata_round_trip() -> None:
     """The metadata reader returns the fields the SBOM generator needs."""
     meta = build_sbom._read_pyproject_metadata(REPO_ROOT)
@@ -285,11 +252,6 @@ def test_read_pyproject_metadata_round_trip() -> None:
     assert meta["license"] == "MIT"
     assert meta["homepage"].startswith("https://")
     assert meta["vcs"].startswith("https://")
-
-
-# ---------------------------------------------------------------------------
-# CLI ``inject`` mode
-# ---------------------------------------------------------------------------
 
 
 def test_cli_inject_copy_to_leaves_original_alone(tmp_path: Path) -> None:
@@ -316,10 +278,8 @@ def test_cli_inject_copy_to_leaves_original_alone(tmp_path: Path) -> None:
     )
     assert rc == 0
 
-    # Source wheel untouched.
     assert wheel_path.read_bytes() == original_bytes
 
-    # Destination wheel has the embedded SBOM under the PEP 770 path.
     copied = dest_dir / wheel_path.name
     assert copied.is_file()
     with zipfile.ZipFile(copied, "r") as wheel:
@@ -336,16 +296,6 @@ def test_cli_inject_copy_to_leaves_original_alone(tmp_path: Path) -> None:
     }
     assert props["cdx:python:git_commit"] == "0" * 40
     assert props["cdx:python:wheel_filename"] == wheel_path.name
-
-
-# ---------------------------------------------------------------------------
-# ``inject_sbom_into_wheel`` must preserve per-entry ZIP metadata
-# (``external_attr``, ``create_system``, ``compress_type``,
-# ``date_time``). ``auditwheel``/``delocate`` wheels rely on the upper
-# 16 bits of ``external_attr`` to mark symlinked SONAMEs; losing them
-# turns ``libfoo.so.1 -> libfoo.so.1.2.3`` into a regular file whose
-# contents are the link target's text.
-# ---------------------------------------------------------------------------
 
 
 def _build_attr_probe_wheel(path: Path) -> None:
@@ -365,17 +315,14 @@ def _build_attr_probe_wheel(path: Path) -> None:
 
     init_info = zipfile.ZipInfo(filename=f"{DIST}/__init__.py", date_time=pinned_dt)
     init_info.compress_type = zipfile.ZIP_DEFLATED
-    init_info.create_system = 3  # Unix
-    init_info.external_attr = (0o644 & 0xFFFF) << 16  # -rw-r--r--
+    init_info.create_system = 3
+    init_info.external_attr = (0o644 & 0xFFFF) << 16
 
     so_info = zipfile.ZipInfo(filename=f"{DIST}/_core.so", date_time=pinned_dt)
-    so_info.compress_type = zipfile.ZIP_STORED  # deliberately uncompressed
+    so_info.compress_type = zipfile.ZIP_STORED
     so_info.create_system = 3
-    so_info.external_attr = (0o755 & 0xFFFF) << 16  # -rwxr-xr-x
+    so_info.external_attr = (0o755 & 0xFFFF) << 16
 
-    # Symlink: external_attr upper 16 bits = stat mode with S_IFLNK set;
-    # payload bytes are the link target string. This is exactly the
-    # shape that auditwheel emits for vendored SONAMEs.
     link_info = zipfile.ZipInfo(
         filename=f"{DIST}/libprobe.so.1", date_time=pinned_dt
     )
@@ -434,8 +381,6 @@ def test_inject_sbom_preserves_per_entry_zip_attributes(tmp_path: Path) -> None:
     wheel_path = tmp_path / f"{DIST}-{VERSION}-cp314-cp314-manylinux_2_28_x86_64.whl"
     _build_attr_probe_wheel(wheel_path)
 
-    # Capture the source metadata BEFORE injection so we know what to
-    # check for afterward.
     with zipfile.ZipFile(wheel_path, "r") as src:
         before = {info.filename: info for info in src.infolist()}
 
@@ -444,59 +389,39 @@ def test_inject_sbom_preserves_per_entry_zip_attributes(tmp_path: Path) -> None:
     with zipfile.ZipFile(wheel_path, "r") as wheel:
         after = {info.filename: info for info in wheel.infolist()}
 
-    # Every original entry is still present.
     for arcname in before:
         assert arcname in after, f"entry {arcname!r} dropped by injector"
 
-    # 1. Symlink bit on libprobe.so.1 survives — the auditwheel
-    #    SONAME case.
     sym = after[f"{DIST}/libprobe.so.1"]
     sym_mode = (sym.external_attr >> 16) & 0xFFFF
     assert stat.S_ISLNK(sym_mode), (
         f"S_IFLNK lost on symlink entry: external_attr=0x{sym.external_attr:08x}, "
         f"high-bits mode=0o{sym_mode:o}"
     )
-    # Permission bits on the symlink also preserved.
     assert (sym_mode & 0o777) == 0o777
 
-    # 2. Executable bit on the .so survives, and the entry stays
-    #    ZIP_STORED — no silent re-DEFLATE.
     so = after[f"{DIST}/_core.so"]
     assert ((so.external_attr >> 16) & 0o777) == 0o755
     assert so.compress_type == zipfile.ZIP_STORED, (
         f"ZIP_STORED entry was recompressed: got {so.compress_type!r}"
     )
 
-    # 3. Regular module: mode bits, create_system, and date_time
-    #    all preserved.
     init = after[f"{DIST}/__init__.py"]
     init_src = before[f"{DIST}/__init__.py"]
     assert ((init.external_attr >> 16) & 0o777) == 0o644
     assert init.create_system == init_src.create_system == 3
     assert init.date_time == init_src.date_time == (2024, 1, 1, 12, 0, 0)
 
-    # 4. The injected SBOM landed and is reachable.
     sbom_arc = f"{DIST_INFO}/sboms/bocpy.cdx.json"
     assert sbom_arc in after
     with zipfile.ZipFile(wheel_path, "r") as wheel:
         assert wheel.read(sbom_arc) == b'{"v": 1}\n'
 
-    # 5. RECORD covers every entry and self-row is empty.
     rows = _read_record_rows(wheel_path)
     paths = [r[0] for r in rows]
     assert f"{DIST}/libprobe.so.1" in paths
     assert sbom_arc in paths
     assert rows[-1] == (f"{DIST_INFO}/RECORD", "", "")
-
-
-# ---------------------------------------------------------------------------
-# SBOMs must be deterministic for a fixed input set so wheel hashes
-# do not drift across rebuilds of the same source tree. `serialNumber`
-# is a UUIDv5 derived from
-# `<name>@<version>+<git_commit>+<wheel_filename>` under a stable
-# bocpy namespace; `metadata.timestamp` honours `SOURCE_DATE_EPOCH`
-# when set, per the freedesktop reproducible-build convention.
-# ---------------------------------------------------------------------------
 
 
 def _sbom_inputs() -> dict:
@@ -523,14 +448,11 @@ def test_build_sbom_document_is_byte_identical_for_same_inputs(
     source, drifting the wheel hash across rebuilds. The deterministic
     UUIDv5 serial + ``SOURCE_DATE_EPOCH`` path keep them byte-stable.
     """
-    # 2024-01-01T12:00:00Z (chosen to also exercise an even-minute,
-    # even-hour rounding so off-by-one errors are visible).
     monkeypatch.setenv("SOURCE_DATE_EPOCH", "1704110400")
 
     doc1 = build_sbom.build_sbom_document(**_sbom_inputs())
     doc2 = build_sbom.build_sbom_document(**_sbom_inputs())
 
-    # JSON-encode under the same settings the injection path uses.
     bytes1 = (json.dumps(doc1, indent=2, sort_keys=True) + "\n").encode()
     bytes2 = (json.dumps(doc2, indent=2, sort_keys=True) + "\n").encode()
     assert bytes1 == bytes2, (
@@ -540,17 +462,10 @@ def test_build_sbom_document_is_byte_identical_for_same_inputs(
         f"vs {doc2['metadata']['timestamp']!r}"
     )
 
-    # The pinned epoch round-trips through ``strftime`` exactly.
     assert doc1["metadata"]["timestamp"] == "2024-01-01T12:00:00Z"
 
-    # The serial number is UUIDv5 (version digit ``5`` and standard
-    # variant ``[89ab]``), which the validator pins.
     serial = doc1["serialNumber"]
     assert serial.startswith("urn:uuid:")
-    # The version digit lives at the start of the UUID's third group:
-    # "urn:uuid:XXXXXXXX-XXXX-VXXX-VXXX-XXXXXXXXXXXX"
-    #  012345678 90123456 7 8901 2 3
-    #                              ^ index 23
     assert serial[23] == "5", (
         f"expected UUIDv5 serial, got version digit {serial[23]!r} in {serial!r}"
     )
@@ -588,9 +503,6 @@ def test_build_sbom_document_falls_back_to_now_without_source_date_epoch(
     monkeypatch.delenv("SOURCE_DATE_EPOCH", raising=False)
     doc = build_sbom.build_sbom_document(**_sbom_inputs())
     ts = doc["metadata"]["timestamp"]
-    # ``YYYY-MM-DDTHH:MM:SSZ`` shape; the validator regex is the
-    # canonical reference but we duplicate the assertion here so a
-    # build_sbom-only regression fires close to the source.
     assert len(ts) == 20
     assert ts[4] == ts[7] == "-"
     assert ts[10] == "T"
@@ -623,13 +535,7 @@ def test_validate_sbom_accepts_deterministic_serial() -> None:
     import validate_sbom
 
     doc = build_sbom.build_sbom_document(**_sbom_inputs())
-    # Must not raise.
     validate_sbom.validate_sbom_document(doc)
-
-
-# ---------------------------------------------------------------------------
-# CLI ``generate`` mode — distinguisher guard
-# ---------------------------------------------------------------------------
 
 
 def test_cli_generate_requires_distinguisher_when_neither_provided(
@@ -731,11 +637,6 @@ def test_cli_generate_accepts_wheel_filename_alone(
     assert out_path.is_file()
 
 
-# ---------------------------------------------------------------------------
-# PyPI RECORD-mismatch regression (the 0.7.0 warning email bug)
-# ---------------------------------------------------------------------------
-
-
 def _build_probe_wheel_with_dir_entries(path: Path) -> None:
     """Build a probe wheel that includes explicit ZIP directory entries.
 
@@ -758,8 +659,6 @@ def _build_probe_wheel_with_dir_entries(path: Path) -> None:
 
     record_buf = io.StringIO()
     writer = csv.writer(record_buf, lineterminator="\n")
-    # Mimic the pre-fix injector exactly: emit a RECORD row for every
-    # ZIP entry, including the directories (empty hash, size 0).
     for arcname, data in file_entries:
         writer.writerow(_record_row(arcname, data))
     for arcname in dir_entries:
@@ -806,17 +705,13 @@ def test_inject_sbom_strips_directory_entries(tmp_path: Path) -> None:
     )
     _build_probe_wheel_with_dir_entries(wheel_path)
 
-    # Sanity check: the pre-injection wheel reproduces the 0.7.0
-    # failure (i.e. our regression fixture is faithful).
     with pytest.raises(InvalidWheelRecordError):
         validate_record(str(wheel_path))
 
     build_sbom.inject_sbom_into_wheel(wheel_path, b'{"v": 1}\n')
 
-    # 1. PyPI's validator now accepts the wheel.
     validate_record(str(wheel_path))
 
-    # 2. No directory entries leaked into the new ZIP or RECORD.
     with zipfile.ZipFile(wheel_path, "r") as wheel:
         for info in wheel.infolist():
             assert not info.is_dir(), (

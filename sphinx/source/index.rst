@@ -1,6 +1,8 @@
 bocpy documentation
 ===================
 
+.. py:currentmodule:: bocpy
+
 `bocpy <https://github.com/microsoft/bocpy>`_ is a Python library implementing
 **Behavior-Oriented Concurrency (BOC)**.  Programmers wrap shared data in
 **cowns** (concurrently-owned objects) and schedule **behaviors** with the

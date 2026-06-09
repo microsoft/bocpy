@@ -83,3 +83,22 @@ key knobs are summarised below.
 
 See [`scripts/bench_matrix.py`](../scripts/bench_matrix.py) for the
 matrix-arithmetic micro-bench used to guard `_math.c` performance.
+
+## [Fanout Benchmark](fanout_benchmark.py)
+`fanout_benchmark.py` measures the dispatch-rate ceiling for the *fanout*
+workload: a producer behavior that, on every step, allocates a batch of
+fresh consumer cowns it does not hold and dispatches one `@when` per
+consumer before rescheduling itself. Because the producer never holds the
+consumer cowns, every child dispatch exercises the producer-local arm of
+the scheduler, so the benchmark surfaces per-worker queue contention
+(`enqueue_cas_retries`) — complementing `benchmark.py`'s chain workload.
+
+- `--producers`, `--fanout-width`, `--producer-steps` — shape the workload
+  (number of producer cowns, consumers dispatched per step, and steps per
+  producer).
+- `--payload-rows` / `--payload-cols` — size of each consumer's `Matrix`.
+- `--sweep-axis` / `--sweep-values` — sweep one knob across a list of values
+  in a single run.
+- `--repeats`, `--output`, `--quiet`, `--json-stdout` — repeat-count,
+  results-file path, and reporting toggles for batch runs.
+

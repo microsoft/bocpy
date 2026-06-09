@@ -19,9 +19,11 @@ Three test classes cover three use shapes:
   ``max_behaviors``, ``raise_on_error``, BaseException propagation,
   and reentry rejection.
 
-All tests follow the standard ``send("assert", ...)`` / ``receive``
-/ trailing-``wait()`` idiom documented in
-``.github/skills/testing-with-boc/SKILL.md``.
+Tests read results back through ``quiesce()`` + :meth:`Cown.unwrap`
+(behaviors return the value under test); worker-scheduled pinned
+``@when`` chains are double-unwrapped. The handful of cross-interpreter
+handoffs that genuinely need the message queue (the round-trip
+producer/consumer split) keep ``send`` / ``receive``.
 """
 
 from __future__ import annotations
@@ -35,27 +37,22 @@ import pytest
 from bocpy import (
     _core,
     Cown,
-    drain,
-    notice_sync,
     notice_update,
     notice_write,
     noticeboard,
     PinnedCown,
     pump,
     quiesce,
-    receive,
-    send,
     set_pump_watchdog,
     set_wait_pump_poll,
     start,
-    TIMEOUT,
     wait,
     when,
 )
 from bocpy import behaviors as _behaviors
 
 
-RECEIVE_TIMEOUT = 10
+QUIESCE_TIMEOUT = 10
 
 
 def _replace_with(new_value, _old):
@@ -82,36 +79,6 @@ class _NotPicklable:
         return "<NotPicklable sentinel>"
 
 
-def receive_asserts(count=1):
-    """Drain all expected assertion messages, then fail on first mismatch.
-
-    The "assert" queue is always drained before returning so that leftover
-    messages from a failing test do not leak into subsequent tests in CI.
-    """
-    failed = None
-    timed_out = False
-    try:
-        for _ in range(count):
-            result = receive("assert", RECEIVE_TIMEOUT)
-            if result[0] == TIMEOUT:
-                timed_out = True
-                break
-            _, (actual, expected) = result
-            if failed is None and actual != expected:
-                failed = (actual, expected)
-    finally:
-        drain("assert")
-
-    assert not timed_out, (
-        "Timed out waiting for an 'assert' message from a behavior. "
-        "Check that every @when arg count matches the decorated "
-        "function's parameter count."
-    )
-    if failed is not None:
-        actual, expected = failed
-        assert actual == expected, f"expected {expected!r}, got {actual!r}"
-
-
 class TestPinnedCownBasics:
     """PinnedCown construction invariants (no schedule, no pump)."""
 
@@ -132,15 +99,16 @@ class TestPinnedCownBasics:
         obj_id = id(obj)
         pc = PinnedCown(obj)
 
+        readers = []
         for _ in range(64):
             @when(pc)
             def _body(pc):
-                send("assert", (id(pc.value), obj_id))
+                return id(pc.value)
+            readers.append(_body)
 
-        # quiesce() so worker sub-interpreters survive until
-        # receive_asserts reads their messages.
-        quiesce()
-        receive_asserts(64)
+        quiesce(QUIESCE_TIMEOUT)
+        for r in readers:
+            assert r.unwrap() == obj_id
 
     def test_pinned_destruct_after_construction_only(self):
         """Drop a pinned cown immediately after construction.
@@ -158,30 +126,18 @@ class TestPinnedCownBasics:
     def test_pinned_cown_off_main_raises(self):
         """``PinnedCown(...)`` from a worker raises ``RuntimeError``.
 
-        The except-clause cannot bind the exception to a name -- the
-        transpiler's free-variable scan treats ``ExceptHandler.name``
-        as a capture and frame-walking cannot resolve it. Capture
-        the type name and a substring of the message into plain
-        locals inside the except block and ship them through the
-        standard ``"assert"`` tag.
+        The behavior runs on a worker (no pinned cown in its request
+        set), constructs a ``PinnedCown`` off-main, and the resulting
+        ``RuntimeError`` is captured on the result cown. ``unwrap``
+        re-raises it on the main thread.
         """
         @when()
-        def _():
-            exc_type_name = "no-raise"
-            msg_mentions_main = False
-            try:
-                PinnedCown(object())
-            except RuntimeError as ex:
-                exc_type_name = "RuntimeError"
-                msg_mentions_main = "main interpreter" in str(ex)
+        def _probe():
+            PinnedCown(object())
 
-            send("assert", (
-                (exc_type_name, msg_mentions_main),
-                ("RuntimeError", True),
-            ))
-
-        quiesce()
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        with pytest.raises(RuntimeError, match="main interpreter"):
+            _probe.unwrap()
 
 
 class TestPinnedCownsAutoDrain:
@@ -191,18 +147,17 @@ class TestPinnedCownsAutoDrain:
     def teardown_class(cls):
         wait()
 
-    # wait() with pinned cowns auto-drains.
     def test_wait_auto_drains_pinned(self):
-        """A pinned behavior scheduled before wait() runs on main without pump()."""
+        """A pinned behavior scheduled before quiesce() runs on main without pump()."""
         pc = PinnedCown({"hits": 0})
 
         @when(pc)
         def _body(pc):
             pc.value["hits"] += 1
-            send("assert", ("ran", "ran"))
+            return pc.value["hits"]
 
-        wait()
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert _body.unwrap() == 1
 
     def test_wait_pinned_cown_in_cown(self):
         pc = PinnedCown({"hits": 0})
@@ -213,18 +168,15 @@ class TestPinnedCownsAutoDrain:
             @when(w.value)
             def _body(pc):
                 pc.value["hits"] += 1
-                send("assert", ("ran", "ran"))
+                return pc.value["hits"]
+            return _body
 
-        wait()
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert _wrapper.unwrap().unwrap() == 1
 
     def test_main_pump_drain_all_marks_result_cowns(self):
         """``_core.main_pump_drain_all`` pops every entry and marks each result Cown with a shutdown RuntimeError."""
-        # 8 distinct cowns: same-cown behaviours serialise via MCS and only the head sits in MAIN_PINNED_QUEUE.
         pcs = [PinnedCown(0) for _ in range(8)]
-        # Capture each @when's result Cown (the value returned by the
-        # decorator) so we can inspect its exception/value after the
-        # drain runs.
         results = []
         for pc in pcs:
             @when(pc)
@@ -232,7 +184,6 @@ class TestPinnedCownsAutoDrain:
                 pc.value += 1
             results.append(_body)
 
-        # Precondition: all 8 still queued (no pump has run yet).
         assert _core.main_pump_queue_depth() == 8
 
         drained = _core.main_pump_drain_all()
@@ -242,7 +193,6 @@ class TestPinnedCownsAutoDrain:
         )
         assert _core.main_pump_queue_depth() == 0
 
-        # Re-acquire each result via the Cown context manager; *every* one must carry the drop-exception.
         for result in results:
             with result:
                 assert result.exception is True, (
@@ -258,52 +208,40 @@ class TestPinnedCownsAutoDrain:
                     f"shutdown: {result.value!r}"
                 )
 
-    # stop() with pending pinned work: drain runs.
     def test_stop_drains_pinned_queue(self):
         """An explicit stop() should leave MAIN_PINNED_QUEUE empty.
 
         Also verifies the transpiler's per-iteration capture of ``i``:
-        a final pinned behaviour reads ``pc.value`` and ships the
-        tuple back via ``send("final", ...)``. A regression that
-        late-bound ``i`` at body-execution time would yield ``(3, 3,
-        3, 3)`` instead of ``(0, 1, 2, 3)``.
+        a final pinned behaviour reads ``pc.value`` and writes the
+        tuple to the noticeboard. A regression that late-bound ``i``
+        at body-execution time would yield ``(3, 3, 3, 3)`` instead of
+        ``(0, 1, 2, 3)``.
         """
         pc = PinnedCown([])
         for i in range(4):
             @when(pc)
             def _body(pc):
                 pc.value.append(i)  # noqa: B023
-                send("assert", ("ran", "ran"))
 
         @when(pc)
         def _final(pc):
-            send("final", tuple(pc.value))
+            notice_write("pinned_final", tuple(pc.value))
 
-        wait()
-        receive_asserts(4)
-        final_tag, final_payload = receive("final", RECEIVE_TIMEOUT)
-        try:
-            assert final_tag != TIMEOUT, (
-                "timed out waiting for the final pinned behaviour"
-            )
-            assert final_payload == (0, 1, 2, 3), (
-                f"per-iteration capture of i broke: expected "
-                f"(0, 1, 2, 3), got {final_payload!r}"
-            )
-        finally:
-            drain("final")
+        snap = wait(noticeboard=True)
+        assert snap["pinned_final"] == (0, 1, 2, 3), (
+            f"per-iteration capture of i broke: expected "
+            f"(0, 1, 2, 3), got {snap['pinned_final']!r}"
+        )
         assert _core.main_pump_queue_depth() == 0
 
-    # shutdown_no_disown: refcount of pinned value preserved.
     def test_shutdown_does_not_disown_pinned_value(self):
         """The Python value inside a PinnedCown must outlive stop().
 
-        Schedule a pinned behaviour that records ``sys.getrefcount`` of the
-        underlying value before and after the body runs; after ``wait()``
-        completes, the value should still be reachable (no disown / no
-        XIData round-trip). The test reads the value via a fresh
-        PinnedCown handle inside a follow-up behaviour rather than from
-        test code so we don't reach across the shutdown boundary.
+        Schedule a pinned behaviour that reads the underlying value's
+        identity and contents; after ``quiesce()`` completes, the value
+        should still be reachable (no disown / no XIData round-trip).
+        The body runs on main via the pump, so ``id(pc.value)`` is
+        directly comparable to the value captured at construction.
         """
         v = ["sentinel"]
         pc = PinnedCown(v)
@@ -311,13 +249,14 @@ class TestPinnedCownsAutoDrain:
 
         @when(pc)
         def _body(pc):
-            # Value identity preserved across acquire/release.
-            send("assert", (id(pc.value), v_id))
+            id_matches = id(pc.value) == v_id
             pc.value.append("post-acquire")
-            send("assert", (pc.value, ["sentinel", "post-acquire"]))
+            return (id_matches, list(pc.value))
 
-        wait()
-        receive_asserts(2)
+        quiesce(QUIESCE_TIMEOUT)
+        id_matches, contents = _body.unwrap()
+        assert id_matches is True
+        assert contents == ["sentinel", "post-acquire"]
 
 
 class TestPinnedCownsManualPump:
@@ -340,7 +279,7 @@ class TestPinnedCownsManualPump:
         for pc in pcs:
             @when(pc)
             def _body(pc):
-                send("assert", ("ran", "ran"))
+                pass
 
         assert _core.main_pump_queue_depth() == 10
 
@@ -354,8 +293,6 @@ class TestPinnedCownsManualPump:
         assert rest.executed == 7
         assert _core.main_pump_queue_depth() == 0
 
-        receive_asserts(10)
-
     def test_pump_deadline_caps_drain(self):
         """``deadline_ms`` may trip before the queue drains.
 
@@ -368,7 +305,7 @@ class TestPinnedCownsManualPump:
         for pc in pcs:
             @when(pc)
             def _body(pc):
-                send("assert", ("ran", "ran"))
+                pass
 
         result = pump(deadline_ms=1)
         assert result.raised == 0
@@ -382,7 +319,6 @@ class TestPinnedCownsManualPump:
             assert result.executed == 50
 
         assert _core.main_pump_queue_depth() == 0
-        receive_asserts(50)
 
     def test_pump_raise_on_error_re_raises(self):
         """``raise_on_error`` re-raises the first body Exception.
@@ -412,7 +348,7 @@ class TestPinnedCownsManualPump:
 
         After the first body's :class:`KeyboardInterrupt` re-raises,
         the second behavior is still queued; a follow-up unbounded
-        pump drains it and surfaces its ``send``.
+        pump drains it.
         """
         pc1 = PinnedCown("payload1")
         pc2 = PinnedCown("payload2")
@@ -423,7 +359,7 @@ class TestPinnedCownsManualPump:
 
         @when(pc2)
         def _body2(pc):
-            send("assert", ("survivor-ran", "survivor-ran"))
+            pass
 
         assert _core.main_pump_queue_depth() == 2
 
@@ -434,36 +370,28 @@ class TestPinnedCownsManualPump:
 
         rest = pump()
         assert rest.executed == 1
-        receive_asserts(1)
 
     def test_pump_rejects_nested_call(self):
         """``pump()`` from inside a pinned body raises ``RuntimeError``.
 
-        The body wraps the inner ``pump()`` in a try/except and ships
-        the captured type name + message-substring through the
-        standard ``"assert"`` tag, so the outer pump observes
+        The body wraps the inner ``pump()`` in a try/except and returns
+        whether the re-entrancy guard fired, so the outer pump observes
         ``raised == 0``.
         """
         pc = PinnedCown("nest")
 
         @when(pc)
         def _attempt(pc):
-            exc_type_name = "no-raise"
-            msg_says_reentrant = False
             try:
                 pump()
+                return False
             except RuntimeError as ex:
-                exc_type_name = "RuntimeError"
-                msg_says_reentrant = "not reentrant" in str(ex)
-            send("assert", (
-                (exc_type_name, msg_says_reentrant),
-                ("RuntimeError", True),
-            ))
+                return "not reentrant" in str(ex)
 
         result = pump()
         assert result.executed == 1
         assert result.raised == 0
-        receive_asserts()
+        assert _attempt.unwrap() is True
 
 
 class TestPumpArgValidation:
@@ -481,7 +409,6 @@ class TestPumpArgValidation:
     def teardown_class(cls):
         wait()
 
-    # Type rejection (incl. 0).
     @pytest.mark.parametrize("bad", [0, -1, -1000, 1.5, "1", True, False])
     def test_pump_deadline_ms_rejects_bad_input(self, bad):
         """Non-None / non-int / non-positive / bool ``deadline_ms`` raises."""
@@ -494,9 +421,6 @@ class TestPumpArgValidation:
         with pytest.raises(TypeError, match="max_behaviors"):
             pump(max_behaviors=bad)
 
-    # The overflow cap is gated on the explicit ``ms=True``
-    # kwarg, not a name-string heuristic. A non-ms bound named
-    # ``max_behaviors`` must NOT trip the cap even at huge values.
     def test_validator_non_ms_bound_not_capped(self):
         """A non-ms bound passes through the validator without OverflowError."""
         huge = _behaviors._MAX_PUMP_MS * 1000 + 1
@@ -527,8 +451,6 @@ class TestPumpRuntimeRequired:
 
     def test_pump_before_start_raises_runtimeerror(self):
         """Without a live ``BEHAVIORS``, :func:`pump` raises immediately."""
-        # Ensure the runtime is fully torn down: a prior test in the
-        # session may have left BEHAVIORS populated.
         assert _behaviors.BEHAVIORS is None, (
             "expected runtime to be stopped before this test; previous "
             "test did not call wait() in teardown"
@@ -536,18 +458,15 @@ class TestPumpRuntimeRequired:
 
         with pytest.raises(RuntimeError, match="bocpy.start"):
             pump()
-        # Stillborn pump must not start the runtime as a side effect.
         assert _behaviors.BEHAVIORS is None
 
 
-# set_wait_pump_poll picked up mid-wait.
 def test_set_wait_pump_poll_re_read():
     """``_WAIT_PUMP_POLL_MS`` is re-read on every auto-pump iteration."""
     set_wait_pump_poll(50)
     assert _behaviors._WAIT_PUMP_POLL_MS == 50
     set_wait_pump_poll(5)
     assert _behaviors._WAIT_PUMP_POLL_MS == 5
-    # restore default
     set_wait_pump_poll(50)
 
 
@@ -562,8 +481,6 @@ def test_set_wait_pump_poll_validation():
     with pytest.raises(TypeError):
         set_wait_pump_poll(True)
 
-# Sanity: the new C constants exist with the expected integer values.
-
 
 def test_terminator_wake_reason_constants():
     assert _core.TERMINATED == 0
@@ -571,14 +488,11 @@ def test_terminator_wake_reason_constants():
     assert _core.WAIT_TIMED_OUT == 2
 
 
-# Sanity: terminator_wait_pumpable returns TERMINATED when no work is in flight.
 def test_terminator_wait_pumpable_terminated_when_empty():
-    # No outstanding behaviours: count must be 0 -> TERMINATED.
     reason = _core.terminator_wait_pumpable(0.01)
     assert reason == _core.TERMINATED
 
 
-# Sanity: main_pump_drain_all on an empty queue returns 0 and is a no-op.
 def test_main_pump_drain_all_empty():
     assert _core.main_pump_drain_all() == 0
     assert _core.main_pump_queue_depth() == 0
@@ -608,95 +522,99 @@ class TestPinnedRoundTrip:
 
         @when(unrelated)
         def _ship(u):
-            send("assert", (_core.cown_is_pinned(pc.impl), True))
-
             @when(pc)
             def _on_main(pc):
                 pc.value.append("main-ran")
-                send("assert", (pc.value, ["main-ran"]))
+                return pc.value
+            return (_core.cown_is_pinned(pc.impl), _on_main)
 
-        quiesce()
-        receive_asserts(2)
+        quiesce(QUIESCE_TIMEOUT)
+        is_pinned, on_main = _ship.unwrap()
+        assert is_pinned is True
+        assert on_main.unwrap() == ["main-ran"]
 
     def test_pinned_via_noticeboard_write(self):
         """``notice_write("k", PinnedCown(x))`` round-trips to a worker reader."""
         start()
         pc = PinnedCown([])
         notice_write("t5_pc", pc)
-        notice_sync()
+        quiesce(QUIESCE_TIMEOUT, noticeboard=True)
 
         unrelated = Cown(0)
 
         @when(unrelated)
         def _reader(u):
             h = noticeboard()["t5_pc"]
-            send("assert", (_core.cown_is_pinned(h.impl), True))
 
             @when(h)
             def _on_main(h):
                 h.value.append("via-noticeboard")
-                send("assert", (h.value, ["via-noticeboard"]))
+                return h.value
+            return (_core.cown_is_pinned(h.impl), _on_main)
 
-        wait()
-        receive_asserts(2)
+        quiesce(QUIESCE_TIMEOUT)
+        is_pinned, on_main = _reader.unwrap()
+        assert is_pinned is True
+        assert on_main.unwrap() == ["via-noticeboard"]
 
     def test_pinned_list_via_noticeboard(self):
         """A worker pulls handles out of a list payload and chains pinned @whens."""
         start()
         pcs = [PinnedCown([]), PinnedCown([])]
         notice_write("t6_pcs", pcs)
-        notice_sync()
+        quiesce(QUIESCE_TIMEOUT, noticeboard=True)
 
         unrelated = Cown(0)
 
         @when(unrelated)
         def _reader(u):
             handles = noticeboard()["t6_pcs"]
-            send("assert", (len(handles), 2))
+            pins = []
+            bodies = []
             for i, h in enumerate(handles):
-                send("assert", (_core.cown_is_pinned(h.impl), True))
+                pins.append(_core.cown_is_pinned(h.impl))
 
                 @when(h)
                 def _on_main(h, i=i):
                     h.value.append(("chain", i))
-                    send("assert", (h.value, [("chain", i)]))
+                    return h.value
+                bodies.append(_on_main)
+            return (len(handles), pins, bodies)
 
-        wait()
-        # 1 length assert + 2 is_pinned asserts + 2 body asserts.
-        receive_asserts(5)
+        quiesce(QUIESCE_TIMEOUT)
+        n, pins, bodies = _reader.unwrap()
+        assert n == 2
+        assert pins == [True, True]
+        assert bodies[0].unwrap() == [("chain", 0)]
+        assert bodies[1].unwrap() == [("chain", 1)]
 
     def test_pinned_nested_in_regular_cown_value(self):
         """``Cown({"pc": PinnedCown(x), ...})`` -- worker extracts the inner handle."""
         pc = PinnedCown([])
         outer = Cown({"pc": pc, "tag": "wrap"})
-        # Pass the expected literal in as a closure capture: the
-        # transpiler ships it via the captures tuple so the string
-        # arrives in the worker with its own ownership, sidestepping a
-        # 3.13 debug-build interned-string teardown bug that bites
-        # comparisons against literals round-tripped through
-        # ``o.value[...]``.
-        expected_tag = "wrap"
 
         @when(outer)
         def _worker(o):
             inner = o.value["pc"]
-            send("assert", (_core.cown_is_pinned(inner.impl), True))
-            send("assert", (o.value["tag"], expected_tag))
 
             @when(inner)
             def _on_main(inner):
                 inner.value.append("from-nested")
-                send("assert", (inner.value, ["from-nested"]))
+                return inner.value
+            return (_core.cown_is_pinned(inner.impl), o.value["tag"], _on_main)
 
-        quiesce()
-        receive_asserts(3)
+        quiesce(QUIESCE_TIMEOUT)
+        is_pinned, tag, on_main = _worker.unwrap()
+        assert is_pinned is True
+        assert tag == "wrap"
+        assert on_main.unwrap() == ["from-nested"]
 
     def test_two_workers_share_pinned_handle_via_noticeboard(self):
         """Two workers each read the same pinned handle; both pinned bodies run on main."""
         start()
         pc = PinnedCown([])
         notice_write("t16_pc", pc)
-        notice_sync()
+        quiesce(QUIESCE_TIMEOUT, noticeboard=True)
 
         u1 = Cown(0)
         u2 = Cown(0)
@@ -704,56 +622,57 @@ class TestPinnedRoundTrip:
         @when(u1)
         def _w1(u):
             h = noticeboard()["t16_pc"]
-            send("assert", (_core.cown_is_pinned(h.impl), True))
 
             @when(h)
             def _body(h):
                 h.value.append("w1")
-                send("assert", (h.value[-1], "w1"))
+                return h.value[-1]
+            return (_core.cown_is_pinned(h.impl), _body)
 
         @when(u2)
         def _w2(u):
             h = noticeboard()["t16_pc"]
-            send("assert", (_core.cown_is_pinned(h.impl), True))
 
             @when(h)
             def _body(h):
                 h.value.append("w2")
-                send("assert", (h.value[-1], "w2"))
+                return h.value[-1]
+            return (_core.cown_is_pinned(h.impl), _body)
 
-        wait()
-        # 2 is_pinned asserts + 2 body asserts.
-        receive_asserts(4)
+        quiesce(QUIESCE_TIMEOUT)
+        p1, b1 = _w1.unwrap()
+        p2, b2 = _w2.unwrap()
+        assert p1 is True and p2 is True
+        assert b1.unwrap() == "w1"
+        assert b2.unwrap() == "w2"
 
-        # Both workers mutated the *same* pinned value -- strong evidence
-        # that both handles resolved to the same underlying capsule.
         sentinel = PinnedCown(None)
 
         @when(sentinel)
         def _inspect(_s):
-            content = sorted(pc.value)
-            send("assert", (content, ["w1", "w2"]))
+            return sorted(pc.value)
 
-        wait()
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert _inspect.unwrap() == ["w1", "w2"]
 
     def test_pinned_via_notice_update(self):
         """``notice_update`` with a pinned producer; readers see the pinned handle."""
         start()
         pc = PinnedCown([])
         notice_update("t16b_pc", partial(_replace_with, pc), default=None)
-        notice_sync()
+        quiesce(QUIESCE_TIMEOUT, noticeboard=True)
 
         unrelated = Cown(0)
 
         @when(unrelated)
         def _reader(u):
             h = noticeboard()["t16b_pc"]
-            send("assert", (h is not None, True))
-            send("assert", (_core.cown_is_pinned(h.impl), True))
+            return (h is not None, _core.cown_is_pinned(h.impl))
 
-        wait()
-        receive_asserts(2)
+        quiesce(QUIESCE_TIMEOUT)
+        not_none, is_pinned = _reader.unwrap()
+        assert not_none is True
+        assert is_pinned is True
 
     def test_body_raise_drains_queue(self):
         """A raising pinned body marks its result cown and the queue still drains."""
@@ -765,18 +684,15 @@ class TestPinnedRoundTrip:
             raise RuntimeError("planned-failure")
 
         @when(pc_ok)
-        def _survivor(pc):
-            send("assert", ("survived", "survived"))
+        def survivor(pc):
+            return "survived"
 
-        @when(raiser)
-        def _inspect(r):
-            send("assert", (r.exception, True))
-
-        quiesce()
-        receive_asserts(2)
+        quiesce(QUIESCE_TIMEOUT)
+        with pytest.raises(RuntimeError, match="planned-failure"):
+            raiser.unwrap()
+        assert survivor.unwrap() == "survived"
         assert _core.main_pump_queue_depth() == 0
 
-    # Mixed pinned/unpinned routing.
     @pytest.mark.parametrize("kind,expected_on_main", [
         (("p", "p"), True),
         (("p", "u"), True),
@@ -794,17 +710,17 @@ class TestPinnedRoundTrip:
             a, b = cowns
 
             @when(a, b)
-            def _body(a, b, expected_on_main=expected_on_main):
-                send("assert", (_core.is_primary(), expected_on_main))
+            def _body(a, b):
+                return _core.is_primary()
         else:
             a, b, c = cowns
 
             @when(a, b, c)
-            def _body(a, b, c, expected_on_main=expected_on_main):
-                send("assert", (_core.is_primary(), expected_on_main))
+            def _body(a, b, c):
+                return _core.is_primary()
 
-        quiesce()
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert _body.unwrap() is expected_on_main
 
 
 class TestPinnedWatchdog:
@@ -821,11 +737,8 @@ class TestPinnedWatchdog:
         wait()
 
     def teardown_method(self, method):
-        # Reset watchdog state so a leaked threshold cannot poison the
-        # next test. ``None`` disables the sampler.
         set_pump_watchdog(warn_ms=None, on_starve=None)
 
-    # Warn fires after starvation threshold.
     def test_warn_only_fires_on_starvation(self):
         """``warn_ms`` invokes on_starve once after the threshold elapses."""
         warns = []
@@ -839,19 +752,14 @@ class TestPinnedWatchdog:
 
         @when(pc)
         def _body(pc):
-            send("assert", ("ran", "ran"))
+            pass
 
-        # Let the queue sit non-empty past warn_ms before the pump runs.
         time.sleep(0.15)
-        # auto-pump drains the body; check_warn samples at pump entry
-        # and sees age > 50ms.
-        quiesce()
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
 
         assert any(s == 0 for s, _ in warns), (
             f"expected warn (severity 0) in {warns!r}")
 
-    # Unpinned-only window leaves warn untripped.
     def test_unpinned_only_window_does_not_trip_watchdog(self):
         """Watchdog gates on pinned-queue age, not on total work time."""
         warns = []
@@ -865,28 +773,19 @@ class TestPinnedWatchdog:
         for _ in range(8):
             @when(c)
             def _busy(c):
-                # Per-behaviour sleep adds up to ~160 ms total worker
-                # time, well past warn_ms. The pinned queue remains
-                # empty throughout, so NONEMPTY_SINCE_NS stays 0.
                 time.sleep(0.02)
-                send("assert", ("ran", "ran"))
         quiesce()
-        receive_asserts(8)
         assert warns == [], (
             f"warn must not fire across unpinned-only window, got {warns!r}")
 
-        # Now schedule a pinned @when. The pinned queue was empty
-        # across the unpinned window, so age = 0 < warn_ms.
         pc = PinnedCown(0)
 
         @when(pc)
         def _body(pc):
-            send("assert", ("pinned-ok", "pinned-ok"))
+            pass
 
-        quiesce()
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
 
-    # Reconfigure-after-first-pinned.
     def test_reconfigure_after_first_pinned(self):
         """``set_pump_watchdog`` succeeds after live pinned work exists.
 
@@ -900,9 +799,8 @@ class TestPinnedWatchdog:
 
         @when(pc)
         def _body(pc):
-            send("assert", ("ran", "ran"))
+            pass
 
-        # Reconfigure mid-flight; must not raise.
         warns = []
 
         def on_starve(severity, message):
@@ -910,10 +808,7 @@ class TestPinnedWatchdog:
 
         set_pump_watchdog(warn_ms=200, on_starve=on_starve)
 
-        quiesce()
-        receive_asserts()
-        # The replaced callback may or may not have fired depending on
-        # exact timing; either way no exception escapes quiesce().
+        quiesce(QUIESCE_TIMEOUT)
 
 
 class TestPumpWatchdogOverflow:
@@ -934,7 +829,6 @@ class TestPumpWatchdogOverflow:
         too_big = _behaviors._MAX_PUMP_MS + 1
         with pytest.raises(OverflowError, match="warn_ms"):
             set_pump_watchdog(warn_ms=too_big)
-        # Restore defaults so we don't leak watchdog state into later tests.
         set_pump_watchdog(warn_ms=1000, on_starve=None)
 
 
@@ -994,11 +888,8 @@ class TestDrainErrorsSurviveBaseException:
         with pytest.raises(KeyboardInterrupt) as ei:
             b._drain_orphan_behaviors()
 
-        # Both failures survive: the ValueError that was already in
-        # the local list, and the KI that triggered the re-raise.
         assert len(b._stop_drain_errors) == 2
         assert isinstance(b._stop_drain_errors[0], ValueError)
         assert isinstance(b._stop_drain_errors[1], KeyboardInterrupt)
-        # The re-raised KI carries a note pointing at the stashed list.
         notes = getattr(ei.value, "__notes__", []) or []
         assert any("2 release_all error" in n for n in notes), notes

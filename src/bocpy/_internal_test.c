@@ -64,7 +64,7 @@ static struct PyModuleDef moduledef = {
     .m_doc = "Test harness for bocpy internal C primitives "
              "(typed atomics, MPMC queue, ...).",
     .m_size = 0,
-    .m_methods = NULL, // methods are added by registrars in exec slot
+    .m_methods = NULL,
     .m_slots = _internal_test_slots,
 };
 

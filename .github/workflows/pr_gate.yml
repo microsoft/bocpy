@@ -243,6 +243,10 @@ jobs:
         with:
           python-version: ${{ matrix.python_version }}
           architecture: x86
+          # 32-bit CPython is not pre-installed in the Windows 2025
+          # toolcache, so resolve against the downloadable manifest
+          # (which ships win32 builds) instead of a local cache hit.
+          check-latest: "true"
 
       - name: Python test
         run: pytest -vv -s

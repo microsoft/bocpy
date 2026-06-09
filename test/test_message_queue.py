@@ -1,19 +1,8 @@
-"""Tests for the underlying message queue system.
+"""Tests for the low-level message queue.
 
-Exercises the low-level queue mechanics: automatic tag-to-queue assignment,
-FIFO ordering, selective receive, capacity limits, set_tags management,
-high-volume throughput, concurrent producers/consumers, error handling,
-and queue reset behavior.
-
-The message queue supports two modes:
-- **Automatic assignment**: tags are assigned to queues on first use, up to the
-  hard limit of ``MAX_QUEUES`` (16).
-- **Explicit assignment via set_tags()**: pre-assigns tags to queues, clears all
-  pending messages, and resets queue state.
-
-Both modes are tested here.  Tests that do *not* need set_tags rely purely on
-the auto-assignment path and use a ``set_tags([])`` call only in the fixture to
-ensure a clean slate.
+Covers tag-to-queue assignment (automatic and explicit via set_tags),
+FIFO ordering, selective receive, capacity limits, throughput, and
+concurrent producers/consumers.
 """
 
 import random
@@ -24,18 +13,8 @@ import pytest
 
 from bocpy import drain, receive, send, set_tags, TIMEOUT
 
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-# Maximum number of dedicated queues supported by the C layer (BOC_QUEUE_COUNT).
 MAX_QUEUES = 16
 
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
 
 @pytest.fixture(autouse=True)
 def reset_queues():
@@ -48,11 +27,6 @@ def reset_queues():
     set_tags([])
     yield
     set_tags([])
-
-
-# ===================================================================
-# Auto-assignment: tags acquire queues on first send/receive
-# ===================================================================
 
 
 class TestAutoAssignment:
@@ -88,7 +62,7 @@ class TestAutoAssignment:
         """Auto-assigning more than MAX_QUEUES tags raises KeyError."""
         tags = [f"aover{i}" for i in range(MAX_QUEUES)]
         for t in tags:
-            send(t, "fill")  # fills all 16 slots
+            send(t, "fill")
         with pytest.raises(KeyError, match="tag capacity exceeded"):
             send("one_too_many", "boom")
 
@@ -100,11 +74,6 @@ class TestAutoAssignment:
         _, v2 = receive("reuse_auto", 1)
         assert v1 == 1
         assert v2 == 2
-
-
-# ===================================================================
-# FIFO ordering within a single queue
-# ===================================================================
 
 
 class TestFIFO:
@@ -128,11 +97,6 @@ class TestFIFO:
             assert val == i
 
 
-# ===================================================================
-# Selective receive (tag filtering)
-# ===================================================================
-
-
 class TestSelectiveReceive:
     """Receive should pick the first matching tag and leave others."""
 
@@ -142,7 +106,6 @@ class TestSelectiveReceive:
         send("sel_want", "yes")
         _, val = receive("sel_want", 1)
         assert val == "yes"
-        # "sel_skip" message still available
         _, val = receive("sel_skip", 1)
         assert val == "no"
 
@@ -188,11 +151,6 @@ class TestSelectiveReceive:
         assert val == 99
 
 
-# ===================================================================
-# Timeout behavior
-# ===================================================================
-
-
 class TestTimeout:
     """Timeout and after-callback edge cases."""
 
@@ -217,7 +175,7 @@ class TestTimeout:
 
         t = threading.Thread(target=delayed_send)
         t.start()
-        tag, val = receive("neg_blk", 5)  # generous upper bound
+        tag, val = receive("neg_blk", 5)
         t.join()
         assert tag == "neg_blk"
         assert val == "arrived"
@@ -245,11 +203,6 @@ class TestTimeout:
         tag, val = receive("aft_custom", 0.05, lambda: ("custom", {"k": "v"}))
         assert tag == "custom"
         assert val == {"k": "v"}
-
-
-# ===================================================================
-# Error handling
-# ===================================================================
 
 
 class TestErrors:
@@ -283,11 +236,9 @@ class TestErrors:
         slot is still usable by sending a normal tag through the
         queue afterwards.
         """
-        bad_tag = "\ud800"  # lone high surrogate
+        bad_tag = "\ud800"
         with pytest.raises(UnicodeEncodeError):
             send(bad_tag, "payload")
-        # Sanity: the queue subsystem is still functional after the
-        # failed attempt.
         send("post_surrogate_ok", "ok")
         _, val = receive("post_surrogate_ok", 1)
         assert val == "ok"
@@ -305,13 +256,7 @@ class TestErrors:
         """
         with pytest.raises(UnicodeEncodeError):
             set_tags(["ok_tag", "\ud800"])
-        # Restore queues to a usable state for the rest of the suite.
         set_tags([])
-
-
-# ===================================================================
-# Queue isolation
-# ===================================================================
 
 
 class TestQueueIsolation:
@@ -341,11 +286,6 @@ class TestQueueIsolation:
 
         _, val = receive("drn_b", 1)
         assert val == "b1"
-
-
-# ===================================================================
-# Payload round-trip fidelity
-# ===================================================================
 
 
 class TestPayloadFidelity:
@@ -380,11 +320,6 @@ class TestPayloadFidelity:
         assert val == payload
 
 
-# ===================================================================
-# High-volume / throughput
-# ===================================================================
-
-
 class TestThroughput:
     """High-volume message passing to stress the ring buffer."""
 
@@ -417,11 +352,6 @@ class TestThroughput:
         t.join()
 
         assert results == list(range(n))
-
-
-# ===================================================================
-# Concurrent producers
-# ===================================================================
 
 
 class TestConcurrentProducers:
@@ -484,11 +414,6 @@ class TestConcurrentProducers:
             )
 
 
-# ===================================================================
-# Cross-thread send/receive
-# ===================================================================
-
-
 class TestCrossThread:
     """Messages crossing thread boundaries."""
 
@@ -542,11 +467,6 @@ class TestCrossThread:
         assert values == set(range(n))
 
 
-# ===================================================================
-# set_tags — explicit tag management
-# ===================================================================
-
-
 class TestSetTags:
     """Tests for the optional set_tags() management function."""
 
@@ -564,7 +484,6 @@ class TestSetTags:
         for i in range(MAX_QUEUES):
             send(f"clr{i}", f"stale_{i}")
         set_tags([f"fresh{i}" for i in range(MAX_QUEUES)])
-        # New tags start empty.
         tag, val = receive("fresh0", 0)
         assert tag == TIMEOUT
 
@@ -608,7 +527,6 @@ class TestSetTags:
         set_tags(["pre"])
         send("pre", "msg")
         set_tags([])
-        # All queues are now unassigned; auto-assignment kicks in.
         send("new_auto", "works")
         tag, val = receive("new_auto", 1)
         assert tag == "new_auto"
@@ -622,11 +540,6 @@ class TestSetTags:
             send("extra_tag_beyond_limit", "boom")
 
 
-# ===================================================================
-# set_tags — idempotence and repeated calls
-# ===================================================================
-
-
 class TestSetTagsRepeated:
     """Calling set_tags multiple times should be safe."""
 
@@ -635,7 +548,6 @@ class TestSetTagsRepeated:
         set_tags(["first"])
         send("first", "msg1")
         set_tags(["second"])
-        # "first" messages are gone; nothing sent on "second" yet.
         tag, val = receive("second", 0)
         assert tag == TIMEOUT
 
@@ -659,11 +571,6 @@ class TestSetTagsRepeated:
             send(tag, cycle)
             _, val = receive(tag, 1)
             assert val == cycle
-
-
-# ===================================================================
-# Worker-pool integration (match/case receive loop)
-# ===================================================================
 
 
 class TestWorkerPool:
@@ -715,11 +622,6 @@ class TestWorkerPool:
         assert result == (max_value * (max_value - 1)) // 2
 
 
-# ===================================================================
-# drain(): clear pending messages for specific tags
-# ===================================================================
-
-
 class TestDrain:
     """Verify that drain() removes pending messages for the specified tags."""
 
@@ -760,9 +662,9 @@ class TestDrain:
     def test_drain_empty_tag(self):
         """Draining a tag with no pending messages is a no-op."""
         send("d_empty", "x")
-        receive("d_empty", 1)  # consume the only message
+        receive("d_empty", 1)
 
-        drain(["d_empty"])  # should not raise
+        drain(["d_empty"])
 
         assert receive("d_empty", 0.1)[0] == TIMEOUT
 
@@ -807,11 +709,6 @@ class TestDrain:
         """Passing non-string elements in the tag list raises TypeError."""
         with pytest.raises(TypeError):
             drain([123])
-
-
-# ===================================================================
-# Spin-then-park: lost-wake stress
-# ===================================================================
 
 
 class TestLostWakeStress:
@@ -872,11 +769,6 @@ class TestLostWakeStress:
         t.join()
         assert tag == "lw_single"
         assert val == iteration
-
-
-# ===================================================================
-# Spin-then-park: multi-tag receive
-# ===================================================================
 
 
 class TestMultiTagBackoff:
@@ -956,11 +848,6 @@ class TestMultiTagBackoff:
             assert sorted(per_tag[t]) == expected
 
 
-# ===================================================================
-# Spin-then-park: timeout accuracy
-# ===================================================================
-
-
 class TestTimeoutAccuracy:
     """Verify that timed receives return within a reasonable time window."""
 
@@ -982,7 +869,7 @@ class TestTimeoutAccuracy:
         tag, _ = receive("ta_upper", timeout)
         elapsed = time.monotonic() - start
         assert tag == TIMEOUT
-        upper = timeout + 0.1  # 100 ms grace for scheduling jitter
+        upper = timeout + 0.1
         assert elapsed <= upper, (
             f"Returned too late: {elapsed:.4f}s > {upper:.4f}s"
         )

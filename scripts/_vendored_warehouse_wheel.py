@@ -56,8 +56,6 @@ def validate_record(wheel_filepath: str) -> bool:
     filename = os.path.basename(wheel_filepath)
     name, version, _ = filename.split("-", 2)
     record_filename = f"{name}-{version}.dist-info/RECORD"
-    # Files that must be missing from 'RECORD',
-    # so we ignore them when cross-checking.
     record_exemptions = {
         f"{name}-{version}.dist-info/RECORD.jws",
         f"{name}-{version}.dist-info/RECORD.p7s",
@@ -66,7 +64,7 @@ def validate_record(wheel_filepath: str) -> bool:
         with zipfile.ZipFile(wheel_filepath) as zfp:
             wheel_record_contents = zfp.read(record_filename).decode()
             record_entries = {
-                fn.replace("\\", "/")  # Normalize Windows path separators.
+                fn.replace("\\", "/")
                 for fn, *_ in csv.reader(wheel_record_contents.splitlines())
             }
             wheel_entries = {
@@ -86,8 +84,6 @@ def validate_record(wheel_filepath: str) -> bool:
         )
     return True
 
-# See:
-# https://packaging.python.org/en/latest/specifications/entry-points/#data-model
 _ENTRY_POINT_NAME_RE = re.compile(r"[\w.-]+")
 
 
@@ -115,8 +111,6 @@ def validate_entrypoints(wheel_filepath: str) -> bool:
     Validation errors are not currently reported via email.
     """
 
-    # See:
-    # <https://packaging.python.org/en/latest/specifications/entry-points/#file-format>
     class CaseSensitiveConfigParser(configparser.ConfigParser):
         optionxform = staticmethod(str)  # type: ignore[assignment]
 
@@ -124,17 +118,14 @@ def validate_entrypoints(wheel_filepath: str) -> bool:
     name, version, _ = filename.split("-", 2)
     entry_points_filename = f"{name}-{version}.dist-info/entry_points.txt"
 
-    # A wheel might not have an `entry_points.txt` file.
     try:
         with zipfile.ZipFile(wheel_filepath) as zfp:
             entry_points_contents = zfp.read(entry_points_filename).decode()
     except KeyError:
         return True
     except UnicodeError:
-        # `entry_points.txt` must be decodable as UTF-8.
         raise InvalidWheelEntryPointsError("entry_points.txt is not decodable as UTF-8")
 
-    # The Entry Points specification requires `=` as the delimiter.
     parser = CaseSensitiveConfigParser(delimiters=("=",))
     try:
         parser.read_string(entry_points_contents)
@@ -147,12 +138,7 @@ def validate_entrypoints(wheel_filepath: str) -> bool:
         try:
             section = parser[section_name]
         except KeyError:
-            # `entry_points.txt` might not have these sections.
             continue
         _validate_section(section)
-
-        # TODO: We could consider validating the entry point value as well.
-        # See:
-        # https://packaging.python.org/en/latest/specifications/entry-points/#data-model
 
     return True

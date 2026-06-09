@@ -100,13 +100,8 @@ void thrd_sleep(const struct timespec *duration, struct timespec *remaining) {
   Sleep(ms);
 }
 
-// ---------------------------------------------------------------------------
-// Physical CPU detection (Windows arm). See boc_compat.h for contract.
-// ---------------------------------------------------------------------------
-
 int boc_physical_cpu_count(void) {
   DWORD len = 0;
-  // First call: query required buffer size.
   GetLogicalProcessorInformationEx(RelationProcessorCore, NULL, &len);
   if (len == 0) {
     return 0;
@@ -121,7 +116,6 @@ int boc_physical_cpu_count(void) {
     free(buf);
     return 0;
   }
-  // One record per physical core; count records.
   int count = 0;
   DWORD off = 0;
   while (off < len) {
@@ -138,17 +132,11 @@ int boc_physical_cpu_count(void) {
 
 #elif defined(__APPLE__)
 
-// ---------------------------------------------------------------------------
-// Physical CPU detection (macOS arm). See boc_compat.h for contract.
-// ---------------------------------------------------------------------------
-
 #include <sys/sysctl.h>
 
 int boc_physical_cpu_count(void) {
   int value = 0;
   size_t len = sizeof(value);
-  // hw.physicalcpu_max reports physical cores in the machine; fall back
-  // to hw.physicalcpu (cores currently available) if unavailable.
   if (sysctlbyname("hw.physicalcpu_max", &value, &len, NULL, 0) == 0 &&
       value > 0) {
     return value;
@@ -161,10 +149,6 @@ int boc_physical_cpu_count(void) {
 }
 
 #else // assume Linux / glibc-compatible
-
-// ---------------------------------------------------------------------------
-// Physical CPU detection (Linux arm). See boc_compat.h for contract.
-// ---------------------------------------------------------------------------
 
 #include <ctype.h>
 #include <dirent.h>
@@ -193,16 +177,10 @@ static int boc_read_first_sibling(const char *path) {
 }
 
 int boc_physical_cpu_count(void) {
-  // Snapshot the affinity mask first so cgroup / taskset restrictions
-  // are honoured. Without this the count would be host-physical even
-  // inside a container with --cpuset-cpus=0-3.
   cpu_set_t affinity;
   CPU_ZERO(&affinity);
   bool have_affinity = (sched_getaffinity(0, sizeof(affinity), &affinity) == 0);
 
-  // Per-CPU sibling-leader array. Sized to the kernel's maximum
-  // reasonable CPU id; CPU_SETSIZE is 1024 on glibc, which exceeds
-  // any current hardware.
   enum { MAX_CPU = 4096 };
   int leaders[MAX_CPU];
   int leader_count = 0;
@@ -213,8 +191,6 @@ int boc_physical_cpu_count(void) {
   }
   struct dirent *ent;
   while ((ent = readdir(d)) != NULL) {
-    // Match "cpu<digits>" entries only. "cpuidle", "cpufreq", etc.
-    // share the prefix but are not per-CPU dirs.
     if (strncmp(ent->d_name, "cpu", 3) != 0) {
       continue;
     }
@@ -228,9 +204,6 @@ int boc_physical_cpu_count(void) {
       continue;
     }
 
-    // Skip CPUs outside our affinity mask: a worker scheduled on
-    // them could not run, so they don't contribute usable physical
-    // cores from this process's point of view.
     if (have_affinity && !CPU_ISSET((int)cpu_id, &affinity)) {
       continue;
     }
@@ -241,15 +214,10 @@ int boc_physical_cpu_count(void) {
              cpu_id);
     int leader = boc_read_first_sibling(path);
     if (leader < 0) {
-      // Topology unreadable (very old kernel, sysfs not mounted, etc.).
-      // Bail out so the caller falls back to the logical count.
       closedir(d);
       return 0;
     }
 
-    // Linear dedup: physical-core counts on real hardware are small
-    // (< 256 typical, < 1024 on the largest current servers), so
-    // O(n^2) over leaders is fine.
     bool seen = false;
     for (int i = 0; i < leader_count; ++i) {
       if (leaders[i] == leader) {
@@ -274,11 +242,6 @@ int boc_physical_cpu_count(void) {
 double boc_now_s(void) {
   const double S_PER_NS = 1.0e-9;
   struct timespec ts;
-  // Prefer clock_gettime on POSIX: timespec_get requires macOS 10.15+ while
-  // Python's default macOS deployment target is older, producing an
-  // -Wunguarded-availability-new warning. clock_gettime has been available on
-  // macOS since 10.12. Windows UCRT provides timespec_get but not
-  // clock_gettime, so fall back there.
 #ifdef _WIN32
   timespec_get(&ts, TIME_UTC);
 #else
@@ -291,17 +254,12 @@ double boc_now_s(void) {
 
 uint64_t boc_now_ns(void) {
 #ifdef _WIN32
-  // QueryPerformanceCounter is monotonic and high-resolution on every
-  // Windows version we target; the frequency is queried once and
-  // cached because it is constant for the lifetime of the system.
   static LARGE_INTEGER freq = {0};
   if (freq.QuadPart == 0) {
     QueryPerformanceFrequency(&freq);
   }
   LARGE_INTEGER counter;
   QueryPerformanceCounter(&counter);
-  // Convert ticks -> ns without overflow on a 64-bit counter for any
-  // realistic frequency (<= 10 GHz): split into seconds + remainder.
   uint64_t sec = (uint64_t)counter.QuadPart / (uint64_t)freq.QuadPart;
   uint64_t rem = (uint64_t)counter.QuadPart % (uint64_t)freq.QuadPart;
   return sec * 1000000000ULL + (rem * 1000000000ULL) / (uint64_t)freq.QuadPart;

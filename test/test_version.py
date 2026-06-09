@@ -5,7 +5,7 @@ import re
 
 try:
     import tomllib  # type: ignore[import-not-found]
-except ModuleNotFoundError:  # Python 3.10
+except ModuleNotFoundError:
     import tomli as tomllib  # type: ignore[import-not-found, no-redef]
 
 import bocpy
@@ -44,19 +44,6 @@ def test_version_is_pep440_shaped():
 
 def test_version_in_dunder_all():
     assert "__version__" in bocpy.__all__
-
-
-# ---------------------------------------------------------------------------
-# Corrupt-installation fallback must log a WARNING.
-# ---------------------------------------------------------------------------
-#
-# When a metadata lookup raises, ``__version__`` falls back to
-# ``"0.0.0+unknown"``. Without a diagnostic a broken installation
-# would look identical to a clean source-checkout import in downstream
-# version gates / wheel telemetry, so the fallback path logs a WARNING
-# naming the exception class. We pin that contract via a subprocess
-# so the test does not need to reload ``bocpy`` (which would tear down
-# the C runtime mid-suite).
 
 
 def test_version_fallback_emits_warning(tmp_path):
@@ -106,7 +93,6 @@ def test_version_fallback_emits_warning(tmp_path):
     assert "VERSION=0.0.0+unknown" in result.stdout, (
         f"expected fallback version string in subprocess output; got:\n{result.stdout}"
     )
-    # The log line names the exception class and includes the fallback string.
     assert "bocpy package metadata unavailable" in result.stdout
     assert "RuntimeError" in result.stdout
     assert "0.0.0+unknown" in result.stdout

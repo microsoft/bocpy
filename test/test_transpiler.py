@@ -7,9 +7,6 @@ import textwrap
 from bocpy.transpiler import BOCModuleTransformer, CapturedVariableFinder, export_module
 
 
-# ── CapturedVariableFinder ──────────────────────────────────────────────
-
-
 class TestCapturedParams:
     """Function parameters must never appear as captured variables."""
 
@@ -71,10 +68,6 @@ class TestCapturedLocals:
         """) == set()
 
     def test_except_as_name_excluded(self):
-        # ``except ... as X`` binds X via ``ExceptHandler.name`` (a
-        # plain identifier, not an ``ast.Name(Store)`` node). The
-        # finder must still treat it as local so a subsequent ``str(X)``
-        # read is not classified as a capture.
         assert "ex" not in self._captures("""\
             def f():
                 try:
@@ -130,8 +123,6 @@ class TestCapturedNestedWhen:
         return finder.captured_vars
 
     def test_inner_when_capture_propagates(self):
-        # `marker` is referenced only inside the nested @when body, but must
-        # be captured by the outer behavior so the inner whencall can see it.
         caps = self._captures("""\
             def outer(c):
                 @when(c)
@@ -141,8 +132,6 @@ class TestCapturedNestedWhen:
         assert "marker" in caps
 
     def test_inner_when_decorator_arg_propagates(self):
-        # The cown argument to the nested @when is evaluated in the outer
-        # frame, so it must also be captured.
         caps = self._captures("""\
             def outer():
                 @when(other_cown)
@@ -152,7 +141,6 @@ class TestCapturedNestedWhen:
         assert "other_cown" in caps
 
     def test_inner_when_locals_not_captured(self):
-        # Names that are local/params of the inner @when should NOT leak out.
         caps = self._captures("""\
             def outer():
                 @when(c)
@@ -163,8 +151,6 @@ class TestCapturedNestedWhen:
         assert caps == {"c"}
 
     def test_plain_nested_def_unchanged(self):
-        # A plain (non-@when) nested def keeps its opaque treatment: names
-        # used only inside its body do not surface in the outer's captures.
         caps = self._captures("""\
             def outer():
                 def helper():
@@ -173,8 +159,6 @@ class TestCapturedNestedWhen:
         assert caps == set()
 
     def test_deeply_nested_when_propagates(self):
-        # A name referenced in a doubly-nested @when must propagate all the
-        # way out to the top-level behavior.
         caps = self._captures("""\
             def outer(c):
                 @when(c)
@@ -184,6 +168,44 @@ class TestCapturedNestedWhen:
                         use(deep_marker)
         """, known_vars={"when", "use"})
         assert "deep_marker" in caps
+
+    def test_when_inside_for_loop_name_not_captured(self):
+        caps = self._captures("""\
+            def outer(handles):
+                bodies = []
+                for h in handles:
+                    @when(h)
+                    def body(h):
+                        pass
+                    bodies.append(body)
+                return bodies
+        """, known_vars={"when"})
+        assert caps == set()
+
+    def test_when_inside_for_loop_capture_propagates(self):
+        caps = self._captures("""\
+            def outer(handles):
+                for h in handles:
+                    @when(h)
+                    def body(h):
+                        use(marker)
+        """, known_vars={"when", "use"})
+        assert "marker" in caps
+
+    def test_when_inside_nested_blocks_capture_propagates(self):
+        caps = self._captures("""\
+            def outer(items):
+                for x in items:
+                    if x:
+                        with ctx():
+                            @when(other_cown)
+                            def inner(c):
+                                use(marker)
+                return inner
+        """, known_vars={"when", "use", "ctx"})
+        assert "other_cown" in caps
+        assert "marker" in caps
+        assert "inner" not in caps
 
     def test_mixed_locals_and_captures(self):
         caps = self._captures("""\
@@ -212,9 +234,6 @@ class TestCapturedClear:
         finder.visit(tree2.body[0])
         assert finder.captured_vars == {"b"}
         assert "a" not in finder.captured_vars
-
-
-# ── BOCModuleTransformer ────────────────────────────────────────────────
 
 
 class TestModuleTransformerImports:
@@ -254,7 +273,6 @@ class TestModuleTransformerImports:
     def test_whencall_injected_when_aliased(self):
         t, tree = self._transform("from bocpy import whencall as wc, Cown")
         aliases = [(a.name, a.asname) for a in tree.body[0].names]
-        # Original aliased import kept, plus bare whencall injected
         assert ("whencall", "wc") in aliases
         assert ("whencall", None) in aliases
         assert "wc" in t.imports
@@ -352,9 +370,6 @@ class TestModuleTransformerFiltering:
         assert len(tree.body) == 0
 
 
-# ── export_module (full pipeline) ───────────────────────────────────────
-
-
 class TestExportBehaviorNaming:
     """Behaviors are renamed to __behavior__N with sequential numbering."""
 
@@ -417,7 +432,6 @@ class TestExportCaptures:
         """)
         info = list(result.behaviors.values())[0]
         assert "factor" in info.captures
-        # factor must appear as a parameter in the generated behavior def
         sig = result.code.split("def __behavior__0(")[1].split("):")[0]
         assert "factor" in sig
 
@@ -764,10 +778,6 @@ class TestExportFileRewrite:
             def f(x):
                 return __file__
         """, path=path)
-        # Walk the generated AST and confirm __file__ has been replaced
-        # with the absolute source path as a string constant. Substring
-        # matching against the unparsed source is platform-fragile because
-        # backslashes in Windows paths get escaped during unparse.
         expected = os.path.abspath(path)
         gen_tree = ast.parse(result.code)
         constants = [
@@ -838,6 +848,27 @@ class TestExportNestedWhen:
         """)
         assert len(result.behaviors) == 2
 
+    def test_nested_when_in_for_loop(self):
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            x = Cown(1)
+
+            @when(x)
+            def outer(x):
+                bodies = []
+                for i, h in enumerate(x.value):
+                    @when(h)
+                    def inner(h, i=i):
+                        return (i, h.value)
+                    bodies.append(inner)
+                return bodies
+        """)
+        assert len(result.behaviors) == 2
+        for info in result.behaviors.values():
+            assert "inner" not in info.captures
+        assert "Cannot resolve" not in result.code
+
 
 class TestExportMetadata:
     """ExportResult carries class, function, and behavior metadata."""
@@ -874,9 +905,6 @@ class TestExportMetadata:
         line = next(iter(result.behaviors.keys()))
         assert isinstance(line, int)
         assert line > 0
-
-
-# ── Import alias tests ──────────────────────────────────────────────────
 
 
 class TestImportAlias:
@@ -923,9 +951,6 @@ class TestImportAlias:
             )
 
 
-# ── Defaults-as-captures (loop-snapshot idiom) ──────────────────────────
-
-
 class TestDefaultsAsCaptures:
     """``def b(c, i=i)`` and ``def b(c, x=y)`` hoist defaults to captures."""
 
@@ -946,7 +971,6 @@ class TestDefaultsAsCaptures:
         """)
         info = list(result.behaviors.values())[0]
         assert info.captures == ["i"]
-        # Default must be stripped from the exported behavior.
         gen_tree = ast.parse(result.code)
         for node in ast.walk(gen_tree):
             if isinstance(node, ast.FunctionDef) and node.name.startswith("__behavior__"):
@@ -1001,7 +1025,6 @@ class TestDefaultsAsCaptures:
                     return i * factor
         """)
         info = list(result.behaviors.values())[0]
-        # Extras come first, then body captures.
         assert info.captures == ["i", "factor"]
 
     def test_non_name_default_rejected(self):
@@ -1037,9 +1060,6 @@ class TestDefaultsAsCaptures:
             raise AssertionError("expected SyntaxError for default on cown position")
 
 
-# ── @when alias support ─────────────────────────────────────────────────
-
-
 class TestWhenAlias:
     """Aliased ``when`` decorators are detected and rewritten."""
 
@@ -1060,7 +1080,6 @@ class TestWhenAlias:
         """)
         names = [info.name for info in result.behaviors.values()]
         assert names == ["__behavior__0"]
-        # The aliased decorator must be stripped from the behavior.
         gen_tree = ast.parse(result.code)
         for node in ast.walk(gen_tree):
             if isinstance(node, ast.FunctionDef) and node.name.startswith("__behavior__"):
@@ -1079,7 +1098,6 @@ class TestWhenAlias:
         """)
         names = [info.name for info in result.behaviors.values()]
         assert names == ["__behavior__0"]
-        # whencall must be auto-imported when only ``import bocpy`` is present.
         assert "from bocpy import whencall" in result.code
         gen_tree = ast.parse(result.code)
         for node in ast.walk(gen_tree):
@@ -1107,14 +1125,17 @@ class TestWhenAlias:
 class TestWhenResultAssignment:
     """@when-decorated functions must produce a name = whencall(...) assignment.
 
-    Regression: WhenTransformer.visit_FunctionDef was returning
-    ``ast.Expr(ast.Assign(...))``, an ast.Assign statement incorrectly
-    wrapped in ast.Expr. visit_Module filters out every ast.Expr node (to
-    drop bare expression-statement whencall results), so the wrapping caused
-    every @when result assignment to be silently dropped from the exported
-    module. Any code that read .value, checked .exception, or chained
-    behaviors on the result was operating on None with no error at schedule
-    time.
+    WhenTransformer.visit_FunctionDef returns an ast.Assign so the behavior
+    result is bound to the function's name. visit_Module filters out every
+    ast.Expr node (to drop bare expression-statement whencall results), so an
+    assignment wrapped in ast.Expr would be discarded and any code reading
+    .value, checking .exception, or chaining behaviors on the result would
+    operate on None.
+
+    visit_Module only filters at module scope; a @when nested inside a
+    function, a method, or another behavior emits its assignment into a
+    function body it never inspects. The nesting-level tests below lock
+    assignment preservation at every depth.
     """
 
     @staticmethod
@@ -1139,7 +1160,7 @@ class TestWhenResultAssignment:
         )
 
     def test_result_is_ast_assign_not_expr(self):
-        """The whencall node returned by visit_FunctionDef must be an ast.Assign, not an ast.Expr wrapping an ast.Assign.
+        """visit_FunctionDef must return an ast.Assign, not an ast.Expr wrapping one.
 
         visit_Module filters out all ast.Expr nodes; an ast.Expr return
         would silently drop the assignment.
@@ -1222,4 +1243,134 @@ class TestWhenResultAssignment:
                 return
         raise AssertionError(
             "no assignment for 'my_task' found in exported AST"
+        )
+
+    def test_result_assigned_inside_function(self):
+        """A @when inside a plain function keeps its assignment in the body."""
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            x = Cown(1)
+
+            def run():
+                @when(x)
+                def task(x):
+                    return x.value
+                return task
+        """)
+        assert "task = whencall(" in result.code, (
+            "in-function @when result assignment was dropped;\n"
+            f"generated code:\n{result.code}"
+        )
+
+    def test_result_assigned_inside_method(self):
+        """A @when inside a method keeps its assignment in the method body."""
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            x = Cown(1)
+
+            class Driver:
+                def run(self):
+                    @when(x)
+                    def task(x):
+                        return x.value
+                    return task
+        """)
+        assert "task = whencall(" in result.code, (
+            "in-method @when result assignment was dropped;\n"
+            f"generated code:\n{result.code}"
+        )
+
+    def test_result_assigned_inside_nested_function(self):
+        """A @when two function levels deep keeps its assignment."""
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            x = Cown(1)
+
+            def outer():
+                def inner():
+                    @when(x)
+                    def task(x):
+                        return x.value
+                    return task
+                return inner
+        """)
+        assert "task = whencall(" in result.code, (
+            "deeply-nested-function @when result assignment was dropped;\n"
+            f"generated code:\n{result.code}"
+        )
+
+    def test_result_assigned_inside_for_loop_in_function(self):
+        """A @when inside a for loop inside a function keeps its assignment."""
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            handles = [Cown(1), Cown(2)]
+
+            def run():
+                bodies = []
+                for h in handles:
+                    @when(h)
+                    def task(h):
+                        return h.value
+                    bodies.append(task)
+                return bodies
+        """)
+        assert "task = whencall(" in result.code, (
+            "for-loop-in-function @when result assignment was dropped;\n"
+            f"generated code:\n{result.code}"
+        )
+
+    def test_nested_when_both_results_assigned(self):
+        """A nested @when assigns both the outer (module) and inner (in-body) results.
+
+        The outer @when sits at module scope; the inner @when's assignment
+        lands inside the extracted ``__behavior__`` body. Both must survive.
+        """
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            x = Cown(1)
+
+            @when(x)
+            def outer(x):
+                @when(x)
+                def inner(x):
+                    return x.value
+                return inner
+        """)
+        assert "outer = whencall(" in result.code, (
+            "outer (module-level) @when result assignment was dropped;\n"
+            f"generated code:\n{result.code}"
+        )
+        assert "inner = whencall(" in result.code, (
+            "inner (in-behavior) @when result assignment was dropped;\n"
+            f"generated code:\n{result.code}"
+        )
+
+    def test_nested_when_inside_function_both_results_assigned(self):
+        """A nested @when wholly inside a function assigns both results in-body."""
+        result = self._export("""\
+            from bocpy import when, whencall, Cown
+
+            x = Cown(1)
+
+            def run():
+                @when(x)
+                def outer(x):
+                    @when(x)
+                    def inner(x):
+                        return x.value
+                    return inner
+                return outer
+        """)
+        assert "outer = whencall(" in result.code, (
+            "in-function outer @when result assignment was dropped;\n"
+            f"generated code:\n{result.code}"
+        )
+        assert "inner = whencall(" in result.code, (
+            "in-behavior inner @when result assignment was dropped;\n"
+            f"generated code:\n{result.code}"
         )

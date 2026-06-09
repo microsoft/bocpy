@@ -18,11 +18,6 @@ bq = pytest.importorskip(
 )
 
 
-# ---------------------------------------------------------------------------
-# Single-threaded sanity
-# ---------------------------------------------------------------------------
-
-
 def test_empty_on_construction_and_after_drain():
     """A fresh queue is empty, and remains empty after a drain cycle."""
     q = bq.bq_make_queue()
@@ -98,11 +93,6 @@ def test_dequeue_all_returns_fifo_segment():
     assert bq.bq_is_empty(q)
 
 
-# ---------------------------------------------------------------------------
-# Multi-producer stress
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("producers,per_producer", [(8, 20_000)])
 def test_mpmc_stress_no_loss_no_dup(producers, per_producer):
     """Many producers, two consumers (one dequeue + one dequeue_all loop).
@@ -116,9 +106,6 @@ def test_mpmc_stress_no_loss_no_dup(producers, per_producer):
     total = producers * per_producer
     q = bq.bq_make_queue()
 
-    # Pre-allocate every node up front (alloc under GIL is not what we
-    # want to stress). Encode (producer_id, sequence) in a single int
-    # so the consumer side can verify per-producer FIFO ordering.
     nodes = [
         [bq.bq_make_node(p * per_producer + i) for i in range(per_producer)]
         for p in range(producers)
@@ -159,8 +146,6 @@ def test_mpmc_stress_no_loss_no_dup(producers, per_producer):
     for t in prods:
         t.join()
 
-    # Drain remainder under stop signal.
-    # Spin until consumers report all values seen, then stop them.
     import time
     deadline = time.monotonic() + 30.0
     while time.monotonic() < deadline:
@@ -172,7 +157,6 @@ def test_mpmc_stress_no_loss_no_dup(producers, per_producer):
     cons1.join()
     cons2.join()
 
-    # Final mop-up in case the consumer threads exited mid-segment.
     while True:
         v = bq.bq_dequeue(q)
         if v is None:
@@ -185,12 +169,5 @@ def test_mpmc_stress_no_loss_no_dup(producers, per_producer):
     assert sorted(seen) == list(range(expected_total)), (
         "values do not form 0..N-1 — duplication or corruption"
     )
-
-    # Note: we deliberately do NOT assert per-producer FIFO on `seen`.
-    # Even though MPMCQ preserves enqueue order at the dequeue point,
-    # `seen` is appended under a lock by two concurrent consumers, so
-    # its order reflects lock-acquisition order, not dequeue order.
-    # The invariant under test is that every value appears exactly
-    # once — no losses, no duplicates.
 
     assert bq.bq_is_empty(q)

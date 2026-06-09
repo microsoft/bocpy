@@ -171,14 +171,12 @@ static int impl_transpose_in_place(matrix_impl *matrix) {
   const size_t N = matrix->columns;
 
   if (M == 1 || N == 1) {
-    // vector
     matrix->rows = N;
     matrix->columns = M;
     return update_row_ptrs(matrix);
   }
 
   if (M == N) {
-    // square matrix
     for (size_t r = 0; r < matrix->rows; ++r) {
       for (size_t c = 0; c < r; ++c) {
         double temp = matrix->row_ptrs[r][c];
@@ -346,6 +344,26 @@ enum BinaryOps {
     }                                                                          \
   }
 
+#define DEFINE_BINARY_OUTER(ENUM, STAMP, EXPR)                                 \
+  BOC_CANARY_NOINLINE                                                          \
+  static void impl_##STAMP##_outer(matrix_impl *colvec, matrix_impl *rowvec,   \
+                                   matrix_impl *out) {                         \
+    const size_t M = out->rows;                                                \
+    const size_t N = out->columns;                                             \
+    assert(colvec->rows == M && colvec->columns == 1);                         \
+    assert(rowvec->rows == 1 && rowvec->columns == N);                         \
+    const double *col_ptr = colvec->data;                                      \
+    double *out_ptr = out->data;                                               \
+    for (size_t r = 0; r < M; ++r, ++col_ptr) {                                \
+      const double lhs = *col_ptr;                                             \
+      const double *row_ptr = rowvec->data;                                    \
+      for (size_t c = 0; c < N; ++c, ++row_ptr, ++out_ptr) {                   \
+        const double rhs = *row_ptr;                                           \
+        *out_ptr = (EXPR);                                                     \
+      }                                                                        \
+    }                                                                          \
+  }
+
 #define X(E, S, EX) DEFINE_BINARY_EWISE(E, S, EX)
 BOC_BINARY_OPS(X)
 #undef X
@@ -359,6 +377,10 @@ BOC_BINARY_OPS(X)
 #undef X
 
 #define X(E, S, EX) DEFINE_BINARY_SCALAR(E, S, EX)
+BOC_BINARY_OPS(X)
+#undef X
+
+#define X(E, S, EX) DEFINE_BINARY_OUTER(E, S, EX)
 BOC_BINARY_OPS(X)
 #undef X
 
@@ -410,6 +432,20 @@ static void dispatch_bin_scalar(matrix_impl *matrix, double scalar,
 #define X(ENUM, STAMP, ...)                                                    \
   case ENUM:                                                                   \
     impl_##STAMP##_scalar(matrix, scalar, out);                                \
+    return;
+    BOC_BINARY_OPS(X)
+#undef X
+  default:
+    fprintf(stderr, "Unknown binary op\n");
+  }
+}
+
+static void dispatch_bin_outer(matrix_impl *colvec, matrix_impl *rowvec,
+                               matrix_impl *out, enum BinaryOps op) {
+  switch (op) {
+#define X(ENUM, STAMP, ...)                                                    \
+  case ENUM:                                                                   \
+    impl_##STAMP##_outer(colvec, rowvec, out);                                 \
     return;
     BOC_BINARY_OPS(X)
 #undef X
@@ -769,18 +805,20 @@ static void impl_matmul(matrix_impl *lhs, matrix_impl *rhs, matrix_impl *out) {
   assert(M0 == out->rows && N1 == out->columns);
   assert(N0 == rhs->rows);
 
-  double *out_ptr = out->data;
-
+  // ikj (rank-1 update) order: the inner c-loop is a contiguous AXPY over
+  // row-major out and rhs rows, with no loop-carried dependency across c, so
+  // -O3 autovectorises it without -ffast-math. Products are still summed in
+  // ascending-k order per (r, c), so results are bitwise identical to ijk.
+  memset(out->data, 0, out->size * sizeof(double));
   for (size_t r = 0; r < M0; ++r) {
-    for (size_t c = 0; c < N1; ++c, ++out_ptr) {
-      const double *lhs_ptr = lhs->row_ptrs[r];
-      const double *rhs_ptr = rhs->data + c;
-      double sum = 0;
-      for (size_t k = 0; k < N0; ++k, ++lhs_ptr, rhs_ptr += N1) {
-        sum += (*lhs_ptr) * (*rhs_ptr);
+    double *out_row = out->row_ptrs[r];
+    const double *lhs_row = lhs->row_ptrs[r];
+    for (size_t k = 0; k < N0; ++k) {
+      const double a = lhs_row[k];
+      const double *rhs_row = rhs->row_ptrs[k];
+      for (size_t c = 0; c < N1; ++c) {
+        out_row[c] += a * rhs_row[c];
       }
-
-      *out_ptr = sum;
     }
   }
 }
@@ -822,26 +860,32 @@ int range_read(range *range, PyObject *key, size_t length) {
   Py_ssize_t start, stop, step;
   if (PyLong_Check(key)) {
     start = PyLong_AsSsize_t(key);
+    if (start == -1 && PyErr_Occurred()) {
+      return -1;
+    }
     if (start < 0) {
       start += (Py_ssize_t)length;
     }
     stop = start + 1;
     step = 1;
   } else if (PySlice_Check(key)) {
-    PySlice_Unpack(key, &start, &stop, &step);
+    if (PySlice_Unpack(key, &start, &stop, &step) < 0) {
+      return -1;
+    }
   } else {
     PyErr_SetString(PyExc_TypeError, "Key must be a long or a slice");
     return -1;
   }
 
-  PySlice_AdjustIndices((Py_ssize_t)length, &start, &stop, step);
+  Py_ssize_t count =
+      PySlice_AdjustIndices((Py_ssize_t)length, &start, &stop, step);
 
   range->start = start;
   range->stop = stop;
   range->step = step;
-  range->count = (size_t)((range->stop - range->start) / range->step);
+  range->count = (size_t)count;
 
-  if (range->count == 0) {
+  if (count == 0) {
     PyErr_SetNone(PyExc_IndexError);
     return -1;
   }
@@ -983,12 +1027,10 @@ static bool impl_check_acquired(matrix_impl *matrix, bool set_error) {
   return true;
 }
 
-// Forward declarations
-static struct PyModuleDef _math_module;
-
 typedef struct {
   int_least64_t interpid;
   PyTypeObject *matrix_type;
+  PyObject *matrix_unpickle;
 } _math_module_state;
 
 static thread_local _math_module_state *LOCAL_STATE;
@@ -1315,8 +1357,8 @@ static int Matrix_aggregate(PyObject *matrix_op, AxisArg axis,
     return 0;
   }
 
-  /* axis.axis == 1 (row-wise). parse_validate_normalise_axis already
-     rejected anything else. */
+  // Fall-through is axis == 1 (row-wise): parse_validate_normalise_axis
+  // restricts axis to {0, 1}.
   matrix_impl *vector = impl_new(impl->rows, 1);
   if (vector == NULL) {
     return -1;
@@ -1331,9 +1373,6 @@ static int Matrix_aggregate(PyObject *matrix_op, AxisArg axis,
 
   return 0;
 }
-
-// this macro provides a kind of template for all the aggregate methods to
-// follow, as they are all identical with the exception of the operator
 
 #define MATRIX_AGGREGATE(agg)                                                  \
   static PyObject *Matrix_##agg##_method(PyObject *op, PyObject *args,         \
@@ -1360,6 +1399,149 @@ MATRIX_AGGREGATE(Magnitude)
 MATRIX_AGGREGATE(Minimum)
 MATRIX_AGGREGATE(Maximum)
 MATRIX_AGGREGATE(MagnitudeSquared)
+
+/* --------------------------------------------------------------------------
+   Arg-reduction (argmin / argmax) kernels.
+
+   These do not fit the BOC_AGG_OPS X-macro: that table accumulates a
+   single double, whereas an arg-reduction must also carry the index of
+   the running extreme. Comparisons are strict so the first occurrence of
+   a tied extreme wins, matching NumPy. Indices are published as doubles
+   in the result matrix (the Matrix type stores only doubles).
+   -------------------------------------------------------------------------- */
+// Arg-reduction (argmin/argmax) kernels: kept out of the BOC_AGG_OPS X-macro
+// because they must carry the running index, not just a double accumulator.
+// Strict comparisons make the first tied extreme win (NumPy tie-break);
+// indices are published as doubles (Matrix stores only doubles).
+static Py_ssize_t argextreme_ewise(matrix_impl *m, bool want_max) {
+  const double *p = m->data;
+  double best = p[0];
+  Py_ssize_t best_i = 0;
+  for (size_t i = 1; i < m->size; ++i) {
+    const double v = p[i];
+    if (want_max ? (v > best) : (v < best)) {
+      best = v;
+      best_i = (Py_ssize_t)i;
+    }
+  }
+  return best_i;
+}
+
+static void argextreme_columnwise(matrix_impl *m, bool want_max,
+                                  matrix_impl *out) {
+  const size_t M = m->rows;
+  const size_t N = m->columns;
+  for (size_t c = 0; c < N; ++c) {
+    double best = m->data[c];
+    size_t best_r = 0;
+    for (size_t r = 1; r < M; ++r) {
+      const double v = m->data[r * N + c];
+      if (want_max ? (v > best) : (v < best)) {
+        best = v;
+        best_r = r;
+      }
+    }
+    out->data[c] = (double)best_r;
+  }
+}
+
+static void argextreme_rowwise(matrix_impl *m, bool want_max,
+                               matrix_impl *out) {
+  const size_t M = m->rows;
+  const size_t N = m->columns;
+  for (size_t r = 0; r < M; ++r) {
+    const double *row = m->data + r * N;
+    double best = row[0];
+    size_t best_c = 0;
+    for (size_t c = 1; c < N; ++c) {
+      const double v = row[c];
+      if (want_max ? (v > best) : (v < best)) {
+        best = v;
+        best_c = c;
+      }
+    }
+    out->data[r] = (double)best_c;
+  }
+}
+
+static int Matrix_argextreme(PyObject *matrix_op, AxisArg axis,
+                             PyObject **out_op, bool want_max) {
+  MatrixObject *matrix = (MatrixObject *)matrix_op;
+  matrix_impl *impl = matrix->impl;
+
+  if (!impl_check_acquired(impl, true)) {
+    return -1;
+  }
+
+  // Defensive: the public constructors reject zero-size matrices, but guard
+  // each axis so a future empty-capable path can't read p[0] out of bounds.
+  const char *empty_error = "arg-reduction of an empty matrix is undefined";
+
+  if (!axis.has_axis) {
+    if (impl->size == 0) {
+      PyErr_SetString(PyExc_ValueError, empty_error);
+      return -1;
+    }
+    *out_op = PyLong_FromSsize_t(argextreme_ewise(impl, want_max));
+    return *out_op == NULL ? -1 : 0;
+  }
+
+  if (axis.axis == 0) {
+    if (impl->rows == 0) {
+      PyErr_SetString(PyExc_ValueError, empty_error);
+      return -1;
+    }
+    matrix_impl *vector = impl_new(1, impl->columns);
+    if (vector == NULL) {
+      return -1;
+    }
+    argextreme_columnwise(impl, want_max, vector);
+    *out_op = wrap_matrix(Py_TYPE(matrix_op), vector);
+    if (*out_op == NULL) {
+      impl_free(vector);
+      return -1;
+    }
+    return 0;
+  }
+
+  if (impl->columns == 0) {
+    PyErr_SetString(PyExc_ValueError, empty_error);
+    return -1;
+  }
+  matrix_impl *vector = impl_new(impl->rows, 1);
+  if (vector == NULL) {
+    return -1;
+  }
+  argextreme_rowwise(impl, want_max, vector);
+  *out_op = wrap_matrix(Py_TYPE(matrix_op), vector);
+  if (*out_op == NULL) {
+    impl_free(vector);
+    return -1;
+  }
+  return 0;
+}
+
+#define MATRIX_ARGEXTREME(name, want_max_val)                                  \
+  static PyObject *Matrix_##name##_method(PyObject *op, PyObject *args,        \
+                                          PyObject *kwds) {                    \
+    PyObject *out = NULL;                                                      \
+    PyObject *axis_obj = NULL;                                                 \
+    static char *kwlist[] = {"axis", NULL};                                    \
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|O", kwlist, &axis_obj)) {   \
+      return NULL;                                                             \
+    }                                                                          \
+    AxisArg axis;                                                              \
+    if (parse_validate_normalise_axis(axis_obj, &axis) < 0) {                  \
+      return NULL;                                                             \
+    }                                                                          \
+    if (Matrix_argextreme(op, axis, &out, want_max_val) < 0) {                 \
+      return NULL;                                                             \
+    }                                                                          \
+    return out;                                                                \
+  }
+
+MATRIX_ARGEXTREME(argmin, false)
+MATRIX_ARGEXTREME(argmax, true)
 
 enum BroadcastShape { BCAST_NONE = 0, BCAST_ROW, BCAST_COL };
 
@@ -1595,7 +1777,6 @@ static PyObject *Matrix_vecdot(PyObject *op, PyObject *args, PyObject *kwds) {
   PyObject *result = NULL;
   matrix_impl *rhs = NULL;
 
-  /* ``other`` is positional-only; ``axis`` accepts both forms. */
   static char *kwlist[] = {"", "axis", NULL};
   if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|O", kwlist, &other, &axis)) {
     return NULL;
@@ -1614,14 +1795,10 @@ static PyObject *Matrix_vecdot(PyObject *op, PyObject *args, PyObject *kwds) {
   matrix_impl *vec_arg = rhs;
   enum BroadcastShape shape;
 
-  /* Shape classification — mirrors Matrix_binary_op's broadcast switch.
-     Two call sites is not enough duplication to warrant a shared helper. */
   if (lhs->rows == rhs->rows && lhs->columns == rhs->columns) {
     shape = BCAST_NONE;
   } else if (lhs->rows == rhs->rows &&
              (lhs->columns == 1 || rhs->columns == 1)) {
-    /* Column-vector broadcast. Canonicalise so the helper sees
-       (matrix, vector). vecdot is commutative — no swap needed. */
     shape = BCAST_COL;
     if (lhs->columns == 1) {
       mat_arg = rhs;
@@ -1629,7 +1806,6 @@ static PyObject *Matrix_vecdot(PyObject *op, PyObject *args, PyObject *kwds) {
     }
   } else if (lhs->columns == rhs->columns &&
              (lhs->rows == 1 || rhs->rows == 1)) {
-    /* Row-vector broadcast — same canonicalisation as above. */
     shape = BCAST_ROW;
     if (lhs->rows == 1) {
       mat_arg = rhs;
@@ -1637,8 +1813,6 @@ static PyObject *Matrix_vecdot(PyObject *op, PyObject *args, PyObject *kwds) {
     }
   } else if ((lhs->rows == 1 || lhs->columns == 1) &&
              (rhs->rows == 1 || rhs->columns == 1) && lhs->size == rhs->size) {
-    /* Both vectors, possibly mixed orientation (1xN vs Nx1): walk the
-       flat buffers in lockstep. No matrix/vector roles, so no swap. */
     shape = BCAST_NONE;
   } else {
     PyErr_Format(PyExc_NotImplementedError,
@@ -1661,8 +1835,8 @@ static PyObject *Matrix_vecdot(PyObject *op, PyObject *args, PyObject *kwds) {
       result = wrap_impl_or_free(out);
     }
   } else {
-    /* axis_arg.axis == 1 (row-wise). parse_validate_normalise_axis
-       already rejected anything else. */
+    // axis == 1 (row-wise): parse_validate_normalise_axis restricts axis
+    // to {0, 1}.
     matrix_impl *out = impl_new(mat_arg->rows, 1);
     if (out != NULL) {
       impl_vecdot_rowwise(mat_arg, vec_arg, out, shape);
@@ -1702,7 +1876,6 @@ static enum CrossAxis classify_cross_axis(const matrix_impl *impl,
                                           bool has_axis, int explicit_axis) {
   const size_t M = impl->rows;
   const size_t N = impl->columns;
-  /* Ambiguous square shapes: axis picks orientation, default is rows. */
   if (M == 2 && N == 2) {
     return (has_axis && explicit_axis == 0) ? CROSS_COLS_2D_2xN
                                             : CROSS_ROWS_2D_Nx2;
@@ -1711,7 +1884,6 @@ static enum CrossAxis classify_cross_axis(const matrix_impl *impl,
     return (has_axis && explicit_axis == 0) ? CROSS_COLS_3D_3xN
                                             : CROSS_ROWS_3D_Nx3;
   }
-  /* Inherently row-oriented scalars: only axis=1 (or no axis) is valid. */
   if (M == 1 && N == 2) {
     if (has_axis && explicit_axis == 0) {
       return CROSS_INVALID;
@@ -1724,7 +1896,6 @@ static enum CrossAxis classify_cross_axis(const matrix_impl *impl,
     }
     return CROSS_SCALAR_3D_1x3;
   }
-  /* Inherently column-oriented scalars: only axis=0 (or no axis) is valid. */
   if (M == 2 && N == 1) {
     if (has_axis && explicit_axis == 1) {
       return CROSS_INVALID;
@@ -1737,9 +1908,6 @@ static enum CrossAxis classify_cross_axis(const matrix_impl *impl,
     }
     return CROSS_SCALAR_3D_3x1;
   }
-  /* Batch shapes with a unique orientation: explicit axis must match.
-     (2x3 and 3x2 remain doubly-valid and fall through to the legacy
-     default selection.) */
   if (N == 2 && M != 3) {
     if (has_axis && explicit_axis == 0) {
       return CROSS_INVALID;
@@ -1764,7 +1932,6 @@ static enum CrossAxis classify_cross_axis(const matrix_impl *impl,
     }
     return CROSS_COLS_3D_3xN;
   }
-  /* Doubly-valid 2x3 / 3x2: legacy default (Nx2 / 2xN wins). */
   if (N == 2) {
     return CROSS_ROWS_2D_Nx2;
   }
@@ -1828,8 +1995,6 @@ static PyObject *Matrix_cross(PyObject *op, PyObject *args, PyObject *kwds) {
     goto done;
   }
 
-  // Scalar inputs: other's orientation is irrelevant, only the flat
-  // element count must match.
   if (flavor == CROSS_SCALAR_2D_1x2 || flavor == CROSS_SCALAR_2D_2x1) {
     if (rhs->size != 2) {
       PyErr_Format(PyExc_NotImplementedError,
@@ -1861,12 +2026,6 @@ static PyObject *Matrix_cross(PyObject *op, PyObject *args, PyObject *kwds) {
     result = wrap_impl_or_free(out);
     goto done;
   }
-
-  // Batch inputs accept either a same-shape batch or a single 2D/3D
-  // vector (1xK / Kx1) broadcast against every per-vector slot. Cross is
-  // anticommutative, so we deliberately do NOT silently swap operands;
-  // ``self`` must be the batch. Per-branch validation below decides which
-  // mode applies and reports the canonical error if neither fits.
 
   if (flavor == CROSS_ROWS_2D_Nx2) {
     const size_t N = lhs->rows;
@@ -2039,7 +2198,6 @@ static PyObject *Matrix_cross(PyObject *op, PyObject *args, PyObject *kwds) {
     goto done;
   }
 
-  // Unreachable: every CrossAxis value is handled above.
   PyErr_SetString(PyExc_RuntimeError,
                   "internal: unhandled CrossAxis in Matrix_cross");
 
@@ -2096,8 +2254,8 @@ static int do_normalize(matrix_impl *impl, AxisArg axis, matrix_impl *out) {
     return 0;
   }
 
-  /* axis.axis == 1 (row-wise). parse_validate_normalise_axis already
-     rejected anything else. */
+  // axis == 1 (row-wise): parse_validate_normalise_axis restricts axis
+  // to {0, 1}.
   matrix_impl *divisor = impl_new(impl->rows, 1);
   if (divisor == NULL) {
     return -1;
@@ -2213,7 +2371,6 @@ static void impl_perpendicular_out_of_place(const matrix_impl *impl,
     }
     return;
   }
-  /* VEC2_SCALAR_2x1 or VEC2_COLS_2xN. */
   const double *src_x = impl->data;
   const double *src_y = impl->data + N;
   double *dst_x = out->data;
@@ -2238,7 +2395,6 @@ static void impl_perpendicular_in_place(matrix_impl *impl,
     }
     return;
   }
-  /* VEC2_SCALAR_2x1 or VEC2_COLS_2xN. */
   double *p = impl->data;
   for (size_t c = 0; c < N; ++c, ++p) {
     const double temp = p[0];
@@ -2339,7 +2495,8 @@ static PyObject *Matrix_angle(PyObject *op, PyObject *args, PyObject *kwds) {
     return wrap_impl_or_free(out);
   }
 
-  /* VEC2_COLS_2xN. */
+  // Fall-through is the 2xN column-batch case: classify_vec2_axis already
+  // rejected every shape other than VEC2_ROWS_Nx2 and this one.
   const size_t N = impl->columns;
   matrix_impl *out = impl_new(1, N);
   if (out == NULL) {
@@ -2758,6 +2915,18 @@ static PyObject *Matrix_uniform(PyObject *cls, PyObject *args,
   return wrap_impl_or_free(impl);
 }
 
+static PyObject *Matrix_seed(PyObject *cls, PyObject *args) {
+  unsigned long value;
+
+  if (!PyArg_ParseTuple(args, "k", &value)) {
+    return NULL;
+  }
+
+  srand((unsigned int)value);
+
+  Py_RETURN_NONE;
+}
+
 static PyObject *Matrix_vector(PyObject *cls, PyObject *args) {
   PyObject *sequence = NULL;
   int as_column = 0;
@@ -2810,11 +2979,15 @@ static int unwrap_and_get_shape(PyObject *object, shape *shape,
   return 0;
 }
 
-static PyObject *Matrix_concat(PyObject *cls, PyObject *args) {
+static PyObject *Matrix_concat(PyObject *cls, PyObject *args,
+                               PyObject *kwargs) {
   PyObject *matrices = NULL;
   int axis = 0;
 
-  if (!PyArg_ParseTuple(args, "O|i", &matrices, &axis)) {
+  static char *kwlist[] = {"values", "axis", NULL};
+
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O|i", kwlist, &matrices,
+                                   &axis)) {
     return NULL;
   }
 
@@ -2950,6 +3123,38 @@ static PyObject *Matrix_concat(PyObject *cls, PyObject *args) {
   return wrap_impl_or_free(out);
 }
 
+/// @brief Pickle support: reduce a matrix to its raw double buffer.
+/// @details Returns ``(_matrix_unpickle, (rows, columns, payload))`` where
+///          ``payload`` is the native-endian byte image of the contiguous
+///          row-major ``double`` data. Reconstruction is a single ``memcpy``,
+///          so pickling cost is linear in the element count with no per-element
+///          Python object churn. ``copy.copy`` and ``copy.deepcopy`` route
+///          through the same path. The current interpreter must own the matrix.
+static PyObject *Matrix_reduce(PyObject *op, PyObject *Py_UNUSED(dummy)) {
+  MatrixObject *self = (MatrixObject *)op;
+  matrix_impl *impl = self->impl;
+
+  if (impl == NULL) {
+    PyErr_SetString(PyExc_ValueError, "Cannot pickle an uninitialized matrix");
+    return NULL;
+  }
+
+  if (!impl_check_acquired(impl, true)) {
+    return NULL;
+  }
+
+  PyObject *rebuild = LOCAL_STATE->matrix_unpickle;
+
+  PyObject *payload = PyBytes_FromStringAndSize(
+      (const char *)impl->data, (Py_ssize_t)(impl->size * sizeof(double)));
+  if (payload == NULL) {
+    return NULL;
+  }
+
+  return Py_BuildValue("(O(nnN))", rebuild, (Py_ssize_t)impl->rows,
+                       (Py_ssize_t)impl->columns, payload);
+}
+
 static PyMethodDef Matrix_methods[] = {
     {"transpose", (PyCFunction)Matrix_transpose, METH_VARARGS | METH_KEYWORDS,
      "transpose($self, /, in_place=False)\n--\n\n"
@@ -3010,6 +3215,18 @@ static PyMethodDef Matrix_methods[] = {
      "min($self, /, axis=None)\n--\n\nMinimum of elements."},
     {"max", (PyCFunction)Matrix_Maximum_method, METH_VARARGS | METH_KEYWORDS,
      "max($self, /, axis=None)\n--\n\nMaximum of elements."},
+    {"argmin", (PyCFunction)Matrix_argmin_method, METH_VARARGS | METH_KEYWORDS,
+     "argmin($self, /, axis=None)\n--\n\n"
+     "Index of the minimum element (first occurrence on ties).\n\n"
+     "NaN elements are skipped unless the running extreme starts at NaN\n"
+     "(element 0 along the reduced axis), which pins the result to that\n"
+     "position. This differs from NumPy, which propagates NaN."},
+    {"argmax", (PyCFunction)Matrix_argmax_method, METH_VARARGS | METH_KEYWORDS,
+     "argmax($self, /, axis=None)\n--\n\n"
+     "Index of the maximum element (first occurrence on ties).\n\n"
+     "NaN elements are skipped unless the running extreme starts at NaN\n"
+     "(element 0 along the reduced axis), which pins the result to that\n"
+     "position. This differs from NumPy, which propagates NaN."},
     {"ceil", (PyCFunction)Matrix_Ceil_method, METH_VARARGS | METH_KEYWORDS,
      "ceil($self, /, in_place=False)\n--\n\n"
      "Element-wise ceiling."},
@@ -3030,6 +3247,9 @@ static PyMethodDef Matrix_methods[] = {
      "Clip elements to a range."},
     {"copy", Matrix_copy, METH_NOARGS,
      "copy($self, /)\n--\n\nReturn a deep copy."},
+    {"__reduce__", Matrix_reduce, METH_NOARGS,
+     "__reduce__($self, /)\n--\n\n"
+     "Pickle helper: serialize the matrix to its raw double buffer."},
     {"select", Matrix_select, METH_VARARGS,
      "select($self, indices, /, axis=0)\n--\n\n"
      "Select rows or columns by index."},
@@ -3050,10 +3270,19 @@ static PyMethodDef Matrix_methods[] = {
      METH_VARARGS | METH_KEYWORDS | METH_CLASS,
      "uniform($type, minval=0.0, maxval=1.0, /, size=None)\n--\n\n"
      "Sample from a uniform distribution."},
+    {"seed", Matrix_seed, METH_VARARGS | METH_CLASS,
+     "seed($type, value, /)\n--\n\n"
+     "Seed the random generator used by normal() and uniform().\n\n"
+     "The generator is the process-global C library PRNG shared by every\n"
+     "sub-interpreter, so a seed only makes subsequent draws reproducible\n"
+     "when random generation stays on a single thread; concurrent draws\n"
+     "interleave on the shared state. The sequence is also not portable\n"
+     "across platforms."},
     {"vector", Matrix_vector, METH_VARARGS | METH_CLASS,
      "vector($type, values, /, as_column=False)\n--\n\n"
      "Create a vector from a sequence."},
-    {"concat", Matrix_concat, METH_VARARGS | METH_CLASS,
+    {"concat", (PyCFunction)Matrix_concat,
+     METH_VARARGS | METH_KEYWORDS | METH_CLASS,
      "concat($type, values, /, axis=0)\n--\n\n"
      "Concatenate matrices along an axis."},
     {NULL} /* Sentinel */
@@ -3297,7 +3526,6 @@ static int Matrix_binary_op(PyObject *lhs_op, PyObject *rhs_op,
   }
 
   if (mat_op != NULL) {
-    // scalar operation
     lhs = unwrap_matrix(mat_op, false);
     if (lhs == NULL) {
       goto error;
@@ -3322,15 +3550,72 @@ static int Matrix_binary_op(PyObject *lhs_op, PyObject *rhs_op,
     goto error;
   }
 
+  // A 1x1 matrix is a scalar: route it through the scalar kernels so it
+  // broadcasts against any shape, exactly like a Python float operand.
+  // Check rhs first so 1x1 op= 1x1 stays in-place-safe.
+  if (rhs->size == 1) {
+    matrix_impl *out = set_output(lhs_op, out_op, inplace);
+    if (out == NULL) {
+      goto error;
+    }
+    dispatch_bin_scalar(lhs, rhs->data[0], out, op);
+    goto exit;
+  }
+  if (lhs->size == 1) {
+    if (inplace) {
+      PyErr_SetString(PyExc_NotImplementedError,
+                      "in-place scalar broadcast would change operand shape");
+      goto error;
+    }
+    matrix_impl *out = set_output(rhs_op, out_op, inplace);
+    if (out == NULL) {
+      goto error;
+    }
+    dispatch_bin_scalar(rhs, lhs->data[0], out, swap_right(op));
+    goto exit;
+  }
+
   const char *mismatch_error = "Dimension mismatch between operands";
 
   if (lhs->rows != rhs->rows) {
     if (lhs->columns != rhs->columns) {
-      PyErr_SetString(PyExc_NotImplementedError, mismatch_error);
-      goto error;
+      matrix_impl *colvec;
+      matrix_impl *rowvec;
+      if (lhs->columns == 1 && rhs->rows == 1) {
+        colvec = lhs;
+        rowvec = rhs;
+      } else if (lhs->rows == 1 && rhs->columns == 1) {
+        colvec = rhs;
+        rowvec = lhs;
+        op = swap_right(op);
+      } else {
+        PyErr_SetString(PyExc_NotImplementedError, mismatch_error);
+        goto error;
+      }
+
+      if (inplace) {
+        PyErr_SetString(PyExc_NotImplementedError,
+                        "in-place outer broadcast would change operand shape");
+        goto error;
+      }
+
+      matrix_impl *out = impl_new(colvec->rows, rowvec->columns);
+      if (out == NULL) {
+        goto error;
+      }
+
+      // Wrap as Py_TYPE(lhs_op) for parity with the elementwise and matmul
+      // paths (preserve the lhs subclass).
+      *out_op = wrap_matrix(Py_TYPE(lhs_op), out);
+      if (*out_op == NULL) {
+        impl_free(out);
+        goto error;
+      }
+
+      dispatch_bin_outer(colvec, rowvec, out, op);
+      goto exit;
     }
 
-    // row-wise
     matrix_impl *matrix;
     matrix_impl *vector;
     if (lhs->rows == 1) {
@@ -3357,7 +3642,6 @@ static int Matrix_binary_op(PyObject *lhs_op, PyObject *rhs_op,
   }
 
   if (lhs->columns != rhs->columns) {
-    // column-wise
     matrix_impl *matrix;
     matrix_impl *vector;
     if (lhs->columns == 1) {
@@ -3383,7 +3667,6 @@ static int Matrix_binary_op(PyObject *lhs_op, PyObject *rhs_op,
     goto exit;
   }
 
-  // element-wise
   matrix_impl *out = set_output(lhs_op, out_op, inplace);
   if (out == NULL) {
     goto error;
@@ -3735,10 +4018,10 @@ static PyObject *Matrix_repr(PyObject *op) {
   size_t length = strlen(prefix);
 
   snprintf(buffer, VALUE_BUFFER_SIZE, "%zu", impl->rows);
-  length += strlen(buffer) + 2; // ", "
+  length += strlen(buffer) + 2;
 
   snprintf(buffer, VALUE_BUFFER_SIZE, "%zu", impl->columns);
-  length += strlen(buffer) + 3; // ", ["
+  length += strlen(buffer) + 3;
 
   for (size_t i = 0; i < impl->size; ++i, ++ptr) {
     snprintf(buffer, VALUE_BUFFER_SIZE, "%g", *ptr);
@@ -3843,7 +4126,6 @@ static PyType_Spec Matrix_Spec = {.name = "bocpy._math.Matrix",
 static PyObject *_new_matrix_object(XIDATA_T *xidata) {
   matrix_impl *impl = (matrix_impl *)xidata->data;
 
-  // take ownership of the C matrix
   int_least64_t expected = BOCPY_NO_OWNER;
   int_least64_t desired = bocpy_interpid();
   if (!atomic_compare_exchange_strong(&impl->owner, &expected, desired)) {
@@ -3854,19 +4136,15 @@ static PyObject *_new_matrix_object(XIDATA_T *xidata) {
     return NULL;
   }
 
-  // Create an instance of MatrixObject using this interpreter's copy of the
-  // type
   PyTypeObject *type = LOCAL_STATE->matrix_type;
   MatrixObject *matrix = (MatrixObject *)type->tp_alloc(type, 0);
   if (matrix == NULL) {
-    // attempt to roll back the ownership change
     int_least64_t rollback_expected = desired;
     desired = BOCPY_NO_OWNER;
     atomic_compare_exchange_strong(&impl->owner, &rollback_expected, desired);
     return NULL;
   }
 
-  // wrap the C matrix
   matrix->impl = impl;
   IMPL_INCREF(impl);
 
@@ -3882,7 +4160,6 @@ XIDATA_GETDATA_FUNC(_matrix_shared) {
   MatrixObject *matrix = (MatrixObject *)obj;
   matrix_impl *impl = matrix->impl;
 
-  // put the underlying C matrix in an ownerless state during transport
   int_least64_t expected = bocpy_interpid();
   int_least64_t desired = BOCPY_NO_OWNER;
   if (!atomic_compare_exchange_strong(&impl->owner, &expected, desired)) {
@@ -3893,12 +4170,66 @@ XIDATA_GETDATA_FUNC(_matrix_shared) {
     return -1;
   }
 
-  // initialize the xidata
   XIDATA_INIT(xidata, tstate->interp, impl, obj, _new_matrix_object);
   return 0;
 }
 
+/// @brief Reconstruct a Matrix from its pickled raw double buffer.
+/// @details Inverse of ``Matrix.__reduce__``: validates the dimensions and the
+///          payload length, then copies the native-endian ``double`` image into
+///          a freshly allocated matrix owned by the current interpreter.
+/// @param args ``(rows, columns, payload)`` where ``payload`` exposes the
+///        buffer protocol.
+/// @return a new MatrixObject reference, or NULL on error
+static PyObject *_matrix_unpickle(PyObject *Py_UNUSED(module), PyObject *args) {
+  Py_ssize_t srows = 0;
+  Py_ssize_t scolumns = 0;
+  Py_buffer payload;
+
+  if (!PyArg_ParseTuple(args, "nny*", &srows, &scolumns, &payload)) {
+    return NULL;
+  }
+
+  if (srows <= 0 || scolumns <= 0) {
+    PyBuffer_Release(&payload);
+    PyErr_SetString(PyExc_ValueError, "Rows and columns must both be > 0");
+    return NULL;
+  }
+
+  size_t rows = (size_t)srows;
+  size_t columns = (size_t)scolumns;
+
+  if (rows > SIZE_MAX / columns) {
+    PyBuffer_Release(&payload);
+    PyErr_SetString(PyExc_ValueError, "Matrix dimensions are too large");
+    return NULL;
+  }
+
+  size_t size = rows * columns;
+  if (size > SIZE_MAX / sizeof(double) ||
+      (size_t)payload.len != size * sizeof(double)) {
+    PyBuffer_Release(&payload);
+    PyErr_SetString(PyExc_ValueError,
+                    "Pickled matrix payload has the wrong length");
+    return NULL;
+  }
+
+  matrix_impl *impl = impl_new(rows, columns);
+  if (impl == NULL) {
+    PyBuffer_Release(&payload);
+    return NULL;
+  }
+
+  memcpy(impl->data, payload.buf, (size_t)payload.len);
+  PyBuffer_Release(&payload);
+
+  return (PyObject *)wrap_impl_or_free(impl);
+}
+
 static PyMethodDef _math_module_methods[] = {
+    {"_matrix_unpickle", _matrix_unpickle, METH_VARARGS,
+     "_matrix_unpickle(rows, columns, payload, /)\n--\n\n"
+     "Internal pickle helper: rebuild a Matrix from its raw byte buffer."},
     {NULL} /* Sentinel */
 };
 
@@ -3915,10 +4246,14 @@ static int _math_module_exec(PyObject *module) {
     return -1;
   }
 
-  // let the XIData system know that the matrix type can be shared
   if (XIDATA_REGISTERCLASS(state->matrix_type, _matrix_shared)) {
     Py_FatalError(
         "could not register MatrixObject for cross-interpreter sharing");
+    return -1;
+  }
+
+  state->matrix_unpickle = PyObject_GetAttrString(module, "_matrix_unpickle");
+  if (state->matrix_unpickle == NULL) {
     return -1;
   }
 
@@ -3931,6 +4266,7 @@ static int _math_module_exec(PyObject *module) {
 static int _math_module_clear(PyObject *module) {
   _math_module_state *state = (_math_module_state *)PyModule_GetState(module);
   Py_CLEAR(state->matrix_type);
+  Py_CLEAR(state->matrix_unpickle);
   return 0;
 }
 
@@ -3941,6 +4277,7 @@ static void _math_module_free(void *module) {
 static int _math_module_traverse(PyObject *module, visitproc visit, void *arg) {
   _math_module_state *state = (_math_module_state *)PyModule_GetState(module);
   Py_VISIT(state->matrix_type);
+  Py_VISIT(state->matrix_unpickle);
   return 0;
 }
 

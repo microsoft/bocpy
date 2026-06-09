@@ -40,19 +40,10 @@ from typing import Any
 import uuid
 import zipfile
 
-# Bumping this version invalidates the ``tools.components`` entry in
-# the SBOM. Keep it in sync with significant changes to the schema or
-# the injection algorithm.
 SBOM_GENERATOR_VERSION = "0.1.0"
 SBOM_FILENAME = "bocpy.cdx.json"
 PEP770_SBOM_SUBDIR = "sboms"
 
-# Stable namespace used to derive a deterministic UUIDv5 ``serialNumber``
-# from the (name, version, git_commit, wheel_filename) tuple. The
-# specific URL string is what makes this namespace stable across builds
-# and across machines — do NOT change it without a coordinated
-# generator-version bump, since every existing SBOM's serial number
-# would change shape.
 _BOCPY_SBOM_NAMESPACE = uuid.uuid5(
     uuid.NAMESPACE_URL, "https://github.com/microsoft/bocpy/sboms"
 )
@@ -77,9 +68,6 @@ def _sbom_timestamp() -> str:
         try:
             epoch = int(raw)
         except ValueError:
-            # Match the upstream reproducible-build spec: a malformed
-            # value is a hard error rather than a silent fall-through,
-            # so that CI surfaces the misconfiguration loudly.
             raise ValueError(
                 f"SOURCE_DATE_EPOCH must be an integer, got {raw!r}"
             ) from None
@@ -200,10 +188,6 @@ def build_sbom_document(
             },
             "component": root_component,
         },
-        # bocpy has zero third-party runtime Python dependencies; the
-        # components list is intentionally empty. System shared libraries
-        # bundled by auditwheel / delocate / delvewheel are not enumerated
-        # here yet (see module docstring).
         "components": [],
         "dependencies": [{"ref": bom_ref, "dependsOn": []}],
     }
@@ -259,9 +243,6 @@ def inject_sbom_into_wheel(
     if not wheel_path.is_file():
         raise FileNotFoundError(wheel_path)
 
-    # We materialise the new wheel in a temporary file alongside the
-    # original so that the final ``shutil.move`` is an atomic rename
-    # on the same filesystem.
     tmp_fd, tmp_name = tempfile.mkstemp(
         prefix=wheel_path.stem + ".",
         suffix=".whl.tmp",
@@ -276,65 +257,23 @@ def inject_sbom_into_wheel(
             sbom_arcname = f"{dist_info}/{PEP770_SBOM_SUBDIR}/{SBOM_FILENAME}"
             record_arcname = f"{dist_info}/RECORD"
 
-            # Collect every entry except the existing RECORD; we
-            # rewrite it last with the new hashes.
-            #
-            # We carry the SOURCE ``ZipInfo`` (not just the filename)
-            # for every entry we copy through, because wheels that
-            # have been through ``auditwheel`` / ``delocate`` /
-            # ``delvewheel`` rely on per-entry ZIP metadata that
-            # ``ZipFile.writestr(arcname, data)`` would silently
-            # drop:
-            #
-            #   * ``external_attr``  — the Unix mode bits in the
-            #     upper 16 bits encode ``S_IFLNK`` for symlinked
-            #     SONAMEs (``libfoo.so.1 -> libfoo.so.1.2.3``).
-            #     Drop them and the install step writes a regular
-            #     file whose contents are the symlink's text.
-            #   * ``create_system`` — tells the reader how to
-            #     interpret ``external_attr`` (Unix vs DOS vs ...).
-            #   * ``compress_type`` — preserves a deliberate
-            #     ``ZIP_STORED`` choice (some wheel builders leave
-            #     pre-compressed ``.so`` payloads uncompressed; a
-            #     naive ``writestr(arcname, data)`` would re-DEFLATE
-            #     them under the destination ZIP's default
-            #     compression).
-            #   * ``date_time`` — reproducible-build timestamps set
-            #     by the upstream wheel builder.
-            #   * ``extra`` / ``internal_attr`` / ``comment`` —
-            #     uncommon but harmless to preserve; some toolchains
-            #     stash Unix UID/GID/mtime extras here.
-            #
-            # We deliberately do NOT copy ``CRC``, ``compress_size``,
-            # ``file_size``, ``header_offset``, or ``flag_bits``:
-            # those are stream-position metadata that ``writestr``
-            # recomputes when the entry is re-emitted. Copying them
-            # would either be silently overridden or, in the case of
-            # ``flag_bits``, leak the source archive's
-            # data-descriptor / streaming bits into a non-streaming
-            # write path.
             entries: list[tuple[zipfile.ZipInfo, bytes]] = []
             sbom_already_present = False
             for info in src.infolist():
                 if info.filename == record_arcname:
                     continue
                 if info.filename == sbom_arcname:
-                    # Tolerate an already-injected SBOM by replacing it,
-                    # but log a line to stderr so re-injection in CI is
-                    # observable. The reinjection path is exercised when
-                    # ``build_sbom.py inject`` is re-run against an
-                    # already-decorated wheel (idempotency check), so
-                    # silencing it would hide a misconfigured repair
-                    # command running the injector twice.
                     sbom_already_present = True
                     continue
                 if info.is_dir():
-                    # PyPI strips trailing-slash entries from the ZIP
-                    # side before comparing RECORD; keeping a row for
-                    # them triggers send_wheel_record_mismatch_email.
+                    # PyPI strips trailing-slash dir entries before comparing
+                    # RECORD; keeping a row for them triggers a mismatch reject.
                     continue
                 with src.open(info) as f:
                     data = f.read()
+                # Copy every ZipInfo field so re-archived entries stay
+                # byte-identical to the source wheel (perms, timestamps,
+                # RECORD hashes must all still match).
                 new_info = zipfile.ZipInfo(
                     filename=info.filename, date_time=info.date_time
                 )
@@ -346,16 +285,12 @@ def inject_sbom_into_wheel(
                 new_info.comment = info.comment
                 entries.append((new_info, data))
 
-            # The injected SBOM and the rewritten RECORD are NEW entries
-            # that this script owns, so they use freshly-constructed
-            # ``ZipInfo`` objects with the stdlib defaults
-            # (``-rw-------`` perms, ``ZIP_DEFLATED`` compression).
+            # SBOM and rewritten RECORD are new entries we own: fresh ZipInfo
+            # with stdlib defaults (rw-------, ZIP_DEFLATED).
             sbom_info = zipfile.ZipInfo(filename=sbom_arcname)
             sbom_info.compress_type = zipfile.ZIP_DEFLATED
             entries.append((sbom_info, sbom_bytes))
 
-            # Build the new RECORD: every entry gets a hash row except
-            # RECORD itself (which has empty hash + empty size).
             record_buf = io.StringIO()
             writer = csv.writer(
                 record_buf, delimiter=",", quoting=csv.QUOTE_MINIMAL, lineterminator="\n"
@@ -380,12 +315,8 @@ def inject_sbom_into_wheel(
                 file=sys.stderr,
             )
 
-        # Atomic rename — the wheel either has the SBOM and a fresh
-        # RECORD, or it is byte-identical to before.
         shutil.move(str(tmp_path), str(wheel_path))
     except BaseException:
-        # Clean the side-file on any failure so we don't leak a
-        # corrupted ``*.whl.tmp`` into the dest directory.
         if tmp_path.exists():
             try:
                 tmp_path.unlink()
@@ -424,14 +355,6 @@ def _read_pyproject_metadata(repo_root: Path) -> dict[str, str]:
 
 def _cmd_generate(args: argparse.Namespace) -> int:
     """Implement the ``generate`` subcommand."""
-    # Reproducibility guard. The serialNumber is a UUIDv5 derived
-    # from ``name@version+git_commit+wheel_filename``. If a caller
-    # invokes ``generate`` standalone with neither ``--git-commit``
-    # (defaulted to $GITHUB_SHA, often unset locally) nor
-    # ``--wheel-filename``, every wheel of the same name+version
-    # collapses to the same UUID — defeating the per-wheel-identifier
-    # purpose of deterministic serials. ``inject`` always passes
-    # ``--wheel-filename`` so it is unaffected.
     if not args.git_commit and not args.wheel_filename:
         print(
             "error: build_sbom.py generate requires at least one of: "
@@ -475,11 +398,6 @@ def _cmd_inject(args: argparse.Namespace) -> int:
     else:
         wheel_path = target
 
-    # When --copy-to is given, work on a copy in the destination directory
-    # and leave the original untouched. This is the pattern used on Windows
-    # cibuildwheel jobs where there is no native repair tool, so the
-    # script is responsible for both placing the wheel in ``{dest_dir}``
-    # and injecting the SBOM into it.
     if args.copy_to is not None:
         copy_target_dir = Path(args.copy_to)
         copy_target_dir.mkdir(parents=True, exist_ok=True)

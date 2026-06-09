@@ -339,6 +339,34 @@ class Matrix:
             If ``1``, return a *rows* x 1 column vector of row maxima.
         """
 
+    def argmin(self, axis: Optional[int] = None) -> Union[int, "Matrix"]:
+        """Index of the minimum element (first occurrence on ties).
+
+        :param axis: If ``None``, return the flat row-major index of the
+            overall minimum as an ``int``.  If ``0``, return a 1 x *columns*
+            row vector of per-column row indices.  If ``1``, return a
+            *rows* x 1 column vector of per-row column indices.
+
+        .. note::
+           NaN elements are skipped unless the running extreme starts at
+           NaN (element 0 along the reduced axis), which pins the result
+           to that position.  This differs from NumPy, which propagates NaN.
+        """
+
+    def argmax(self, axis: Optional[int] = None) -> Union[int, "Matrix"]:
+        """Index of the maximum element (first occurrence on ties).
+
+        :param axis: If ``None``, return the flat row-major index of the
+            overall maximum as an ``int``.  If ``0``, return a 1 x *columns*
+            row vector of per-column row indices.  If ``1``, return a
+            *rows* x 1 column vector of per-row column indices.
+
+        .. note::
+           NaN elements are skipped unless the running extreme starts at
+           NaN (element 0 along the reduced axis), which pins the result
+           to that position.  This differs from NumPy, which propagates NaN.
+        """
+
     def ceil(self, in_place: bool = False) -> "Matrix":
         """Round each element up to the nearest integer.
 
@@ -382,6 +410,14 @@ class Matrix:
 
     def copy(self) -> "Matrix":
         """Return a deep copy of this matrix."""
+
+    def __reduce__(self) -> tuple:
+        """Support pickling and :func:`copy.deepcopy`.
+
+        Serializes the matrix to its native-endian raw ``double`` buffer
+        so reconstruction is a single copy with no per-element Python
+        object overhead. The current interpreter must own the matrix.
+        """
 
     def select(self, indices: Union[list[int], tuple[int]], axis=0):
         """Return a new matrix containing only the selected rows or columns.
@@ -486,6 +522,20 @@ class Matrix:
         """
 
     @classmethod
+    def seed(cls, value: int) -> None:
+        """Seed the random generator used by :meth:`normal` and :meth:`uniform`.
+
+        :param value: The seed value.
+
+        .. note::
+           The generator is the process-global C library PRNG shared by
+           every sub-interpreter, so a seed only makes subsequent draws
+           reproducible when random generation stays on a single thread;
+           concurrent draws interleave on the shared state.  The sequence
+           is also not portable across platforms.
+        """
+
+    @classmethod
     def vector(cls, values: Sequence[Union[float, int]], as_column=False) -> "Matrix":
         """Create a matrix from a flat sequence of values.
 
@@ -548,6 +598,41 @@ class Cown(Generic[T]):
 
     def release(self):
         """Releases the cown."""
+
+    def unwrap(self) -> T:
+        """Consume and return the stored value, or re-raise a captured behavior exception.
+
+        Mirrors Rust's ``Result::unwrap``: on success the stored value
+        is returned; if the cown carries an unhandled behavior
+        exception (``self.exception`` is ``True``) that exception is
+        cleared from the cown and re-raised on the caller's thread.
+
+        ``unwrap`` **consumes** the cown: the stored payload is handed
+        to the caller and the cown is emptied to ``None``. The returned
+        value is therefore owned by the caller, and a second
+        :meth:`unwrap` returns ``None``. Consuming is what makes
+        move-type values (e.g. :class:`Matrix`) usable after the call --
+        the cown no longer aliases the value's single backing store, so
+        the value keeps its ownership on the caller's interpreter rather
+        than being released back into the cown. The emptied cown remains
+        schedulable, so a fresh value may be stored into it again.
+
+        The cown is acquired for the duration of the read, so call
+        :meth:`unwrap` from the caller's thread once the runtime is
+        globally quiescent -- after :func:`quiesce` or :func:`wait`, not
+        merely after this cown's own producer.
+
+        Calling :meth:`unwrap` while behaviors are still in flight
+        raises :class:`RuntimeError`: reading a result before its
+        producer completes would race the worker still mutating the
+        cown. Call :func:`quiesce` (or :func:`wait`) first.
+
+        :returns: The stored value when no exception is held.
+        :rtype: T
+        :raises BaseException: The captured exception, re-raised verbatim
+            with its original type and message.
+        :raises RuntimeError: If the runtime is not quiescent.
+        """
 
     @property
     def exception(self) -> bool:
@@ -647,7 +732,7 @@ class PinnedCown(Cown[T]):
 
     Nested pumping
         Calling :func:`pump` from inside a pinned-behavior body
-        raises :class:`RuntimeError` (v1).
+        raises :class:`RuntimeError`.
 
     Handle vs. value
         A :class:`PinnedCown` *handle* (the Python wrapper object
@@ -758,7 +843,7 @@ def pump(deadline_ms: Optional[int] = None,
 
     Reentrance
         Not reentrant. Calling from inside a pinned-behavior body
-        raises :class:`RuntimeError` (v1).
+        raises :class:`RuntimeError`.
 
     :param deadline_ms: Wall-clock budget in milliseconds.
         ``None`` for unbounded; otherwise a positive :class:`int`.
@@ -860,6 +945,40 @@ def notice_write(key: str, value: Any) -> None:
     :type key: str
     :param value: The value to store.
     :type value: Any
+    """
+
+
+def notice_seed(key: str, value: Any) -> None:
+    """Synchronously write a value to the noticeboard from the primary interpreter.
+
+    Unlike :func:`notice_write`, this commits **before it returns**: the
+    value is applied under the noticeboard mutex on the calling thread,
+    so once :func:`notice_seed` returns the entry is live and visible to
+    every behavior scheduled afterwards (and to the calling thread's own
+    subsequent :func:`notice_read`). It is the recommended way to install
+    read-mostly configuration before scheduling the behaviors that read
+    it.
+
+    If the runtime is not yet running, :func:`notice_seed` starts it,
+    so seeding can be the first bocpy call a program makes — no explicit
+    :func:`start` is required.
+
+    **Primary interpreter only.** Calling :func:`notice_seed` from a
+    worker raises :class:`RuntimeError`; use :func:`notice_write` for
+    fire-and-forget writes from within behaviors.
+
+    It is a plain overwrite intended for *seeding* before concurrent
+    noticeboard mutations are in flight. It does **not** provide the
+    read-modify-write atomicity of :func:`notice_update`, and a seed
+    that races an in-flight :func:`notice_update` on the same key may be
+    lost. Seed once, up front, rather than interleaving seeds with
+    concurrent updates.
+
+    :param key: The noticeboard key (max 63 UTF-8 bytes).
+    :type key: str
+    :param value: The value to store.
+    :type value: Any
+    :raises RuntimeError: If called from a worker interpreter.
     """
 
 
@@ -978,29 +1097,6 @@ def notice_read(key: str, default: Any = None) -> Any:
     :type default: Any
     :return: The stored value, or *default* if the key does not exist.
     :rtype: Any
-    """
-
-
-def notice_sync(timeout: Optional[float] = 30.0) -> None:
-    """Block until the caller's prior noticeboard mutations are committed.
-
-    Because :func:`notice_write`, :func:`notice_update`, and
-    :func:`notice_delete` are fire-and-forget, a behavior that wants
-    read-your-writes ordering against a *subsequent* behavior must call
-    ``notice_sync()`` after its writes. By the time this returns, every
-    write/update/delete posted from the calling thread before the call
-    has been applied to the noticeboard.
-
-    The barrier carries **no ordering guarantee** with respect to
-    writes posted from other threads or behaviors interleaved with the
-    caller's; it only flushes the caller's own queued mutations.
-
-    :param timeout: Maximum seconds to wait. ``None`` waits forever.
-        Defaults to 30 seconds.
-    :type timeout: Optional[float]
-    :raises TimeoutError: If the barrier does not complete within
-        *timeout* seconds.
-    :raises RuntimeError: If the runtime is not started.
     """
 
 

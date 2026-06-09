@@ -77,16 +77,6 @@ int tag_compare_with_utf8(BOCTag *lhs, const char *rhs_str,
 /// @return -1 if before, 1 if after, 0 if equivalent. -2 on error.
 int tag_compare_with_PyUnicode(BOCTag *lhs, PyObject *rhs_op);
 
-// ---------------------------------------------------------------------------
-// Hot-path inlines.
-//
-// These were `static` in `_core.c` and called via the TAG_INCREF /
-// TAG_DECREF macros on the send / receive / set_tags paths. Promoting
-// them to `static inline` in this header preserves the inlining when
-// the macros are used from any including TU (and matches CPython's
-// `Py_INCREF` / `Py_DECREF` header-inline pattern).
-// ---------------------------------------------------------------------------
-
 static inline int_least64_t tag_decref(BOCTag *tag) {
   int_least64_t rc = atomic_fetch_add(&tag->rc, -1) - 1;
   if (rc == 0) {

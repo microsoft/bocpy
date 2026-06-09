@@ -33,11 +33,6 @@ DIST_INFO = f"{DIST}-{VERSION}.dist-info"
 WHEEL_NAME = f"{DIST}-{VERSION}-cp314-cp314-manylinux_2_28_x86_64.whl"
 
 
-# ---------------------------------------------------------------------------
-# Wheel builders
-# ---------------------------------------------------------------------------
-
-
 def _record_row(arcname: str, data: bytes) -> tuple[str, str, str]:
     digest = hashlib.sha256(data).digest()
     b64 = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
@@ -110,17 +105,11 @@ def _write_wheel_raw(
         wheel.writestr(record_arc, record_text)
 
 
-# ---------------------------------------------------------------------------
-# Happy path
-# ---------------------------------------------------------------------------
-
-
 def test_clean_wheel_passes(tmp_path):
     """A faithfully-built probe wheel passes both checks."""
     wheel_path = tmp_path / WHEEL_NAME
     _write_wheel(wheel_path, _wheel_metadata_entries())
 
-    # No exception means OK.
     validate_wheel.validate_wheel_file(wheel_path)
 
 
@@ -137,7 +126,7 @@ def test_main_returns_zero_on_clean_wheel(tmp_path, capsys):
 
 def test_main_accepts_directory_input(tmp_path, capsys):
     """Passing a directory expands to every *.whl in it."""
-    (tmp_path / WHEEL_NAME).touch()  # placeholder so glob matches the dir
+    (tmp_path / WHEEL_NAME).touch()
     wheel_a = tmp_path / WHEEL_NAME
     wheel_b = tmp_path / f"{DIST}-{VERSION}-cp314-cp314-linux_aarch64.whl"
     _write_wheel(wheel_a, _wheel_metadata_entries())
@@ -150,11 +139,6 @@ def test_main_accepts_directory_input(tmp_path, capsys):
     assert out.count("OK") == 2
 
 
-# ---------------------------------------------------------------------------
-# Negative cases: validate_record
-# ---------------------------------------------------------------------------
-
-
 def test_record_with_directory_entries_is_rejected(tmp_path):
     """Regression for the 0.7.0 PyPI warning.
 
@@ -165,7 +149,6 @@ def test_record_with_directory_entries_is_rejected(tmp_path):
     """
     wheel_path = tmp_path / WHEEL_NAME
     entries = _wheel_metadata_entries()
-    # RECORD claims an extra directory entry that PyPI ignores in the wheel.
     bad_rows = [_record_row(arc, data) for arc, data in entries]
     empty_hash = (
         "sha256="
@@ -183,7 +166,6 @@ def test_record_missing_an_entry_is_rejected(tmp_path):
     """An honest file present in the ZIP but absent from RECORD fails."""
     wheel_path = tmp_path / WHEEL_NAME
     entries = _wheel_metadata_entries()
-    # Build RECORD that omits the last entry.
     short_rows = [_record_row(arc, data) for arc, data in entries[:-1]]
     _write_wheel(wheel_path, entries, record_rows=short_rows)
 
@@ -210,7 +192,6 @@ def test_missing_record_file_raises(tmp_path):
     with zipfile.ZipFile(wheel_path, "w", zipfile.ZIP_DEFLATED) as wheel:
         for arcname, data in entries:
             wheel.writestr(arcname, data)
-        # Deliberately do NOT write RECORD.
 
     with pytest.raises(MissingWheelRecordError):
         validate_wheel.validate_wheel_file(wheel_path)
@@ -222,11 +203,8 @@ def test_record_with_jws_signature_is_exempt(tmp_path):
     entries = _wheel_metadata_entries() + [
         (f"{DIST_INFO}/RECORD.jws", b"<signature bytes>"),
     ]
-    # RECORD must list everything except RECORD itself and the signature.
     visible_entries = entries[:-1]
     _write_wheel(wheel_path, visible_entries, record_rows=None)
-    # Re-open and append the signature to the existing ZIP without
-    # adding it to RECORD (mirroring how signing tools work).
     with zipfile.ZipFile(wheel_path, "a", zipfile.ZIP_DEFLATED) as wheel:
         wheel.writestr(f"{DIST_INFO}/RECORD.jws", b"<signature bytes>")
 
@@ -245,11 +223,6 @@ def test_main_returns_nonzero_on_failure(tmp_path, capsys):
     assert rc == 1
     err = capsys.readouterr().err
     assert "RECORD mismatch" in err
-
-
-# ---------------------------------------------------------------------------
-# Negative cases: validate_entrypoints
-# ---------------------------------------------------------------------------
 
 
 def test_valid_entry_points_pass(tmp_path):

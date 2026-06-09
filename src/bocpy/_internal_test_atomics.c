@@ -20,17 +20,13 @@
 
 #include "boc_compat.h"
 
-// Single shared block of atomic slots, accessed by every test entry
-// point through a PyCapsule handle. Cacheline-sized (64B) to avoid
-// false-sharing between the producer and consumer fields when the
-// test spawns multiple threads.
 typedef struct {
-  boc_atomic_u64_t flag;       // 0 → producer not yet ready
-  uint64_t payload;            // plain (non-atomic); guarded by flag
-  boc_atomic_u64_t counter64;  // fetch_add / CAS contention slot
-  boc_atomic_u32_t counter32;  // 32-bit fetch_add contention slot
-  boc_atomic_bool_t bool_slot; // bool exchange / cas test
-  boc_atomic_ptr_t ptr_slot;   // ptr exchange / cas test
+  boc_atomic_u64_t flag;
+  uint64_t payload;
+  boc_atomic_u64_t counter64;
+  boc_atomic_u32_t counter32;
+  boc_atomic_bool_t bool_slot;
+  boc_atomic_ptr_t ptr_slot;
   char _padding[64];
 } hs_state_t;
 
@@ -42,10 +38,6 @@ static void hs_destroy(PyObject *cap) {
 static hs_state_t *hs_get(PyObject *cap) {
   return (hs_state_t *)PyCapsule_GetPointer(cap, "boc_hs_state");
 }
-
-// ---------------------------------------------------------------------------
-// State setup / inspection.
-// ---------------------------------------------------------------------------
 
 static PyObject *py_make_state(PyObject *Py_UNUSED(self),
                                PyObject *Py_UNUSED(args)) {
@@ -109,10 +101,6 @@ static PyObject *py_load_ptr(PyObject *Py_UNUSED(self), PyObject *cap) {
   return PyLong_FromVoidPtr(v);
 }
 
-// ---------------------------------------------------------------------------
-// Acquire / release handshake (the canonical weak-memory test).
-// ---------------------------------------------------------------------------
-
 static PyObject *py_producer(PyObject *Py_UNUSED(self), PyObject *args) {
   PyObject *cap;
   unsigned long long payload;
@@ -123,11 +111,7 @@ static PyObject *py_producer(PyObject *Py_UNUSED(self), PyObject *args) {
   if (h == NULL) {
     return NULL;
   }
-  Py_BEGIN_ALLOW_THREADS
-      // Plain non-atomic write of the payload, then a release store of
-      // the flag. A consumer that observes flag==1 with an acquire load
-      // MUST see the payload write (acq-rel synchronises-with).
-      h->payload = (uint64_t)payload;
+  Py_BEGIN_ALLOW_THREADS h->payload = (uint64_t)payload;
   boc_atomic_store_u64_explicit(&h->flag, 1, BOC_MO_RELEASE);
   Py_END_ALLOW_THREADS Py_RETURN_NONE;
 }
@@ -139,17 +123,11 @@ static PyObject *py_consumer(PyObject *Py_UNUSED(self), PyObject *cap) {
   }
   uint64_t got;
   Py_BEGIN_ALLOW_THREADS while (
-      boc_atomic_load_u64_explicit(&h->flag, BOC_MO_ACQUIRE) == 0) {
-    // tight spin; the producer thread is the only writer
-  }
+      boc_atomic_load_u64_explicit(&h->flag, BOC_MO_ACQUIRE) == 0) {}
   got = h->payload;
   Py_END_ALLOW_THREADS return PyLong_FromUnsignedLongLong(
       (unsigned long long)got);
 }
-
-// ---------------------------------------------------------------------------
-// Multi-thread fetch_add contention (relaxed counter).
-// ---------------------------------------------------------------------------
 
 static PyObject *py_fetch_add_loop_u64(PyObject *Py_UNUSED(self),
                                        PyObject *args) {
@@ -185,10 +163,6 @@ static PyObject *py_fetch_add_loop_u32(PyObject *Py_UNUSED(self),
   Py_END_ALLOW_THREADS Py_RETURN_NONE;
 }
 
-// ---------------------------------------------------------------------------
-// Multi-thread CAS contention loop (acq_rel on success, relaxed on failure).
-// ---------------------------------------------------------------------------
-
 static PyObject *py_cas_increment_loop_u64(PyObject *Py_UNUSED(self),
                                            PyObject *args) {
   PyObject *cap;
@@ -204,20 +178,10 @@ static PyObject *py_cas_increment_loop_u64(PyObject *Py_UNUSED(self),
     uint64_t cur = boc_atomic_load_u64_explicit(&h->counter64, BOC_MO_RELAXED);
     while (!boc_atomic_compare_exchange_strong_u64_explicit(
         &h->counter64, &cur, cur + 1, BOC_MO_ACQ_REL, BOC_MO_RELAXED)) {
-      // CAS updates `cur` on failure; loop body is empty.
     }
   }
   Py_END_ALLOW_THREADS Py_RETURN_NONE;
 }
-
-// ---------------------------------------------------------------------------
-// Single-threaded round-trip: every (op, type, order) at least once.
-// ---------------------------------------------------------------------------
-//
-// On Linux the typed API is a thin wrapper around <stdatomic.h>, so this
-// is mostly a "does it compile and link" smoke. On MSVC it exercises the
-// per-order Interlocked* dispatch; on ARM64 MSVC it exercises the
-// __ldar*/__stlr* fast paths.
 
 static int round_trip_u64(void) {
   boc_atomic_u64_t slot = 0;
@@ -226,18 +190,15 @@ static int round_trip_u64(void) {
                                        BOC_MO_SEQ_CST};
   for (size_t i = 0; i < sizeof(orders) / sizeof(orders[0]); ++i) {
     boc_memory_order_t o = orders[i];
-    // store/load round-trip.
     boc_atomic_store_u64_explicit(&slot, 0x1234567890ABCDEFULL, o);
     if (boc_atomic_load_u64_explicit(&slot, o) != 0x1234567890ABCDEFULL) {
       return -1;
     }
-    // exchange returns previous, installs new.
     uint64_t prev = boc_atomic_exchange_u64_explicit(&slot, 42ULL, o);
     if (prev != 0x1234567890ABCDEFULL ||
         boc_atomic_load_u64_explicit(&slot, o) != 42ULL) {
       return -1;
     }
-    // fetch_add / fetch_sub.
     if (boc_atomic_fetch_add_u64_explicit(&slot, 8ULL, o) != 42ULL ||
         boc_atomic_load_u64_explicit(&slot, o) != 50ULL) {
       return -1;
@@ -246,14 +207,12 @@ static int round_trip_u64(void) {
         boc_atomic_load_u64_explicit(&slot, o) != 45ULL) {
       return -1;
     }
-    // CAS success.
     uint64_t exp = 45ULL;
     if (!boc_atomic_compare_exchange_strong_u64_explicit(&slot, &exp, 99ULL, o,
                                                          BOC_MO_RELAXED) ||
         boc_atomic_load_u64_explicit(&slot, o) != 99ULL) {
       return -1;
     }
-    // CAS failure must update `exp` to the current value.
     exp = 0ULL;
     if (boc_atomic_compare_exchange_strong_u64_explicit(&slot, &exp, 7ULL, o,
                                                         BOC_MO_RELAXED) ||
@@ -388,10 +347,6 @@ static PyObject *py_round_trip(PyObject *Py_UNUSED(self),
   }
   Py_RETURN_NONE;
 }
-
-// ---------------------------------------------------------------------------
-// Registrar.
-// ---------------------------------------------------------------------------
 
 static PyMethodDef methods[] = {
     {"atomics_make_state", py_make_state, METH_NOARGS,

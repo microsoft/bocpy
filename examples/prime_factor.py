@@ -6,11 +6,8 @@ import logging
 import math
 import random
 
-from bocpy import (Cown, notice_read, notice_update, notice_write,
-                   receive, send, wait, when)
-
-
-# -- Helpers for notice_update (must be module-level and picklable) -----------
+from bocpy import (Cown, notice_read, notice_seed, notice_update,
+                   notice_write, quiesce, wait, when)
 
 
 def _merge_sieve(existing, new_primes):
@@ -29,7 +26,6 @@ def _merge_sieve(existing, new_primes):
         return new_primes
 
     cutoff = existing[-1]
-    # Binary search for the first new prime beyond the existing sieve
     lo, hi = 0, len(new_primes)
     while lo < hi:
         mid = (lo + hi) // 2
@@ -41,9 +37,6 @@ def _merge_sieve(existing, new_primes):
     if lo >= len(new_primes):
         return existing
     return existing + new_primes[lo:]
-
-
-# -- Sieve phase: find primes from random candidates -------------------------
 
 
 class SieveLane:
@@ -71,7 +64,6 @@ def sieve_check(lane: Cown[SieveLane]):
     @when(lane)
     def _(lane):
         if lane.value.remaining <= 0:
-            send("sieve_done", lane.value.found)
             return
 
         sieve_work(lane)
@@ -82,7 +74,7 @@ def sieve_work(lane: Cown[SieveLane]):
     @when(lane)
     def _(lane):
         info = lane.value
-        sieve = list(notice_read("sieve") or [2, 3])
+        sieve = list(notice_read("sieve"))
         new_sieve_primes = []
         count = min(info.batch, info.remaining)
 
@@ -90,7 +82,6 @@ def sieve_work(lane: Cown[SieveLane]):
             c = random.randrange(info.lo, info.hi) | 1
             limit = int(math.isqrt(c)) + 1
 
-            # Extend the local sieve until it covers sqrt(c)
             n = sieve[-1] + 2
             while sieve[-1] < limit:
                 if all(n % p != 0 for p in sieve if p * p <= n):
@@ -98,7 +89,6 @@ def sieve_work(lane: Cown[SieveLane]):
                     new_sieve_primes.append(n)
                 n += 2
 
-            # Test c against the sieve
             is_prime = True
             for p in sieve:
                 if p * p > c:
@@ -117,9 +107,6 @@ def sieve_work(lane: Cown[SieveLane]):
                           default=[2, 3])
 
         sieve_check(lane)
-
-
-# -- Factor phase: Pollard's rho with parallel random walks ------------------
 
 
 class RhoLane:
@@ -166,7 +153,6 @@ def rho_work(lane: Cown[RhoLane], n: int):
                 print(f"  lane {info.lane_id} found factor {d}")
                 return
             if d == n:
-                # Cycle with trivial gcd — restart with new constants
                 info.c = random.randrange(1, n)
                 info.x = random.randrange(2, n)
                 info.y = info.x
@@ -176,9 +162,6 @@ def rho_work(lane: Cown[RhoLane], n: int):
         info.x = x
         info.y = y
         rho_check(lane, n)
-
-
-# -- Main --------------------------------------------------------------------
 
 
 def main():
@@ -197,25 +180,32 @@ def main():
 
     logging.basicConfig(level=args.loglevel)
 
-    # Phase 1 — parallel sieve to find primes from random candidates
     lo = 1 << (args.bits - 1)
     hi = (1 << args.bits) - 1
     per_lane = args.candidates // args.lanes
     print(f"sieving {args.candidates} candidates ({args.bits}-bit) "
           f"across {args.lanes} lanes ...")
 
+    # Seed the shared sieve synchronously so every lane reads a populated
+    # "sieve" entry from its first behavior; later growth is merged by the
+    # worker-side notice_update below.
+    notice_seed("sieve", [2, 3, 5, 7, 11, 13, 17, 19])
+
+    sieve_lane_cowns = []
     for i in range(args.lanes):
-        lane = Cown(SieveLane(i, per_lane, args.batch, lo, hi))
-        sieve_check(lane)
+        lane_cown = Cown(SieveLane(i, per_lane, args.batch, lo, hi))
+        sieve_check(lane_cown)
+        sieve_lane_cowns.append(lane_cown)
+
+    quiesce()
 
     primes = []
-    for _ in range(args.lanes):
-        _, found = receive("sieve_done")
-        primes.extend(found)
+    for lane_cown in sieve_lane_cowns:
+        with lane_cown as lane:
+            primes.extend(lane.found)
 
     print(f"found {len(primes)} primes")
 
-    # Phase 2 — pick two primes, form a semiprime, and factor it
     p, q = random.sample(primes, 2)
     n = p * q
 
@@ -223,15 +213,8 @@ def main():
     print(f"Pollard's rho with {args.lanes} parallel walks, batch={args.batch}")
 
     for i in range(args.lanes):
-        lane = Cown(RhoLane(i, n, args.batch))
-        rho_check(lane, n)
+        rho_check(Cown(RhoLane(i, n, args.batch)), n)
 
-    # Every rho lane self-terminates once `notice_read("factor")`
-    # returns a value, so the runtime quiesces on its own. `wait()`
-    # is the barrier; `noticeboard=True` lifts the result back
-    # across shutdown. `.get` (not `[]`) so a quiescence with no
-    # factor surfaces as a clean diagnostic rather than a
-    # `KeyError`.
     snap = wait(noticeboard=True)
     factor = snap.get("factor")
     if factor is None:

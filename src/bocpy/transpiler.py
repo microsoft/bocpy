@@ -66,52 +66,62 @@ class CapturedVariableFinder(ast.NodeVisitor):
         self.known_vars: Set[str] = known_vars
         self.when_aliases: Set[str] = when_aliases
         self.bocpy_module_aliases: Set[str] = bocpy_module_aliases
+        self._entered: bool = False
 
     def clear(self):
         """Reset the tracked state between function visits."""
         self.local_vars.clear()
         self.used_vars.clear()
         self.captured_vars.clear()
+        self._entered = False
 
     def visit_FunctionDef(self, node):  # noqa: N802
-        """Collect locals and recurse to find captured variables."""
-        for arg in node.args.args:
-            self.local_vars.add(arg.arg)
+        """Find captured variables.
 
-        if node.args.vararg:
-            self.local_vars.add(node.args.vararg.arg)
+        First call (the root behavior): collect its params as locals and
+        recurse. Every later call is a nested def discovered during recursion:
+        record its name, and for a nested ``@when`` surface its free names as
+        the outer behavior's captures (its cown args and capture tuple are
+        evaluated in the outer frame). Plain nested defs are left to Python's
+        own closure.
+        """
+        if not self._entered:
+            self._entered = True
 
-        if node.args.kwarg:
-            self.local_vars.add(node.args.kwarg.arg)
+            for arg in node.args.args:
+                self.local_vars.add(arg.arg)
 
-        for stmt in node.body:
-            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                self.local_vars.add(stmt.name)
-                # A nested @when is rewritten by WhenTransformer into a
-                # whencall(...) at this position. The cown arguments and the
-                # capture tuple are evaluated in *this* (outer) frame, so any
-                # free names they reference must appear in the outer
-                # behavior's captures. Plain nested def's keep their normal
-                # opaque treatment because Python's own closure handles them.
-                if _has_when_decorator(stmt, self.when_aliases,
-                                       self.bocpy_module_aliases):
-                    inner = CapturedVariableFinder(
-                        self.known_vars,
-                        when_aliases=self.when_aliases,
-                        bocpy_module_aliases=self.bocpy_module_aliases,
-                    )
-                    inner.visit(stmt)
-                    self.used_vars |= inner.captured_vars
-                    for dec in stmt.decorator_list:
-                        if _is_when_call(dec, self.when_aliases,
-                                         self.bocpy_module_aliases):
-                            for arg in dec.args:
-                                self.visit(arg)
-                continue
+            if node.args.vararg:
+                self.local_vars.add(node.args.vararg.arg)
 
-            self.generic_visit(stmt)
+            if node.args.kwarg:
+                self.local_vars.add(node.args.kwarg.arg)
 
-        self.captured_vars = self.used_vars - self.local_vars - self.known_vars
+            for stmt in node.body:
+                self.visit(stmt)
+
+            self.captured_vars = self.used_vars - self.local_vars - self.known_vars
+            return
+
+        self.local_vars.add(node.name)
+
+        if _has_when_decorator(node, self.when_aliases,
+                               self.bocpy_module_aliases):
+            # Nested @when is rewritten to a whencall() evaluated here, so its
+            # free names must join the outer captures and its cown args are
+            # resolved in this frame.
+            inner = CapturedVariableFinder(
+                self.known_vars,
+                when_aliases=self.when_aliases,
+                bocpy_module_aliases=self.bocpy_module_aliases,
+            )
+            inner.visit(node)
+            self.used_vars |= inner.captured_vars
+            for dec in node.decorator_list:
+                if _is_when_call(dec, self.when_aliases,
+                                 self.bocpy_module_aliases):
+                    for arg in dec.args:
+                        self.visit(arg)
 
     visit_AsyncFunctionDef = visit_FunctionDef  # noqa: N815
 
@@ -126,9 +136,6 @@ class CapturedVariableFinder(ast.NodeVisitor):
 
     def visit_ExceptHandler(self, node: ast.ExceptHandler):  # noqa: N802
         """Treat ``except ... as X`` binding as a local, not a capture."""
-        # ``except ... as X`` (and ``try ... except* ... as X``) bind X
-        # on ``ExceptHandler.name`` as a plain identifier, not an
-        # ``ast.Name(Store)`` node, so the Name visitor never sees it.
         if node.name:
             self.local_vars.add(node.name)
         self.generic_visit(node)
@@ -147,15 +154,7 @@ class BOCModuleTransformer(ast.NodeTransformer):
         self.functions = set()
         self.imports = set()
         self.constants = set()
-        # Names that bind to ``bocpy.when`` (populated by
-        # ``visit_ImportFrom``). Always starts with the bare name
-        # ``"when"`` so a synthetic test or partial source still
-        # matches the historical literal-name spelling; the import
-        # visitor adds any explicit ``as`` alias to the set.
         self.when_aliases: set = {"when"}
-        # Names that bind to the ``bocpy`` module (populated by
-        # ``visit_Import``). Used so ``@alias.when(...)`` is
-        # recognised as a behavior decorator.
         self.bocpy_module_aliases: set = set()
 
     def known_vars(self):
@@ -226,10 +225,6 @@ class BOCModuleTransformer(ast.NodeTransformer):
     def visit_Assign(self, node: ast.Assign):  # noqa: N802
         """Add module-level constants."""
         if isinstance(node.value, ast.Constant):
-            # Constant assignments survive in the export. Record every
-            # target name (including chained ``A = B = 1`` and tuple
-            # ``A, B = 1, 2``) so the decorator validator can resolve
-            # them.
             self._record_constant_targets(node.targets)
             return node
 
@@ -239,7 +234,6 @@ class BOCModuleTransformer(ast.NodeTransformer):
         name = node.targets[0]
 
         if isinstance(name, ast.Name):
-            # use naming convention to allow some non-constant values as well
             if name.id.isupper():
                 self.constants.add(name.id)
                 return node
@@ -276,13 +270,6 @@ class BOCModuleTransformer(ast.NodeTransformer):
 
             new_body.append(new_value)
 
-        # If the user only spelled ``import bocpy [as alias]`` we never
-        # injected ``whencall`` into a ``from bocpy import`` statement,
-        # but the generated ``__behavior__N`` rewrite still emits
-        # ``whencall(...)`` as a bare ``Name``. Prepend an explicit
-        # import so worker resolution succeeds. No-op when ``whencall``
-        # is already imported or when no bocpy import is present (in
-        # which case nothing in the exported module would call it).
         if (self.bocpy_module_aliases and "whencall" not in self.imports):
             inject = ast.ImportFrom(
                 module="bocpy",
@@ -307,22 +294,6 @@ class WhenTransformer(ast.NodeTransformer):
     the function with a call to `whencall` for that behavior.
     """
 
-    # Best-effort early warning for stdlib decorators that produce
-    # non-callable descriptors at module scope (``staticmethod``,
-    # ``classmethod``, ``property``). Applied below ``@when``, these
-    # would silently break worker dispatch — the generated
-    # ``__behavior__N`` is invoked as a plain function on the worker,
-    # but the descriptor is not callable that way; ``property`` even
-    # raises ``TypeError`` at import time.
-    #
-    # This is **not** a correctness guarantee. The transpiler can only
-    # see decorator *syntax*, not what the expression evaluates to at
-    # import time on the worker, so any third-party decorator with the
-    # same shape (e.g., ``functools.cached_property``, custom
-    # descriptor factories) will slip through. Treat the set below as a
-    # convenience: a precise, actionable error for the few stdlib names
-    # we can recognise from the AST. Users applying exotic decorators
-    # below ``@when`` are on their own.
     _BANNED_BELOW_DECORATORS = frozenset({"staticmethod", "classmethod", "property"})
 
     def __init__(self, known_vars: set, path: str, module_scope_names: set,
@@ -380,7 +351,6 @@ class WhenTransformer(ast.NodeTransformer):
 
         def visit(node: ast.AST) -> None:
             if isinstance(node, ast.Lambda):
-                # Defaults are evaluated in the *outer* scope.
                 for d in node.args.defaults:
                     visit(d)
                 for d in node.args.kw_defaults:
@@ -395,8 +365,6 @@ class WhenTransformer(ast.NodeTransformer):
                                  ast.GeneratorExp, ast.DictComp)):
                 local: set = set()
                 for i, gen in enumerate(node.generators):
-                    # The *first* iter is evaluated in the enclosing
-                    # scope; later iters see prior targets.
                     if i == 0:
                         visit(gen.iter)
                     else:
@@ -463,15 +431,12 @@ class WhenTransformer(ast.NodeTransformer):
         if when_dec is None:
             return self.generic_visit(node)
 
-        # Reject async functions — there is no event loop on workers.
         if isinstance(node, ast.AsyncFunctionDef):
             raise SyntaxError(
                 "@when does not support async functions",
                 (self.path, node.lineno, node.col_offset, None),
             )
 
-        # Reject decorators above @when — they would wrap the
-        # scheduling call (a Cown), not the behavior body.
         when_idx = node.decorator_list.index(when_dec)
         if when_idx > 0:
             bad = node.decorator_list[0]
@@ -483,23 +448,9 @@ class WhenTransformer(ast.NodeTransformer):
                 (self.path, bad.lineno, bad.col_offset, None),
             )
 
-        # first create a deep copy of the function
         behavior_node = copy.deepcopy(node)
         ast.copy_location(behavior_node, node)
 
-        # Extras-as-captures: positional parameters declared beyond the
-        # cown count are captured by name from the caller's frame. This
-        # supports two idioms transparently:
-        #   * the canonical Python loop-snapshot ``def b(c, i=i)`` —
-        #     defaults align with the *tail* of ``args.args``; the
-        #     default name becomes the capture source.
-        #   * the rename form ``def b(c, x=y)`` — capture by ``y``,
-        #     bind into param ``x``.
-        # Undefaulted trailing positionals (``def b(c, factor)``) are
-        # captured by the parameter's own name. Non-Name defaults and
-        # defaults landing on cown positions are rejected up front so a
-        # broken signature surfaces at export time, not as a confusing
-        # worker TypeError.
         extras_captures: list[str] = []
         n_cowns = len(when_dec.args)
         all_params = behavior_node.args.args
@@ -528,40 +479,24 @@ class WhenTransformer(ast.NodeTransformer):
                 )
             extras_captures.append(dflt.id)
 
-        # Strip defaults so the worker never tries to evaluate them.
-        # The captured values are passed positionally by ``whencall``.
         behavior_node.args.defaults = []
 
-        # find all the captured variables. These will need to be passed
-        # to the behavior as additional arguments, as the closure will
-        # no longer function properly. Extras (already in args.args) are
-        # in ``local_vars`` thanks to the finder's param walk, so they
-        # will not be re-classified as body free-vars.
         self.cap_finder.clear()
         self.cap_finder.visit(behavior_node)
-        # __file__ is rewritten to a string constant by visit_Name below,
-        # so it must not be added to the parameter list as a capture.
         body_captures = [c for c in self.cap_finder.captured_vars
                          if c != "__file__"]
 
-        # add the body captures as trailing parameters; extras are
-        # already part of the user's signature.
         for name in body_captures:
             behavior_node.args.args.append(ast.Name(id=name))
 
         captures = extras_captures + body_captures
 
-        # Remove only @when decorators; other decorators compose with
-        # the behavior body and are preserved in the exported module.
         behavior_node.decorator_list = [
             d for d in behavior_node.decorator_list
             if not _is_when_call(d, self.when_aliases,
                                  self.bocpy_module_aliases)
         ]
 
-        # Reject descriptor-producing decorators that would silently
-        # break worker dispatch when applied to a module-level
-        # ``__behavior__N`` (the worker calls it as a plain function).
         for dec in behavior_node.decorator_list:
             banned = None
             if isinstance(dec, ast.Name) and dec.id in self._BANNED_BELOW_DECORATORS:
@@ -577,27 +512,16 @@ class WhenTransformer(ast.NodeTransformer):
                     (self.path, dec.lineno, dec.col_offset, None),
                 )
 
-        # Validate that remaining decorator expressions only reference
-        # names available at module scope in the worker. Walk only
-        # *free* variables — names bound by ``Lambda`` /
-        # comprehension / generator-expression scopes inside the
-        # decorator are local and must not be flagged.
         for dec in behavior_node.decorator_list:
             self._validate_decorator_names(dec)
 
-        # deal with any recursive behaviors within this behavior
         behavior_node = self.visit(behavior_node)
 
-        # assign a unique name
         behavior_node.name = f"__behavior__{len(self.behaviors)}"
 
-        # add the node to our list of behavior function nodes
         ast.fix_missing_locations(behavior_node)
         self.nodes.append(behavior_node)
 
-        # this allows name and capture lookup for execution of behaviors
-        # from the primary interpreter (using source line numbers from the
-        # frame)
         self.behaviors[when_dec.lineno] = BehaviorInfo(behavior_node.name, captures)
 
         args = [ast.Constant(value=behavior_node.name),
@@ -623,12 +547,6 @@ ExportResult = NamedTuple("ExportResult", [("code", str), ("classes", Set[str]),
                                            ("behaviors", Mapping[int, BehaviorInfo])])
 
 
-# Module-level dunders (__name__, __doc__, __package__, __spec__, __loader__)
-# are exposed via __builtins__, but inside a behavior they should refer to the
-# *user* module's value, not the worker's exported module. Removing them from
-# `known_vars` lets the capture mechanism pick them up from the call-site
-# frame's globals at runtime. __file__ is handled separately via inlining in
-# WhenTransformer.visit_Name.
 MODULE_DUNDERS = {"__name__", "__doc__", "__package__",
                   "__spec__", "__loader__"}
 

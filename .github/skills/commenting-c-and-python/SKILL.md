@@ -60,19 +60,29 @@ typedef struct boc_message {
 
 ### Inline Comments — `//` Style
 
-Use `//` for short explanatory comments inside function bodies. Place them on
-the line **above** the code they describe, at the current indentation level:
+**An inline comment defaults to a single line of at most 120
+characters, or it is deleted.** Verbose multi-line inline comments rot
+as the code beneath them changes and make the code harder to read, not
+easier. Place the comment on the line **above** the code it describes,
+at the current indentation level:
 
 ```c
-  // two possibilities:
-  // 1. queue is empty
-  // 2. queue is inconsistent
-
-  // step 1: swap the new node in as the new head
+  // swap the new node in as the new head
   node->next = head;
 ```
 
-End-of-line `//` comments are reserved for preprocessor version annotations:
+A multi-line `//` inline comment is permitted **only** when it records
+something the code cannot express and that does not fit on one line:
+a non-obvious concurrency invariant (2PL lock ordering, MCS handoff,
+memory-ordering rationale), the rationale above a version-gate
+`#if`/`#elif` ladder, an X-macro / `clang-format off` table boundary,
+or a reference anchor that needs a line of context. When in doubt,
+collapse to one line. (Doxygen `///` / `/** */` doc-blocks are
+documentation, not inline comments, and are exempt from this rule —
+they may carry in-depth prose.)
+
+End-of-line `//` comments are reserved for preprocessor version
+annotations:
 
 ```c
 #if PY_VERSION_HEX >= 0x030E0000 // 3.14
@@ -249,18 +259,25 @@ def send(tag: str, contents: Any):
 
 ### Inline `#` Comments
 
-Use `#` comments for short notes inside function bodies. Place them on the line
-above the code, at the current indentation:
+**An inline comment defaults to a single line of at most 120
+characters, or it is deleted.** Verbose multi-line inline comments rot
+as the surrounding code changes and reduce readability. Place the
+comment on the line above the code, at the current indentation:
 
 ```python
         orphan_cowns = _core.cowns()
         if len(orphan_cowns) != 0:
             logger.debug("acquiring orphan cowns")
-            # at this stage all behaviors have exited, but it may be the case
-            # that some cowns are released but associated with this interpreter.
-            # by acquiring them, we ensure that the XIData objects have been
-            # freed _before_ this interpreter is destroyed.
+            # acquire orphaned cowns so their XIData is freed before teardown
 ```
+
+A multi-line `#` inline comment is permitted **only** when it records
+something the code cannot express and that does not fit on one line:
+a non-obvious concurrency invariant, a behavior-changing transpiler
+rule, the rationale above a version gate, or a reference anchor that
+needs context. When in doubt, collapse to one line. Docstrings are
+*not* inline comments and are exempt — they should carry in-depth,
+useful documentation across as many lines as the reader needs.
 
 Same-line `#` comments are acceptable for very short annotations:
 

@@ -27,8 +27,6 @@ BOCTag *tag_from_PyUnicode(PyObject *unicode, BOCQueue *queue) {
   Py_ssize_t size = -1;
   const char *str = PyUnicode_AsUTF8AndSize(unicode, &size);
   if (str == NULL) {
-    // PyUnicode_AsUTF8AndSize sets the exception (UnicodeEncodeError on
-    // surrogates, etc.). Free the partial allocation before returning.
     PyMem_RawFree(tag);
     return NULL;
   }
@@ -44,11 +42,6 @@ BOCTag *tag_from_PyUnicode(PyObject *unicode, BOCQueue *queue) {
 
   memcpy(tag->str, str, tag->size + 1);
   tag->queue = queue;
-  // Return with rc = 1: callers receive an owning reference. The prior
-  // rc = 0 idiom required every caller to TAG_INCREF immediately after
-  // the publish-store, but the publish-then-incref window left the
-  // tag visible to peers at rc = 0 and a racing TAG_DECREF could free
-  // it before the publisher's INCREF ran.
   atomic_store(&tag->rc, 1);
   atomic_store(&tag->disabled, 0);
 

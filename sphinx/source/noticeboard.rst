@@ -223,9 +223,9 @@ deleted, regardless of how many readers have observed the entry.
    :func:`wait` with ``noticeboard=True`` (see "Reading the Final
    State at Shutdown" above) and :func:`quiesce` with
    ``noticeboard=True`` (see "Reading the State Between Rounds"
-   above). Seeding the noticeboard with :func:`notice_write` from
-   the main thread *before* scheduling behaviors is fine and is
-   the recommended pattern for installing read-mostly configuration.
+   above). To install read-mostly configuration from the main thread
+   *before* scheduling behaviors, use :func:`notice_seed` (see
+   "Seeding Before Scheduling" below), which commits synchronously.
 
 Writing and Updating
 --------------------
@@ -278,40 +278,50 @@ Deleting Entries
 
     notice_delete("temporary_flag")
 
-``notice_sync`` (Testing Only)
--------------------------------
 
-:func:`notice_sync` blocks until every mutation the calling thread has
-posted so far has been committed by the noticeboard thread. It exists to
-make the noticeboard's eventual consistency tractable for **tests** — a
-test can write a value, call ``notice_sync()``, and then assert that a
-subsequently scheduled behavior observes the write — not as a primitive
-for application code.
+Seeding Before Scheduling
+-------------------------
 
-.. warning::
+:func:`notice_write` is fire-and-forget: it hands the write to the
+noticeboard thread and returns before the value commits, so a behavior
+scheduled immediately afterwards is *not* guaranteed to observe it. To
+install read-mostly configuration on the main thread *before* scheduling
+the behaviors that read it, use :func:`notice_seed`, which commits
+synchronously under the noticeboard mutex and returns only once the entry
+is live::
 
-   Outside of tests, reaching for ``notice_sync`` is almost always an
-   anti-pattern. The guarantee it provides is much weaker than it looks:
+    from bocpy import notice_seed, notice_read, when, Cown
 
-   - It only orders the **calling thread's prior writes** against the
-     **next per-behavior snapshot** taken on any thread. Snapshots are
-     captured once per behavior, so a behavior already executing when
-     ``notice_sync`` returns will keep seeing its existing snapshot.
-   - It does **not** refresh the calling behavior's own snapshot — you
-     cannot ``notice_sync`` and then ``notice_read`` to see your write.
-   - It establishes no happens-before relationship between unrelated
-     behaviors and is not a substitute for cown-mediated ordering.
+    notice_seed("config.threshold", 0.5)   # committed before it returns
 
-   If application code needs read-your-writes ordering, model the shared
-   state as a :class:`Cown`. If you find yourself wanting
-   ``notice_sync`` outside a test, that is a strong signal the noticeboard
-   is the wrong primitive for the problem.
+    work = Cown(load_work())
+
+    @when(work)
+    def _(work):
+        threshold = notice_read("config.threshold")   # always observes 0.5
+        ...
+
+:func:`notice_seed` may be called only from the primary interpreter — never
+from inside a ``@when`` body (use :func:`notice_write` there). If the runtime
+is not yet running it starts it, so seeding can be the first bocpy call a
+program makes, with no explicit :func:`start`.
+
+.. note::
+
+   :func:`notice_seed` is a plain overwrite intended for one-shot seeding
+   *before* concurrent noticeboard mutations are in flight. It does **not**
+   provide the read-modify-write atomicity of :func:`notice_update`, and a
+   seed that races an in-flight :func:`notice_update` on the same key may be
+   lost. Seed once, up front, rather than interleaving seeds with concurrent
+   updates.
 
 
 API Reference
 -------------
 
 .. autofunction:: notice_write
+   :no-index:
+.. autofunction:: notice_seed
    :no-index:
 .. autofunction:: notice_update
    :no-index:
@@ -320,8 +330,6 @@ API Reference
 .. autofunction:: noticeboard
    :no-index:
 .. autofunction:: notice_read
-   :no-index:
-.. autofunction:: notice_sync
    :no-index:
 .. autodata:: REMOVED
    :no-index:

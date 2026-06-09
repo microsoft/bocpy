@@ -20,8 +20,7 @@
 /// API (@ref noticeboard_snapshot, @ref nb_pin_cowns,
 /// @ref noticeboard_write, @ref noticeboard_delete) set a Python
 /// exception and return -1 / NULL on failure. Functions that are
-/// pure C (@ref noticeboard_clear,
-/// @ref notice_sync_*) cannot fail.
+/// pure C (@ref noticeboard_clear) cannot fail.
 
 #ifndef BOCPY_NOTICEBOARD_H
 #define BOCPY_NOTICEBOARD_H
@@ -42,7 +41,7 @@
 /// @brief Maximum size of a key, including the trailing NUL byte.
 #define NB_KEY_SIZE 64
 
-/// @brief Initialize the noticeboard's mutex and notice_sync primitives.
+/// @brief Initialize the noticeboard's mutex.
 /// @details Called once at module init.
 void noticeboard_init(void);
 
@@ -135,19 +134,5 @@ void noticeboard_clear(void);
 /// @return New strong reference to the proxy, or NULL on failure
 ///         (PyErr set).
 PyObject *noticeboard_snapshot(PyObject *loads);
-
-/// @brief Reserve a fresh notice_sync sequence number.
-int_least64_t notice_sync_request(void);
-
-/// @brief Mark @p seq as processed and wake any @ref notice_sync_wait
-///        callers.
-void notice_sync_complete(int_least64_t seq);
-
-/// @brief Block the calling thread until @p seq has been processed.
-/// @param seq The sequence number returned by @ref notice_sync_request.
-/// @param timeout Maximum wait in seconds. Ignored if @p wait_forever.
-/// @param wait_forever If true, ignore @p timeout and wait until signalled.
-/// @return true if @p seq has been processed, false on timeout.
-bool notice_sync_wait(int_least64_t seq, double timeout, bool wait_forever);
 
 #endif // BOCPY_NOTICEBOARD_H
