@@ -44,7 +44,7 @@ QUEUE_FIELDS = {
 
 def test_scheduler_stats_empty_when_runtime_down():
     """With the runtime down, the snapshot must be an empty list."""
-    wait()  # ensure runtime is down
+    wait()
     stats = _core.scheduler_stats()
     assert isinstance(stats, list)
     assert stats == []
@@ -58,7 +58,7 @@ def test_wait_returns_final_snapshot():
     correct way to read the counters for the session that just
     ended.
     """
-    wait()  # baseline
+    wait()
     W = 2  # noqa: N806
     bocpy.start(worker_count=W)
     c = Cown(0)
@@ -67,18 +67,13 @@ def test_wait_returns_final_snapshot():
     def _(c):
         pass
 
-    # `wait()` blocks on the C-level terminator until every scheduled
-    # behavior has decremented it -- no send/receive handshake needed
-    # to know the behavior body actually ran.
     snapshot = wait(stats=True)
     assert isinstance(snapshot, list)
     assert len(snapshot) == W, snapshot
     for s in snapshot:
         assert SCHEDULER_FIELDS == set(s.keys()), s
-    # At least one push happened across the pool.
     assert sum(s["pushed_local"] + s["dispatched_to_pending"]
                + s["pushed_remote"] for s in snapshot) >= 1
-    # And the per-worker array is gone now.
     assert _core.scheduler_stats() == []
 
 
@@ -86,7 +81,6 @@ def test_wait_stats_default_returns_none():
     """`wait()` without `stats=True` returns ``None`` (back-compat)."""
     wait()
     assert wait() is None
-    # Even with a real session, default still returns None.
     bocpy.start(worker_count=2)
     c = Cown(0)
 
@@ -126,7 +120,6 @@ def test_off_worker_dispatch_bumps_pushed_remote_not_pending():
     total_remote = sum(s["pushed_remote"] for s in snap)
     total_pending = sum(s["dispatched_to_pending"] for s in snap)
     assert total_remote >= N, snap
-    # No producer-local arm was ever taken, so pending stays at 0.
     assert total_pending == 0, snap
 
 
@@ -162,7 +155,6 @@ def test_dispatched_to_pending_increments_from_worker_dispatch():
 def test_queue_stats_reflects_set_tags_and_traffic():
     """`queue_stats` should expose tagged queues with monotonic counters."""
     set_tags(["t_one", "t_two"])
-    # Drain in case a previous test sent on these tags.
     drain(["t_one", "t_two"])
 
     before = _core.queue_stats()
@@ -189,7 +181,6 @@ def test_queue_stats_reflects_set_tags_and_traffic():
     by_tag_after = {q["tag"]: q for q in after}
     assert by_tag_after["t_one"]["pushed_total"] == pushed_before + 2
     assert by_tag_after["t_one"]["popped_total"] == popped_before + 1
-    # Other tag must not move.
     assert (by_tag_after["t_two"]["pushed_total"]
             == by_tag_before["t_two"]["pushed_total"])
     assert (by_tag_after["t_two"]["popped_total"]
@@ -210,14 +201,12 @@ def test_queue_stats_monotonic_and_no_side_effect():
     s2 = by_tag(snap2)
     s3 = by_tag(snap3)
 
-    # No traffic between snapshots → counters are stable.
     for tag in s1:
         assert s2[tag]["pushed_total"] == s1[tag]["pushed_total"]
         assert s2[tag]["popped_total"] == s1[tag]["popped_total"]
         assert s3[tag]["pushed_total"] == s1[tag]["pushed_total"]
         assert s3[tag]["popped_total"] == s1[tag]["popped_total"]
 
-    # And calling scheduler_stats does not perturb queue_stats either.
     _ = _core.scheduler_stats()
     snap4 = _core.queue_stats()
     s4 = by_tag(snap4)
@@ -242,7 +231,5 @@ def test_drain_does_not_decrement_pushed_or_popped_total():
     drain(["t_drain"])
     after = next(q for q in _core.queue_stats() if q["tag"] == "t_drain")
 
-    # Drain pulls the messages out via boc_dequeue, so popped_total
-    # advances. pushed_total must not retreat.
     assert after["pushed_total"] == before["pushed_total"]
     assert after["popped_total"] >= before["popped_total"]

@@ -34,15 +34,10 @@ import pytest
 
 import bocpy
 from bocpy import _core
-from bocpy import Cown, drain, receive, send, TIMEOUT, wait, when
+from bocpy import Cown, quiesce, wait, when
 
 
-RECEIVE_TIMEOUT = 30
-
-
-# ---------------------------------------------------------------------------
-# Module-level helpers (must be importable by worker sub-interpreters)
-# ---------------------------------------------------------------------------
+QUIESCE_TIMEOUT = 5
 
 
 class _Counter:
@@ -64,18 +59,12 @@ def _ensure_quiesced():
     bocpy.wait()
 
 
-# ---------------------------------------------------------------------------
-# Runtime re-entry
-# ---------------------------------------------------------------------------
-
-
 class TestRuntimeReentry:
     """``start()`` / ``wait()`` / ``start()`` runs two clean workloads."""
 
     @classmethod
     def teardown_class(cls):
         wait()
-        drain("done")
 
     def test_start_wait_start_runs_two_workloads(self):
         """Two independent workloads bracketed by start/wait/start/wait.
@@ -88,7 +77,6 @@ class TestRuntimeReentry:
         """
         _ensure_quiesced()
 
-        # First workload.
         bocpy.start(worker_count=2)
         try:
             c = Cown(_Counter())
@@ -96,17 +84,17 @@ class TestRuntimeReentry:
                 @when(c)
                 def _(c):
                     c.value.count += 1
-                    send("done", c.value.count)
-            for _ in range(50):
-                tag, _payload = receive("done", RECEIVE_TIMEOUT)
-                assert tag != TIMEOUT, "first workload stalled"
+
+            @when(c)
+            def first(c):
+                return c.value.count
+            quiesce(QUIESCE_TIMEOUT)
+            assert first.unwrap() == 50, "first workload stalled"
         finally:
-            drain("done")
             wait()
 
         assert _core.scheduler_stats() == []
 
-        # Second workload after teardown — must come up clean.
         bocpy.start(worker_count=2)
         try:
             c = Cown(_Counter())
@@ -114,18 +102,14 @@ class TestRuntimeReentry:
                 @when(c)
                 def _(c):
                     c.value.count += 1
-                    send("done", c.value.count)
-            for _ in range(50):
-                tag, _payload = receive("done", RECEIVE_TIMEOUT)
-                assert tag != TIMEOUT, "second workload stalled"
+
+            @when(c)
+            def second(c):
+                return c.value.count
+            quiesce(QUIESCE_TIMEOUT)
+            assert second.unwrap() == 50, "second workload stalled"
         finally:
-            drain("done")
             wait()
-
-
-# ---------------------------------------------------------------------------
-# Paired-release on uncaught body exception
-# ---------------------------------------------------------------------------
 
 
 def _raising_step(c):
@@ -134,6 +118,7 @@ def _raising_step(c):
     def _(c):
         c.value.count += 1
         raise RuntimeError("intentional failure")
+    return _
 
 
 def _follow_on(c):
@@ -141,7 +126,8 @@ def _follow_on(c):
     @when(c)
     def _(c):
         c.value.count += 1
-        send("done", c.value.count)
+        return c.value.count
+    return _
 
 
 class TestPairedRelease:
@@ -150,7 +136,6 @@ class TestPairedRelease:
     @classmethod
     def teardown_class(cls):
         wait()
-        drain("done")
 
     def test_cown_reacquirable_after_uncaught_exception(self):
         """A failing behaviour releases its cown so the next one runs.
@@ -159,28 +144,23 @@ class TestPairedRelease:
         funnels it to ``Cown.set_exception``, then runs the
         release/release_all pair. If the release path were broken the
         follow-on ``@when(c)`` would block forever; the test would
-        time out on ``receive`` instead of returning a count of 2.
+        time out on ``quiesce`` instead of returning a count of 2.
         """
         _ensure_quiesced()
         bocpy.start(worker_count=2)
         try:
             c = Cown(_Counter())
-            _raising_step(c)
-            _follow_on(c)
+            raising = _raising_step(c)
+            follow = _follow_on(c)
+            quiesce(QUIESCE_TIMEOUT)
 
-            tag, payload = receive("done", RECEIVE_TIMEOUT)
-            assert tag != TIMEOUT, (
+            with pytest.raises(RuntimeError, match="intentional failure"):
+                raising.unwrap()
+            assert follow.unwrap() == 2, (
                 "cown was not re-acquired after an uncaught exception"
             )
-            assert payload == 2, payload
         finally:
-            drain("done")
             wait()
-
-
-# ---------------------------------------------------------------------------
-# Over-registration contract on scheduler_worker_register
-# ---------------------------------------------------------------------------
 
 
 def test_over_registration_raises_runtime_error():
@@ -192,7 +172,6 @@ def test_over_registration_raises_runtime_error():
     """
     bocpy.start()
     try:
-        # Workers have already registered; one more must fail.
         with pytest.raises(RuntimeError, match="over-registration"):
             _core.scheduler_worker_register()
     finally:

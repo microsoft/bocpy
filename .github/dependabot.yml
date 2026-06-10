@@ -36,6 +36,24 @@ updates:
         applies-to: version-updates
         patterns:
           - "*"
+    # Deferred docs-stack updates. These releases require Python >=3.11
+    # and therefore cannot enter ``ci/constraints-docs.txt`` while the
+    # project floor in ``pyproject.toml`` is still ``>=3.10``. Keep this
+    # list in sync with the comment above ``requires-python`` in
+    # ``pyproject.toml``; remove the block (and regenerate the
+    # constraints) once the floor is bumped to >=3.11 after Python 3.10
+    # reaches EOL (October 2026).
+    #
+    # ``ignore`` filters out matching packages before the group is
+    # assembled, so non-docs bumps (cyclonedx-python-lib, idna, etc.)
+    # still land in a smaller weekly PR. Security advisories for the
+    # ignored packages bypass this list and open immediately.
+    ignore:
+      - dependency-name: "docutils"
+      - dependency-name: "ruamel-yaml"
+      - dependency-name: "sphinx-tabs"
+      - dependency-name: "sphinx-toolbox"
+      - dependency-name: "standard-imghdr"
     labels:
       - "dependencies"
       - "ci"

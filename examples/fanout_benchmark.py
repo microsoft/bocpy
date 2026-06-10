@@ -7,7 +7,7 @@ fanout workload. Each producer behavior runs on a
 1. Allocates ``fanout_width`` **fresh** ``Cown[Matrix]`` consumers
    (the producer does not hold them).
 2. Dispatches ``@when(consumer_i)`` per consumer; each child mutates
-   its own cown and emits a ``"child"`` completion token.
+   its own cown.
 3. Reschedules itself on the producer cown until ``producer_steps``
    steps have run.
 
@@ -36,16 +36,11 @@ import sys
 import time
 from typing import Optional
 
-from bocpy import Cown, Matrix, receive, send, start, wait, when
+from bocpy import Cown, Matrix, quiesce, start, wait, when
 
 SENTINEL_BEGIN = "---BOCPY-FANOUT-BEGIN---"
 SENTINEL_END = "---BOCPY-FANOUT-END---"
 SCHEMA_VERSION = 1
-
-
-# ---------------------------------------------------------------------------
-# Behavior code (fanout workload, fresh-cown shape)
-# ---------------------------------------------------------------------------
 
 
 class ProducerState:
@@ -83,8 +78,8 @@ def schedule_child(consumer_cown: Cown, child_iters: int) -> None:
     """Schedule one child step on a fresh consumer cown.
 
     The child does ``child_iters`` in-place self-multiplications of
-    its matrix, then emits a ``("child", 1)`` token so the parent
-    can count completions.
+    its matrix. It reports nothing: BOC quiescence is the completion
+    signal, so no per-child token rides the message queue.
 
     :param consumer_cown: The child's exclusively-acquired matrix cown.
     :param child_iters: Inner-loop matmul iterations, captured.
@@ -93,7 +88,6 @@ def schedule_child(consumer_cown: Cown, child_iters: int) -> None:
     def _child(c):
         for _ in range(child_iters):
             c.value = c.value @ c.value
-        send("child", 1)
 
 
 def schedule_producer(p_cown: Cown) -> None:
@@ -101,8 +95,9 @@ def schedule_producer(p_cown: Cown) -> None:
 
     Allocates ``fanout_width`` fresh ``Cown[Matrix]`` consumers,
     dispatches one child per consumer, then either reschedules
-    itself or emits ``("producer_done", producer_id)`` when
-    ``target_steps`` is reached.
+    itself or stops once ``target_steps`` is reached. The running
+    dispatch count is accumulated on the producer's state cown so the
+    parent can cross-check it after quiescence.
 
     The producer holds only ``p_cown``; the fresh consumer cowns are
     not in its acquired set, so each child dispatch takes the
@@ -122,16 +117,8 @@ def schedule_producer(p_cown: Cown) -> None:
         ps.dispatched += k
         ps.steps += 1
         if ps.steps >= ps.target_steps:
-            send("producer_done", (ps.producer_id, ps.dispatched))
             return
-        # Pass the already-acquired wrapper rather than the
-        # closure-captured ``p_cown`` to keep the capture set minimal.
         schedule_producer(producer)
-
-
-# ---------------------------------------------------------------------------
-# Configuration and result types
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -174,11 +161,6 @@ class PointResult:
     error: Optional[dict] = None
 
 
-# ---------------------------------------------------------------------------
-# Sizing / validation
-# ---------------------------------------------------------------------------
-
-
 def derive_sizes(cfg: FanoutConfig) -> FanoutConfig:
     """Auto-size ``producers`` and ``fanout_width`` if not overridden.
 
@@ -217,19 +199,14 @@ def validate_config(cfg: FanoutConfig) -> Optional[str]:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Single-point measurement
-# ---------------------------------------------------------------------------
-
-
 def run_single_point_body(cfg: FanoutConfig, repeat_index: int) -> RepeatResult:
     """Run one fanout measurement in a fresh BOC runtime.
 
     Total expected completions = ``producers * fanout_width *
-    producer_steps``. The parent waits for that many ``child`` tokens
-    and ``producers`` ``producer_done`` tokens before tearing the
-    runtime down. ``wait(stats=True)`` returns the per-worker
-    counters captured at shutdown.
+    producer_steps``. The parent blocks on :func:`quiesce` until every
+    producer and child behavior has run, then tears the runtime down.
+    ``wait(stats=True)`` returns the per-worker counters captured at
+    shutdown.
 
     :param cfg: The fully-derived config.
     :param repeat_index: Repeat index for reporting.
@@ -247,7 +224,6 @@ def run_single_point_body(cfg: FanoutConfig, repeat_index: int) -> RepeatResult:
           f"(~{payload_bytes / 1024:.2f} KiB per consumer cown)",
           file=sys.stderr)
 
-    # Allocate producer state cowns.
     producer_cowns = [
         Cown(ProducerState(
             producer_id=pid,
@@ -259,7 +235,6 @@ def run_single_point_body(cfg: FanoutConfig, repeat_index: int) -> RepeatResult:
         for pid in range(cfg.producers)
     ]
 
-    # Generous wall-clock ceiling.
     timeout_s = max(60.0, total_expected * 0.001)
 
     try:
@@ -269,29 +244,19 @@ def run_single_point_body(cfg: FanoutConfig, repeat_index: int) -> RepeatResult:
         for p_cown in producer_cowns:
             schedule_producer(p_cown)
 
-        # Drain child completions.
-        completed = 0
-        while completed < total_expected:
-            msg = receive(["child"], timeout_s)
-            if msg is None or msg[0] != "child":
-                raise RuntimeError(
-                    f"only {completed}/{total_expected} child tokens "
-                    f"received within {timeout_s:.0f}s")
-            completed += 1
-
-        # Drain producer-done acks.
-        producer_dispatched = 0
-        for _ in range(cfg.producers):
-            msg = receive(["producer_done"], timeout_s)
-            if msg is None or msg[0] != "producer_done":
-                raise RuntimeError(
-                    f"producer_done not received within {timeout_s:.0f}s")
-            _, (_pid, count) = msg
-            producer_dispatched += count
+        try:
+            quiesce(timeout_s)
+        except TimeoutError:
+            raise RuntimeError(
+                f"fanout did not quiesce within {timeout_s:.0f}s "
+                f"(expected {total_expected} children)")
 
         t_end = time.perf_counter()
         elapsed_s = t_end - t_measure_start
 
+        completed = total_expected
+        producer_dispatched = sum(
+            p.unwrap().dispatched for p in producer_cowns)
         if producer_dispatched != completed:
             raise RuntimeError(
                 f"dispatched/completed mismatch: dispatched="
@@ -309,11 +274,6 @@ def run_single_point_body(cfg: FanoutConfig, repeat_index: int) -> RepeatResult:
         wall_clock_ns_start=wall_clock_ns_start,
         scheduler_stats=sched_stats_end,
         derived=compute_derived_metrics(sched_stats_end, int(completed)))
-
-
-# ---------------------------------------------------------------------------
-# Derived metrics (dispatch-contention signal)
-# ---------------------------------------------------------------------------
 
 
 def compute_derived_metrics(stats: Optional[list],
@@ -380,11 +340,6 @@ def compute_derived_metrics(stats: Optional[list],
     if total_attempts > 0:
         out["idle_ratio"] = total_failures / total_attempts
 
-    # Fairness: distribution of work across workers. We count
-    # popped_local + popped_via_steal per worker — this is what each
-    # worker actually executed (regardless of who pushed it). For a
-    # single-producer fanout the producer worker pushes everything;
-    # fairness measures whether stealing redistributed evenly.
     pops = [
         int(w.get("popped_local", 0)) + int(w.get("popped_via_steal", 0))
         for w in stats
@@ -398,7 +353,6 @@ def compute_derived_metrics(stats: Optional[list],
             out["fairness_cv"] = stdev / mean if mean > 0 else None
         else:
             out["fairness_cv"] = 0.0
-        # Gini: 0 is perfectly equal, 1 is maximally unequal.
         sorted_pops = sorted(pops)
         cum = 0
         weighted = 0
@@ -412,11 +366,6 @@ def compute_derived_metrics(stats: Optional[list],
         out["worker_pop_mean"] = mean
         out["worker_pop_counts"] = pops
     return out
-
-
-# ---------------------------------------------------------------------------
-# Subprocess orchestration (one repeat per child, fresh runtime)
-# ---------------------------------------------------------------------------
 
 
 def cfg_to_argv(cfg: FanoutConfig) -> list:
@@ -496,11 +445,6 @@ def _extract_sentinel_payload(stdout: str) -> Optional[dict]:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Sweep orchestration
-# ---------------------------------------------------------------------------
-
-
 def cfg_for_axis(base: FanoutConfig, axis: str, value) -> FanoutConfig:
     """Clone ``base`` with one axis varied to ``value``.
 
@@ -513,8 +457,6 @@ def cfg_for_axis(base: FanoutConfig, axis: str, value) -> FanoutConfig:
     cfg = FanoutConfig(**asdict(base))
     if axis == "workers":
         cfg.workers = int(value)
-        # Re-derive producers/fanout-width when sweeping workers
-        # unless the user explicitly pinned them at the base.
         if base.producers is None:
             cfg.producers = None
         if base.fanout_width is None:
@@ -672,11 +614,6 @@ def _json_default(obj):
                     "JSON-serializable")
 
 
-# ---------------------------------------------------------------------------
-# Metadata
-# ---------------------------------------------------------------------------
-
-
 def collect_metadata(argv: list, git_sha: Optional[str]) -> dict:
     """Collect metadata for the top of the results JSON."""
     try:
@@ -716,11 +653,6 @@ def _git_sha() -> Optional[str]:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
     return None
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 
 def parse_sweep_values(axis: str, raw: Optional[str]) -> list:

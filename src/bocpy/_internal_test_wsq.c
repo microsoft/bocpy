@@ -31,10 +31,6 @@
 #include "boc_compat.h"
 #include "boc_sched.h"
 
-// ---------------------------------------------------------------------------
-// Worker fixture capsule
-// ---------------------------------------------------------------------------
-
 #define WSQ_WORKER_CAPSULE_NAME "bocpy._internal_test.wsq_worker"
 #define WSQ_NODE_CAPSULE_NAME "bocpy._internal_test.wsq_node"
 
@@ -50,12 +46,8 @@ static void wsq_worker_capsule_destructor(PyObject *capsule) {
   if (w == NULL) {
     return;
   }
-  // Drain every sub-queue so destroy_assert_empty does not abort if
-  // a test left items behind. We do NOT free the test nodes here —
-  // they are owned by the Python side via their own capsules.
   for (size_t i = 0; i < (size_t)BOC_WSQ_N; ++i) {
     while (boc_bq_dequeue(&w->q[i]) != NULL) {
-      // discard
     }
     boc_bq_destroy_assert_empty(&w->q[i]);
   }
@@ -75,19 +67,12 @@ static boc_sched_worker_t *wsq_worker_from_capsule(PyObject *capsule) {
                                                     WSQ_WORKER_CAPSULE_NAME);
 }
 
-// ---------------------------------------------------------------------------
-// Methods
-// ---------------------------------------------------------------------------
-
 static PyObject *wsq_n(PyObject *Py_UNUSED(self), PyObject *Py_UNUSED(args)) {
   return PyLong_FromSize_t((size_t)BOC_WSQ_N);
 }
 
 static PyObject *wsq_make_worker(PyObject *Py_UNUSED(self),
                                  PyObject *Py_UNUSED(args)) {
-  // Calloc so all unused worker fields (mutex, cv, ring link, stats,
-  // owner_interp_id, ...) are zero. The WSQ helpers only touch q[]
-  // and the three cursors, all of which we re-init explicitly.
   boc_sched_worker_t *w = PyMem_RawCalloc(1, sizeof(boc_sched_worker_t));
   if (w == NULL) {
     return PyErr_NoMemory();
@@ -255,9 +240,6 @@ static PyObject *wsq_spread_segment_counts(PyObject *Py_UNUSED(self),
     PyErr_SetString(PyExc_ValueError, "length must be positive");
     return NULL;
   }
-  // Allocate L nodes and link them head-to-tail. The link payload
-  // stored in `next_in_queue` is `boc_bq_node_t *`; we use plain
-  // stores via the typed atomic helper to construct the segment.
   wsq_test_node_t **nodes = PyMem_RawCalloc((size_t)length, sizeof(*nodes));
   if (nodes == NULL) {
     return PyErr_NoMemory();
@@ -273,10 +255,6 @@ static PyObject *wsq_spread_segment_counts(PyObject *Py_UNUSED(self),
     }
     nodes[i]->id = (int64_t)i;
   }
-  // Link 0->1->...->L-1; tail's next stays NULL. Relaxed stores
-  // are fine — the segment is private to this thread until we hand
-  // it to enqueue_spread, which uses the queue's release/acquire
-  // protocol on its own.
   for (Py_ssize_t i = 0; i < length - 1; ++i) {
     boc_atomic_store_ptr_explicit(&nodes[i]->node.next_in_queue,
                                   &nodes[i + 1]->node, BOC_MO_RELAXED);
@@ -311,10 +289,6 @@ static PyObject *wsq_spread_segment_counts(PyObject *Py_UNUSED(self),
   }
   return out;
 }
-
-// ---------------------------------------------------------------------------
-// Registrar
-// ---------------------------------------------------------------------------
 
 static PyMethodDef wsq_methods[] = {
     {"wsq_n", wsq_n, METH_NOARGS,

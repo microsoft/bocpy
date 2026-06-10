@@ -59,11 +59,10 @@ from bocpy import Matrix
 
 
 REPS = 11
-MIN_BATCH_NS = 1_000_000  # 1 ms
-# Per-thunk warmup window. Long enough to push past Intel boost transients
-# (PL2 -> PL1 on i7-14700F lands in the 50-150 ms range) so every timed rep
-# is sampled at the sustained P-state, not at the post-idle boost clock.
-WARMUP_NS = 200_000_000  # 200 ms
+MIN_BATCH_NS = 1_000_000  # 1 ms: long enough to dwarf perf_counter resolution
+# 200 ms warm-up pushes past the Intel PL2->PL1 boost transient (50-150 ms on
+# the reference CPU) so every timed rep samples the sustained P-state.
+WARMUP_NS = 200_000_000
 
 
 def _cpu_model() -> str:
@@ -121,22 +120,17 @@ def _tune_batch(thunk: Callable[[], None]) -> int:
         if elapsed >= MIN_BATCH_NS:
             return batch
         batch *= 2
-        if batch > 1 << 24:  # 16M; sanity guard
+        if batch > 1 << 24:  # 16M: sanity guard against a no-op thunk
             return batch
 
 
 def measure(label: str, thunk: Callable[[], None]) -> dict[str, float]:
     """Run the contract-compliant measurement loop and return ns stats."""
-    # Warm-up batch sizing and JIT-of-the-interpreter warm-up.
     batch = _tune_batch(thunk)
 
     gc.collect()
     gc.disable()
     try:
-        # Sustained warmup: run for >= WARMUP_NS to push the CPU past its
-        # post-idle boost transient and into its sustained P-state. Without
-        # this, the first few timed reps land on boost clocks while the rest
-        # land on base clock, producing 5-10% session-to-session drift.
         warmup_deadline = time.perf_counter_ns() + WARMUP_NS
         while time.perf_counter_ns() < warmup_deadline:
             for _ in range(batch):
@@ -187,7 +181,6 @@ def _make_matrix(rows: int, cols: int, seed: int = 0) -> Matrix:
     values: list[float] = []
     n = rows * cols
     for _ in range(n):
-        # Simple LCG; deterministic across runs.
         rng_state = (rng_state * 1103515245 + 12345) & 0x7FFFFFFF
         values.append((rng_state / 0x7FFFFFFF) * 2.0 - 1.0)
     return Matrix(rows, cols, values)
@@ -254,7 +247,6 @@ def bench_vecdot(results: list[dict[str, float]]) -> None:
     """Bench vecdot against (a*b).sum(axis=k) to confirm the fusion win."""
     _print_section("vecdot vs (a*b).sum(axis=k) (fusion win)")
 
-    # Same-shape 1000x3
     a = _make_matrix(1000, 3, seed=4)
     b = _make_matrix(1000, 3, seed=5)
     for axis_label, axis in [("axis=None", None), ("axis=0", 0), ("axis=1", 1)]:
@@ -281,7 +273,6 @@ def bench_vecdot(results: list[dict[str, float]]) -> None:
             ))
             _print_row(results[-1])
 
-    # Row broadcast: 1000x3 . 1x3
     row = _make_matrix(1, 3, seed=6)
     results.append(measure(
         "vecdot(row)            row-broadcast 1000x3 . 1x3 axis=1",
@@ -294,7 +285,6 @@ def bench_vecdot(results: list[dict[str, float]]) -> None:
     ))
     _print_row(results[-1])
 
-    # Column broadcast: 1000x3 . 1000x1
     col = _make_matrix(1000, 1, seed=7)
     results.append(measure(
         "vecdot(col, axis=0)    col-broadcast 1000x3 . 1000x1",
@@ -341,9 +331,6 @@ def bench_cross(results: list[dict[str, float]]) -> None:
     ))
     _print_row(results[-1])
 
-    # Broadcast: single vec reused across the whole batch. These are the
-    # shapes a user typically writes when applying a constant axis-of-rotation
-    # or up-vector to every particle in a batch.
     b_vec3 = _make_matrix(1, 3, seed=26)
     results.append(measure(
         "cross(vec3)        1000x3 (3D row batch, broadcast 1x3)",
@@ -427,8 +414,6 @@ def bench_angle(results: list[dict[str, float]]) -> None:
     ))
     _print_row(results[-1])
 
-    # Python equivalent — pre-extract the data once so the loop measures
-    # math.atan2 + list allocation, not the C accessor cost.
     rows = shape[0]
     xs = [m[i, 0] for i in range(rows)]
     ys = [m[i, 1] for i in range(rows)]
@@ -444,16 +429,6 @@ def bench_angle(results: list[dict[str, float]]) -> None:
         py_angle_loop,
     ))
     _print_row(results[-1])
-
-
-# ----------------------------------------------------------------------
-# Sections below cover the rest of the Matrix surface, added to give a
-# point-in-time perf reference for tracking regressions across versions.
-# Order: cheap properties first, then element-wise, then reductions,
-# then binary arithmetic, matmul, reshape/select/copy/clip/allclose,
-# and finally construction & factories. Per-section function names
-# follow the bench_<group> convention used above.
-# ----------------------------------------------------------------------
 
 
 def bench_properties(results: list[dict[str, float]]) -> None:
@@ -520,7 +495,6 @@ def bench_binary_arithmetic(results: list[dict[str, float]]) -> None:
     row = _make_matrix(1, 100, seed=106)
     col = _make_matrix(1000, 1, seed=107)
 
-    # Add
     results.append(measure(
         f"add scalar              shape={shape} + 1.5",
         lambda a=a: a + 1.5,
@@ -541,7 +515,6 @@ def bench_binary_arithmetic(results: list[dict[str, float]]) -> None:
         lambda a=a, c=col: a + c,
     ))
     _print_row(results[-1])
-    # Subtract
     results.append(measure(
         f"sub scalar              shape={shape} - 1.5",
         lambda a=a: a - 1.5,
@@ -562,7 +535,6 @@ def bench_binary_arithmetic(results: list[dict[str, float]]) -> None:
         lambda a=a, c=col: a - c,
     ))
     _print_row(results[-1])
-    # Multiply
     results.append(measure(
         f"mul scalar              shape={shape} * 1.5",
         lambda a=a: a * 1.5,
@@ -583,7 +555,6 @@ def bench_binary_arithmetic(results: list[dict[str, float]]) -> None:
         lambda a=a, c=col: a * c,
     ))
     _print_row(results[-1])
-    # Divide
     results.append(measure(
         f"div scalar              shape={shape} / 1.5",
         lambda a=a: a / 1.5,
@@ -604,7 +575,6 @@ def bench_binary_arithmetic(results: list[dict[str, float]]) -> None:
         lambda a=a, c=col: a / c,
     ))
     _print_row(results[-1])
-    # In-place same-shape path (separate _math.c branch).
     a_ip = _make_matrix(*shape, seed=104)
     results.append(measure(
         f"iadd same-shape         shape={shape}",
@@ -660,9 +630,7 @@ def bench_select(results: list[dict[str, float]]) -> None:
 
     shape = (1000, 100)
     m = _make_matrix(*shape, seed=108)
-    # 100 indices walking strided through the rows.
     row_idx = list(range(0, 1000, 10))
-    # 50 columns out of 100.
     col_idx = list(range(0, 100, 2))
     results.append(measure(
         f"select rows (100/1000)  shape={shape}",
@@ -693,7 +661,7 @@ def bench_copy_clip_allclose(results: list[dict[str, float]]) -> None:
     ))
     _print_row(results[-1])
 
-    n = _make_matrix(*shape, seed=109)  # identical to m
+    n = _make_matrix(*shape, seed=109)
     results.append(measure(
         f"allclose(m, n)          shape={shape}",
         lambda m=m, n=n: Matrix.allclose(m, n),
@@ -853,7 +821,6 @@ def main(argv: list[str] | None = None) -> int:
 
     results: list[dict[str, float]] = []
 
-    # Existing Matrix surface — order goes cheap → expensive.
     bench_properties(results)
     bench_unary(results)
     bench_aggregations(results)

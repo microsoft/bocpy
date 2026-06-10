@@ -24,22 +24,6 @@
 
 #include "boc_compat.h"
 
-// ---------------------------------------------------------------------------
-// Verona MPMC behaviour queue (`boc_bq_*`)
-// ---------------------------------------------------------------------------
-//
-// Port of `verona-rt/src/rt/sched/mpmcq.h`. Memory orderings match
-// `mpmcq.h` line-for-line; deviations are called out in the
-// doc-comments.
-//
-// The queue is intrusive: each node carries an `_Atomic` link
-// (`boc_bq_node_t::next_in_queue`). Production users embed a
-// `boc_bq_node_t` field (see `boc_behavior_prehdr_t::bq_node` below
-// for the BOCBehavior case) and pass its address to the
-// enqueue/dequeue API; the queue never dereferences anything other
-// than the link, so larger user-defined payloads are reached via
-// container_of-style arithmetic at the call site.
-
 /// @brief Verona-style intrusive link node.
 /// @details Embedded at offset 0 of @c boc_behavior_prehdr_t (see
 /// below); the prehdr sits immediately before each @c BOCBehavior.
@@ -106,8 +90,6 @@ static const size_t BOC_BQ_BATCH_SIZE = 100;
 #define BOC_SCHED_YIELD() ((void)0)
 #endif
 
-// --- Lifecycle -------------------------------------------------------------
-
 /// @brief Initialise an empty queue in place.
 /// @details Sets `back == &front` and `front == NULL`. Safe to call
 /// on a zeroed allocation.
@@ -119,8 +101,6 @@ void boc_bq_init(boc_bq_t *q);
 /// @c assert(3) in debug builds if the queue still holds nodes.
 /// @param q The queue to destroy (must be non-NULL).
 void boc_bq_destroy_assert_empty(boc_bq_t *q);
-
-// --- Producers -------------------------------------------------------------
 
 /// @brief Enqueue a single node at the back of the queue.
 /// @details Equivalent to `boc_bq_enqueue_segment({n, &n->next_in_queue})`.
@@ -143,8 +123,6 @@ void boc_bq_enqueue_segment(boc_bq_t *q, boc_bq_segment_t s);
 /// @param q The queue (must be non-NULL).
 /// @param n The node to insert (must be non-NULL).
 void boc_bq_enqueue_front(boc_bq_t *q, boc_bq_node_t *n);
-
-// --- Consumers -------------------------------------------------------------
 
 /// @brief Try to dequeue a single node from the front.
 /// @details May spuriously return NULL even when the queue is non-
@@ -182,42 +160,12 @@ boc_bq_node_t *boc_bq_acquire_front(boc_bq_t *q);
 /// @return The detached head, or NULL.
 boc_bq_node_t *boc_bq_segment_take_one(boc_bq_segment_t *s);
 
-// --- Inspection ------------------------------------------------------------
-
 /// @brief Best-effort emptiness test.
 /// @details Mirrors `MPMCQ::is_empty` (mpmcq.h:206-210). Result may
 /// be stale by the time the caller acts on it.
 /// @param q The queue (must be non-NULL).
 /// @return @c true if the queue currently appears empty.
 bool boc_bq_is_empty(boc_bq_t *q);
-
-// ---------------------------------------------------------------------------
-// Scheduler-visible behaviour pre-header (`boc_behavior_prehdr_t`)
-// ---------------------------------------------------------------------------
-//
-// Pre-header sitting immediately *before* each BOCBehavior
-// allocation (CPython `_PyGC_Head` / `_Py_AS_GC()` style). Holds
-// the fields the scheduler needs to inspect without including
-// BOCBehavior's private definition: the intrusive queue link and
-// the OR-fold pinned byte set by `BehaviorCapsule_init` from the
-// per-arg cown classification (`is_pinned`).
-//
-// Why a pre-header instead of fields on BOCBehavior. The dispatch
-// path in `boc_sched.c` receives a `boc_bq_node_t *` and must read
-// the pinned byte to route pinned behaviours onto the main-thread
-// queue. BOCBehavior's struct definition is private to `_core.c`,
-// so the alternatives are (a) leak the full struct via this header,
-// (b) call through a function pointer on the hot path, or (c)
-// hard-code an `offsetof(BOCBehavior, pinned)` magic number in
-// `boc_sched.c` and protect it with `static_assert` mirrors. The
-// pre-header avoids all three: the scheduler reads `pinned` via a
-// normal struct field access, and `bq_node` at offset 0 makes the
-// container_of cast trivial and impossible to drift.
-//
-// `_core.c` owns allocation: `behavior_new` calls
-// `PyMem_RawMalloc(sizeof(prehdr) + sizeof(BOCBehavior))`, zeroes
-// the prehdr, and returns the pointer past it. Recovery on the free
-// path uses `BOC_BEHAVIOR_PREHDR(b)` to walk back.
 
 /// @brief Scheduler-visible pre-header attached to every behaviour.
 /// @details Allocated in front of each @c BOCBehavior; sits in the
@@ -275,29 +223,6 @@ static inline uint8_t boc_behavior_node_is_pinned(const boc_bq_node_t *n) {
 ///         contract).
 int boc_main_pinned_enqueue(boc_bq_node_t *n);
 
-// ---------------------------------------------------------------------------
-// Verona work-stealing queue cursors (`boc_wsq_*`)
-// ---------------------------------------------------------------------------
-//
-// Port of `verona-rt/src/rt/sched/workstealingqueue.h` and
-// `ds/wrapindex.h`. A WSQ is N independent `boc_bq_t` sub-queues
-// indexed by three plain-`size_t` cursors:
-//   - `enqueue_index`: producer side; pre-increment then push.
-//   - `dequeue_index`: owner pop side; pre-increment then pop, try
-//                       all N before declaring empty.
-//   - `steal_index`: thief side; selects which of the *victim*'s
-//                     sub-queues to drain in a steal attempt.
-//
-// All three cursors are owned by the worker that owns the WSQ.
-// `enqueue_index` is touched by every thread that pushes onto this
-// worker (including remote producers). The race on it is benign:
-// (1) `size_t` aligned loads/stores are atomic at the hardware level
-// on every ISA bocpy supports; (2) `(idx + 1) % N` is always in
-// `[0, N)` regardless of what value was read; (3) the underlying
-// `boc_bq_t` is multi-producer-safe; (4) the only observable effect
-// is distribution quality, bounded by concurrent-producer count.
-// Verona-rt accepts the same race; we make no deviation.
-
 /// @brief Number of sub-queues per worker WSQ.
 /// @details Matches verona-rt's `WorkStealingQueue<4>` template
 /// instantiation in `core.h`. Tunable at compile time.
@@ -341,10 +266,6 @@ static inline size_t boc_wsq_post_dec(boc_wsq_cursor_t *c) {
   c->idx = (r == 0u) ? ((size_t)BOC_WSQ_N - 1u) : (r - 1u);
   return r;
 }
-
-// ---------------------------------------------------------------------------
-// Scheduler instrumentation
-// ---------------------------------------------------------------------------
 
 /// @brief Per-worker statistics counter block (POD).
 ///
@@ -475,25 +396,6 @@ typedef struct boc_sched_stats_atomic {
   boc_atomic_u64_t fairness_arm_fires;
 } boc_sched_stats_atomic_t;
 
-// ---------------------------------------------------------------------------
-// Per-worker scheduler state (`boc_sched_worker_t`)
-// ---------------------------------------------------------------------------
-//
-// Holds the per-worker MPMC queue, the fairness-token slot
-// (`token_work` / `should_steal_for_fairness`), the parking-protocol
-// `cv_mu` / `cv` pair (`boc_compat.h` `BOCMutex` / `BOCCond`, pthread on
-// POSIX, SRWLock on MSVC), the ring-link `next_in_ring` pointer, the
-// per-worker counter block, and a reserved terminator-delta slot.
-// Atomics use the typed `boc_compat.h` shim (`boc_atomic_*_t` +
-// `boc_atomic_*_explicit`) so the layout compiles identically on POSIX
-// and MSVC ARM64.
-//
-// Cacheline-aligned at the type level (`alignas(BOC_SCHED_CACHELINE)`)
-// and a trailing pad rounds the size up to the next cacheline so that
-// arrays of workers do not false-share between adjacent slots. The
-// pad size is computed from a `_payload` helper struct so it tracks
-// the platform-dependent sizes of `BOCMutex` / `BOCCond` automatically.
-
 #ifndef BOC_SCHED_CACHELINE
 #define BOC_SCHED_CACHELINE 64
 #endif
@@ -614,16 +516,6 @@ static_assert(sizeof(boc_sched_worker_t) % BOC_SCHED_CACHELINE == 0,
 static_assert(alignof(boc_sched_worker_t) >= BOC_SCHED_CACHELINE,
               "boc_sched_worker_t must be cacheline-aligned");
 
-// ---------------------------------------------------------------------------
-// Verona work-stealing queue helpers (`boc_wsq_*`)
-// ---------------------------------------------------------------------------
-//
-// Inline routing wrappers around the per-worker WSQ. They mirror
-// verona-rt's `WorkStealingQueue<N>` member functions one-for-one;
-// the underlying `boc_bq_*` MPMCQ is unchanged. Each wrapper takes a
-// `boc_sched_worker_t *` rather than a bare `boc_bq_t *` because the
-// cursor lives on the worker.
-
 /// @brief Push a single node onto a worker's WSQ.
 /// @details Mirrors `WorkStealingQueue::enqueue` (verona-rt
 /// `workstealingqueue.h`): pre-increments @c enqueue_index then
@@ -700,11 +592,6 @@ static inline void boc_wsq_enqueue_spread(boc_sched_worker_t *self,
     }
     boc_wsq_enqueue(self, n);
   }
-  // Tail residual: verona pushes the final segment unconditionally
-  // onto a single sub-queue via `++enqueue_index`. With N=4 and
-  // typical steal segments of dozens of nodes, the spreading has
-  // already happened; the tail is at most a singleton (or a
-  // mid-link partial we could not drain).
   size_t idx = boc_wsq_pre_inc(&self->enqueue_index);
   boc_bq_enqueue_segment(&self->q[idx], ls);
 }
@@ -776,10 +663,6 @@ int boc_sched_stats_snapshot(Py_ssize_t worker_index, boc_sched_stats_t *out);
 ///         `threadpool.h:40` precedent: not @c _Atomic).
 size_t boc_sched_incarnation_get(void);
 
-// ---------------------------------------------------------------------------
-// Per-worker registration
-// ---------------------------------------------------------------------------
-
 /// @brief Atomically claim a worker slot for the calling thread.
 /// @details Allocates the next free slot in @ref WORKERS using an
 /// internal atomic counter that is reset on every @ref boc_sched_init.
@@ -803,13 +686,6 @@ size_t boc_sched_incarnation_get(void);
 /// @return The assigned slot (0 .. worker_count-1) on success, or -1
 ///         if no free slot remains. No Python exception is set on -1.
 Py_ssize_t boc_sched_worker_register(void);
-
-// ---------------------------------------------------------------------------
-// Park / unpark protocol
-// ---------------------------------------------------------------------------
-//
-// Port of Verona's two-epoch `pause`/`unpause` protocol from
-// `verona-rt/src/rt/sched/threadpool.h:282-379`.
 
 /// @brief Pop the next behaviour for the calling worker, blocking
 ///        until work arrives or shutdown is requested.
@@ -875,15 +751,6 @@ void boc_sched_signal_one(boc_sched_worker_t *target);
 /// @c thread_local mirror.
 boc_sched_worker_t *boc_sched_current_worker(void);
 
-// ---------------------------------------------------------------------------
-// Dispatch + fast-path pop
-// ---------------------------------------------------------------------------
-//
-// @ref boc_sched_dispatch is the producer-side entry point. Production
-// callers in @c _core.c invoke it as
-// @c boc_sched_dispatch(&behavior->bq_node); test code reaches it via
-// @c _core.scheduler_dispatch_node / @c _core.scheduler_pop_fast.
-
 /// @brief Schedule a behaviour for execution.
 /// @details Producer-side dispatch with two arms (chosen by whether
 /// the calling thread is registered as a worker):
@@ -936,14 +803,6 @@ int boc_sched_dispatch(boc_bq_node_t *n);
 ///         queue are both empty.
 boc_bq_node_t *boc_sched_worker_pop_fast(boc_sched_worker_t *self);
 
-// ---------------------------------------------------------------------------
-// Build-time feature gate
-// ---------------------------------------------------------------------------
-//
-// `BOC_HAVE_TRY_STEAL` toggles the parker's `check_for_work` walk
-// between "inspect own queue only" (off) and "walk the full ring"
-// (on). Defined unconditionally here; the off mode is reserved for
-// debugging and is not part of any supported build.
 #define BOC_HAVE_TRY_STEAL 1
 
 /// @brief Test whether any worker's queue currently has visible work.
@@ -969,21 +828,6 @@ boc_bq_node_t *boc_sched_worker_pop_fast(boc_sched_worker_t *self);
 /// catches it before the worker actually sleeps.
 /// @return @c true if at least one worker has visible queue work.
 bool boc_sched_any_work_visible(void);
-
-// ---------------------------------------------------------------------------
-// Per-worker fairness token (`token_work`)
-// ---------------------------------------------------------------------------
-//
-// Each worker owns a `BOCBehavior`-shaped sentinel whose `is_token`
-// discriminator is set to 1. The token is allocated by
-// `_core_scheduler_runtime_start` (because it knows the
-// `BOCBehavior` layout) and installed into the worker's
-// `token_work` slot via @ref boc_sched_set_token_node. On every
-// successful pop, the dispatch site checks `is_token`; if set, the
-// popping worker flips its `should_steal_for_fairness` flag and
-// re-enqueues the token instead of running user code. Verona ports:
-// `Core::token_work` (`core.h:22-37`), token-thunk dequeue
-// (`schedulerthread.h::run_inner`).
 
 /// @brief Install the per-worker fairness token's queue node.
 /// @details Stores @p node into @c WORKERS[worker_index].token_work

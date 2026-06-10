@@ -9,16 +9,10 @@
 ///   - The per-thread snapshot cache (dict, proxy, version, checked
 ///     flag).
 ///   - The single-writer thread-identity check (@c NB_NOTICEBOARD_TID).
-///   - The notice_sync barrier primitives (@c NB_SYNC_REQUESTED,
-///     @c NB_SYNC_PROCESSED, @c NB_SYNC_MUTEX, @c NB_SYNC_COND).
 
 #include "boc_noticeboard.h"
 
 #include <string.h>
-
-// ---------------------------------------------------------------------------
-// File-scope state.
-// ---------------------------------------------------------------------------
 
 /// @brief A single noticeboard entry.
 typedef struct nb_entry {
@@ -64,38 +58,17 @@ static thread_local PyObject *NB_SNAPSHOT_PROXY = NULL;
 ///        unset.
 static atomic_intptr_t NB_NOTICEBOARD_TID = 0;
 
-/// @brief Monotonic counter incremented by every notice_sync caller.
-static atomic_int_least64_t NB_SYNC_REQUESTED = 0;
-
-/// @brief Highest sequence number processed by the noticeboard thread.
-static atomic_int_least64_t NB_SYNC_PROCESSED = 0;
-
-/// @brief Mutex protecting NB_SYNC_COND.
-static BOCMutex NB_SYNC_MUTEX;
-
-/// @brief Condition variable signalled when NB_SYNC_PROCESSED advances.
-static BOCCond NB_SYNC_COND;
-
-// ---------------------------------------------------------------------------
-// Module init / teardown.
-// ---------------------------------------------------------------------------
-
 void noticeboard_init(void) {
   memset(&NB, 0, sizeof(NB));
   boc_mtx_init(&NB.mutex);
-  boc_mtx_init(&NB_SYNC_MUTEX);
-  cnd_init(&NB_SYNC_COND);
 }
 
 void noticeboard_destroy(void) {
-  // Drop the calling thread's snapshot cache before freeing entries.
   Py_CLEAR(NB_SNAPSHOT_PROXY);
   Py_CLEAR(NB_SNAPSHOT_CACHE);
   NB_SNAPSHOT_VERSION = -1;
   NB_VERSION_CHECKED = false;
 
-  // Collect entries to free after releasing the mutex — XIDATA_FREE
-  // and COWN_DECREF can run Python __del__ which may re-enter.
   XIDATA_T *to_free[NB_MAX_ENTRIES];
   int to_free_count = 0;
   BOCCown **to_unpin[NB_MAX_ENTRIES];
@@ -131,16 +104,7 @@ void noticeboard_destroy(void) {
   }
 
   mtx_destroy(&NB.mutex);
-  // NB_SYNC_MUTEX / NB_SYNC_COND are SRWLOCK / CONDITION_VARIABLE on
-  // Windows (no destroy needed) and pthread / mtx_t on POSIX (handled
-  // by mtx_destroy / cnd_destroy in boc_compat.h shims). The original
-  // _core.c module-free path never destroyed these; preserve that
-  // behaviour to keep the symbol-additions-only invariant.
 }
-
-// ---------------------------------------------------------------------------
-// Single-writer thread-identity check.
-// ---------------------------------------------------------------------------
 
 int noticeboard_check_thread(const char *op_name) {
   uintptr_t owner = (uintptr_t)atomic_load_intptr(&NB_NOTICEBOARD_TID);
@@ -159,10 +123,6 @@ int noticeboard_check_thread(const char *op_name) {
 int noticeboard_set_thread(void) {
   intptr_t expected = 0;
   intptr_t self_id = (intptr_t)(uintptr_t)PyThread_get_thread_ident();
-  // One-shot per runtime: refuse if the slot is already owned.
-  // noticeboard_clear_thread() resets NB_NOTICEBOARD_TID to 0 at
-  // stop(), so a fresh start() cycle is fine. This closes the
-  // hijack-the-mutator-slot hole identified by the security lens.
   if (!atomic_compare_exchange_strong_intptr(&NB_NOTICEBOARD_TID, &expected,
                                              self_id)) {
     PyErr_SetString(PyExc_RuntimeError,
@@ -177,10 +137,6 @@ void noticeboard_clear_thread(void) {
   (void)atomic_exchange_intptr(&NB_NOTICEBOARD_TID, (intptr_t)0);
 }
 
-// ---------------------------------------------------------------------------
-// Snapshot cache primitives.
-// ---------------------------------------------------------------------------
-
 void noticeboard_drop_local_cache(void) {
   Py_CLEAR(NB_SNAPSHOT_PROXY);
   Py_CLEAR(NB_SNAPSHOT_CACHE);
@@ -189,10 +145,6 @@ void noticeboard_drop_local_cache(void) {
 }
 
 void noticeboard_cache_clear_for_behavior(void) { NB_VERSION_CHECKED = false; }
-
-// ---------------------------------------------------------------------------
-// Pin helper.
-// ---------------------------------------------------------------------------
 
 int nb_pin_cowns(PyObject *cowns, BOCCown ***out_array, int *out_count) {
   *out_array = NULL;
@@ -226,11 +178,6 @@ int nb_pin_cowns(PyObject *cowns, BOCCown ***out_array, int *out_count) {
     PyObject *item = PySequence_Fast_GET_ITEM(seq, i);
     BOCCown *cown = (BOCCown *)PyLong_AsVoidPtr(item);
     if (cown == NULL) {
-      // PyLong_AsVoidPtr returns NULL both on error and for integer 0.
-      // Reject both paths explicitly: a NULL pin would be dereferenced
-      // downstream (COWN_DECREF on NULL is UB), and an integer 0 is
-      // indistinguishable from a crafted attacker pin pointing at the
-      // zero page.
       if (!PyErr_Occurred()) {
         PyErr_SetString(PyExc_ValueError,
                         "noticeboard pin list must not contain NULL / "
@@ -251,7 +198,6 @@ int nb_pin_cowns(PyObject *cowns, BOCCown ***out_array, int *out_count) {
   return 0;
 
 fail:
-  // Release every transferred ref the writer pre-INCREFed for us.
   for (int i = 0; i < taken; i++) {
     COWN_DECREF(pins[i]);
   }
@@ -268,10 +214,6 @@ fail:
   Py_DECREF(seq);
   return -1;
 }
-
-// ---------------------------------------------------------------------------
-// Mutations.
-// ---------------------------------------------------------------------------
 
 int noticeboard_write(const char *key, Py_ssize_t key_len, XIDATA_T *xidata,
                       bool pickled, BOCCown **pins, int pin_count) {
@@ -310,9 +252,6 @@ int noticeboard_write(const char *key, Py_ssize_t key_len, XIDATA_T *xidata,
     target->pinned_count = 0;
   }
 
-  // Stash old value and old pins to free after releasing the mutex —
-  // XIDATA_FREE / COWN_DECREF may invoke Python __del__ which could
-  // re-enter the noticeboard.
   XIDATA_T *old_value = target->value;
   BOCCown **old_pins = target->pinned_cowns;
   int old_pin_count = target->pinned_count;
@@ -338,7 +277,6 @@ int noticeboard_write(const char *key, Py_ssize_t key_len, XIDATA_T *xidata,
   return 0;
 
 fail:
-  // Roll back: free the new XIData and decref the new pins.
   if (xidata != NULL) {
     XIDATA_FREE(xidata);
   }
@@ -439,24 +377,15 @@ void noticeboard_clear(void) {
     PyMem_RawFree(to_unpin[i]);
   }
 
-  // Drop this thread's cache so a subsequent same-thread snapshot
-  // does not reuse a stale proxy. Other threads will revalidate via
-  // NB_VERSION.
   noticeboard_drop_local_cache();
 }
-
-// ---------------------------------------------------------------------------
-// Snapshot.
-// ---------------------------------------------------------------------------
 
 PyObject *noticeboard_snapshot(PyObject *loads) {
   if (NB_SNAPSHOT_PROXY != NULL) {
     if (NB_VERSION_CHECKED) {
-      // Within-behavior repeat call: same proxy, no atomic load.
       Py_INCREF(NB_SNAPSHOT_PROXY);
       return NB_SNAPSHOT_PROXY;
     }
-    // First snapshot call this behavior: do exactly one version check.
     int_least64_t current = atomic_load(&NB_VERSION);
     if (current == NB_SNAPSHOT_VERSION) {
       NB_VERSION_CHECKED = true;
@@ -471,22 +400,10 @@ PyObject *noticeboard_snapshot(PyObject *loads) {
     return NULL;
   }
 
-  // Deferred entries: pickled values whose bytes were extracted under
-  // mutex but need unpickling outside the lock.
   PyObject *deferred_keys[NB_MAX_ENTRIES];
   PyObject *deferred_bytes[NB_MAX_ENTRIES];
   int deferred_count = 0;
 
-  // Keepalive pins: while we hold the mutex we take an extra
-  // COWN_INCREF on every pin reachable from a deferred (pickled)
-  // entry. The bytes we are about to unpickle outside the mutex
-  // contain raw BOCCown pointers whose validity depends on the
-  // entry's pin list. Without this extra ref, a concurrent writer
-  // could overwrite the entry the instant we drop the mutex, release
-  // the old pins, and free the BOCCowns before we touch them — UAF
-  // in _cown_capsule_from_pointer. Released after the deferred
-  // unpickling completes. Each deferred entry contributes a heap-
-  // allocated pin pointer array sized to its pin count.
   BOCCown **keepalive_pins[NB_MAX_ENTRIES];
   int keepalive_counts[NB_MAX_ENTRIES];
   for (int i = 0; i < NB_MAX_ENTRIES; i++) {
@@ -496,9 +413,6 @@ PyObject *noticeboard_snapshot(PyObject *loads) {
 
   mtx_lock(&NB.mutex);
 
-  // Capture the noticeboard version while still holding the mutex so
-  // that no concurrent writer can bump it between snapshot completion
-  // and version capture.
   int_least64_t built_version = atomic_load(&NB_VERSION);
 
   for (int i = 0; i < NB.count; i++) {
@@ -507,7 +421,6 @@ PyObject *noticeboard_snapshot(PyObject *loads) {
       continue;
     }
 
-    // XIDATA_NEWOBJECT is lightweight (no Python code execution).
     PyObject *raw = XIDATA_NEWOBJECT(entry->value);
     if (raw == NULL) {
       mtx_unlock(&NB.mutex);
@@ -522,7 +435,6 @@ PyObject *noticeboard_snapshot(PyObject *loads) {
     }
 
     if (!entry->pickled) {
-      // Non-pickled: add directly to dict.
       if (PyDict_SetItem(dict, key, raw) < 0) {
         Py_DECREF(key);
         Py_DECREF(raw);
@@ -532,9 +444,6 @@ PyObject *noticeboard_snapshot(PyObject *loads) {
       Py_DECREF(key);
       Py_DECREF(raw);
     } else {
-      // Pickled: defer unpickling to outside the mutex. Take a fresh
-      // COWN_INCREF on every pin so the BOCCowns referenced by the
-      // bytes survive past mtx_unlock — see keepalive_pins comment.
       if (entry->pinned_count > 0) {
         BOCCown **pins = (BOCCown **)PyMem_RawMalloc(sizeof(BOCCown *) *
                                                      entry->pinned_count);
@@ -560,7 +469,6 @@ PyObject *noticeboard_snapshot(PyObject *loads) {
 
   mtx_unlock(&NB.mutex);
 
-  // Unpickle deferred entries outside the mutex.
   for (int i = 0; i < deferred_count; i++) {
     PyObject *value = PyObject_CallOneArg(loads, deferred_bytes[i]);
     Py_DECREF(deferred_bytes[i]);
@@ -569,13 +477,10 @@ PyObject *noticeboard_snapshot(PyObject *loads) {
     if (value == NULL) {
       Py_DECREF(deferred_keys[i]);
       deferred_keys[i] = NULL;
-      // Clean up remaining deferred entries.
       for (int j = i + 1; j < deferred_count; j++) {
         Py_DECREF(deferred_keys[j]);
         Py_DECREF(deferred_bytes[j]);
       }
-      // Release every keepalive pin (including the one for this
-      // entry).
       for (int j = 0; j < deferred_count; j++) {
         if (keepalive_pins[j] != NULL) {
           for (int k = 0; k < keepalive_counts[j]; k++) {
@@ -612,9 +517,6 @@ PyObject *noticeboard_snapshot(PyObject *loads) {
     Py_DECREF(deferred_keys[i]);
     Py_DECREF(value);
 
-    // Successful unpickle: the snapshot dict (and its CownCapsules)
-    // now hold their own refs on every BOCCown referenced by the
-    // bytes. Drop our keepalive pin for this entry.
     if (keepalive_pins[i] != NULL) {
       for (int k = 0; k < keepalive_counts[i]; k++) {
         COWN_DECREF(keepalive_pins[i][k]);
@@ -630,9 +532,6 @@ PyObject *noticeboard_snapshot(PyObject *loads) {
     return NULL;
   }
 
-  // The proxy holds a strong reference to dict; we keep our own as
-  // well so that the dict is reachable for direct mutation in the
-  // rebuild path and the proxy survives at least as long as the dict.
   NB_SNAPSHOT_CACHE = dict;
   NB_SNAPSHOT_PROXY = proxy;
   NB_SNAPSHOT_VERSION = built_version;
@@ -654,49 +553,4 @@ fail_deferred:
   }
   Py_DECREF(dict);
   return NULL;
-}
-
-// ---------------------------------------------------------------------------
-// notice_sync barrier.
-// ---------------------------------------------------------------------------
-
-int_least64_t notice_sync_request(void) {
-  return atomic_fetch_add(&NB_SYNC_REQUESTED, 1) + 1;
-}
-
-void notice_sync_complete(int_least64_t seq) {
-  mtx_lock(&NB_SYNC_MUTEX);
-  // Defense in depth: with a single noticeboard thread draining the
-  // FIFO boc_noticeboard tag, `seq` arrives strictly monotonically
-  // and a plain `atomic_store(seq)` would be correct. We keep the
-  // max-of pattern so that if a future change introduces a second
-  // mutator thread or any out-of-order delivery, NB_SYNC_PROCESSED
-  // can never regress and unblock waiters early.
-  int_least64_t cur = atomic_load(&NB_SYNC_PROCESSED);
-  if (seq > cur) {
-    atomic_store(&NB_SYNC_PROCESSED, seq);
-  }
-  cnd_broadcast(&NB_SYNC_COND);
-  mtx_unlock(&NB_SYNC_MUTEX);
-}
-
-bool notice_sync_wait(int_least64_t seq, double timeout, bool wait_forever) {
-  bool ok = true;
-  double end_time = wait_forever ? 0.0 : boc_now_s() + timeout;
-
-  mtx_lock(&NB_SYNC_MUTEX);
-  while (atomic_load(&NB_SYNC_PROCESSED) < seq) {
-    if (!wait_forever) {
-      double now = boc_now_s();
-      if (now >= end_time) {
-        ok = false;
-        break;
-      }
-      cnd_timedwait_s(&NB_SYNC_COND, &NB_SYNC_MUTEX, end_time - now);
-    } else {
-      cnd_wait(&NB_SYNC_COND, &NB_SYNC_MUTEX);
-    }
-  }
-  mtx_unlock(&NB_SYNC_MUTEX);
-  return ok;
 }

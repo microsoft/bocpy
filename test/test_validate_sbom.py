@@ -23,11 +23,6 @@ import pytest
 import validate_sbom
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
 def _good_doc() -> dict:
     """A freshly built CycloneDX 1.6 SBOM produced by ``build_sbom.py``.
 
@@ -46,11 +41,6 @@ def _good_doc() -> dict:
     )
 
 
-# ---------------------------------------------------------------------------
-# Happy path
-# ---------------------------------------------------------------------------
-
-
 def test_validate_sbom_document_accepts_build_sbom_output():
     """The generator and validator must agree on the wire format."""
     validate_sbom.validate_sbom_document(_good_doc())
@@ -62,19 +52,12 @@ def test_validate_sbom_file_accepts_round_trip(tmp_path: Path):
     validate_sbom.validate_sbom_file(sbom)
 
 
-# ---------------------------------------------------------------------------
-# Header invariants (bomFormat / specVersion / serialNumber / version)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize(
     "mutation",
     [
-        # (key, replacement_value, expected_substring_in_error)
         ("bomFormat", "SPDX", "bomFormat"),
         ("specVersion", "1.5", "specVersion"),
         ("serialNumber", "urn:uuid:not-a-uuid", "serialNumber"),
-        # version-1 UUID still rejected by the UUIDv5 regex
         ("serialNumber", "urn:uuid:11111111-1111-1111-1111-111111111111",
          "serialNumber"),
         ("version", 0, "version"),
@@ -89,11 +72,6 @@ def test_validate_sbom_document_rejects_bad_header(mutation):
         validate_sbom.validate_sbom_document(doc)
 
 
-# ---------------------------------------------------------------------------
-# Metadata invariants
-# ---------------------------------------------------------------------------
-
-
 def test_metadata_must_be_object():
     doc = _good_doc()
     doc["metadata"] = []
@@ -103,9 +81,6 @@ def test_metadata_must_be_object():
 
 def test_timestamp_must_match_iso_z_format():
     doc = _good_doc()
-    # Missing the ``Z`` suffix and using ``+00:00`` instead — same instant,
-    # different lexical form. The validator pins the format because
-    # build_sbom.py commits to a specific shape.
     doc["metadata"]["timestamp"] = "2026-05-28T12:00:00+00:00"
     with pytest.raises(validate_sbom.ValidationError, match="timestamp"):
         validate_sbom.validate_sbom_document(doc)
@@ -142,14 +117,8 @@ def test_root_component_type_must_be_library():
         validate_sbom.validate_sbom_document(doc)
 
 
-# ---------------------------------------------------------------------------
-# components / dependencies invariants
-# ---------------------------------------------------------------------------
-
-
 def test_dependencies_must_reference_root_component():
     doc = _good_doc()
-    # Replace with a dependencies block that points at a different ref.
     doc["dependencies"] = [{"ref": "pkg:pypi/other@1.0", "dependsOn": []}]
     with pytest.raises(validate_sbom.ValidationError, match="dependencies"):
         validate_sbom.validate_sbom_document(doc)
@@ -160,11 +129,6 @@ def test_components_field_must_be_list():
     doc["components"] = None
     with pytest.raises(validate_sbom.ValidationError, match="components"):
         validate_sbom.validate_sbom_document(doc)
-
-
-# ---------------------------------------------------------------------------
-# File-level + CLI
-# ---------------------------------------------------------------------------
 
 
 def test_validate_sbom_file_reports_invalid_json(tmp_path: Path):
@@ -226,7 +190,5 @@ def test_good_doc_helper_is_deep_copyable():
     b = _good_doc()
     a["metadata"]["component"]["name"] = "mutated"
     assert b["metadata"]["component"]["name"] == "bocpy"
-    # And the validator still accepts the unmutated copy:
     validate_sbom.validate_sbom_document(b)
-    # While rejecting nothing here — exercising copy semantics only.
     _ = copy.deepcopy(a)

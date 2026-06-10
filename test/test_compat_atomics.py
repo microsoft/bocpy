@@ -23,8 +23,6 @@ _it = pytest.importorskip(
     reason="internal test extension not built (set BOCPY_BUILD_INTERNAL_TESTS=1 and reinstall)",
 )
 
-# Bind the atomics-domain methods under the historical `ca.*` name so
-# the body of this file stays readable and untouched.
 ca = SimpleNamespace(
     make_state=_it.atomics_make_state,
     reset=_it.atomics_reset,
@@ -63,11 +61,6 @@ def test_reset_zeros_all_slots():
     ca.reset(h)
     assert ca.load_counter64(h) == 0
     assert ca.load_counter32(h) == 0
-
-
-# ---------------------------------------------------------------------------
-# Acquire / release handshake
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("payload", [
@@ -116,11 +109,6 @@ def test_handshake_repeated():
         assert result == [payload], f"iteration {i}: expected {payload:#x}, got {result[0]:#x}"
 
 
-# ---------------------------------------------------------------------------
-# Multi-thread fetch_add contention
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("threads,per_thread", [
     (2, 50_000),
     (4, 50_000),
@@ -162,11 +150,6 @@ def test_fetch_add_u32_contention(threads, per_thread):
         w.join(timeout=30.0)
         assert not w.is_alive()
     assert ca.load_counter32(h) == threads * per_thread
-
-
-# ---------------------------------------------------------------------------
-# Multi-thread CAS contention
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("threads,per_thread", [

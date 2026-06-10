@@ -8,7 +8,7 @@ import sys
 from ._core import drain, receive, send, set_tags, TIMEOUT
 from ._math import Matrix
 from .behaviors import (Behaviors, Cown, notice_delete, notice_read,
-                        notice_sync, notice_update, notice_write, noticeboard,
+                        notice_seed, notice_update, notice_write, noticeboard,
                         PinnedCown, pump, PumpResult, quiesce,
                         REMOVED,
                         set_pump_watchdog, set_wait_pump_poll,
@@ -16,23 +16,10 @@ from .behaviors import (Behaviors, Cown, notice_delete, notice_read,
 
 try:
     __version__ = _metadata.version("bocpy")
+# Broad on purpose: namespace-package / frozen / editable installs surface
+# metadata failures other than PackageNotFoundError.
 except Exception as _version_lookup_error:  # pragma: no cover - source checkout w/o install
-    # ``importlib.metadata.version`` normally raises
-    # ``PackageNotFoundError`` for an uninstalled package, but the
-    # broader ``Exception`` net catches namespace-package and
-    # vendored-installer edge cases (Bazel ``py_binary`` zip
-    # imports, Nuitka-frozen apps, some PEP 660 editable hybrids)
-    # that surface as other ``importlib.metadata`` exceptions. The
-    # fallback string lets ``import bocpy`` keep working in those
-    # environments instead of dying at module load. Assign the
-    # fallback first so the WARNING emit — which is best-effort and
-    # itself wrapped — cannot leave ``__version__`` unbound if the
-    # logging stack is broken (closed stderr, misconfigured handler).
     __version__ = "0.0.0+unknown"
-    # Best-effort WARNING naming the exception class so a corrupt
-    # installation does not silently masquerade as a clean source
-    # checkout in downstream version gates / telemetry. Swallow any
-    # logger failure: import-time logging is not load-bearing.
     try:
         _logging.getLogger("bocpy").warning(
             "bocpy package metadata unavailable (%s: %s); "
@@ -84,8 +71,8 @@ __all__ = ["Behaviors", "Cown", "Matrix", "PinnedCown", "PumpResult",
            "REMOVED", "TIMEOUT",
            "WORKER_COUNT", "__version__", "drain",
            "get_include", "get_sources",
-           "notice_delete", "notice_read",
-           "notice_sync", "notice_update", "notice_write", "noticeboard",
+           "notice_delete", "notice_read", "notice_seed",
+           "notice_update", "notice_write", "noticeboard",
            "pump",
            "quiesce",
            "receive",

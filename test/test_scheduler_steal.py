@@ -25,8 +25,8 @@ mechanisms are exercised end-to-end by the benchmarks in
 ``examples/`` and at the data-structure level by
 ``test_internal_wsq.py``.
 
-All tests follow the same module-level helper / receive-pattern
-discipline as the other scheduler integration tests (see
+All tests follow the same module-level helper discipline as the
+other scheduler integration tests (see
 ``test_scheduler_integration.py``), because behaviours run on
 worker sub-interpreters that import this module to resolve symbols.
 """
@@ -36,16 +36,7 @@ import time
 import pytest
 
 import bocpy
-from bocpy import _core
-from bocpy import Cown, drain, receive, send, TIMEOUT, wait, when
-
-
-RECEIVE_TIMEOUT = 30
-
-
-# ---------------------------------------------------------------------------
-# Module-level helpers (must be importable by worker sub-interpreters)
-# ---------------------------------------------------------------------------
+from bocpy import Cown, wait, when
 
 
 class _Counter:
@@ -63,19 +54,7 @@ def _ensure_quiesced():
     bocpy.wait()
 
 
-def _fanout_done(c_pin, marker):
-    """Final ``@when`` extracted to a helper.
-
-    Inlining inside ``_fanout_kickoff`` would trigger the transpiler
-    nested-capture gap (outer ``marker`` not forwarded into the inner
-    behaviour's capture tuple).
-    """
-    @when(c_pin)
-    def _(c_pin):
-        send("done", marker)
-
-
-def _fanout_kickoff(c_pin, work_cowns, marker):
+def _fanout_kickoff(c_pin, work_cowns):
     """Fan ``len(work_cowns)`` independent behaviours onto the kickoff worker.
 
     The kickoff is dispatched from the main thread and lands on
@@ -95,12 +74,6 @@ def _fanout_kickoff(c_pin, work_cowns, marker):
             @when(wc)
             def _(wc):
                 wc.value.count += 1
-        _fanout_done(c_pin, marker)
-
-
-# ---------------------------------------------------------------------------
-# Token-work fairness sanity
-# ---------------------------------------------------------------------------
 
 
 class TestStealFairnessSanity:
@@ -109,7 +82,6 @@ class TestStealFairnessSanity:
     @classmethod
     def teardown_class(cls):
         wait()
-        drain("done")
 
     def test_fanout_exceeding_batch_size_provokes_steal_attempts(self):
         """K > BATCH_SIZE (=100) must produce non-zero steal_attempts.
@@ -126,28 +98,16 @@ class TestStealFairnessSanity:
         """
         _ensure_quiesced()
         W = 4  # noqa: N806
-        K = 300  # > BOC_BQ_BATCH_SIZE (100)  # noqa: N806
+        K = 300  # noqa: N806
         bocpy.start(worker_count=W)
-        try:
-            c_pin = Cown(_Counter())
-            work_cowns = [Cown(_Counter()) for _ in range(K)]
-            _fanout_kickoff(c_pin, work_cowns, "fairness-done")
+        c_pin = Cown(_Counter())
+        work_cowns = [Cown(_Counter()) for _ in range(K)]
+        _fanout_kickoff(c_pin, work_cowns)
 
-            tag, _payload = receive("done", RECEIVE_TIMEOUT)
-            assert tag != TIMEOUT, "kickoff failed to complete"
-
-            stats = _core.scheduler_stats()
-        finally:
-            drain("done")
-            wait()
+        stats = wait(stats=True)
 
         assert len(stats) == W, stats
         total_attempts = sum(s["steal_attempts"] for s in stats)
-        # The exact distribution of attempts across workers depends
-        # on scheduling races; we only assert the aggregate is
-        # non-zero. ``last_steal_attempt_ns`` on at least one worker
-        # must also be non-zero (it's stamped on every try_steal
-        # entry).
         assert total_attempts > 0, (
             f"no steal_attempts recorded — fairness/empty-queue arms "
             f"never fired: {stats}"
@@ -156,11 +116,6 @@ class TestStealFairnessSanity:
         assert len(nonzero_ts) > 0, (
             f"no worker's last_steal_attempt_ns was set: {stats}"
         )
-
-
-# ---------------------------------------------------------------------------
-# Empty-queue race: workers with no work must park
-# ---------------------------------------------------------------------------
 
 
 class TestStealEmptyQueueNoSpin:
@@ -193,20 +148,15 @@ class TestStealEmptyQueueNoSpin:
         _ensure_quiesced()
         W = 4  # noqa: N806
         bocpy.start(worker_count=W)
-        try:
-            # Brief warm-up so workers actually reach pop_slow and
-            # commit to parking before we start measuring.
-            time.sleep(0.05)
+        time.sleep(0.05)
 
-            wall_start = time.monotonic()
-            cpu_start = time.process_time()
-            time.sleep(0.30)
-            wall_elapsed = time.monotonic() - wall_start
-            cpu_elapsed = time.process_time() - cpu_start
+        wall_start = time.monotonic()
+        cpu_start = time.process_time()
+        time.sleep(0.30)
+        wall_elapsed = time.monotonic() - wall_start
+        cpu_elapsed = time.process_time() - cpu_start
 
-            stats = _core.scheduler_stats()
-        finally:
-            wait()
+        stats = wait(stats=True)
 
         ratio = cpu_elapsed / wall_elapsed
         assert ratio < 0.5, (

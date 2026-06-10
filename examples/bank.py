@@ -34,12 +34,6 @@ def atomic_transfer(src: Cown[Account], dst: Cown[Account], amount: float):
         else:
             print("failure")
 
-        # Schedule follow-up behaviors that each acquire only a single
-        # account cown.  These demonstrate that a behavior body can
-        # schedule further behaviors on a subset of its cowns — the
-        # inner behaviors will run after the outer one releases.  The
-        # two inner behaviors are independent (they hold disjoint
-        # cowns) and may run in either order or in parallel.
         @when(src)
         def _(a: Cown[Account]):
             print("src (after transfer):", a.value)

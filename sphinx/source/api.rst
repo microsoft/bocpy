@@ -111,11 +111,11 @@ See the :ref:`noticeboard` guide for a conceptual overview, consistency model,
 and worked examples.
 
 .. autofunction:: notice_write
+.. autofunction:: notice_seed
 .. autofunction:: notice_update
 .. autofunction:: notice_delete
 .. autofunction:: noticeboard
 .. autofunction:: notice_read
-.. autofunction:: notice_sync
 .. autodata:: REMOVED
 
 

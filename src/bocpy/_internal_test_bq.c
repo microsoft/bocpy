@@ -24,10 +24,6 @@
 #include "boc_compat.h"
 #include "boc_sched.h"
 
-// ---------------------------------------------------------------------------
-// Node and queue capsule helpers
-// ---------------------------------------------------------------------------
-
 /// @brief Test node: a `boc_bq_node_t` followed by an integer identity.
 typedef struct {
   boc_bq_node_t node; ///< Link field consumed by `boc_bq_*`.
@@ -41,18 +37,11 @@ static void bq_queue_capsule_destructor(PyObject *capsule) {
   boc_bq_t *q =
       (boc_bq_t *)PyCapsule_GetPointer(capsule, BQ_QUEUE_CAPSULE_NAME);
   if (q != NULL) {
-    // Drain any leftover nodes so destroy_assert_empty does not abort
-    // on a leaked test queue. We do NOT free the nodes here; the
-    // Python side owns them via their own capsules.
     boc_bq_node_t *n;
     while ((n = boc_bq_dequeue(q)) != NULL) {
       (void)n;
     }
     boc_bq_destroy_assert_empty(q);
-    // Raw allocator: bq queues exist precisely to be crossed between
-    // sub-interpreters in production (per-worker queues), so the test
-    // harness uses the same process-global allocator to avoid masking
-    // a cross-interpreter free bug behind a same-interpreter test.
     PyMem_RawFree(q);
   }
 }
@@ -61,7 +50,6 @@ static void bq_node_capsule_destructor(PyObject *capsule) {
   bq_test_node_t *n =
       (bq_test_node_t *)PyCapsule_GetPointer(capsule, BQ_NODE_CAPSULE_NAME);
   if (n != NULL) {
-    // Raw allocator: see bq_queue_capsule_destructor above.
     PyMem_RawFree(n);
   }
 }
@@ -73,10 +61,6 @@ static boc_bq_t *bq_queue_from_capsule(PyObject *capsule) {
 static bq_test_node_t *bq_node_from_capsule(PyObject *capsule) {
   return (bq_test_node_t *)PyCapsule_GetPointer(capsule, BQ_NODE_CAPSULE_NAME);
 }
-
-// ---------------------------------------------------------------------------
-// Methods
-// ---------------------------------------------------------------------------
 
 static PyObject *bq_make_queue(PyObject *Py_UNUSED(self),
                                PyObject *Py_UNUSED(args)) {
@@ -140,8 +124,6 @@ static PyObject *bq_node_ptr(PyObject *Py_UNUSED(self), PyObject *args) {
   if (n == NULL) {
     return NULL;
   }
-  // bq_test_node_t puts `node` first, so &n == &n->node, but be
-  // explicit for clarity and to keep the test invariant readable.
   return PyLong_FromVoidPtr((void *)&n->node);
 }
 
@@ -185,8 +167,6 @@ static PyObject *bq_dequeue(PyObject *Py_UNUSED(self), PyObject *args) {
   boc_bq_node_t *raw;
   Py_BEGIN_ALLOW_THREADS raw = boc_bq_dequeue(q);
   Py_END_ALLOW_THREADS if (raw == NULL) { Py_RETURN_NONE; }
-  // Recover the embedding test-node and return its id. Tests don't
-  // need the original capsule object back; identity is the contract.
   bq_test_node_t *n = (bq_test_node_t *)raw;
   return PyLong_FromLongLong((long long)n->id);
 }
@@ -211,34 +191,6 @@ static PyObject *bq_dequeue_all(PyObject *Py_UNUSED(self), PyObject *args) {
   if (seg.start == NULL) {
     return list;
   }
-  // Walk the segment via segment_take_one. take_one returns NULL for
-  // three reasons (mpmcq.h:67-89, also documented at
-  // boc_sched.c::boc_sched_steal):
-  //   1. fully empty (impossible here — guarded above),
-  //   2. singleton segment (end == &start->next_in_queue) — append
-  //      start as the tail and return,
-  //   3. broken link: producer P has CASed itself onto the queue
-  //      tail (back.exchange) but has not yet completed the
-  //      "publish next pointer" store. seg.start->next_in_queue
-  //      reads as NULL, but the segment is NOT singleton — there
-  //      is at least one more node the producer is mid-publish.
-  //
-  // Verona's WorkStealingQueue::steal handles case 3 by spreading
-  // the partial segment back across its multi-N WSQ. The bocpy
-  // production caller (boc_sched_steal) handles it by splicing the
-  // partial segment onto self->q, deferring the missing tail to a
-  // subsequent dequeue once the producer's store lands.
-  //
-  // For a test helper there is no other queue to spread/splice
-  // onto, AND the test contract is "every enqueued item is observed
-  // exactly once". The pragmatic answer is to BUSY-SPIN on the
-  // broken next pointer until the producer's store becomes visible.
-  // The producer is mid-call (between `back.exchange` and
-  // `b->store(seg.start, release)` — three instructions wide), so
-  // the spin is bounded by producer scheduling latency. Without
-  // this spin the previous implementation silently dropped the
-  // entire post-broken-link tail, manifesting as the
-  // `[8-100000]` stress test losing 1-227 items per run.
   for (;;) {
     boc_bq_node_t *taken = boc_bq_segment_take_one(&seg);
     if (taken != NULL) {
@@ -252,31 +204,14 @@ static PyObject *bq_dequeue_all(PyObject *Py_UNUSED(self), PyObject *args) {
       Py_DECREF(id);
       continue;
     }
-    // take_one returned NULL. Distinguish singleton from broken-link
-    // (case 1 is impossible; we guarded seg.start != NULL above and
-    // each take_one advances seg.start to a known-non-NULL node).
     if (seg.end == &seg.start->next_in_queue) {
-      // Singleton tail — done.
       break;
     }
-    // Broken-link case: spin until the producer publishes. The wait
-    // is bounded by producer scheduling latency; under TSan or
-    // heavy oversubscription it could be milliseconds, but it is
-    // never unbounded — the producer is mid-call by construction.
-    // Drop the GIL across the spin so other Python threads (e.g.
-    // the other consumer in the stress test) can make progress.
     Py_BEGIN_ALLOW_THREADS while (
         boc_atomic_load_ptr_explicit(&seg.start->next_in_queue,
-                                     BOC_MO_ACQUIRE) == NULL) {
-      // Compiler/CPU hint: tight spin on a single cacheline. No
-      // platform-specific PAUSE intrinsic here — the spin is short
-      // and the cost is dwarfed by GIL re-acquire.
-    }
+                                     BOC_MO_ACQUIRE) == NULL) {}
     Py_END_ALLOW_THREADS
-    // Producer's store is now visible; loop and let take_one walk it.
   }
-  // Append the tail node (seg.start now points at it; its
-  // next_in_queue is NULL by segment-end invariant).
   bq_test_node_t *tail = (bq_test_node_t *)seg.start;
   PyObject *tail_id = PyLong_FromLongLong((long long)tail->id);
   if (tail_id == NULL || PyList_Append(list, tail_id) < 0) {
@@ -302,10 +237,6 @@ static PyObject *bq_is_empty(PyObject *Py_UNUSED(self), PyObject *args) {
   }
   Py_RETURN_FALSE;
 }
-
-// ---------------------------------------------------------------------------
-// Method table and registrar
-// ---------------------------------------------------------------------------
 
 static PyMethodDef bq_methods[] = {
     {"bq_make_queue", bq_make_queue, METH_NOARGS,

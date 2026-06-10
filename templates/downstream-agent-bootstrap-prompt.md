@@ -276,7 +276,6 @@ The five replacement patterns you should know cold:
 | `notice_write(key, value)` | Non-blocking write. |
 | `notice_update(key, fn, default)` | Atomic read-modify-write. `fn` must be picklable (module-level function or `functools.partial`). Return `REMOVED` to delete. |
 | `notice_delete(key)` | Non-blocking delete. |
-| `notice_sync()` | Flush this thread's pending noticeboard writes before releasing the current cown. Use when a downstream behavior must observe your write. |
 | `REMOVED` | Sentinel for deleting via `notice_update`. |
 | `wait(timeout)` | Block until all scheduled behaviors complete; stops the runtime. |
 | `start(workers, export_dir, module)` | Manually start the runtime (auto-called on first `@when`). |

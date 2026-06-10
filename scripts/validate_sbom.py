@@ -41,26 +41,16 @@ from typing import Iterable
 
 SBOM_GLOB = "*.cdx.json"
 
-# Match what ``build_sbom.py`` emits — these invariants must hold for
-# every SBOM bocpy ships. Drift here will be caught at CI time.
 EXPECTED_BOM_FORMAT = "CycloneDX"
 EXPECTED_SPEC_VERSION = "1.6"
 EXPECTED_TOOL_NAME = "build_sbom.py"
 EXPECTED_PURL_PREFIX = "pkg:pypi/bocpy@"
 
-# UUIDv5 serial number per CycloneDX 1.6 (the spec requires the
-# ``urn:uuid:`` prefix). ``build_sbom.py`` derives the serial as
-# ``uuid.uuid5(namespace, "<name>@<version>+<git>+<wheel>")`` so the
-# value is byte-identical across rebuilds of the same source tree
-# (reproducible-build contract). UUIDv5's version digit is ``5`` and
-# the variant nibble is the standard ``[89ab]``.
 _URN_UUID_RE = re.compile(
     r"^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}"
     r"-[0-9a-f]{12}$"
 )
 
-# ISO 8601 UTC timestamp, ``YYYY-MM-DDTHH:MM:SSZ`` — what
-# ``_sbom_timestamp`` emits.
 _TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
@@ -90,7 +80,6 @@ def validate_sbom_document(doc: Any) -> None:
     """
     _require(isinstance(doc, dict), "top-level value must be a JSON object")
 
-    # --- Header invariants --------------------------------------------------
     _require(
         doc.get("bomFormat") == EXPECTED_BOM_FORMAT,
         f"bomFormat must be {EXPECTED_BOM_FORMAT!r}, got {doc.get('bomFormat')!r}",
@@ -111,10 +100,9 @@ def validate_sbom_document(doc: Any) -> None:
         f"version must be a positive integer, got {doc.get('version')!r}",
     )
 
-    # --- metadata ----------------------------------------------------------
     metadata = doc.get("metadata")
     _require(isinstance(metadata, dict), "metadata must be an object")
-    assert isinstance(metadata, dict)  # for type-checkers
+    assert isinstance(metadata, dict)
 
     timestamp = _require_str(metadata, "timestamp")
     _require(
@@ -165,7 +153,6 @@ def validate_sbom_document(doc: Any) -> None:
         f"metadata.component.purl must start with {EXPECTED_PURL_PREFIX!r}, got {purl!r}",
     )
 
-    # --- components & dependencies ----------------------------------------
     components = doc.get("components")
     _require(isinstance(components, list), "components must be a list")
 

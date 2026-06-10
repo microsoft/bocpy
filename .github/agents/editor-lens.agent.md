@@ -25,6 +25,38 @@ target is a codebase where every remaining comment is one a maintainer
 would write today, from scratch, knowing nothing about the PR that
 introduced it.
 
+### The inline-comment single-line rule (repo norm)
+
+**Every inline comment defaults to a single line of at most 120
+characters, or it is deleted.** An inline comment is a `#` block in
+Python or a `//` block in C that sits inside a function body or above a
+statement. This is the repo standard, not a per-PR cleanup: verbose
+multi-line inline comments rot as the code beneath them changes, drift
+out of sync, and bury the few comments that earn their keep. A
+multi-line inline comment is a smell — collapse it to one line or cut
+it.
+
+A multi-line inline comment survives **only** with an explicit
+per-case justification, and only these justifications qualify:
+
+- a non-obvious concurrency invariant the code cannot express (2PL
+  lock ordering, MCS handoff, memory-ordering rationale);
+- the rationale block above a non-trivial version-gate `#if`/`#elif`
+  ladder;
+- an X-macro / `clang-format off` table boundary that is itself
+  structural;
+- a reference anchor that needs a line of context to be followed.
+
+If a surviving multi-line inline comment does not fall into one of
+those buckets, collapse it. When in doubt, collapse.
+
+**Docstrings and doc-blocks are exempt from the single-line rule.**
+Python docstrings, C `///` / `/** */` Doxygen headers, and Sphinx
+`:param:` / `:returns:` stubs in `.pyi` files are *documentation*, not
+inline commentary. They may — and should — carry in-depth, useful
+prose across multiple lines. Trim genuine wordiness, but do not force a
+docstring onto one line; a docstring's job is to document thoroughly.
+
 A second, broader mandate: catch **cryptic references to internal
 review artifacts** wherever they appear in the diff, including
 user-facing files (`README.md`, `sphinx/source/**`, `CHANGELOG.md`,
@@ -144,7 +176,9 @@ finalize.
   express: 2PL lock ordering by cown ID, MCS handoff invariants,
   memory-ordering rationale (`// acquire pairs with the release in
   ...`), why a particular `_Py_atomic_*` was chosen, why a
-  sub-interpreter API ladder is structured the way it is.
+  sub-interpreter API ladder is structured the way it is. These are
+  the canonical justification for a multi-line inline comment — but
+  prefer one tight line even here when the invariant fits.
 - **Version-gate rationale** — the prose above a non-trivial
   `#if PY_VERSION_HEX >= ...` ladder explaining what changed
   upstream. Trim if wordy; do not delete.
@@ -160,6 +194,14 @@ finalize.
 
 ### Rewrite (collapse, don't delete)
 
+- **Any multi-line inline comment without a qualifying justification.**
+  Per the inline-comment single-line rule above, a `#` or `//`
+  comment spanning more than one line is collapsed to a single
+  ≤120-char line unless it is a concurrency invariant, version-gate
+  rationale, X-macro / `clang-format` table boundary, or a reference
+  anchor needing context. Default to collapsing; keep multi-line only
+  when one of those buckets applies. (Docstrings and Doxygen / Sphinx
+  doc-blocks are exempt — see the rule above.)
 - **Wordy explanations of correct behavior.** Three sentences
   paraphrasing what the next ten lines obviously do → one line, a
   reference anchor, or nothing.
@@ -249,8 +291,10 @@ When reviewing, produce findings in these sections:
    archaeology, or paraphrase. List file + line range + the comment
    text. These can be deleted without further review. *Full prose
    edit scope only.*
-3. **Rewrites** — wordy or stale comments that should be collapsed.
-   For each, give the original and the proposed replacement. *Full
+3. **Rewrites** — wordy or stale comments that should be collapsed,
+   including every multi-line inline comment collapsed to a single
+   ≤120-char line under the inline-comment single-line rule. For
+   each, give the original and the proposed replacement. *Full
    prose edit scope only.*
 4. **Keep with edit** — load-bearing comments that need a small fix
    (stale file path, wrong PEP number, dated phrasing). *Full prose
@@ -262,7 +306,9 @@ When reviewing, produce findings in these sections:
    comment and what's ambiguous. Always include any `TODO` / `FIXME`
    without an issue or sketch link.
 6. **Summary** — counts (cuts / rewrites / edits / kept / asked),
-   and an estimated LOC reduction.
+   the number of multi-line inline comments collapsed to one line
+   and the number of multi-line inline comments kept (each with its
+   qualifying justification), and an estimated LOC reduction.
 
 When invoked via `review-loop`, expect to iterate: apply approved
 cuts and rewrites, then re-scan the same target until no new

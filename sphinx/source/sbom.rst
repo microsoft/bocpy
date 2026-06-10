@@ -215,7 +215,7 @@ is the only reliable way to predict whether PyPI will accept a wheel:
 only checks RECORD hashes and sizes, and ``check-wheel-contents`` only
 checks layout — none of them runs PyPI's actual acceptance code.
 
-The vendored file's docstring records the exact upstream commit it
+The vendored file's header records the exact upstream commit it
 was synced from and the refresh procedure.  The wheel-integrity job
 in ``.github/workflows/build_wheels.yml`` runs it twice per release:
 once inside ``CIBW_REPAIR_WHEEL_COMMAND`` (so a per-platform build

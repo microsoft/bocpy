@@ -30,9 +30,6 @@ from pathlib import Path
 import sys
 from typing import Iterable
 
-# ``scripts/`` is added to ``sys.path`` for pytest by pyproject.toml,
-# but a direct ``python scripts/validate_wheel.py`` invocation only
-# has the script's own directory on the path — which is what we want.
 from _vendored_warehouse_wheel import (
     InvalidWheelEntryPointsError,
     InvalidWheelRecordError,

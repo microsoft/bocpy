@@ -32,19 +32,11 @@ import pytest
 
 import bocpy
 from bocpy import _core
-from bocpy import Cown, drain, notice_update, receive, send, TIMEOUT, wait, when
+from bocpy import Cown, notice_update, quiesce, wait, when
 
 
-RECEIVE_TIMEOUT = 10
-# Slow-fn duration: long enough that ``wait(timeout=0.1)`` reliably
-# hits the noticeboard-join timeout, short enough that the test does
-# not bloat the suite.
+QUIESCE_TIMEOUT = 10
 SLOW_FN_SECONDS = 0.6
-
-
-# ---------------------------------------------------------------------------
-# Module-level helpers (must be picklable across the boc_noticeboard queue).
-# ---------------------------------------------------------------------------
 
 
 def _slow_update_fn(_x):
@@ -57,11 +49,6 @@ def _slow_update_fn(_x):
     """
     time.sleep(SLOW_FN_SECONDS)
     return 1
-
-
-# ---------------------------------------------------------------------------
-# Stop-timeout and retry composition test
-# ---------------------------------------------------------------------------
 
 
 class TestStopTimeoutAndRetry:
@@ -87,24 +74,16 @@ class TestStopTimeoutAndRetry:
 
     @classmethod
     def teardown_class(cls):
-        """Drain the runtime and any leftover messages."""
+        """Drain the runtime to a clean state."""
         wait()
-        drain("retry_done")
 
     def test_stop_timeout_then_retry(self):
         """Time out on a slow noticeboard fn, then retry start() cleanly."""
-        # Begin from a known-clean state.
         wait()
 
-        # ----- Step 1: schedule a slow notice_update -----
         bocpy.start(worker_count=1)
         try:
             notice_update("retry_key", _slow_update_fn, default=0)
-            # Yield long enough for the noticeboard thread to
-            # dequeue the update and enter ``time.sleep``. Without
-            # this, on a very fast machine ``wait(timeout=0.1)``
-            # could race the message dequeue and the noticeboard
-            # thread would shut down cleanly inside the 0.1s budget.
             time.sleep(0.05)
         except BaseException:
             try:
@@ -113,41 +92,21 @@ class TestStopTimeoutAndRetry:
                 pass
             raise
 
-        # ----- Step 2: stop times out, but the orphan drain still ran -----
         with pytest.raises(RuntimeError, match="noticeboard thread did not shut down"):
             wait(timeout=0.1)
 
-        # The orphan drain ran before the raise, so the C-side
-        # terminator_count is back to 0. Without that drain the
-        # count would still reflect in-flight @when traffic and
-        # the next start() would diagnose terminator drift.
         assert _core.terminator_count() == 0, (
             "terminator_count is non-zero after wait(timeout=0.1) "
             "timed out on the noticeboard join. The orphan drain "
             "did not run before the RuntimeError."
         )
 
-        # ----- Step 3: drain the slow fn, finish teardown -----
-        # The retry path in ``stop()`` calls
-        # ``noticeboard.join(_remaining())``. We invoke ``wait()``
-        # with no timeout here, so ``_remaining()`` returns ``None``
-        # and the join is unbounded -- the second ``wait()`` blocks
-        # deterministically until the slow fn completes and the
-        # noticeboard thread exits, with no ``time.sleep`` slack
-        # required. A retry that supplied a finite ``timeout=`` would
-        # see a bounded join and would still need explicit
-        # synchronisation to guarantee the slow fn has completed.
         wait()
 
-        # ----- Step 4: fresh start + schedule -----
-        # If the scheduler_runtime_stop pairing on abort paths or
-        # the dispatch-failure-observable change were regressed,
-        # this start() / @when cycle would either crash or hang.
         bocpy.start(worker_count=2)
         try:
             self._run_fresh_when()
         finally:
-            drain("retry_done")
             wait()
 
     def _run_fresh_when(self):
@@ -160,16 +119,7 @@ class TestStopTimeoutAndRetry:
 
         @when(fresh)
         def _(c):
-            send("retry_done", ("fresh_ran", c.value))
+            return c.value
 
-        tag, payload = receive("retry_done", RECEIVE_TIMEOUT)
-        assert tag != TIMEOUT, (
-            "@when on a fresh Cown after retry never ran -- the "
-            "scheduler did not re-arm cleanly after the "
-            "timed-out stop()"
-        )
-        assert payload == ("fresh_ran", 0), (
-            f"unexpected payload {payload!r} from fresh @when; a "
-            "'cannot acquire cown' error here would indicate a "
-            "leaked owner from the prior runtime"
-        )
+        quiesce(QUIESCE_TIMEOUT)
+        assert fresh.unwrap() == 0

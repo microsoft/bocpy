@@ -114,13 +114,17 @@ later `@when` to enforce happens-after across unrelated data:
 ```python
 @when(x)
 def writer(x):
-    notice_write("k", x.value)
-    notice_sync()                           # commit before returning
+    x.value = compute()
 
-@when(x, writer)                            # waits for writer to finish
-def reader(x, _):
-    assert notice_read("k") == x.value
+@when(y, writer)                            # y is unrelated; writer is the result cown
+def reader(y, w):
+    consume(y.value, w.value)               # runs only after writer finished
 ```
+
+Here `reader` touches its own data (`y`) and would otherwise be free to run
+concurrently with `writer`. Depending on the `writer` result cown is what
+serializes them: the runtime cannot acquire `writer` until that behavior has
+returned, so `reader` sees its result via `w.value`.
 
 ### 4. Run when *any* worker is free — `@when()`
 
@@ -176,30 +180,7 @@ cown between chunks, so:
 `prime_factor.py` (`sieve_check` → `sieve_work` → `sieve_check`) is the
 canonical example in this repository.
 
-### 6. Flushing your own queued mutations — `notice_sync()`
-
-The noticeboard mutator runs on its own thread. `notice_write` /
-`notice_update` / `notice_delete` are fire-and-forget. If a *subsequent
-behavior* must observe your noticeboard mutation, call `notice_sync()` at
-the end of the writing behavior:
-
-```python
-@when(x)
-def writer(x):
-    notice_write("k", v)
-    notice_sync()                           # block until commit
-
-@when(x, writer)                            # now reader sees v
-def reader(x, _):
-    assert notice_read("k") == v
-```
-
-`notice_sync()` flushes **only the calling thread's** prior writes. For
-cross-producer ordering, lean on `@when(cowns)` (pattern 2) — let the cown
-graph do the synchronization, and let each writer's `notice_sync()` make
-its own commit visible before it releases its cown.
-
-### 7. Single-assignment rendezvous — the behavior's own result cown
+### 6. Single-assignment rendezvous — the behavior's own result cown
 
 `@when` returns a `Cown` holding whatever the behavior returns. That cown
 *is* your rendezvous — there is no need to allocate a separate `Cown(None)`

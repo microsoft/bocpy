@@ -71,10 +71,23 @@ _include_dirs = ["src/bocpy/include", "src/bocpy"]
 #
 # Stays at ``-O3``; never ``-Ofast``/``-ffast-math``, which would break
 # IEEE semantics that ``fabs``, ``nearbyint``, and NaN handling depend on.
+#
+# ``-ffp-contract=off`` is required for bit-reproducible results. By
+# default gcc and clang contract a ``a * b + c`` expression into a single
+# fused-multiply-add (one rounding) on targets that have an FMA unit --
+# notably every arm64 chip. x86-64 at the SSE2 baseline has no FMA, so
+# the same source rounds twice there, and the matmul kernel's ascending-k
+# accumulation then diverges by 1 ULP between architectures (see
+# test_matmul_bitwise_reproducible). Turning contraction off makes the
+# multiply and add round separately everywhere, matching the two-rounding
+# reference. It does not inhibit autovectorisation -- NEON still vectorises
+# the loop with separate FMUL/FADD lanes instead of fused FMLA. MSVC's
+# default ``/fp:precise`` does not contract across statements, so the
+# Windows build needs no equivalent flag.
 if sys.platform == "win32":
     _math_extra_compile_args = ["/O2"]
 else:
-    _math_extra_compile_args = ["-O3"]
+    _math_extra_compile_args = ["-O3", "-ffp-contract=off"]
 
 _ext_modules = [
     Extension(

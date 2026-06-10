@@ -1,10 +1,10 @@
-"""Dining philosophers demo using cowns and message passing."""
+"""Dining philosophers demo using cowns."""
 
 import argparse
 import logging
 from typing import NamedTuple
 
-from bocpy import Cown, receive, send, wait, when
+from bocpy import Cown, quiesce, wait, when
 
 
 class Fork:
@@ -28,19 +28,17 @@ class Philosopher(NamedTuple("Philosopher", [("index", int), ("left", Cown),
         """Attempt to eat; reschedule until hunger reaches zero."""
         index = self.index
 
+        # BOC acquires both forks atomically in cown-id order, so the classic deadlock cannot occur.
         @when(self.left, self.right, self.hunger)
         def take_bite(left: Cown[Fork], right: Cown[Fork], hunger: Cown[int]):
             left.value.use()
             right.value.use()
-            send("report", ("bite", index))
+            print(f"Philosopher {index} has taken a bite")
             hunger.value -= 1
             if hunger.value > 0:
                 Philosopher(index, left, right, hunger).eat()
             else:
-                # send the report after the forks have been released
-                @when()
-                def _():
-                    send("report", ("full", index))
+                print(f"Philosopher {index} is full")
 
 
 def main():
@@ -56,15 +54,7 @@ def main():
     for i in range(args.philosophers):
         Philosopher.eat(Philosopher(i, forks[i-1], forks[i], Cown(args.hunger)))
 
-    num_eating = args.philosophers
-    while num_eating > 0:
-        match receive("report"):
-            case ["report", ("bite", index)]:
-                print(f"Philosopher {index} has taken a bite")
-
-            case ["report", ("full", index)]:
-                print(f"Philosopher {index} is full")
-                num_eating -= 1
+    quiesce()
 
     for i, f in enumerate(forks):
         with f as fork:

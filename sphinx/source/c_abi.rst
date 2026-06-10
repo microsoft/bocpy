@@ -3,6 +3,8 @@
 C ABI
 =====
 
+.. py:currentmodule:: bocpy
+
 This page documents the public C ABI shipped with bocpy. Use it when
 writing a downstream C extension that needs to participate in
 behavior-oriented concurrency at the C level — typically by registering

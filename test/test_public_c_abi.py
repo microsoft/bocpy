@@ -30,19 +30,16 @@ import bocpy
 
 EXPECTED_PUBLIC_C_FILES = {"bocpy.h", "xidata.h", "bocpy_msvc.c"}
 
-# Filename extensions a wheel install of bocpy is allowed to ship.
 _ALLOWED_SHIPPED_EXTS = {
-    ".py",       # source modules
-    ".pyc",      # bytecode in __pycache__
-    ".pyi",      # type stubs
-    ".so",       # Linux/BSD compiled extensions
-    ".pyd",      # Windows compiled extensions
-    ".dylib",    # macOS dynamic libraries (defensive)
-    ".dll",      # Windows dynamic libraries (defensive)
-    ".txt",      # bocpy.examples ships menu.txt / cheese.txt
+    ".py",
+    ".pyc",
+    ".pyi",
+    ".so",
+    ".pyd",
+    ".dylib",
+    ".dll",
+    ".txt",
 }
-# Filenames (full basename, no extension) that are allowed even
-# though they don't match _ALLOWED_SHIPPED_EXTS.
 _ALLOWED_SHIPPED_NAMES = {"py.typed"}
 
 EXPECTED_ATOMIC_NAMES = {
@@ -51,11 +48,6 @@ EXPECTED_ATOMIC_NAMES = {
     "atomic_fetch_add",
     "atomic_compare_exchange_strong",
 }
-
-
-# ---------------------------------------------------------------------------
-# get_include / get_sources
-# ---------------------------------------------------------------------------
 
 
 def test_get_include_points_at_headers():
@@ -73,11 +65,6 @@ def test_get_sources_shape():
         assert os.path.isfile(sources[0])
     else:
         assert sources == []
-
-
-# ---------------------------------------------------------------------------
-# Wheel allow-list (no internal .h / .c leaks)
-# ---------------------------------------------------------------------------
 
 
 def _assert_only_public_artefacts(package_dir: str) -> None:
@@ -138,11 +125,6 @@ def test_wheel_allowlist_rejects_unknown_extension(tmp_path):
     assert "secrets.json" in str(exc_info.value)
 
 
-# ---------------------------------------------------------------------------
-# MSVC atomic bodies in lockstep (boc_compat.c vs bocpy_msvc.c)
-# ---------------------------------------------------------------------------
-
-
 _MARKER_BEGIN = "/* @atomic-bodies-begin */"
 _MARKER_END = "/* @atomic-bodies-end */"
 
@@ -168,11 +150,6 @@ def test_msvc_bodies_in_lockstep():
     a = _extract_marker_region(str(compat_c))
     b = _extract_marker_region(str(msvc_c))
     assert a == b, "marker regions differ — atomic bodies have drifted"
-
-
-# ---------------------------------------------------------------------------
-# Static prototype/body parameter-signature parity (bocpy.h vs bocpy_msvc.c)
-# ---------------------------------------------------------------------------
 
 
 def _extract_atomic_signatures(text: str) -> dict[str, str]:

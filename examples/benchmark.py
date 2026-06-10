@@ -33,11 +33,10 @@ import time
 from typing import Optional
 
 from bocpy import _core
-from bocpy import (Cown, Matrix, notice_write, noticeboard, PinnedCown,
+from bocpy import (Cown, Matrix, notice_seed, notice_write, noticeboard,
+                   PinnedCown,
                    pump, start, wait, when)
 
-# Sentinels for the parent/child JSON protocol.  Uppercase so the
-# transpiler keeps them as module-level constants in the worker export.
 SENTINEL_BEGIN = "---BOCPY-BENCH-BEGIN---"
 SENTINEL_END = "---BOCPY-BENCH-END---"
 SCHEMA_VERSION = 1
@@ -56,11 +55,6 @@ def _physical_cpu_count() -> int:
     if n > 0:
         return n
     return os.cpu_count() or 1
-
-
-# ---------------------------------------------------------------------------
-# Behavior code (chain workload)
-# ---------------------------------------------------------------------------
 
 
 class ChainState:
@@ -125,16 +119,7 @@ def schedule_step(state_cown: Cown, window_list: list, group_size: int) -> None:
     @when(state_cown, window_list)
     def _step(state, window):
         cs = state.value
-        # When ``cr_null`` is set, skip the matmul loop entirely.  The
-        # behavior still acquires its window of cowns, mutates
-        # ``ChainState``, and reschedules itself — so the measured
-        # throughput reflects pure BOC runtime overhead (2PL, queue
-        # ops, sub-interpreter crossings, return-cown allocation)
-        # with the application work removed.
         if not noticeboard().get("cr_null", False):
-            # The inner loop's first slot multiplies window[0] by itself.
-            # Intentional — it keeps the per-behavior multiply count
-            # exactly `iters * group_size`.
             for _ in range(cs.iters):
                 for c in window:
                     window[0].value = window[0].value @ c.value
@@ -142,15 +127,17 @@ def schedule_step(state_cown: Cown, window_list: list, group_size: int) -> None:
         cs.count += 1
         cs.head_idx = (cs.head_idx + cs.stride) % cs.ring_size
         if not noticeboard().get("cr_stop", False):
-            # Pass the already-acquired `state` cown wrapper directly
-            # rather than the closure-captured `state_cown` to keep the
-            # capture set minimal.
             schedule_step(state, next_window(cs, group_size), group_size)
 
 
-# ---------------------------------------------------------------------------
-# Configuration and result types (plain data only; no Cowns)
-# ---------------------------------------------------------------------------
+# Mirror of the noticeboard's hard entry cap in boc_noticeboard.c
+# (NB_MAX_ENTRIES). The workload publishes one "ring_{r}" entry per ring
+# plus the NB_RESERVED_KEYS non-ring keys below; validate_config rejects
+# configs that would overflow this rather than dropping entries mid-run.
+NB_CAPACITY = 64
+# Non-ring noticeboard keys: cr_null, cr_stop, final_count,
+# final_count_ts_ns, pinned_dispatches.
+NB_RESERVED_KEYS = 5
 
 
 @dataclass
@@ -190,13 +177,7 @@ class RepeatResult:
     wall_clock_ns_start: int
     scheduler_stats: Optional[list] = None
     queue_stats: Optional[list] = None
-    # ``derived`` holds the post-processed metrics computed from the
-    # per-window scheduler-stats delta (see
-    # ``compute_derived_metrics``).
     derived: Optional[dict] = None
-    # Count of pinned spinner @when dispatches that fired during the
-    # run (0 when ``pinned_spinner`` was off). Lifted out of the
-    # noticeboard at shutdown.
     pinned_dispatches: int = 0
 
 
@@ -213,32 +194,20 @@ class PointResult:
     error: Optional[dict] = None
 
 
-# ---------------------------------------------------------------------------
-# Sizing / validation helpers (parent-side, no BOC required)
-# ---------------------------------------------------------------------------
-
-
 def derive_sizes(cfg: BenchConfig) -> BenchConfig:
     """Auto-size ``rings`` and ``chains_per_ring`` if not overridden.
+
+    Biases toward many rings with few chains each so the benchmark
+    measures scheduler scaling (lots of independent work) rather than
+    contention/starvation within a single oversubscribed ring.
 
     :param cfg: An input config (mutated and returned).
     :return: The same config with ``rings`` / ``chains_per_ring`` set.
     """
     if cfg.chains_per_ring is None:
-        # Use a small per-ring chain count (4) so chains never collide
-        # on adjacent slots as they advance. Independent rings carry
-        # the load instead.
         cfg.chains_per_ring = max(
             1, cfg.ring_size // (cfg.group_size * cfg.stride * 8))
     if cfg.rings is None:
-        # Bias toward more *rings* rather than more chains-per-ring:
-        # chains on the same ring contend for adjacent slots as they
-        # advance, so per-ring concurrency is bounded well below
-        # ``chains_per_ring``. Independent rings, by contrast, never
-        # collide. Provision at least ``workers * 4`` rings so every
-        # worker sees a deep, independent supply of ready chains and
-        # the measured throughput reflects scheduler scaling rather
-        # than workload starvation.
         cfg.rings = max(cfg.workers * 16 // cfg.chains_per_ring,
                         cfg.workers * 4)
     return cfg
@@ -256,6 +225,11 @@ def validate_config(cfg: BenchConfig) -> Optional[str]:
     if cfg.group_size * cfg.stride * 2 > cfg.ring_size:
         return (f"group_size*stride*2 ({cfg.group_size}*{cfg.stride}*2) "
                 f"> ring_size ({cfg.ring_size}); chains would collide")
+    nb_used = cfg.rings + NB_RESERVED_KEYS
+    if nb_used > NB_CAPACITY:
+        return (f"rings ({cfg.rings}) + {NB_RESERVED_KEYS} reserved keys "
+                f"= {nb_used} exceeds noticeboard capacity ({NB_CAPACITY}); "
+                f"lower --workers/--rings or raise --ring-size")
     if cfg.workers < 1:
         return f"workers must be >= 1, got {cfg.workers}"
     if cfg.iters < 1:
@@ -282,11 +256,6 @@ def emit_soft_warnings(cfg: BenchConfig, cpu_count: int) -> None:
               f"hyperthreads will be used)", file=sys.stderr)
 
 
-# ---------------------------------------------------------------------------
-# Workload construction
-# ---------------------------------------------------------------------------
-
-
 def build_workload(cfg: BenchConfig):
     """Build per-ring cowns and per-chain state cowns.
 
@@ -310,9 +279,7 @@ def build_workload(cfg: BenchConfig):
                                     (cfg.payload_rows, cfg.payload_cols)))
                 for _ in range(cfg.ring_size)]
         rings.append(ring)
-        notice_write(f"ring_{r}", ring)
-        # Spread chains evenly across the ring so adjacent chains'
-        # initial windows don't overlap.
+        notice_seed(f"ring_{r}", ring)
         spacing = max(1, cfg.ring_size // cfg.chains_per_ring)
         for k in range(cfg.chains_per_ring):
             head = (k * spacing) % cfg.ring_size
@@ -322,11 +289,6 @@ def build_workload(cfg: BenchConfig):
             state_cowns.append(Cown(cs))
             chain_id += 1
     return rings, state_cowns
-
-
-# ---------------------------------------------------------------------------
-# Snapshot helpers (used by the measurement flow)
-# ---------------------------------------------------------------------------
 
 
 def schedule_snap(state_cowns: list) -> None:
@@ -349,13 +311,6 @@ def schedule_snap(state_cowns: list) -> None:
     notice_write("cr_stop", True)
 
 
-# The pinned cown wraps a one-slot list: ``[count]``. Counting inside
-# the cown's own value keeps the hot per-dispatch path off the
-# noticeboard, so NB_VERSION is not bumped on every spinner iteration
-# (which would invalidate every worker's cached snapshot and skew the
-# worker-throughput measurement). The spinner publishes the final
-# count to the noticeboard exactly once -- on the iteration where it
-# observes ``cr_stop`` and breaks the tail-recursion.
 _PINNED_COUNT = 0
 
 
@@ -386,11 +341,6 @@ def schedule_pinned_spinner(spin_cown: "PinnedCown",
             notice_write("pinned_dispatches", p.value[_PINNED_COUNT])
 
 
-# ---------------------------------------------------------------------------
-# Single-point measurement (in-process; one BOC start/wait cycle)
-# ---------------------------------------------------------------------------
-
-
 def run_single_point_body(cfg: BenchConfig, repeat_index: int) -> RepeatResult:
     """Run one chain-ring measurement in a fresh BOC runtime.
 
@@ -404,16 +354,9 @@ def run_single_point_body(cfg: BenchConfig, repeat_index: int) -> RepeatResult:
     :param repeat_index: Index of this repeat for reporting.
     :return: A ``RepeatResult`` with no Cown references.
     """
-    # Start the runtime first: ``build_workload`` writes rings to the
-    # noticeboard, and noticeboard writes require the runtime to be
-    # running.
     start(worker_count=cfg.workers)
     rings, state_cowns = build_workload(cfg)
-    # Publish the null-payload toggle so worker behaviors can read it
-    # from their per-behavior noticeboard snapshot.  Written before the
-    # warmup sleep so the noticeboard thread has flushed it well
-    # before t_measure_start.
-    notice_write("cr_null", cfg.null_payload)
+    notice_seed("cr_null", cfg.null_payload)
     payload_bytes = cfg.payload_rows * cfg.payload_cols * 8
     total_bytes = cfg.rings * cfg.ring_size * payload_bytes
     print(f"workload: chain rings={cfg.rings} ring_size={cfg.ring_size} "
@@ -423,10 +366,6 @@ def run_single_point_body(cfg: BenchConfig, repeat_index: int) -> RepeatResult:
           file=sys.stderr)
 
     try:
-        # Kick off one chain per (ring, chain-slot) pair.  Recompute the
-        # head positions exactly the way `build_workload` chose them:
-        # we cannot read `cs_cown.value` from the main thread because
-        # Cowns are released to the runtime on construction.
         spacing = max(1, cfg.ring_size // cfg.chains_per_ring)
         chain_idx = 0
         for r in range(cfg.rings):
@@ -444,13 +383,6 @@ def run_single_point_body(cfg: BenchConfig, repeat_index: int) -> RepeatResult:
         wall_clock_ns_start = time.time_ns()
         t_measure_start_ns = time.perf_counter_ns()
 
-        # Measurement window. When ``--pinned-spinner`` is set, drive
-        # a tail-recursing @when on a PinnedCown by hand from this
-        # thread via ``pump(max_behaviors=1)``. The spinner's per-body
-        # ``time.sleep(sleep_s)`` self-paces the dispatch rate. The
-        # point is to load the C-level pinned-queue 0->1 wakeup path
-        # (single terminator cv broadcast per pump) and measure
-        # worker-throughput regression under that load.
         if cfg.pinned_spinner:
             pinned = PinnedCown([0])
             schedule_pinned_spinner(pinned, cfg.pinned_spinner_sleep_s)
@@ -462,35 +394,18 @@ def run_single_point_body(cfg: BenchConfig, repeat_index: int) -> RepeatResult:
 
         schedule_snap(state_cowns)
 
-        # Snapshot tagged-queue counters BEFORE wait() tears the
-        # runtime down. Per-tag assignments are rebound on the next
-        # start(), so capture here while they still reflect this run.
         queue_stats_snap = (
             _core.queue_stats() if hasattr(_core, "queue_stats") else None
         )
     finally:
-        # Drop bare-Cown locals before wait(). ``pinned`` (when set)
-        # is intentionally left in scope: ``wait()`` auto-pumps any
-        # remaining pinned bodies on this thread, the spinner
-        # observes ``cr_stop`` from snap, publishes its final count,
-        # and stops re-scheduling so the queue drains.
         del rings
         del state_cowns
-        # ``wait(stats=True, noticeboard=True)`` returns a WaitResult
-        # carrying both the per-worker scheduler_stats snapshot and
-        # the final noticeboard contents. Both are captured AFTER all
-        # behaviors completed but BEFORE the per-worker array and the
-        # noticeboard entries are freed -- the only correct moment.
         wait_result = wait(stats=True, noticeboard=True)
         sched_stats_end = wait_result.stats
         nb_snap = wait_result.noticeboard
 
     total = int(nb_snap.get("final_count", 0))
     pinned_dispatches = int(nb_snap.get("pinned_dispatches", 0))
-    # Use the snap behavior's own write-time so the elapsed_s
-    # numerator denominator pairing matches: ``total`` is the count
-    # snap observed at that instant, ``t_measure_start`` is when the
-    # chains began contributing to it.
     snap_ts_ns = nb_snap.get("final_count_ts_ns")
     if snap_ts_ns is None:
         raise RuntimeError("snap behavior did not publish final_count_ts_ns")
@@ -510,16 +425,6 @@ def run_single_point_body(cfg: BenchConfig, repeat_index: int) -> RepeatResult:
                         pinned_dispatches=pinned_dispatches)
 
 
-# ---------------------------------------------------------------------------
-# Stats-delta + derived metrics
-# ---------------------------------------------------------------------------
-
-
-# Counter fields in ``_core.scheduler_stats()`` that are monotonically
-# increasing per-worker counters and therefore subtractable across two
-# snapshots.  Non-counter fields (``last_steal_attempt_ns``,
-# ``parked``) are carried over from the end-of-window snapshot
-# unchanged because subtracting them is meaningless.
 _COUNTER_FIELDS = (
     "pushed_local",
     "dispatched_to_pending",
@@ -584,10 +489,6 @@ def compute_derived_metrics(stats: Optional[list],
     }
     if not stats:
         return out
-    # Producer worker = the worker with the most local pushes over
-    # the measurement window. For chain that is whichever worker's
-    # queue saw the most ``schedule_fifo`` evicts of ``pending`` to
-    # ``q``.
     pushed_local = [int(w.get("pushed_local", 0)) for w in stats]
     if not pushed_local or max(pushed_local) == 0:
         return out
@@ -608,11 +509,6 @@ def compute_derived_metrics(stats: Optional[list],
     if total_attempts > 0:
         out["idle_ratio"] = total_failures / total_attempts
     return out
-
-
-# ---------------------------------------------------------------------------
-# Subprocess orchestration
-# ---------------------------------------------------------------------------
 
 
 def cfg_to_argv(cfg: BenchConfig) -> list:
@@ -647,9 +543,6 @@ def cfg_to_argv(cfg: BenchConfig) -> list:
     return args
 
 
-# Sidechannel: the parent passes its --emit-scheduler-stats flag down
-# to the child via an env var so cfg_to_argv stays a pure function of
-# BenchConfig (the flag is a reporting concern, not a workload knob).
 BOCPY_BENCH_EMIT_SCHED_STATS_ENV = "BOCPY_BENCH_EMIT_SCHED_STATS"
 
 
@@ -724,11 +617,6 @@ def _extract_sentinel_payload(stdout: str) -> Optional[dict]:
         return None
 
 
-# ---------------------------------------------------------------------------
-# Sweep orchestration (parent side)
-# ---------------------------------------------------------------------------
-
-
 def cfg_for_axis(base: BenchConfig, axis: str, value) -> BenchConfig:
     """Clone ``base`` with one axis varied to ``value``.
 
@@ -740,7 +628,6 @@ def cfg_for_axis(base: BenchConfig, axis: str, value) -> BenchConfig:
     :return: A fresh ``BenchConfig`` with that axis applied.
     """
     cfg = BenchConfig(**asdict(base))
-    # Reset auto-sized fields so each point recomputes.
     cfg.rings = base.rings
     cfg.chains_per_ring = base.chains_per_ring
     if axis == "workers":
@@ -838,7 +725,7 @@ def run_sweep(axis: str, values: list, base: BenchConfig,
                         error={"message": str(ex), "stderr_tail": ""})
                     points.append(asdict(point))
                     _flush_results(output_path, metadata, sweep_meta, points)
-                    repeats = None  # marker: already appended
+                    repeats = None
                     break
         except KeyboardInterrupt:
             interrupted = True
@@ -926,11 +813,6 @@ def _json_default(obj):
                     "JSON-serializable")
 
 
-# ---------------------------------------------------------------------------
-# Metadata
-# ---------------------------------------------------------------------------
-
-
 def collect_metadata(argv: list, git_sha: Optional[str]) -> dict:
     """Collect metadata for the top of the results JSON.
 
@@ -991,11 +873,6 @@ def _git_sha() -> Optional[str]:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
     return None
-
-
-# ---------------------------------------------------------------------------
-# ASCII table renderer
-# ---------------------------------------------------------------------------
 
 
 def render_table(document: dict) -> str:
@@ -1076,11 +953,6 @@ def _axis_label(axis: str, pt: dict) -> str:
     if axis == "payload":
         return f"{inputs.get('payload_rows')}x{inputs.get('payload_cols')}"
     return "-"
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 
 def parse_payload_token(token: str) -> tuple:
@@ -1274,12 +1146,8 @@ def child_main(args) -> int:
         "pinned_dispatches": rep.pinned_dispatches,
     }
     if args.emit_scheduler_stats:
-        # Read from the snapshot taken INSIDE run_single_point_body,
-        # before wait() freed the per-worker array. Querying _core
-        # here would return empty lists.
         payload["scheduler_stats"] = rep.scheduler_stats or []
         payload["queue_stats"] = rep.queue_stats or []
-    # Always forward derived metrics (small dict; harmless when None).
     if rep.derived is not None:
         payload["derived"] = rep.derived
     sys.stdout.write("\n" + SENTINEL_BEGIN + "\n")
@@ -1302,7 +1170,6 @@ def parent_main(args) -> int:
         print(f"benchmark: {ex}", file=sys.stderr)
         return 2
 
-    # Pre-spawn validation across every sweep point.
     cpu = _physical_cpu_count()
     derived_points = []
     for value in sweep_values:
@@ -1317,13 +1184,9 @@ def parent_main(args) -> int:
 
     git_sha = _git_sha()
 
-    # Sidechannel: forward the emit-scheduler-stats flag to children
-    # via an env var. cfg_to_argv stays a pure function of BenchConfig
-    # because the flag is a reporting concern, not a workload knob.
     if args.emit_scheduler_stats:
         os.environ[BOCPY_BENCH_EMIT_SCHED_STATS_ENV] = "1"
 
-    # Wall-clock estimate for sweep duration.
     startup_slack = 5.0
     est = sum((cfg.duration + cfg.warmup + startup_slack) * base.repeats
               for cfg in derived_points)

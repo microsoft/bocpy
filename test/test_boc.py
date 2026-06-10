@@ -5,49 +5,22 @@ import functools
 import random
 import sys
 import threading
+import time
 import traceback
 from typing import NamedTuple
 
 import pytest
 
-from bocpy import (Cown, drain, notice_sync, notice_write, noticeboard,
-                   receive, send, start, TIMEOUT, wait, when)
+from bocpy import (Cown, drain, notice_write,
+                   quiesce, receive, send, start, TIMEOUT, wait, when)
 from bocpy._core import CownCapsule
 
 RECEIVE_TIMEOUT = 10
 
+QUIESCE_TIMEOUT = 5
+
 
 GLOBAL_FACTOR = 7
-
-
-def receive_asserts(count=1):
-    """Drain all expected assertion messages, then fail on first mismatch.
-
-    The "assert" queue is always drained before returning so that leftover
-    messages from a failing test do not leak into subsequent tests in CI.
-    """
-    failed = None
-    timed_out = False
-    try:
-        for _ in range(count):
-            result = receive("assert", RECEIVE_TIMEOUT)
-            if result[0] == TIMEOUT:
-                timed_out = True
-                break
-            _, (actual, expected) = result
-            if failed is None and actual != expected:
-                failed = (actual, expected)
-    finally:
-        drain("assert")
-
-    assert not timed_out, (
-        "Timed out waiting for an 'assert' message from a behavior. "
-        "Check that every @when arg count matches the decorated "
-        "function's parameter count."
-    )
-    if failed is not None:
-        actual, expected = failed
-        assert actual == expected, f"expected {expected!r}, got {actual!r}"
 
 
 class Multiplier:
@@ -269,63 +242,63 @@ class TestBOC:
         y = simple(x)
         assert isinstance(y, Cown)
 
-        @when(y)
-        def _(y):
-            send("assert", (y.value, 2))
-
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert y.unwrap() == 2
 
     def test_nested_dispatch(self):
         """Ensure nested behaviors see updated state."""
         x = Cown(1)
-        y = nested(x)
+        nested(x)
 
-        # Only assert the final state. The intermediate value of x is racy:
-        # the inner nested_triple is scheduled on x from inside nested_double
-        # and may run before or after a behavior the main thread enqueues on
-        # x, depending on worker timing.
-        @when(x, y)
-        def check_double(x, y):
-            @when(x, y.value)
-            def check_triple(x, _inner):
-                send("assert", (x.value, 6))
-
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert x.unwrap() == 6
 
     def test_exception(self):
         """Exceptions propagate as values in behaviors."""
         x = Cown(1)
         y = exception(x)
 
-        @when(y)
-        def _(y):
-            send("assert", (isinstance(y.value, ZeroDivisionError), True))
-            y.value = None
+        quiesce(QUIESCE_TIMEOUT)
+        with pytest.raises(ZeroDivisionError):
+            y.unwrap()
 
-        receive_asserts()
+    def test_unwrap_consumes_value(self):
+        """unwrap() consumes the cown: a second unwrap returns None."""
+        x = Cown(1)
+        y = simple(x)
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert y.unwrap() == 2
+        assert y.unwrap() is None
 
     def test_two_cown_coordination(self):
         """Move value between two cowns with coordinated when."""
         x = Cown(100)
         y = Cown(0)
 
-        def check(c: Cown, value: int):
+        def read(c: Cown):
             @when(c)
-            def do_check(c):
-                send("assert", (c.value, value))
+            def do_read(c):
+                return c.value
 
-        check(x, 100)
-        check(y, 0)
+            return do_read
+
+        x_before = read(x)
+        y_before = read(y)
 
         @when(x, y)
         def _(x, y):
             y.value += 50
             x.value -= 50
 
-        check(x, 50)
-        check(y, 50)
+        x_after = read(x)
+        y_after = read(y)
 
-        receive_asserts(4)
+        quiesce(QUIESCE_TIMEOUT)
+        assert x_before.unwrap() == 100
+        assert y_before.unwrap() == 0
+        assert x_after.unwrap() == 50
+        assert y_after.unwrap() == 50
 
     def test_classes(self, num_philosophers=5, hunger=4):
         """Simulate dining philosophers and verify fork usage."""
@@ -339,12 +312,18 @@ class TestBOC:
                 case ["report", ("full", _)]:
                     num_eating -= 1
 
-        for _, f in enumerate(forks):
+        readers = []
+        for f in forks:
             @when(f)
-            def _(f):
-                send("assert", (f.value.uses, 2*f.value.hunger))
+            def read_fork(f):
+                return (f.value.uses, 2 * f.value.hunger)
 
-        receive_asserts(num_philosophers)
+            readers.append(read_fork)
+
+        quiesce(QUIESCE_TIMEOUT)
+        for r in readers:
+            uses, expected = r.unwrap()
+            assert uses == expected
 
     @pytest.mark.parametrize("n", [1, 10, 15])
     def test_variable_termination(self, n: int):
@@ -352,22 +331,16 @@ class TestBOC:
         result = fib_parallel(n)
         expected = fib_sequential(n)
 
-        @when(result)
-        def check(result):
-            send("assert", (result.value, expected))
-
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert result.unwrap() == expected
 
     def test_cown_grouping(self):
         """Verify cown grouping returns correct sums."""
         expected, results = cown_grouping()
 
-        @when(results)
-        def check(results: list[Cown]):
-            for r in results:
-                send("assert", (r.value, expected))
-
-        receive_asserts(len(results))
+        quiesce(QUIESCE_TIMEOUT)
+        for r in results:
+            assert r.unwrap() == expected
 
     def test_grouped_cown_mutation(self):
         """Write to cowns within a group and verify mutations stick."""
@@ -380,10 +353,10 @@ class TestBOC:
 
         @when(cowns)
         def verify(group: list[Cown[int]]):
-            for i, c in enumerate(group):
-                send("assert", (c.value, i * 2))
+            return [c.value for c in group]
 
-        receive_asserts(5)
+        quiesce(QUIESCE_TIMEOUT)
+        assert verify.unwrap() == [i * 2 for i in range(5)]
 
     def test_group_and_single_mutation(self):
         """Mutate a group and a single cown in the same behavior."""
@@ -397,15 +370,16 @@ class TestBOC:
                 c.value = 0
 
         @when(total)
-        def check_total(t):
-            send("assert", (t.value, 6))
+        def read_total(t):
+            return t.value
 
         @when(items)
-        def check_zeroed(group: list[Cown[int]]):
-            for c in group:
-                send("assert", (c.value, 0))
+        def read_items(group: list[Cown[int]]):
+            return [c.value for c in group]
 
-        receive_asserts(4)
+        quiesce(QUIESCE_TIMEOUT)
+        assert read_total.unwrap() == 6
+        assert read_items.unwrap() == [0, 0, 0]
 
     def test_behavior_chain(self):
         """Chain three behaviors where each result feeds the next."""
@@ -413,21 +387,18 @@ class TestBOC:
 
         @when(x)
         def step1(x):
-            return x.value + 3          # 5
+            return x.value + 3
 
         @when(step1)
         def step2(s1):
-            return s1.value * 4         # 20
+            return s1.value * 4
 
         @when(step2)
         def step3(s2):
-            return s2.value - 7         # 13
+            return s2.value - 7
 
-        @when(step3)
-        def check(s3):
-            send("assert", (s3.value, 13))
-
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert step3.unwrap() == 13
 
     def test_contention(self):
         """Many behaviors on the same cown serialize correctly."""
@@ -440,10 +411,11 @@ class TestBOC:
                 c.value += 1
 
         @when(counter)
-        def check(c):
-            send("assert", (c.value, n))
+        def read(c):
+            return c.value
 
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert read.unwrap() == n
 
     def test_exception_type_error(self):
         """Verify TypeError inside a behavior is captured in the result cown."""
@@ -451,14 +423,11 @@ class TestBOC:
 
         @when(x)
         def bad(x):
-            return x.value + 1          # str + int -> TypeError
+            return x.value + 1
 
-        @when(bad)
-        def check(b):
-            send("assert", (isinstance(b.value, TypeError), True))
-            b.value = None
-
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        with pytest.raises(TypeError):
+            bad.unwrap()
 
     def test_exception_key_error(self):
         """Verify KeyError inside a behavior is captured in the result cown."""
@@ -466,14 +435,11 @@ class TestBOC:
 
         @when(x)
         def bad(x):
-            return x.value["missing"]   # KeyError
+            return x.value["missing"]
 
-        @when(bad)
-        def check(b):
-            send("assert", (isinstance(b.value, KeyError), True))
-            b.value = None
-
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        with pytest.raises(KeyError):
+            bad.unwrap()
 
     def test_complex_object_repeated_mutation(self):
         """Multiple sequential behaviors mutate the same object in a cown."""
@@ -487,10 +453,11 @@ class TestBOC:
                 a.value.add(val_to_add)  # noqa: B023
 
         @when(acc)
-        def check(a):
-            send("assert", (sorted(a.value.items), list(range(10))))
+        def read(a):
+            return sorted(a.value.items)
 
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert read.unwrap() == list(range(10))
 
     def test_duplicate_cown_same_twice(self):
         """Same cown passed twice to @when completes without deadlock."""
@@ -500,11 +467,8 @@ class TestBOC:
         def add(a, b):
             return a.value + b.value
 
-        @when(add)
-        def check(r):
-            send("assert", (r.value, 10))
-
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert add.unwrap() == 10
 
     def test_duplicate_cown_same_thrice(self):
         """Same cown passed three times to @when completes without deadlock."""
@@ -514,11 +478,8 @@ class TestBOC:
         def triple(a, b, d):
             return a.value + b.value + d.value
 
-        @when(triple)
-        def check(r):
-            send("assert", (r.value, 9))
-
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert triple.unwrap() == 9
 
     def test_duplicate_cown_non_adjacent(self):
         """Non-adjacent duplicate cowns in @when complete correctly."""
@@ -529,11 +490,8 @@ class TestBOC:
         def mixed(x, y, z):
             return x.value + y.value + z.value
 
-        @when(mixed)
-        def check(r):
-            send("assert", (r.value, 40))
-
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert mixed.unwrap() == 40
 
     def test_duplicate_cown_in_group(self):
         """Duplicate cowns within a group complete without deadlock."""
@@ -543,11 +501,8 @@ class TestBOC:
         def group_sum(group):
             return sum(g.value for g in group)
 
-        @when(group_sum)
-        def check(r):
-            send("assert", (r.value, 14))
-
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert group_sum.unwrap() == 14
 
     def test_duplicate_cown_mutation(self):
         """Mutating a cown passed twice reflects same underlying value."""
@@ -558,11 +513,8 @@ class TestBOC:
             a.value = 42
             return b.value
 
-        @when(mutate)
-        def check(r):
-            send("assert", (r.value, 42))
-
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert mutate.unwrap() == 42
 
     def test_cown_of_cown_direct(self):
         """CownCapsule as direct child of a Cown survives release/acquire."""
@@ -571,9 +523,10 @@ class TestBOC:
 
         @when(outer)
         def read_outer(o):
-            send("assert", (type(o.value).__name__, "Cown"))
+            return type(o.value).__name__
 
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert read_outer.unwrap() == "Cown"
 
     def test_cown_of_cown_access_inner(self):
         """Inner cown's value is accessible after outer round-trip."""
@@ -582,9 +535,10 @@ class TestBOC:
 
         @when(outer, inner)
         def check_both(o, i):
-            send("assert", (i.value, 99))
+            return i.value
 
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert check_both.unwrap() == 99
 
     def test_cown_of_cown_in_container(self):
         """CownCapsule nested in a dict survives pickle round-trip."""
@@ -593,9 +547,10 @@ class TestBOC:
 
         @when(outer)
         def check_container(o):
-            send("assert", (type(o.value["key"]).__name__, "Cown"))
+            return type(o.value["key"]).__name__
 
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert check_container.unwrap() == "Cown"
 
     def test_cown_of_cown_schedule_inner(self):
         """Extract inner cown from outer and schedule a behavior on it."""
@@ -612,9 +567,112 @@ class TestBOC:
 
             @when(inner_cown)
             def read_inner(i):
-                send("assert", (i.value, 10))
+                return i.value
 
-        receive_asserts()
+            return read_inner
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert schedule_on_inner.unwrap().unwrap() == 10
+
+
+class TestUnwrap:
+    """Cown.unwrap() under the quiesce() result-reading scheme."""
+
+    @classmethod
+    def teardown_class(cls):
+        wait()
+
+    def test_unwrap_returns_value(self):
+        """unwrap() returns a worker-produced value after quiesce()."""
+        x = Cown(3)
+        y = simple(x)
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert y.unwrap() == 6
+
+    def test_unwrap_reraises_behavior_exception(self):
+        """unwrap() re-raises a captured exception verbatim on the caller."""
+        x = Cown(1)
+
+        @when(x)
+        def boom(x):
+            assert x.value == 999, f"expected 999, got {x.value}"
+
+        quiesce(QUIESCE_TIMEOUT)
+        with pytest.raises(AssertionError, match="expected 999, got 1"):
+            boom.unwrap()
+
+    def test_unwrap_clears_exception_after_consuming(self):
+        """A consumed exception is cleared: a second unwrap() returns None."""
+        x = Cown(1)
+
+        @when(x)
+        def boom(x):
+            raise ValueError("once")
+
+        quiesce(QUIESCE_TIMEOUT)
+        with pytest.raises(ValueError, match="once"):
+            boom.unwrap()
+        assert boom.unwrap() is None
+
+    def test_unwrap_returned_exception_is_a_value(self):
+        """An Exception *returned* (not raised) is a value, so unwrap() returns it."""
+        x = Cown(1)
+
+        @when(x)
+        def returns_exc(x):
+            return ValueError("just a value")
+
+        quiesce(QUIESCE_TIMEOUT)
+        result = returns_exc.unwrap()
+        assert isinstance(result, ValueError)
+        assert str(result) == "just a value"
+
+    def test_unwrap_in_flight_raises(self):
+        """unwrap() before quiesce(), while work is in flight, raises RuntimeError."""
+        x = Cown(0)
+
+        @when(x)
+        def slow(x):
+            time.sleep(0.2)
+            return x.value + 1
+
+        with pytest.raises(RuntimeError, match="still in flight"):
+            slow.unwrap()
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert slow.unwrap() == 1
+
+    def test_unwrap_rejects_last_behavior_in_seed_dropped_window(self):
+        """unwrap() rejects an in-flight behavior even while the seed is dropped.
+
+        During quiesce()/wait() the Pyrona seed is dropped, so a single
+        in-flight behavior leaves ``terminator_count == 1`` -- the same
+        value as a fully quiesced, seed-armed runtime. The guard keys
+        off ``count - seeded`` rather than ``count > 1`` so it still
+        rejects this case. Simulated by poking the terminator into the
+        seed-dropped + one-hold state on the primary interpreter.
+        """
+        from bocpy import _core
+
+        x = Cown(0)
+        result = simple(x)
+        quiesce(QUIESCE_TIMEOUT)
+
+        seed_dropped = _core.terminator_seed_dec()
+        held = _core.terminator_inc() >= 0
+        try:
+            assert _core.terminator_count() == 1
+            assert _core.terminator_seeded() == 0
+            with pytest.raises(RuntimeError, match="still in flight"):
+                result.unwrap()
+        finally:
+            if held:
+                _core.terminator_dec()
+            if seed_dropped:
+                _core.terminator_seed_inc()
+
+        assert result.unwrap() == 0
 
 
 class TestGlobalCapture:
@@ -631,11 +689,8 @@ class TestGlobalCapture:
         x = Cown(5)
         result = m.multiply(x)
 
-        @when(result)
-        def _(r):
-            send("assert", (r.value, 5 * GLOBAL_FACTOR))
-
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert result.unwrap() == 5 * GLOBAL_FACTOR
 
     def test_method_captures_global_directly(self):
         """A method's @when captures a module-level global by name."""
@@ -643,11 +698,8 @@ class TestGlobalCapture:
         x = Cown(3)
         result = m.multiply_direct(x)
 
-        @when(result)
-        def _(r):
-            send("assert", (r.value, 3 * GLOBAL_FACTOR))
-
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert result.unwrap() == 3 * GLOBAL_FACTOR
 
     @pytest.mark.parametrize("value", [1, 10, 100])
     def test_method_captures_global_parametrized(self, value):
@@ -656,11 +708,8 @@ class TestGlobalCapture:
         x = Cown(value)
         result = m.multiply_direct(x)
 
-        @when(result)
-        def _(r):
-            send("assert", (r.value, value * GLOBAL_FACTOR))  # noqa: B023
-
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert result.unwrap() == value * GLOBAL_FACTOR
 
 
 class TestCownAcquireDeserialiseFailure:
@@ -703,15 +752,14 @@ class TestCownAcquireDeserialiseFailure:
 
         @when(bad)
         def use_bad(b):
-            # This body never runs — acquire fails first.
-            send("assert", (b.value, "unreachable"))
+            return b.value
 
         @when(use_bad)
         def check(b):
-            send("assert", (b.exception, True))
-            send("assert", (isinstance(b.value, ZeroDivisionError), True))
+            return (b.exception, isinstance(b.value, ZeroDivisionError))
 
-        receive_asserts(2)
+        quiesce(QUIESCE_TIMEOUT)
+        assert check.unwrap() == (True, True)
 
 
 class TestCownInCown:
@@ -756,9 +804,12 @@ class TestCownInCown:
 
             @when(c1, c2)
             def c(c1, c2):
-                send("assert", (c2.value.key, 20))
+                return c2.value.key
 
-        receive_asserts(1)
+            return c
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert b.unwrap().unwrap() == 20
 
     def test_cown_chain_through_message_queue(self):
         """Cown sent via message queue must survive sender's release.
@@ -780,10 +831,6 @@ class TestCownInCown:
         def sender(a):
             inner = Cown(42)
             send("cown_chain", inner)
-            # ``inner`` goes out of scope when ``sender`` returns;
-            # only the encoded pickle bytes inside the queued
-            # message reference the underlying BOCCown after that
-            # point.
 
         @when(anchor)
         def receiver(a):
@@ -792,9 +839,12 @@ class TestCownInCown:
 
             @when(payload)
             def use(c):
-                send("assert", (c.value, 42))
+                return c.value
 
-        receive_asserts(1)
+            return use
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert receiver.unwrap().unwrap() == 42
         drain("cown_chain")
 
     def test_cown_of_cown_fuzz_container_shapes(self):
@@ -813,14 +863,19 @@ class TestCownInCown:
         * ``__slots__``-only instance
         * 2-level ``Cown[Cown[T]]`` chain
 
-        Every trial sends exactly one ``(value, expected)`` tuple
-        on the ``"assert"`` queue; the receive loop drains all 50
-        at the end via :func:`receive_asserts`.
+        Every trial returns its leaf value through a result-cown chain;
+        after :func:`quiesce` each leaf is read with :meth:`Cown.unwrap`.
+        The 2-level ``Cown[Cown[T]]`` shape adds one extra result-cown
+        layer, so its leaf is one ``unwrap()`` deeper.
         """
         n_trials = 50
         n_shapes = 7
         rng = random.Random(0xC0C0)
+        # The last shape index is the Cown(inner) deep case (the else branch
+        # below); keep them in sync if shapes are reordered.
+        deep_shape = n_shapes - 1
 
+        results = []
         for trial in range(n_trials):
             shape = rng.randrange(n_shapes)
             expected = trial * 1000 + 17
@@ -844,41 +899,50 @@ class TestCownInCown:
                 else:
                     o.value = Cown(inner)
 
-            @when(outer)
-            def verify(o):
-                container = o.value
-                inner_c = None
-                if isinstance(container, list):
-                    inner_c = container[0]
-                elif isinstance(container, tuple):
-                    inner_c = container[0]
-                elif isinstance(container, dict):
-                    inner_c = container["k"]
-                elif isinstance(container, DataClassSlots):
-                    inner_c = container.c
-                elif isinstance(container, (DictOnly, SlotsOnly)):
-                    inner_c = container.c
-                elif isinstance(container, Cown):
-                    # 2-level chain: schedule against the wrapping
-                    # cown to peel the layer, then check the leaf.
-                    @when(container)
+            if shape == deep_shape:
+                @when(outer)
+                def verify_deep(o):
+                    wrapping = o.value
+
+                    @when(wrapping)
                     def peel(wc):
                         leaf = wc.value
 
                         @when(leaf)
                         def check_nested(c):
-                            send("assert", (c.value, expected))  # noqa: B023
+                            return c.value
+
+                        return check_nested
+
+                    return peel
+
+                results.append((shape, expected, verify_deep))
+                continue
+
+            @when(outer)
+            def verify(o):
+                container = o.value
+                if isinstance(container, (list, tuple)):
+                    inner_c = container[0]
+                elif isinstance(container, dict):
+                    inner_c = container["k"]
                 else:
-                    raise AssertionError(
-                        f"unhandled shape {type(container)!r}"
-                    )
+                    inner_c = container.c
 
-                if inner_c is not None:
-                    @when(inner_c)
-                    def check(c):
-                        send("assert", (c.value, expected))  # noqa: B023
+                @when(inner_c)
+                def check(c):
+                    return c.value
 
-        receive_asserts(n_trials)
+                return check
+
+            results.append((shape, expected, verify))
+
+        quiesce(QUIESCE_TIMEOUT)
+        for shape, expected, verify in results:
+            leaf = verify.unwrap()
+            if shape == deep_shape:
+                leaf = leaf.unwrap()
+            assert leaf.unwrap() == expected
 
     def test_cached_snapshot_survives_entry_overwrite(self):
         """Borrowing reconstructor: snapshot's CownCapsule owns its own ref.
@@ -897,38 +961,28 @@ class TestCownInCown:
 
         @when(anchor)
         def write_initial(a):
-            # ``inner`` arrives here as a capture-tuple reference.
-            # F821: closure variable is ``del``-ed in the enclosing
-            # scope before the behavior runs; the transpiler has
-            # already snapshotted it into the capture tuple.
-            notice_write("k", inner)  # noqa: B023, F821
-            notice_sync()
+            notice_write("k", inner)  # noqa: F821
 
-        @when(anchor, write_initial)
-        def read_then_overwrite(a, _w):
-            snap = noticeboard()
-            stash["k"] = snap["k"]
-            # Overwrite the entry — releases the noticeboard's
-            # nb_pin_cowns +1 on the original inner. After this point
-            # the only strong reference to the original BOCCown is
-            # the one taken by the borrowing reconstructor when
-            # ``snap["k"]`` was materialised above.
-            notice_write("k", "unrelated_value")
-            notice_sync()
+        snap = quiesce(QUIESCE_TIMEOUT, noticeboard=True)
+        stash["k"] = snap["k"]
+        del snap
 
-            @when(anchor)
-            def use_stashed(a2):
-                stashed = stash["k"]
-
-                @when(stashed)
-                def check(s):
-                    send("assert", (s.value, 20))
-
-        # Drop the main-thread reference; the capture tuple snapshotted
-        # by the ``write_initial`` schedule above still holds it until
-        # that behavior runs.
         del inner
-        receive_asserts(1)
+
+        @when(anchor)
+        def overwrite(a):
+            notice_write("k", "unrelated_value")
+
+        quiesce(QUIESCE_TIMEOUT, noticeboard=True)
+
+        stashed = stash["k"]
+
+        @when(stashed)
+        def check(s):
+            return s.value
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert check.unwrap() == 20
 
 
 class TestAcquireFailureTerminal:
@@ -963,57 +1017,51 @@ class TestAcquireFailureTerminal:
 
         @when(bad)
         def use_bad_1(b):
-            # Body must not run.
-            send("assert", (b.value, "unreachable_1"))
+            return b.value
 
         @when(bad)
         def use_bad_2(b):
-            send("assert", (b.value, "unreachable_2"))
+            return b.value
 
         @when(bad)
         def use_bad_3(b):
-            send("assert", (b.value, "unreachable_3"))
+            return b.value
 
         @when(use_bad_1)
         def check_1(b):
-            send("assert", (b.exception, True))
-            send("assert", (isinstance(b.value, ZeroDivisionError), True))
+            return (b.exception, isinstance(b.value, ZeroDivisionError))
 
         @when(use_bad_2)
         def check_2(b):
-            send("assert", (b.exception, True))
-            send("assert", (isinstance(b.value, RuntimeError), True))
-            send("assert", ("permanently unavailable" in str(b.value), True))
-            send("repeat_msg", str(b.value))
+            return (
+                b.exception,
+                isinstance(b.value, RuntimeError),
+                "permanently unavailable" in str(b.value),
+                str(b.value),
+            )
 
         @when(use_bad_3)
         def check_3(b):
-            send("assert", (b.exception, True))
-            send("assert", (isinstance(b.value, RuntimeError), True))
-            send("assert", ("permanently unavailable" in str(b.value), True))
-            send("repeat_msg", str(b.value))
+            return (
+                b.exception,
+                isinstance(b.value, RuntimeError),
+                "permanently unavailable" in str(b.value),
+                str(b.value),
+            )
 
-        # 2 from check_1 + 3 from check_2 + 3 from check_3.
-        receive_asserts(8)
+        quiesce(QUIESCE_TIMEOUT)
 
-        # The two terminal-state messages must be byte-identical so a
-        # future regression that started producing per-waiter messages
-        # (e.g. by formatting in the calling interpreter's id) is
-        # caught.
-        msgs = []
-        try:
-            for _ in range(2):
-                result = receive("repeat_msg", RECEIVE_TIMEOUT)
-                assert result[0] != TIMEOUT, (
-                    "timed out waiting for repeat_msg from check_2/check_3"
-                )
-                msgs.append(result[1])
-        finally:
-            drain("repeat_msg")
-        assert msgs[0] == msgs[1], (
-            f"terminal-state messages diverged: {msgs[0]!r} != {msgs[1]!r}"
+        assert check_1.unwrap() == (True, True)
+
+        c2 = check_2.unwrap()
+        c3 = check_3.unwrap()
+        assert c2[:3] == (True, True, True)
+        assert c3[:3] == (True, True, True)
+
+        assert c2[3] == c3[3], (
+            f"terminal-state messages diverged: {c2[3]!r} != {c3[3]!r}"
         )
-        assert "permanently unavailable" in msgs[0], msgs[0]
+        assert "permanently unavailable" in c2[3], c2[3]
 
 
 class TestBehaviorCapsuleArgsSize:
@@ -1042,13 +1090,9 @@ class TestBehaviorCapsuleArgsSize:
         """BehaviorCapsule with empty args list must construct cleanly."""
         from bocpy import start as _start_runtime
         from bocpy._core import BehaviorCapsule
-        # start() is idempotent; no try/except needed on re-entry.
         _start_runtime()
 
         result = Cown(None)
-        # Empty args list — args_size == 0. The
-        # ``args_size > 0 && group_ids == NULL`` guard avoids a
-        # spurious failure if PyMem_RawCalloc(0, ...) returns NULL.
         capsule = BehaviorCapsule(
             "__behavior_zero_args__",
             result.impl,
@@ -1061,13 +1105,9 @@ class TestBehaviorCapsuleArgsSize:
         """BehaviorCapsule with many args constructs and group_ids works."""
         from bocpy import start as _start_runtime
         from bocpy._core import BehaviorCapsule
-        # start() is idempotent; no try/except needed on re-entry.
         _start_runtime()
 
         result = Cown(None)
-        # 32 distinct cowns with distinct group_ids. Exercises the
-        # group_ids[i] = group_id loop that NULL-derefs without
-        # the alloc check on OOM.
         cowns = [Cown(i) for i in range(32)]
         args = [(i, c.impl) for i, c in enumerate(cowns)]
 
@@ -1098,11 +1138,12 @@ class TestExceptionFlag:
 
         @when(bad)
         def check(b):
-            send("assert", (b.exception, True))
-            send("assert", (isinstance(b.value, ZeroDivisionError), True))
+            flags = (b.exception, isinstance(b.value, ZeroDivisionError))
             b.value = None
+            return flags
 
-        receive_asserts(2)
+        quiesce(QUIESCE_TIMEOUT)
+        assert check.unwrap() == (True, True)
 
     def test_exception_flag_on_return(self):
         """Returned Exception object has .exception False."""
@@ -1114,10 +1155,10 @@ class TestExceptionFlag:
 
         @when(returns_exc)
         def check(r):
-            send("assert", (r.exception, False))
-            send("assert", (isinstance(r.value, ValueError), True))
+            return (r.exception, isinstance(r.value, ValueError))
 
-        receive_asserts(2)
+        quiesce(QUIESCE_TIMEOUT)
+        assert check.unwrap() == (False, True)
 
     def test_exception_flag_cleared_on_value_write(self):
         """Writing .value clears the exception flag."""
@@ -1129,11 +1170,13 @@ class TestExceptionFlag:
 
         @when(bad)
         def check(b):
-            send("assert", (b.exception, True))
+            before = b.exception
             b.value = "fixed"
-            send("assert", (b.exception, False))
+            after = b.exception
+            return (before, after)
 
-        receive_asserts(2)
+        quiesce(QUIESCE_TIMEOUT)
+        assert check.unwrap() == (True, False)
 
     def test_exception_flag_manual_set_clear(self):
         """Manual .exception set and clear works."""
@@ -1141,13 +1184,15 @@ class TestExceptionFlag:
 
         @when(x)
         def check(x):
-            send("assert", (x.exception, False))
+            s0 = x.exception
             x.exception = True
-            send("assert", (x.exception, True))
+            s1 = x.exception
             x.exception = False
-            send("assert", (x.exception, False))
+            s2 = x.exception
+            return (s0, s1, s2)
 
-        receive_asserts(3)
+        quiesce(QUIESCE_TIMEOUT)
+        assert check.unwrap() == (False, True, False)
 
     def test_returned_exception_no_unhandled_report(self, capsys):
         """Returned Exception doesn't trigger unhandled exception report."""
@@ -1159,10 +1204,10 @@ class TestExceptionFlag:
 
         @when(returns_exc)
         def check(r):
-            send("assert", (r.exception, False))
-            send("assert", (isinstance(r.value, ValueError), True))
+            return (r.exception, isinstance(r.value, ValueError))
 
-        receive_asserts(2)
+        quiesce(QUIESCE_TIMEOUT)
+        assert check.unwrap() == (False, True)
         wait()
         captured = capsys.readouterr()
         assert "unhandled exception" not in captured.err.lower()
@@ -1189,13 +1234,11 @@ class TestUnicodeSource:
         x = Cown(0)
 
         @when(x)
-        def _(x):
-            # "€" (U+20AC) is 3 bytes in UTF-8 and a single byte 0x80 in
-            # cp1252; if the export file is not written as UTF-8 the
-            # worker fails to import this module.
-            send("assert", ("€", "€"))
+        def euro(x):
+            return "€"
 
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert euro.unwrap() == "€"
 
 
 class TestModuleDunderCapture:
@@ -1220,10 +1263,11 @@ class TestModuleDunderCapture:
         expected = __name__
 
         @when(x)
-        def _(x):
-            send("assert", (__name__, expected))  # noqa: B023
+        def read_name(x):
+            return __name__
 
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert read_name.unwrap() == expected
 
     def test_package_resolves_to_user_module(self):
         """__package__ inside a behavior matches the user module's value."""
@@ -1231,25 +1275,11 @@ class TestModuleDunderCapture:
         expected = __package__
 
         @when(x)
-        def _(x):
-            send("assert", (__package__, expected))  # noqa: B023
+        def read_package(x):
+            return __package__
 
-        receive_asserts()
-
-
-# ---------------------------------------------------------------------------
-# Cross-worker scheduling and cown-identity round-trip invariants.
-#
-# These two properties of the BOC runtime are not asserted directly by
-# any of the @when / Cown / capture tests above:
-#
-#   1. With workers >= 2, behaviors really run on more than one worker
-#      thread. Without this, every "parallel" workload degenerates to
-#      single-threaded throughput.
-#   2. A Cown round-tripped through XIData into a worker arrives back
-#      as a CownCapsule. This exercises the XIData round-trip path
-#      that the 2PL dedup machinery relies on.
-# ---------------------------------------------------------------------------
+        quiesce(QUIESCE_TIMEOUT)
+        assert read_package.unwrap() == expected
 
 
 class TestCrossWorker:
@@ -1257,12 +1287,8 @@ class TestCrossWorker:
 
     @classmethod
     def teardown_class(cls):
-        """Drain leftover tagged messages so subsequent tests start clean."""
-        for tag in ("probe_tid", "probe_id"):
-            try:
-                drain(tag)
-            except Exception:
-                pass
+        """Drain the runtime after the cross-worker probes."""
+        wait()
 
     def test_two_workers_observe_distinct_thread_ids(self):
         """At workers=2, >=2 distinct worker thread ids must appear."""
@@ -1276,21 +1302,19 @@ class TestCrossWorker:
         cells = [Cown(0) for _ in range(tid_samples)]
 
         start(worker_count=2)
-        try:
-            for c in cells:
-                @when(c)
-                def _tid(_c):
-                    send("probe_tid", threading.get_ident())
-        finally:
-            del cells
-            wait()
+        readers = []
+        for c in cells:
+            @when(c)
+            def _tid(_c):
+                deadline = time.perf_counter() + 0.01
+                while time.perf_counter() < deadline:
+                    pass
+                return threading.get_ident()
 
-        thread_ids = set()
-        for _ in range(tid_samples):
-            msg = receive(["probe_tid"], RECEIVE_TIMEOUT)
-            assert msg is not None and msg[0] != TIMEOUT, (
-                "thread-id probe timed out")
-            thread_ids.add(msg[1])
+            readers.append(_tid)
+
+        quiesce(QUIESCE_TIMEOUT)
+        thread_ids = {r.unwrap() for r in readers}
 
         assert len(thread_ids) >= 2, (
             f"only {len(thread_ids)} distinct worker thread id observed "
@@ -1314,23 +1338,18 @@ class TestCrossWorker:
         seen = {}
 
         start(worker_count=2)
-        try:
-            for idx, cell in enumerate(ring):
-                # The transpiler auto-captures `idx` and `cell` as free
-                # variables; do NOT use the `idx=idx` default-arg trick
-                # — it confuses the worker module export.
-                @when(cell)
-                def _probe(c):
-                    send("probe_id", (idx, c))  # noqa: B023
-            for _ in range(ring_size):
-                msg = receive(["probe_id"], RECEIVE_TIMEOUT)
-                assert msg is not None and msg[0] != TIMEOUT, (
-                    "identity probe timed out")
-                _, (probe_idx, probe_cown) = msg
-                seen[probe_idx] = probe_cown
-        finally:
-            del ring
-            wait()
+        probes = []
+        for idx, cell in enumerate(ring):
+            @when(cell)
+            def _probe(c):
+                return (idx, c)  # noqa: B023
+
+            probes.append(_probe)
+
+        quiesce(QUIESCE_TIMEOUT)
+        for p in probes:
+            probe_idx, probe_cown = p.unwrap()
+            seen[probe_idx] = probe_cown
 
         for idx in range(ring_size):
             observed = seen.get(idx)
@@ -1378,22 +1397,17 @@ class TestInMemoryExport:
         """
         c = Cown(0)
         start(worker_count=2)
-        try:
-            @when(c)
-            def _b(c):  # noqa: B023
-                try:
-                    raise RuntimeError("synthetic-from-test-traceback")
-                except RuntimeError:
-                    send("tb_done", traceback.format_exc())
-            tag, tb_str = receive(["tb_done"], RECEIVE_TIMEOUT)
-            assert tag != TIMEOUT, "traceback probe timed out"
-        finally:
-            drain("tb_done")
-            wait()
 
-        # The traceback must reference the synthetic bootstrap
-        # filename ``<bocpy:__bocmain__>`` (the test module is the
-        # worker's __main__ alias).
+        @when(c)
+        def _b(c):
+            try:
+                raise RuntimeError("synthetic-from-test-traceback")
+            except RuntimeError:
+                return traceback.format_exc()
+
+        quiesce(QUIESCE_TIMEOUT)
+        tb_str = _b.unwrap()
+
         assert "<bocpy:" in tb_str, (
             f"traceback did not reference synthetic filename; got:\n{tb_str}"
         )
@@ -1408,28 +1422,10 @@ class TestInMemoryExport:
         """
         c = Cown(0)
         start(worker_count=2)
-        try:
-            @when(c)
-            def _(c):  # noqa: B023
-                # 1. Non-ASCII identifier-class literal
-                # 2. Embedded quotes of every flavour
-                # 3. Triple-quoted string literal
-                # 4. Backslash and raw-string-style content
-                # 5. Surrogate-free Unicode (U+1F600 grinning face)
-                # 6. NUL byte in a literal — repr() must escape it
-                payload = (
-                    "héllo",
-                    'mix "single" and \'double\' quotes',
-                    """triple-quoted with embedded "quote" and 'apostrophe'""",
-                    r"raw \n not a newline",
-                    'back\\slash and "escaped quote"',
-                    "emoji \U0001F600 in literal",
-                    "with\x00nul",
-                )
-                send("tricky_done", payload)
-            tag, payload = receive(["tricky_done"], RECEIVE_TIMEOUT)
-            assert tag != TIMEOUT, "tricky-source probe timed out"
-            assert payload == (
+
+        @when(c)
+        def _tricky(c):
+            return (
                 "héllo",
                 'mix "single" and \'double\' quotes',
                 """triple-quoted with embedded "quote" and 'apostrophe'""",
@@ -1437,10 +1433,18 @@ class TestInMemoryExport:
                 'back\\slash and "escaped quote"',
                 "emoji \U0001F600 in literal",
                 "with\x00nul",
-            ), f"payload round-trip mismatch: {payload!r}"
-        finally:
-            drain("tricky_done")
-            wait()
+            )
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert _tricky.unwrap() == (
+            "héllo",
+            'mix "single" and \'double\' quotes',
+            """triple-quoted with embedded "quote" and 'apostrophe'""",
+            r"raw \n not a newline",
+            'back\\slash and "escaped quote"',
+            "emoji \U0001F600 in literal",
+            "with\x00nul",
+        ), "payload round-trip mismatch"
 
     def test_module_name_with_quote_rejected(self):
         """``module_name`` containing a double-quote is rejected at start().
@@ -1452,29 +1456,16 @@ class TestInMemoryExport:
         is still nonsensical and the boundary check refuses it with
         a ``ValueError``.
         """
-        # Reach Behaviors.start directly so we can pass an arbitrary
-        # module name. We cannot use the public ``bocpy.start()``
-        # entry point because it overrides ``module`` from the
-        # caller's frame.
         from bocpy import behaviors as _behaviors
 
-        wait()  # ensure no live runtime
+        wait()
         b = _behaviors.Behaviors(2)
-        # Provide a path that exists so export_module_from_file does not
-        # raise on FileNotFoundError before reaching the validation.
-        # The transpiler will parse this test file itself; the body
-        # never runs because the validation fires first.
         with pytest.raises(ValueError, match="dotted Python module path"):
             b.start(module=('a"b', __file__))
 
 
-# ---------------------------------------------------------------------------
-# NaN/Inf timeout helper
-# ---------------------------------------------------------------------------
-
-
 class TestTimeoutValidation:
-    """Boundary validation for wait/notice_sync_wait timeouts.
+    """Boundary validation for wait timeouts.
 
     The C-level ``boc_validate_finite_timeout`` helper rejects NaN with
     ``ValueError``, treats ``+Inf`` as "wait forever", and clamps
@@ -1493,12 +1484,6 @@ class TestTimeoutValidation:
         with pytest.raises(ValueError, match="NaN"):
             _core.terminator_wait(float("nan"))
 
-    def test_notice_sync_wait_nan_timeout_raises_value_error(self):
-        """NaN timeout to ``_core.notice_sync_wait`` raises ``ValueError``."""
-        from bocpy import _core
-        with pytest.raises(ValueError, match="NaN"):
-            _core.notice_sync_wait(0, float("nan"))
-
     def test_wait_inf_timeout_blocks_until_done(self):
         """``+Inf`` timeout treats wait as "wait forever" and returns once done.
 
@@ -1507,74 +1492,81 @@ class TestTimeoutValidation:
         than blocking. The point is that it does *not* raise.
         """
         from bocpy import _core
-        # No runtime has incremented the terminator, so this returns at
-        # once. The test exists to assert +Inf is accepted (not ValueError).
         assert _core.terminator_wait(float("inf")) is True
 
     def test_terminator_wait_negative_timeout_returns_immediately(self):
         """Negative timeout to ``_core.terminator_wait`` is mapped to wait_forever.
 
-        bocpy's existing convention treats negatives as "wait forever"
-        (matching the historical Python-side semantics). The new
-        validator preserves that behaviour for negatives — only NaN is
-        upgraded to a hard error. With no live runtime the terminator
+        bocpy treats negatives as "wait forever"; the timeout validator
+        preserves that for negatives and upgrades only NaN to a hard
+        error. With no live runtime the terminator
         is already at 0, so this returns immediately either way.
         """
         from bocpy import _core
-        # Returns True immediately because count is already 0.
         assert _core.terminator_wait(-1.0) is True
 
 
-# ---------------------------------------------------------------------------
-# BaseException discipline
-# ---------------------------------------------------------------------------
-
-
 class TestBaseExceptionDiscipline:
-    """KeyboardInterrupt in a @when body releases the cown.
+    """A ``BaseException`` escaping a @when body still releases the cown.
 
-    Without ``finally``-based cleanup, ``except Exception`` arms in
-    ``worker.py`` and the orphan-drain loop in ``behaviors.py``
-    silently let ``KeyboardInterrupt`` / ``SystemExit`` escape past
-    the per-iteration cleanup. The MCS chain would stay linked, the
-    cown would stay owned, and every successor on it would strand.
+    The worker's per-behavior cleanup and the orphan-drain loop in
+    ``behaviors.py`` must release cowns in a ``finally``, not only
+    under ``except Exception``. ``KeyboardInterrupt`` and
+    ``SystemExit`` derive from ``BaseException`` (not ``Exception``),
+    so an ``except Exception`` arm lets them escape past the
+    per-iteration cleanup: the MCS chain stays linked, the cown stays
+    owned, and every successor on it strands.
+
+    Note: these tests *explicitly* ``raise KeyboardInterrupt`` inside
+    the body — they do not simulate a Ctrl-C / SIGINT. A signal-driven
+    ``KeyboardInterrupt`` can only ever surface on the main thread of
+    the main interpreter, never inside a worker sub-interpreter;
+    ``KeyboardInterrupt`` is used here purely as the canonical
+    non-``Exception`` ``BaseException`` to drive the cleanup path.
     """
 
     @classmethod
     def teardown_class(cls):
         wait()
-        drain("ki_done")
 
-    def test_keyboard_interrupt_during_worker_releases_cown(self):
-        """A ``KeyboardInterrupt`` from a @when body releases the cown.
+    def test_base_exception_from_worker_body_releases_cown(self):
+        """An explicitly-raised ``BaseException`` releases the cown.
 
-        Schedules a behavior that raises ``KeyboardInterrupt``, then
-        a follow-on behavior on the same cown. If the
-        ``finally``-based release / release_all chain is wired
-        correctly, the follow-on runs and the test sees its message.
-        Otherwise the cown is stranded and ``receive`` times out.
+        Schedules a behavior that does ``raise KeyboardInterrupt`` (a
+        ``BaseException``, not an ``Exception``), then a follow-on
+        behavior on the same cown. If the worker's ``finally``-based
+        release / release_all chain is wired correctly, the cown is
+        released even though the escaping exception is not an
+        ``Exception``, so the follow-on runs and ``_follow.unwrap()``
+        returns its value. If cleanup were gated on ``except
+        Exception`` the cown would stay owned and ``quiesce`` would
+        time out.
+
+        The worker captures the escaped ``BaseException`` onto
+        ``_raise``'s result cown, so ``_raise.unwrap()`` re-raises it;
+        consuming it here also keeps it from being reported as
+        unhandled at teardown.
         """
         wait()
         start(worker_count=2)
-        try:
-            c = Cown(0)
 
-            @when(c)
-            def _raise(c):
-                raise KeyboardInterrupt("intentional KI")
+        c = Cown(0)
 
-            @when(c)
-            def _follow(c):
-                send("ki_done", "ok")
+        @when(c)
+        def _raise(c):
+            raise KeyboardInterrupt("intentional KI")
 
-            tag, payload = receive("ki_done", RECEIVE_TIMEOUT)
-            assert tag != TIMEOUT, (
-                "follow-on never ran -- cown was not released after KI"
-            )
-            assert payload == "ok"
-        finally:
-            drain("ki_done")
-            wait()
+        @when(c)
+        def _follow(c):
+            return "ok"
+
+        quiesce(QUIESCE_TIMEOUT)
+        with pytest.raises(KeyboardInterrupt, match="intentional KI"):
+            _raise.unwrap()
+        assert _follow.unwrap() == "ok", (
+            "follow-on never ran -- cown was not released after the "
+            "BaseException escaped the body"
+        )
 
     def test_keyboard_interrupt_during_orphan_drain_completes_drain(self):
         """KI mid-drain still drains the remaining orphans.
@@ -1585,23 +1577,13 @@ class TestBaseExceptionDiscipline:
         orphans before the deferred KI is re-raised, so no MCS chain or
         terminator hold leaks.
         """
-        # NOT ``unittest.mock``: workers re-import this module, and
-        # mock pulls in asyncio which can deadlock under PEP 684 init
-        # on macOS arm64.
         from mockreplacement import patch_attr
 
         from bocpy import behaviors as _behaviors
 
         wait()
-        # Build a Behaviors directly so we can drive _drain_orphan_behaviors
-        # against synthetic capsules without standing up the full runtime.
         b = _behaviors.Behaviors(2)
 
-        # Synthetic capsule that records its release_all call. We do
-        # NOT actually inject these into the C scheduler queue; instead
-        # we monkey-patch `_core.scheduler_drain_all_queues` to return
-        # them, and patch `_core.terminator_dec` to be a no-op so the
-        # test does not touch global C state.
         class FakeCapsule:
             def __init__(self):
                 self.set_drop_called = False
@@ -1616,14 +1598,11 @@ class TestBaseExceptionDiscipline:
         cap_ki = FakeCapsule()
         cap_ok = FakeCapsule()
 
-        # First call returns both capsules; second call returns [] so
-        # the drain loop terminates cleanly.
         drain_returns = [[cap_ki, cap_ok], []]
 
         def fake_drain():
             return drain_returns.pop(0) if drain_returns else []
 
-        # Make set_drop_exception on cap_ki raise KI; cap_ok works normally.
         original_set_drop = FakeCapsule.set_drop_exception
 
         def patched_set_drop(self, exc):
@@ -1645,13 +1624,9 @@ class TestBaseExceptionDiscipline:
             with pytest.raises(KeyboardInterrupt, match="orphan-drain KI"):
                 b._drain_orphan_behaviors()
 
-        # cap_ok must still have had its release_all called -- the KI on
-        # cap_ki did not abort the drain partway.
         assert cap_ok.released, (
             "second orphan was not drained -- KI aborted the loop"
         )
-        # cap_ki's release_all was attempted too (the KI was raised
-        # from set_drop_exception, which runs *before* release_all).
         assert cap_ki.released
 
 
@@ -1687,11 +1662,8 @@ class TestDecoratorComposition:
         def doubled_plus_one(x):
             return x.value * 2
 
-        @when(doubled_plus_one)
-        def _(result):
-            send("assert", (result.value, 21))
-
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert doubled_plus_one.unwrap() == 21
 
     def test_stacked_below_decorators_apply_in_order(self):
         """Stacked below-decorators compose innermost-first on the worker.
@@ -1708,11 +1680,8 @@ class TestDecoratorComposition:
         def composed(x):
             return x.value
 
-        @when(composed)
-        def _(result):
-            send("assert", (result.value, 22))
-
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert composed.unwrap() == 22
 
     def test_below_decorator_inside_nested_when(self):
         """A nested ``@when`` body may itself carry a below-decorator."""
@@ -1726,11 +1695,10 @@ class TestDecoratorComposition:
             def inner(y):
                 return y.value
 
-            @when(inner)
-            def _(result):
-                send("assert", (result.value, 8))
+            return inner
 
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert outer.unwrap().unwrap() == 8
 
 
 class TestLoopDefaultCapture:
@@ -1744,12 +1712,17 @@ class TestLoopDefaultCapture:
     def test_loop_default_captures_per_iteration_value(self):
         """``i=i`` captures the loop value at schedule time, not at execution."""
         c = Cown(0)
+        readers = []
         for i in range(4):
             @when(c)
-            def _(c, i=i):
-                send("assert", (i, i))
+            def read(c, i=i):
+                return i
 
-        receive_asserts(4)
+            readers.append(read)
+
+        quiesce(QUIESCE_TIMEOUT)
+        for idx, r in enumerate(readers):
+            assert r.unwrap() == idx
 
     def test_rename_default_binds_into_param(self):
         """``def b(c, x=y)`` — capture ``y`` from caller, bind into ``x``."""
@@ -1757,7 +1730,8 @@ class TestLoopDefaultCapture:
         y = 99
 
         @when(c)
-        def _(c, x=y):
-            send("assert", (x, 99))
+        def read(c, x=y):
+            return x
 
-        receive_asserts()
+        quiesce(QUIESCE_TIMEOUT)
+        assert read.unwrap() == 99

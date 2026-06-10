@@ -26,6 +26,17 @@ inputs:
       windows-x86 sets this to ``x86``).
     required: false
     default: ""
+  check-latest:
+    description: >
+      Forwarded to ``actions/setup-python``. When ``"true"`` the
+      action resolves the interpreter against the downloadable
+      versions-manifest instead of relying on a local toolcache hit.
+      Required for ``x86`` on the Windows 2025 image, where 32-bit
+      CPython is no longer pre-installed in the toolcache (only the
+      manifest ships ``win32`` builds). Defaults to ``"false"`` so
+      the cached fast path is used everywhere else.
+    required: false
+    default: "false"
   upgrade-pip:
     description: >
       When ``"true"`` (the default) run ``python -m pip install
@@ -51,6 +62,7 @@ runs:
       with:
         python-version: ${{ inputs.python-version }}
         architecture: ${{ inputs.architecture }}
+        check-latest: ${{ inputs.check-latest }}
 
     - name: Upgrade pip
       if: ${{ inputs.upgrade-pip == 'true' }}

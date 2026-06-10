@@ -1,3 +1,140 @@
+## 2026-06-08 - Version 0.10.0
+A result-reading and documentation release. `Cown.unwrap()` replaces
+ad-hoc context-manager reads of behavior results with a single
+quiescence-guarded call lowered to the C capsule, and the test suite
+moves wholesale to the `quiesce()` + `unwrap()` pattern. `Matrix`
+gains arg-reductions (`argmin` / `argmax`) and an explicit PRNG
+`seed`, and its matmul kernel is re-ordered for cache-friendly
+auto-vectorization (bit-for-bit identical output). The legacy
+`notice_sync` shim is removed in favour of
+`quiesce(noticeboard=True)` for reads and the new `notice_seed`
+for synchronous main-thread seeding.
+
+**New Features**
+
+- **`notice_seed(key, value)`** — a synchronous, main-interpreter-only
+  noticeboard write that commits under the noticeboard mutex *before it
+  returns*, so every behavior scheduled afterwards observes it. Unlike
+  the fire-and-forget `notice_write`, it gives read-your-writes ordering
+  for installing read-mostly configuration before scheduling the
+  behaviors that read it, and it starts the runtime if called first — so
+  seeding can be a program's first bocpy call with no explicit `start()`.
+  It is a plain overwrite and does not provide `notice_update`'s
+  read-modify-write atomicity. Calling it from a worker raises
+  `RuntimeError`.
+- **`Cown.unwrap()`** — return the cown's stored value, or re-raise a
+  captured behavior exception on the caller's thread (Rust
+  `Result::unwrap` shape). Acquires the cown for the read and requires
+  global quiescence (`quiesce` / `wait`) first, raising
+  `RuntimeError` otherwise so a result is never read while its
+  producer is still in flight. Lowered to a C-level
+  `CownCapsule.unwrap`, so a behavior that returns a `Cown`
+  (surfacing downstream as a bare `CownCapsule`) unwraps the same way
+  without rewrapping. `unwrap()` *consumes* the cown: it takes the
+  stored payload by reference and resets the cown to hold `None` before
+  releasing it, so the returned object is never re-serialized back into
+  the cown. This matters for move-typed payloads such as `Matrix`,
+  whose ownership would otherwise be flipped away from the caller on
+  release, leaving an unreadable result. Because the payload is removed,
+  a captured exception is not re-reported when the cown is dropped, and a
+  second `unwrap()` returns `None`. The emptied cown stays schedulable,
+  so a later behavior can refill it.
+- **`Matrix.argmin(axis=None)` / `Matrix.argmax(axis=None)`** — index
+  of the minimum / maximum element, first occurrence on ties. Flat
+  (`axis=None`) returns a row-major `int`; `axis=0` / `axis=1`
+  return per-column / per-row index vectors. NaN elements are skipped
+  unless the running extreme starts at NaN, which pins the result to
+  that position (this differs from NumPy, which propagates NaN).
+- **`Matrix.seed(value)`** — classmethod seeding the process-global C
+  PRNG used by `normal()` / `uniform()`, making subsequent draws
+  reproducible when generation stays on a single thread.
+- **`Matrix` pickling** — `Matrix` now supports `pickle` (all
+  protocols) and `copy.deepcopy` via `__reduce__`, so a matrix nested in
+  a pickled container (dict, list, …) round-trips with its neighbours
+  instead of raising `TypeError`. Serialization copies the raw,
+  native-endian, row-major `double` buffer in one block, so the cost is
+  linear in the element count with no per-element Python object churn and
+  every value (including `NaN`, `±inf`, `-0.0`, and subnormals) is
+  preserved bit-for-bit. The current interpreter must own the matrix:
+  pickling one that has been released into a `Cown` raises
+  `RuntimeError`. The encoding is native-endian, so a pickle is not
+  portable across architectures of differing byte order.
+- **`examples/fanout_benchmark.py`** — a dispatch-rate microbenchmark
+  for the fanout workload (a producer that allocates fresh consumer
+  cowns it does not hold and dispatches one `@when` each), surfacing
+  per-worker queue contention (`enqueue_cas_retries`) as the gating
+  signal. Complements the chain workload in `examples/benchmark.py`.
+
+**Improvements**
+
+- **matmul cache-friendly reorder** — `impl_matmul` is re-ordered from
+  `ijk` to `ikj` so the inner loop walks contiguous rows of the
+  right-hand operand and the output, enabling compiler
+  auto-vectorization. Output is bit-for-bit identical (each inner
+  product still accumulates `k` in ascending order); measured ~2.9–3.2×
+  faster on square shapes, ~1.5–1.8× on rectangular ones. A
+  bitwise-reproducibility regression test pins the accumulation order.
+
+**Bug Fixes**
+
+A warm welcome and thank-you to first-time contributor **Shivanand
+Mishra** (@xemishra), who tracked down and fixed a subtle transpiler
+bug this release — exactly the kind of sharp-eyed catch that makes the
+project better.
+
+- **`@when` result assignment dropped for module-level behaviors**
+  (#30, thanks @xemishra) — a behavior defined at module level
+  transpiled without its result cown, so the exported module silently
+  dropped the return value and downstream behaviors could not schedule
+  over it. Fixed, with a regression test guarding the exported-module
+  shape.
+- **Nested `@when` capture** — the transpiler now correctly surfaces a
+  nested `@when`'s free names as the outer behavior's captures and
+  resolves its cown arguments in the outer frame, instead of leaving
+  them to Python's closure machinery where they could not be reached
+  from the worker interpreter.
+- **`Matrix` range/return checks** — added overflow and return-value
+  checks on the `range_read` path uncovered while migrating the
+  matrix tests.
+
+**Breaking Changes**
+
+- **`notice_sync` removed** — the noticeboard-sync shim is gone from
+  `bocpy.__all__`. Use `quiesce(noticeboard=True)` instead, which
+  blocks until in-flight behaviors complete and returns a noticeboard
+  snapshot without tearing the runtime down.
+
+**Documentation**
+
+- Removed the `notice_sync` references from `noticeboard` and the
+  type stubs; documented the NaN tie-break behavior of
+  `argmin` / `argmax`; corrected the happens-after example in the
+  `thinking-in-boc` skill to order across genuinely unrelated data;
+  added a `fanout_benchmark.py` section to the examples README.
+
+**Tests**
+
+- Migrated `test_boc.py`, `test_noticeboard.py`, and the scheduler /
+  pinned-pump suites to the `quiesce()` + `Cown.unwrap()` pattern.
+  Added matmul bitwise-reproducibility and `argmin` / `argmax` NaN
+  regression tests.
+
+**Dependencies**
+
+- Bumped the `github-actions` group (#31, #27, dependabot):
+  `actions/checkout` 6.0.2 → 6.0.3 and `pypa/cibuildwheel`
+  3.4.1 → 4.0.0.
+
+**Internal**
+
+- Large comment scrub across the C extensions, Python runtime, scripts,
+  and tests, followed by a remediation pass that restored load-bearing
+  rationale (memory-ordering fences, UAF guards, deliberate-leak notes,
+  and the vendored Apache-2.0 provenance header) as condensed
+  summaries.
+- Ignored Sphinx-related updates in `dependabot.yml` to keep the docs
+  toolchain pinned.
+
 ## 2026-06-05 - Version 0.9.0
 Main-pinned cowns — a new `PinnedCown` subclass holds its
 value as a plain `PyObject *` on the main interpreter, never

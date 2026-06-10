@@ -25,9 +25,6 @@ static BOCMutex TERMINATOR_MUTEX;
 static BOCCond TERMINATOR_COND;
 
 void terminator_init(void) {
-  // The Pyrona seed (count=1, seeded=1) is set by terminator_reset()
-  // when the runtime starts; here we only initialize the kernel
-  // objects.
   boc_mtx_init(&TERMINATOR_MUTEX);
   cnd_init(&TERMINATOR_COND);
 }
@@ -38,6 +35,8 @@ int_least64_t terminator_inc(void) {
   }
   int_least64_t newval = atomic_fetch_add(&TERMINATOR_COUNT, 1) + 1;
   if (atomic_load(&TERMINATOR_CLOSED)) {
+    // close() raced in after our first check: undo, and broadcast on a
+    // 0-transition since close()'s own wake predated our increment.
     int_least64_t after = atomic_fetch_add(&TERMINATOR_COUNT, -1) - 1;
     if (after == 0) {
       mtx_lock(&TERMINATOR_MUTEX);
@@ -96,8 +95,6 @@ bool terminator_seed_dec(void) {
 }
 
 bool terminator_seed_inc(void) {
-  // CAS 0->1: single-shot inc; no broadcast needed (terminator_wait only wakes
-  // on count==0).
   int_least64_t expected = 0;
   if (atomic_compare_exchange_strong(&TERMINATOR_SEEDED, &expected, 1)) {
     atomic_fetch_add(&TERMINATOR_COUNT, 1);
@@ -107,12 +104,6 @@ bool terminator_seed_inc(void) {
 }
 
 void terminator_reset(int_least64_t *prior_count, int_least64_t *prior_seeded) {
-  // Fence: raise the closed bit before we touch anything else so any
-  // stray thread still holding a reference to the previous runtime
-  // (e.g. a late whencall call) is refused by terminator_inc rather
-  // than slipping a new behavior past the reset boundary. We clear
-  // the bit again at the end, once the new COUNT/SEEDED values have
-  // been published, so a fresh start() sees closed=0.
   atomic_store(&TERMINATOR_CLOSED, 1);
   mtx_lock(&TERMINATOR_MUTEX);
   *prior_count = atomic_load(&TERMINATOR_COUNT);

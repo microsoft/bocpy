@@ -18,11 +18,6 @@ _it = pytest.importorskip(
 WSQ_N = _it.wsq_n()
 
 
-# ---------------------------------------------------------------------------
-# Cursor arithmetic
-# ---------------------------------------------------------------------------
-
-
 def test_pre_inc_uniform_over_full_cycles():
     """`boc_wsq_pre_inc` must distribute uniformly over k = N * K calls."""
     K = 1000  # noqa: N806
@@ -34,13 +29,11 @@ def test_pre_inc_uniform_over_full_cycles():
 def test_pre_inc_first_indices():
     """First N pre-increments must visit indices 1, 2, ..., N-1, 0."""
     counts = _it.wsq_pre_inc_histogram(WSQ_N)
-    # Every index hit exactly once over a full cycle (regardless of order).
     assert counts == [1] * WSQ_N
 
 
 def test_pre_inc_partial_cycle_within_bounds():
     """A partial cycle hits a contiguous prefix of indices."""
-    # k = N - 1: indices 1..N-1 each receive 1, index 0 receives 0.
     counts = _it.wsq_pre_inc_histogram(WSQ_N - 1)
     assert counts[0] == 0
     for i in range(1, WSQ_N):
@@ -50,16 +43,9 @@ def test_pre_inc_partial_cycle_within_bounds():
 def test_post_dec_first_returns_zero_then_wraps():
     """`boc_wsq_post_dec` returns the *pre*-decrement index."""
     seq = _it.wsq_post_dec_sequence(WSQ_N + 2)
-    # First call: cursor was 0 -> returns 0, advances to N-1.
     assert seq[0] == 0
-    # Then N-1, N-2, ..., 0 (wrap), N-1, N-2.
     expected = [0] + list(range(WSQ_N - 1, -1, -1)) + [WSQ_N - 1]
     assert seq == expected[: len(seq)]
-
-
-# ---------------------------------------------------------------------------
-# Single-node enqueue distribution
-# ---------------------------------------------------------------------------
 
 
 def test_enqueue_round_robin_full_cycles():
@@ -73,11 +59,10 @@ def test_enqueue_round_robin_full_cycles():
 
 def test_enqueue_partial_cycle_distribution():
     """A non-multiple-of-N push count distributes within ±1 across sub-queues."""
-    K = 7  # noqa: N806  7 pushes, N=4 -> [1, 2, 2, 2] in some rotation.
+    K = 7  # noqa: N806
     w = _it.wsq_make_worker()
     counts = _it.wsq_enqueue_drain_counts(w, K)
     assert sum(counts) == K
-    # Max-min must be <= 1: round-robin gives near-uniform.
     assert max(counts) - min(counts) <= 1
 
 
@@ -86,11 +71,6 @@ def test_enqueue_zero_pushes_leaves_all_empty():
     w = _it.wsq_make_worker()
     counts = _it.wsq_enqueue_drain_counts(w, 0)
     assert counts == [0] * WSQ_N
-
-
-# ---------------------------------------------------------------------------
-# enqueue_spread distribution invariant
-# ---------------------------------------------------------------------------
 
 
 def test_spread_preserves_total_count():
@@ -108,10 +88,8 @@ def test_spread_distributes_long_segment_uniformly():
     w = _it.wsq_make_worker()
     counts = _it.wsq_spread_segment_counts(w, length)
     assert sum(counts) == length
-    # Every sub-queue must receive at least one node.
     assert all(c >= 1 for c in counts), (
         f"some sub-queue starved: {counts}")
-    # Spread is near-uniform: max-min <= 1 for an exact multiple of N.
     assert max(counts) - min(counts) <= 1, (
         f"long-segment spread non-uniform: {counts}")
 
