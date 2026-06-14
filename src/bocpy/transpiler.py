@@ -1,10 +1,20 @@
-"""AST transformers that export when-decorated functions as behaviors."""
+"""AST transformer that reduces __main__ to the bindings a worker needs."""
 
 import ast
-import copy
 import os
 import sys
-from typing import Mapping, NamedTuple, Set
+import types
+from typing import NamedTuple, Set
+
+# REPL-injected noise no behavior references; denied from live bindings
+# because pre-3.12 ``import readline`` (libedit/macOS) hangs a worker.
+_LIVE_BINDING_DENY = frozenset({"readline", "rlcompleter"})
+
+
+def _is_dotted_identifier(name: str) -> bool:
+    """Return True iff ``name`` is a non-empty dotted Python identifier."""
+    parts = name.split(".")
+    return all(parts) and all(part.isidentifier() for part in parts)
 
 
 def _is_when_call(node: ast.AST,
@@ -43,105 +53,7 @@ def _has_when_decorator(node: ast.FunctionDef,
     return False
 
 
-class CapturedVariableFinder(ast.NodeVisitor):
-    """Finds captured variables in a FunctionDef."""
-
-    def __init__(self, known_vars: Set[str],
-                 when_aliases: Set[str] = frozenset({"when"}),
-                 bocpy_module_aliases: Set[str] = frozenset()):
-        """Initialize the captured variable finder.
-
-        :param known_vars: Any known identifiers (imports, global functions/classes)
-        :type known_vars: Set[str]
-        :param when_aliases: Names that bind to ``bocpy.when`` (defaults
-            to the bare name ``"when"``).
-        :type when_aliases: Set[str]
-        :param bocpy_module_aliases: Names that bind to the ``bocpy``
-            module so ``alias.when(...)`` is recognised.
-        :type bocpy_module_aliases: Set[str]
-        """
-        self.local_vars: Set[str] = set()
-        self.used_vars: Set[str] = set()
-        self.captured_vars: Set[str] = set()
-        self.known_vars: Set[str] = known_vars
-        self.when_aliases: Set[str] = when_aliases
-        self.bocpy_module_aliases: Set[str] = bocpy_module_aliases
-        self._entered: bool = False
-
-    def clear(self):
-        """Reset the tracked state between function visits."""
-        self.local_vars.clear()
-        self.used_vars.clear()
-        self.captured_vars.clear()
-        self._entered = False
-
-    def visit_FunctionDef(self, node):  # noqa: N802
-        """Find captured variables.
-
-        First call (the root behavior): collect its params as locals and
-        recurse. Every later call is a nested def discovered during recursion:
-        record its name, and for a nested ``@when`` surface its free names as
-        the outer behavior's captures (its cown args and capture tuple are
-        evaluated in the outer frame). Plain nested defs are left to Python's
-        own closure.
-        """
-        if not self._entered:
-            self._entered = True
-
-            for arg in node.args.args:
-                self.local_vars.add(arg.arg)
-
-            if node.args.vararg:
-                self.local_vars.add(node.args.vararg.arg)
-
-            if node.args.kwarg:
-                self.local_vars.add(node.args.kwarg.arg)
-
-            for stmt in node.body:
-                self.visit(stmt)
-
-            self.captured_vars = self.used_vars - self.local_vars - self.known_vars
-            return
-
-        self.local_vars.add(node.name)
-
-        if _has_when_decorator(node, self.when_aliases,
-                               self.bocpy_module_aliases):
-            # Nested @when is rewritten to a whencall() evaluated here, so its
-            # free names must join the outer captures and its cown args are
-            # resolved in this frame.
-            inner = CapturedVariableFinder(
-                self.known_vars,
-                when_aliases=self.when_aliases,
-                bocpy_module_aliases=self.bocpy_module_aliases,
-            )
-            inner.visit(node)
-            self.used_vars |= inner.captured_vars
-            for dec in node.decorator_list:
-                if _is_when_call(dec, self.when_aliases,
-                                 self.bocpy_module_aliases):
-                    for arg in dec.args:
-                        self.visit(arg)
-
-    visit_AsyncFunctionDef = visit_FunctionDef  # noqa: N815
-
-    def visit_Name(self, node: ast.Name):  # noqa: N802
-        """Track variable usage to determine captures."""
-        if isinstance(node.ctx, ast.Load):
-            self.used_vars.add(node.id)
-        elif isinstance(node.ctx, ast.Store):
-            self.local_vars.add(node.id)
-
-        self.generic_visit(node)
-
-    def visit_ExceptHandler(self, node: ast.ExceptHandler):  # noqa: N802
-        """Treat ``except ... as X`` binding as a local, not a capture."""
-        if node.name:
-            self.local_vars.add(node.name)
-        self.generic_visit(node)
-
-
-class BOCModuleTransformer(ast.NodeTransformer):
+class MainModuleBinder(ast.NodeTransformer):
     """Prepares a main module for transpiling.
 
     This transformer collects the names of classes, functions, imports,
@@ -153,23 +65,8 @@ class BOCModuleTransformer(ast.NodeTransformer):
         self.classes = set()
         self.functions = set()
         self.imports = set()
-        self.constants = set()
         self.when_aliases: set = {"when"}
         self.bocpy_module_aliases: set = set()
-
-    def known_vars(self):
-        """Return identifiers known at module scope for capture exclusion."""
-        return self.classes | self.functions | self.imports
-
-    def module_scope_names(self):
-        """Return all names available at module scope in the exported module.
-
-        This is a superset of ``known_vars`` that also includes
-        UPPERCASE constants and literal assignments kept by
-        ``visit_Assign``. It is used for decorator name-resolution
-        validation only — NOT for capture exclusion.
-        """
-        return self.classes | self.functions | self.imports | self.constants
 
     def visit_Import(self, node: ast.Import):  # noqa: N802
         """Record imported names and keep the node."""
@@ -181,7 +78,7 @@ class BOCModuleTransformer(ast.NodeTransformer):
         return node
 
     def visit_ImportFrom(self, node: ast.ImportFrom):  # noqa: N802
-        """Record imported names and ensure whencall is available."""
+        """Record imported names and the ``when`` decorator aliases."""
         for name in node.names:
             self.imports.add(name.asname if name.asname else name.name)
 
@@ -189,9 +86,6 @@ class BOCModuleTransformer(ast.NodeTransformer):
             for n in node.names:
                 if n.name == "when":
                     self.when_aliases.add(n.asname or n.name)
-            if not any((a.asname or a.name) == "whencall" for a in node.names):
-                node.names.append(ast.alias(name="whencall"))
-                self.imports.add("whencall")
 
         ast.fix_missing_locations(node)
 
@@ -203,29 +97,45 @@ class BOCModuleTransformer(ast.NodeTransformer):
         return node
 
     def visit_FunctionDef(self, node: ast.FunctionDef):  # noqa: N802
-        """Record non-when functions for later capture resolution."""
-        if not _has_when_decorator(node, self.when_aliases,
-                                   self.bocpy_module_aliases):
-            self.functions.add(node.name)
+        """Record non-when functions; drop module-level @when defs.
 
+        A module-level @when def is scheduled at runtime by the
+        decorator itself. Keeping it in the worker bindings module would
+        re-run the decorator at import time and re-schedule the behavior,
+        so it is filtered out of the bindings module here.
+        """
+        if _has_when_decorator(node, self.when_aliases,
+                               self.bocpy_module_aliases):
+            return None
+
+        self.functions.add(node.name)
         return node
 
     visit_AsyncFunctionDef = visit_FunctionDef  # noqa: N815
 
-    def _record_constant_targets(self, targets):
-        """Record every ``Name`` (including nested in tuple targets) as a constant."""
-        for tgt in targets:
-            if isinstance(tgt, ast.Name):
-                self.constants.add(tgt.id)
-            elif isinstance(tgt, (ast.Tuple, ast.List)):
-                for elt in tgt.elts:
-                    if isinstance(elt, ast.Name):
-                        self.constants.add(elt.id)
-
     def visit_Assign(self, node: ast.Assign):  # noqa: N802
-        """Add module-level constants."""
+        """Keep module-level assignments so behaviors can resolve their globals.
+
+        Sub-interpreters cannot share a Python object, so a kept
+        module-level binding is **re-evaluated once per worker** at
+        bindings-import time. Two consequences a maintainer must keep in
+        mind:
+
+        - The RHS runs in every worker, so any side effect (opening a
+          connection, spawning a thread, mutating external state) happens
+          *N* times, not once.
+        - The bound object is a distinct per-interpreter instance, so a
+          mutable module-level singleton is **not** shared across
+          behaviors. Treat kept globals as per-worker immutable
+          initialisers; cross-behavior shared mutable state belongs in a
+          :class:`~bocpy.Cown` or the noticeboard, never a module global.
+
+        Both UPPERCASE constants and lowercase singletons are kept
+        regardless of case; only the bound name (not its spelling)
+        matters for resolution. Multi-target chained assignments and
+        non-``Name`` targets are still dropped.
+        """
         if isinstance(node.value, ast.Constant):
-            self._record_constant_targets(node.targets)
             return node
 
         if len(node.targets) > 1:
@@ -234,26 +144,18 @@ class BOCModuleTransformer(ast.NodeTransformer):
         name = node.targets[0]
 
         if isinstance(name, ast.Name):
-            if name.id.isupper():
-                self.constants.add(name.id)
-                return node
+            return node
 
         if isinstance(name, (ast.Tuple, ast.List)) and all(
-                isinstance(e, ast.Name) and e.id.isupper() for e in name.elts):
-            for elt in name.elts:
-                self.constants.add(elt.id)
+                isinstance(e, ast.Name) for e in name.elts):
             return node
 
         return None
 
     def visit_AnnAssign(self, node: ast.AnnAssign):  # noqa: N802
-        """Keep annotated module-level constants and uppercase names."""
+        """Keep annotated module-level assignments regardless of case."""
         if isinstance(node.target, ast.Name):
-            is_constant = isinstance(node.value, ast.Constant)
-            is_upper = node.target.id.isupper()
-            if is_constant or is_upper:
-                self.constants.add(node.target.id)
-                return node
+            return node
         return None
 
     def generic_visit(self, node):
@@ -270,319 +172,39 @@ class BOCModuleTransformer(ast.NodeTransformer):
 
             new_body.append(new_value)
 
-        if (self.bocpy_module_aliases and "whencall" not in self.imports):
-            inject = ast.ImportFrom(
-                module="bocpy",
-                names=[ast.alias(name="whencall")],
-                level=0,
-            )
-            ast.fix_missing_locations(inject)
-            new_body.insert(0, inject)
-            self.imports.add("whencall")
-
         node.body[:] = new_body
 
 
-BehaviorInfo = NamedTuple("BehaviorInfo", [("name", str), ("captures", list[str])])
+MainBindings = NamedTuple("MainBindings", [("code", str), ("classes", Set[str]),
+                                           ("functions", Set[str])])
 
 
-class WhenTransformer(ast.NodeTransformer):
-    """Transforms functions marked with @when into behaviors.
+def bind_module(tree: ast.Module) -> MainBindings:
+    """Reduce a module to the bindings a worker needs (no behavior extraction).
 
-    Every time a function with the when decorator is encountered, this transformer
-    creates a new behavior function with a unique name for that and replaces
-    the function with a call to `whencall` for that behavior.
-    """
-
-    _BANNED_BELOW_DECORATORS = frozenset({"staticmethod", "classmethod", "property"})
-
-    def __init__(self, known_vars: set, path: str, module_scope_names: set,
-                 when_aliases: Set[str] = frozenset({"when"}),
-                 bocpy_module_aliases: Set[str] = frozenset()):
-        """Prepare behavior extraction with known identifiers and file path."""
-        self.known_vars = known_vars
-        self.module_scope_names = module_scope_names
-        self.when_aliases = when_aliases
-        self.bocpy_module_aliases = bocpy_module_aliases
-        self.cap_finder = CapturedVariableFinder(
-            known_vars,
-            when_aliases=when_aliases,
-            bocpy_module_aliases=bocpy_module_aliases,
-        )
-        self.nodes = []
-        self.behaviors = {}
-        self.path = path
-
-    def _validate_decorator_names(self, dec: ast.AST):
-        """Reject free names in ``dec`` that the worker cannot resolve.
-
-        Walks the decorator subtree honoring lexical scope: parameters
-        of ``Lambda`` and target names of comprehensions / generator
-        expressions are *local* to those forms and must not be flagged.
-        Free ``Name(Load)`` references must appear in
-        ``module_scope_names`` (imports, classes, functions, constants,
-        builtins) so they resolve when the exported module is imported
-        on a worker.
-        """
-        bound_stack: list[set] = []
-
-        def is_bound(name: str) -> bool:
-            return any(name in s for s in bound_stack)
-
-        def lambda_locals(args: ast.arguments) -> set:
-            local = set()
-            for grp in (args.posonlyargs, args.args, args.kwonlyargs):
-                for a in grp:
-                    local.add(a.arg)
-            if args.vararg:
-                local.add(args.vararg.arg)
-            if args.kwarg:
-                local.add(args.kwarg.arg)
-            return local
-
-        def collect_targets(target: ast.AST, into: set) -> None:
-            if isinstance(target, ast.Name):
-                into.add(target.id)
-            elif isinstance(target, (ast.Tuple, ast.List)):
-                for elt in target.elts:
-                    collect_targets(elt, into)
-            elif isinstance(target, ast.Starred):
-                collect_targets(target.value, into)
-
-        def visit(node: ast.AST) -> None:
-            if isinstance(node, ast.Lambda):
-                for d in node.args.defaults:
-                    visit(d)
-                for d in node.args.kw_defaults:
-                    if d is not None:
-                        visit(d)
-                bound_stack.append(lambda_locals(node.args))
-                visit(node.body)
-                bound_stack.pop()
-                return
-
-            if isinstance(node, (ast.ListComp, ast.SetComp,
-                                 ast.GeneratorExp, ast.DictComp)):
-                local: set = set()
-                for i, gen in enumerate(node.generators):
-                    if i == 0:
-                        visit(gen.iter)
-                    else:
-                        bound_stack.append(local)
-                        visit(gen.iter)
-                        bound_stack.pop()
-                    collect_targets(gen.target, local)
-                    bound_stack.append(local)
-                    for if_ in gen.ifs:
-                        visit(if_)
-                    bound_stack.pop()
-                bound_stack.append(local)
-                if isinstance(node, ast.DictComp):
-                    visit(node.key)
-                    visit(node.value)
-                else:
-                    visit(node.elt)
-                bound_stack.pop()
-                return
-
-            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-                if not is_bound(node.id) and node.id not in self.module_scope_names:
-                    raise SyntaxError(
-                        f"Decorator references '{node.id}' which is "
-                        f"not defined as an import, class, function, or "
-                        f"constant at module level. Ensure it is "
-                        f"importable in the worker.",
-                        (self.path, node.lineno, node.col_offset, None),
-                    )
-
-            for child in ast.iter_child_nodes(node):
-                visit(child)
-
-        visit(dec)
-
-    def visit_Module(self, node: ast.Module):  # noqa: N802
-        """Remove when-call expressions and append generated behaviors."""
-        new_body = []
-        for old_value in node.body:
-            new_value = self.visit(old_value)
-            if isinstance(new_value, ast.Expr):
-                continue
-
-            new_body.append(new_value)
-
-        node.body[:] = new_body
-
-    def visit_Name(self, node: ast.Name):  # noqa: N802
-        """Rewrite __file__ to refer to the exported path."""
-        if node.id == "__file__":
-            return ast.Constant(value=os.path.abspath(self.path))
-
-        return node
-
-    def visit_FunctionDef(self, node: ast.FunctionDef):  # noqa: N802
-        """Transform @when functions into exported behaviors."""
-        when_dec: ast.Expr = None
-        for dec in node.decorator_list:
-            if _is_when_call(dec, self.when_aliases,
-                             self.bocpy_module_aliases):
-                when_dec = dec
-                break
-
-        if when_dec is None:
-            return self.generic_visit(node)
-
-        if isinstance(node, ast.AsyncFunctionDef):
-            raise SyntaxError(
-                "@when does not support async functions",
-                (self.path, node.lineno, node.col_offset, None),
-            )
-
-        when_idx = node.decorator_list.index(when_dec)
-        if when_idx > 0:
-            bad = node.decorator_list[0]
-            above = [ast.unparse(d) for d in node.decorator_list[:when_idx]]
-            raise SyntaxError(
-                "Decorators above @when are not supported — move them "
-                "below @when to apply them to the behavior body: "
-                + ", ".join(above),
-                (self.path, bad.lineno, bad.col_offset, None),
-            )
-
-        behavior_node = copy.deepcopy(node)
-        ast.copy_location(behavior_node, node)
-
-        extras_captures: list[str] = []
-        n_cowns = len(when_dec.args)
-        all_params = behavior_node.args.args
-        defaults = behavior_node.args.defaults
-
-        if len(defaults) > len(all_params) - n_cowns:
-            raise SyntaxError(
-                "Default arguments on @when behavior cown positions are "
-                "not supported — defaults are allowed only on trailing "
-                "parameters beyond the @when cown count.",
-                (self.path, node.lineno, node.col_offset, None),
-            )
-
-        extras = all_params[n_cowns:]
-        n_undefaulted = len(extras) - len(defaults)
-        for arg in extras[:n_undefaulted]:
-            extras_captures.append(arg.arg)
-        for arg, dflt in zip(extras[n_undefaulted:], defaults):
-            if not isinstance(dflt, ast.Name):
-                raise SyntaxError(
-                    f"Default for @when behavior parameter '{arg.arg}' "
-                    f"must be a plain name (e.g. ``{arg.arg}={arg.arg}``). "
-                    f"Compute the value before the @when call and "
-                    f"capture the resulting name.",
-                    (self.path, dflt.lineno, dflt.col_offset, None),
-                )
-            extras_captures.append(dflt.id)
-
-        behavior_node.args.defaults = []
-
-        self.cap_finder.clear()
-        self.cap_finder.visit(behavior_node)
-        body_captures = [c for c in self.cap_finder.captured_vars
-                         if c != "__file__"]
-
-        for name in body_captures:
-            behavior_node.args.args.append(ast.Name(id=name))
-
-        captures = extras_captures + body_captures
-
-        behavior_node.decorator_list = [
-            d for d in behavior_node.decorator_list
-            if not _is_when_call(d, self.when_aliases,
-                                 self.bocpy_module_aliases)
-        ]
-
-        for dec in behavior_node.decorator_list:
-            banned = None
-            if isinstance(dec, ast.Name) and dec.id in self._BANNED_BELOW_DECORATORS:
-                banned = dec.id
-            elif (isinstance(dec, ast.Call) and isinstance(dec.func, ast.Name)
-                    and dec.func.id in self._BANNED_BELOW_DECORATORS):
-                banned = dec.func.id
-            if banned is not None:
-                raise SyntaxError(
-                    f"@{banned} is not supported below @when — the generated "
-                    f"behavior runs as a module-level function on the worker, "
-                    f"where {banned} produces a non-callable descriptor.",
-                    (self.path, dec.lineno, dec.col_offset, None),
-                )
-
-        for dec in behavior_node.decorator_list:
-            self._validate_decorator_names(dec)
-
-        behavior_node = self.visit(behavior_node)
-
-        behavior_node.name = f"__behavior__{len(self.behaviors)}"
-
-        ast.fix_missing_locations(behavior_node)
-        self.nodes.append(behavior_node)
-
-        self.behaviors[when_dec.lineno] = BehaviorInfo(behavior_node.name, captures)
-
-        args = [ast.Constant(value=behavior_node.name),
-                ast.Tuple(when_dec.args),
-                ast.Tuple([ast.Name(id=capture)
-                           for capture in captures])]
-
-        when_call = ast.Call(func=ast.Name(id="whencall"), args=args, keywords=[])
-        ast.copy_location(when_call, node)
-        assign = ast.Assign(
-            targets=[ast.Name(id=node.name, ctx=ast.Store())],
-            value=when_call,
-        )
-        ast.copy_location(assign, node)
-        ast.fix_missing_locations(assign)
-        return assign
-
-    visit_AsyncFunctionDef = visit_FunctionDef  # noqa: N815
-
-
-ExportResult = NamedTuple("ExportResult", [("code", str), ("classes", Set[str]),
-                                           ("functions", Set[str]),
-                                           ("behaviors", Mapping[int, BehaviorInfo])])
-
-
-MODULE_DUNDERS = {"__name__", "__doc__", "__package__",
-                  "__spec__", "__loader__"}
-
-
-def export_module(tree: ast.Module, path: str = None) -> ExportResult:
-    """Extract an AST as a BOC-enlightened module with generated behaviors.
+    The ``@when`` decorator schedules behaviors at runtime via the
+    marshalled-code registry, so the worker bindings module must **not**
+    contain ``@when`` defs or behavior thunks. This pass keeps only the
+    module-level imports, classes, functions, and constants a worker
+    needs in order to resolve a behavior's globals.
 
     :param tree: The source tree
     :type tree: ast.Module
-    :return: An export result with code and metadata
-    :rtype: ExportResult
+    :return: A bindings result with the reduced module code and
+        class/function metadata.
+    :rtype: MainBindings
     """
-    builtins = set(globals()["__builtins__"].keys()) - MODULE_DUNDERS
-
-    boc_export = BOCModuleTransformer()
-    boc_export.visit(tree)
-
-    when_transformer = WhenTransformer(
-        boc_export.known_vars() | builtins,
-        path,
-        module_scope_names=boc_export.module_scope_names() | builtins,
-        when_aliases=boc_export.when_aliases,
-        bocpy_module_aliases=boc_export.bocpy_module_aliases,
-    )
-    when_transformer.visit(tree)
-
-    tree.body.extend(when_transformer.nodes)
+    binder = MainModuleBinder()
+    binder.visit(tree)
 
     ast.fix_missing_locations(tree)
 
     code = ast.unparse(tree)
 
-    return ExportResult(code, boc_export.classes, boc_export.functions, when_transformer.behaviors)
+    return MainBindings(code, binder.classes, binder.functions)
 
 
-def export_module_from_file(path: str) -> ExportResult:
+def bind_file(path: str) -> MainBindings:
     """Parse a Python file and export it with behavior metadata."""
     with open(path, "r", encoding="utf-8") as f:
         source = f.read()
@@ -592,9 +214,70 @@ def export_module_from_file(path: str) -> ExportResult:
     except SyntaxError as e:
         raise SyntaxError(f"Error parsing {path}: {e}")
 
-    return export_module(tree, path)
+    return bind_module(tree)
 
 
-def export_main() -> ExportResult:
-    """Export the currently running __main__ module."""
-    return export_module_from_file(sys.modules["__main__"].__file__)
+def bind_live_module(module: types.ModuleType) -> MainBindings:
+    """Reduce a sourceless module to bindings from its live namespace.
+
+    Used for a module with no source file on disk (the REPL, ``python
+    -c``, or an ``exec``-ed ``__main__``), where there is nothing to
+    parse. An interactively-defined behavior is validated to reference
+    only builtins, imported modules, and explicit captures, so the
+    bindings a worker needs are exactly the modules currently imported
+    in the namespace -- synthesize an ``import`` statement for each.
+
+    Modules in :data:`_LIVE_BINDING_DENY` are dropped (REPL noise that
+    can hang a worker); every other import is wrapped in ``try/except
+    ImportError`` so a module that refuses to load on a sub-interpreter
+    is skipped rather than aborting the whole bindings load -- it would
+    surface later as a ``NameError`` on the worker instead.
+
+    The synthesized import statement is compiled and executed on the
+    worker, so both the namespace key and the module's ``__name__`` must
+    be dotted Python identifiers. An entry whose key or ``__name__`` is
+    not (a module object bound under a non-identifier key, or one whose
+    ``__name__`` is missing, non-``str``, or not import-syntax-safe) is
+    skipped: it cannot be named in a behavior anyway, and emitting it
+    raw would inject malformed source that fails the worker ``compile``.
+
+    :param module: The live module whose namespace to reduce.
+    :type module: types.ModuleType
+    :return: A bindings result whose code re-imports the namespace's
+        modules defensively; ``classes`` and ``functions`` are empty.
+    :rtype: MainBindings
+    """
+    blocks = []
+    for name, value in vars(module).items():
+        if name.startswith("__") or not isinstance(value, types.ModuleType):
+            continue
+        if not name.isidentifier():
+            continue
+        real = getattr(value, "__name__", None)
+        if not isinstance(real, str) or not _is_dotted_identifier(real):
+            continue
+        if real in _LIVE_BINDING_DENY:
+            continue
+        stmt = f"import {real}" if name == real else f"import {real} as {name}"
+        blocks.append(f"try:\n    {stmt}\nexcept ImportError:\n    pass")
+    code = "\n".join(blocks) + ("\n" if blocks else "")
+    return MainBindings(code, set(), set())
+
+
+def bind_main(module_name: str = "__main__") -> MainBindings:
+    """Export the live module named ``module_name`` (default ``__main__``).
+
+    Falls back to a live-namespace reduction when the module has no
+    source file on disk (the REPL, ``python -c``, or an ``exec``-ed
+    module): a missing ``__file__`` or one that is not a real file
+    (e.g. ``<stdin>``) is treated as sourceless. ``module_name`` selects
+    *which* loaded module to reduce so a sourceless first ``@when``
+    scheduled from a non-``__main__`` module binds that module's
+    namespace, not ``__main__``'s. A ``module_name`` not present in
+    ``sys.modules`` falls back to ``__main__``.
+    """
+    mod = sys.modules.get(module_name) or sys.modules["__main__"]
+    path = getattr(mod, "__file__", None)
+    if path is None or not os.path.isfile(path):
+        return bind_live_module(mod)
+    return bind_file(path)

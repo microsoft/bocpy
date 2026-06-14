@@ -23,7 +23,7 @@ execute asynchronously on worker interpreters.
 | Concept | Description |
 |---------|-------------|
 | `Cown(value)` | A concurrently-owned wrapper. Behaviors receive exclusive temporal access to the cown's `.value`. |
-| `@when(*cowns)` | Decorator that schedules the function as a behavior. The decorator replaces the function with a `Cown` holding the return value. The first N parameters bind to the N cowns; any trailing parameters are auto-captured from the caller's frame (see below). |
+| `@when(*cowns)` | Decorator that schedules the function as a behavior. The decorator replaces the function with a `Cown` holding the return value. The first N parameters bind to the N cowns; every trailing parameter **must carry a default**, whose value is snapshotted as a capture at schedule time (see below). |
 | `quiesce(timeout=None)` | Blocks until all in-flight behaviors complete **without** tearing down the workers. The preferred test-thread barrier before reading results. |
 | `Cown.unwrap()` | After quiescence, returns the behavior's result value, or **re-raises** the exception the behavior captured (verbatim, on the test thread). Raises `RuntimeError` if called while behaviors are still in flight. |
 | `send(tag, contents)` | Sends a cross-interpreter message with the given tag. |
@@ -31,21 +31,35 @@ execute asynchronously on worker interpreters.
 | `TIMEOUT` | Sentinel string returned as the tag by `receive` when a timeout elapses. |
 | `wait(timeout)` | Blocks until all scheduled behaviors have completed, then tears the runtime down. |
 
-### Cown count, parameter count, and auto-captured extras
+### Cown count, parameter count, and captures
 
 The first `N` parameters of the decorated function bind positionally to the
-`N` arguments of `@when`. Any **additional** trailing parameters are treated
-as captures of names from the caller's scope:
+`N` arguments of `@when`. **Every additional trailing parameter must carry a
+default value**; that default is evaluated when the `def` runs and
+snapshotted as the capture at schedule time:
 
-* `def b(c, factor)` — captures `factor` by the parameter's own name.
+* `def b(c, factor=factor)` — captures `factor` (read from the enclosing
+  scope at schedule time).
 * `def b(c, i=i)` — captures `i` (the canonical loop-snapshot idiom).
 * `def b(c, x=y)` — captures `y` and binds it into param `x`.
 
-Defaults must be plain names; computed defaults (`def b(c, k=foo())`) and
-defaults on cown positions (`def b(c=c)`) raise `SyntaxError` at export
-time. Free variables referenced in the body (but not in the signature) are
-also auto-captured, so the simplest spelling is usually to omit the extras
-entirely and just reference them in the body.
+The runtime enforces this at **decoration time**:
+
+* A **bare** extra parameter (`def b(c, factor)` — no default) raises
+  `TypeError`: the capture count must equal the trailing-parameter count.
+* A **closure** over an enclosing-*function* local raises `SyntaxError`
+  — a behavior runs in another interpreter and cannot capture by closure.
+  The error names the variable and suggests the `x=x` fix. (A plain
+  **module-level global** is *not* a closure: the bindings reducer keeps
+  module-level assignments, so a behavior may read them directly. The
+  closure rule only bites names bound in an enclosing function — the
+  common case when a behavior is written inside a test method.)
+* `async def` / generator behaviors raise `SyntaxError`.
+
+Computed defaults (`def b(c, k=expensive())`) are allowed — the value is
+evaluated once and snapshotted like any other capture. A default on a cown
+position (`def b(c=c)` under `@when(x)`) is just a capture-count mismatch and
+raises `TypeError`.
 
 ```python
 # CORRECT — 1 @when arg, 1 function param
@@ -53,19 +67,25 @@ entirely and just reference them in the body.
 def good(x):
     return x.value * 2
 
-# ALSO CORRECT — extra params beyond the cown count are auto-captured
-# from the caller's frame by name. Plain extras use the param's own
-# name; defaults of the form ``i=i`` or ``x=y`` use the default's name.
-factor = 2
+# CORRECT — extra params beyond the cown count are captures and must
+# carry a default. The default is snapshotted at schedule time.
+def schedule(x):
+    factor = 2
+    @when(x)
+    def with_extra(x, factor=factor):   # capture ``factor`` via default
+        return x.value * factor
+
+# WRONG — bare extra parameter (no default) raises TypeError
 @when(x)
-def with_extra(x, factor):              # ``factor`` captured by name
+def missing_default(x, factor):         # TypeError at decoration
     return x.value * factor
 
-# FIX — for older code: capture extra values via closure
-factor = 2
-@when(x)
-def fixed(x):                           # 1 param matches 1 @when arg
-    return x.value * factor             # factor captured from enclosing scope
+# WRONG — closing over an enclosing-function local raises SyntaxError
+def schedule_bad(x):
+    factor = 2
+    @when(x)
+    def via_closure(x):                  # SyntaxError: closes over 'factor'
+        return x.value * factor          # pass it as ``factor=factor`` instead
 ```
 
 ### The `def _(c, i=i)` loop-capture idiom is supported
@@ -80,27 +100,27 @@ for i, c in enumerate(cowns):
         send("done", i)
 ```
 
-The transpiler hoists positional parameters beyond the cown count into
-captures: bare extras (`def b(c, factor)`) capture by the parameter's own
-name; defaults (`def b(c, i=i)` or the rename form `def b(c, x=y)`) capture by
-the default expression's name. The default expression must be a plain
-`Name`; computed defaults (`def b(c, k=foo())`) and defaults on cown
-positions (`def b(c=c)`) raise `SyntaxError` at export time.
+Parameters beyond the cown count are captures, snapshotted at schedule time.
+A capture is a trailing parameter carrying a default whose value is read when
+the behavior is scheduled: `def b(c, i=i)` captures `i` (the rename form
+`def b(c, x=y)` captures `y`). A bare extra parameter (`def b(c, factor)`)
+raises `TypeError` at decoration time, and a closure over a free variable
+raises `SyntaxError` — a behavior runs in another interpreter and cannot
+capture by closure.
 
-Because the transpiler already snapshots loop variables into a tuple at
-schedule time, you can also just reference the loop variable directly without
-the `i=i` idiom — both spellings work:
+A behavior **cannot** reference a loop variable by closure; you must capture
+it explicitly:
 
 ```python
 for i, c in enumerate(cowns):
     @when(c)
-    def _(c):
-        send("done", i)                 # i is captured by value at schedule time
+    def _(c, i=i):                      # capture i; bare `i` reference would fail
+        send("done", i)
 ```
 
-See the "Inspecting Transpiler Output" section of
-`.github/copilot-instructions.md` for how to use `export_module.py` to confirm
-exactly which names are parameters and which are captures.
+See the "Inspecting the Worker Bindings Module" section of
+`.github/copilot-instructions.md` for how `@when` captures work and how to
+inspect the bindings module workers import.
 
 If you want a fresh scope per iteration (e.g. to avoid sharing mutable state
 between iterations), use a helper function:
@@ -117,8 +137,8 @@ for i, c in enumerate(cowns):
 
 ### Critical rule: classes and functions must be declared at module level
 
-Behaviors run in separate sub-interpreters. The transpiler exports the module so
-workers can import it, which means **any class or function referenced inside a
+Behaviors run in separate sub-interpreters. Workers import the module's
+bindings, which means **any class or function referenced inside a
 `@when` behavior must be defined at module level**. A class defined inside a test
 method or local function cannot be resolved by the worker and will crash.
 
@@ -606,15 +626,15 @@ def test_object_in_cown(self):
 
 | Pitfall | Fix |
 |---------|-----|
-| **Parameter count mismatch in `@when`** | The decorated function must have **exactly** as many parameters as `@when` arguments. A mismatch crashes the worker. Use closure variables instead of default arguments to capture extra values. |
+| **Parameter count mismatch in `@when`** | The decorated function must have exactly as many cown parameters as `@when` arguments; any further parameters must be captures (trailing parameters with defaults). A mismatch raises `TypeError` at decoration. |
 | **Classes/functions defined inside a test** | Behaviors run in sub-interpreters that import the module. Define all classes and functions used in behaviors at **module level** so workers can resolve them. |
 | Asserting in the test body right after `@when` | The behavior hasn't run yet. Call `quiesce()` first, then read results with `unwrap()` (Pattern 1). |
 | `receive` without a timeout | If a behavior crashes silently, the test hangs forever. Always pass a timeout (e.g. `RECEIVE_TIMEOUT = 10`) and assert the result is not `TIMEOUT`. |
 | Forgetting `wait()` in teardown | Pending behaviors may leak into the next test class. Always call `wait()` in `teardown_class`. |
 | Reading `cown.value` outside a behavior | A cown must be acquired first. After `quiesce()`, use `unwrap()` (which acquires for you); otherwise read inside `@when`. |
-| Using default arguments to capture loop variables | Default args add parameters, breaking the arg-count rule. Use a closure variable instead: `val = i` on a separate line before `@when`. |
+| Trying to capture a loop variable by closure | A behavior runs in another interpreter and cannot close over free variables (raises `SyntaxError`). Capture it as a trailing default instead: `def _(c, i=i): ...`. |
 | Non-XIData-compatible objects in cowns across interpreters | Stick to built-in types or objects that support cross-interpreter data. |
-| Importing `unittest.mock` in a BOC test | The transpiler exports the whole test module for import in every worker sub-interpreter. `unittest.mock` transitively imports `asyncio`, which can deadlock during PEP 684 per-interpreter init (observed on macOS arm64 + Python 3.12/3.13). Use the in-house `mockreplacement.patch_attr` / `Recorder` helpers (see `test/mockreplacement.py`), and import them **inside the test method** — never at module scope, because workers also fail to find `mockreplacement` on their `sys.path` during bootstrap. |
+| Importing `unittest.mock` in a BOC test | Worker sub-interpreters import the test module's bindings. `unittest.mock` transitively imports `asyncio`, which can deadlock during PEP 684 per-interpreter init (observed on macOS arm64 + Python 3.12/3.13). Use the in-house `mockreplacement.patch_attr` / `Recorder` helpers (see `test/mockreplacement.py`), and import them **inside the test method** — never at module scope, because workers also fail to find `mockreplacement` on their `sys.path` during bootstrap. |
 | Test function names with uppercase letters (N802) | Test names must be lowercase. E.g., `test_t_equals_transpose`, **not** `test_T_equals_transpose`, even when testing a property like `.T`. |
 | Assigning `Cown(m)` to an unused variable (F841) | When the return value isn't needed (e.g., releasing a resource), use bare `Cown(m)` without assignment. |
 | Using single quotes (Q000) | The project enforces `inline-quotes = double`. Use `"nan"` not `'nan'`. |

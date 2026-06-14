@@ -129,7 +129,7 @@ class RhoLane:
 def rho_check(lane: Cown[RhoLane], n: int):
     """Check the noticeboard for a result before continuing the walk."""
     @when(lane)
-    def _(lane):
+    def _(lane, n=n):
         if notice_read("factor") is not None:
             return
 
@@ -139,7 +139,7 @@ def rho_check(lane: Cown[RhoLane], n: int):
 def rho_work(lane: Cown[RhoLane], n: int):
     """Run a batch of Pollard's rho iterations using Floyd's cycle detection."""
     @when(lane)
-    def _(lane):
+    def _(lane, n=n):
         info = lane.value
         x, y, c = info.x, info.y, info.c
 

@@ -107,17 +107,16 @@ def next_window(cs: "ChainState", group_size: int) -> list:
 def schedule_step(state_cown: Cown, window_list: list, group_size: int) -> None:
     """Schedule one chain step with the given window.
 
-    The static ``@when`` decorator inside this helper is rewritten by
-    the transpiler into a ``whencall`` invocation, so this function
-    works correctly when called from a worker sub-interpreter (where
-    the Python ``when`` decorator is not wired up).
+    The ``@when`` decorator inside this helper registers the behavior at
+    runtime, so this function works correctly when called from a worker
+    sub-interpreter as well as from the main interpreter.
 
     :param state_cown: The chain's state cown.
     :param window_list: Adjacent cowns to acquire for this step.
     :param group_size: Window size, captured into the behavior.
     """
     @when(state_cown, window_list)
-    def _step(state, window):
+    def _step(state, window, group_size=group_size):
         cs = state.value
         if not noticeboard().get("cr_null", False):
             for _ in range(cs.iters):
@@ -332,7 +331,7 @@ def schedule_pinned_spinner(spin_cown: "PinnedCown",
         dispatch rate (e.g. ``0.001`` for ~1 kHz).
     """
     @when(spin_cown)
-    def _spinner(p):
+    def _spinner(p, sleep_s=sleep_s, spin_cown=spin_cown):
         p.value[_PINNED_COUNT] += 1
         if not noticeboard().get("cr_stop", False):
             time.sleep(sleep_s)

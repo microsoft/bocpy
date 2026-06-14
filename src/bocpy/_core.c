@@ -3,6 +3,7 @@
 #include "boc_compat.h"
 #include "boc_cown.h"
 #include "boc_noticeboard.h"
+#include "boc_registry.h"
 #include "boc_sched.h"
 #include "boc_tags.h"
 #include "boc_terminator.h"
@@ -776,6 +777,60 @@ static PyObject *_core_clear_noticeboard_thread(PyObject *self,
   }
   noticeboard_clear_thread();
   Py_RETURN_NONE;
+}
+
+/// @brief Idempotently store a marshalled behavior under a canonical key
+/// @details The key is computed in Python (the recursive canonical
+/// digest over the code object's semantic fields); C treats it as an
+/// opaque interned string. Writable from any interpreter, including
+/// worker sub-interpreters that schedule nested behaviors. Returns the
+/// key unchanged so callers can chain.
+/// @param self The module (unused)
+/// @param args Tuple of (key: str, blob: bytes, module_name: str,
+///        source: str | None)
+/// @return The key string on success, NULL on error
+static PyObject *_core_registry_register(PyObject *Py_UNUSED(self),
+                                         PyObject *args) {
+  const char *key;
+  Py_ssize_t key_len;
+  const char *blob;
+  Py_ssize_t blob_len;
+  const char *module_name;
+  Py_ssize_t module_len;
+  const char *source;
+  Py_ssize_t source_len;
+
+  if (!PyArg_ParseTuple(args, "s#y#s#z#", &key, &key_len, &blob, &blob_len,
+                        &module_name, &module_len, &source, &source_len)) {
+    return NULL;
+  }
+
+  if (registry_register(key, key_len, blob, blob_len, module_name, module_len,
+                        source, source_len) < 0) {
+    return NULL;
+  }
+
+  return PyUnicode_FromStringAndSize(key, key_len);
+}
+
+/// @brief Look up a behavior by key, rebuilding objects in the caller
+/// @details Rebuilds fresh @c PyBytes / @c str in the calling
+/// interpreter from the stored raw buffers (sub-interpreters share the C
+/// heap but not Python objects).
+/// @param self The module (unused)
+/// @param args Tuple of (key: str)
+/// @return A @c (blob: bytes, module_name: str, source: str | None)
+///         tuple on a hit, @c None on a miss, NULL on error
+static PyObject *_core_registry_lookup(PyObject *Py_UNUSED(self),
+                                       PyObject *args) {
+  const char *key;
+  Py_ssize_t key_len;
+
+  if (!PyArg_ParseTuple(args, "s#", &key, &key_len)) {
+    return NULL;
+  }
+
+  return registry_lookup(key, key_len);
 }
 
 /// @brief Try to register a new behavior with the terminator.
@@ -4347,9 +4402,9 @@ static inline uintptr_t boc_pump_thread_id(void) {
 /// FT CAS released.
 /// @param args (deadline_ms, max_behaviors, raise_on_error,
 ///              boc_export). deadline_ms / max_behaviors accept None
-///              for "no limit"; boc_export is the namespace whose
-///              attributes resolve `__behavior__N` thunks (typically
-///              ``sys.modules[__main__]``).
+///              for "no limit"; boc_export is the ``Resolver`` whose
+///              attributes resolve marshalled-code registry keys
+///              (installed for ``__main__``).
 /// @return ``(executed, deadline_reached, raised)`` 3-tuple on
 ///         success, NULL on gate rejection or raise_on_error trigger.
 static PyObject *_core_main_pump_bounded(PyObject *Py_UNUSED(self),
@@ -5564,6 +5619,14 @@ static PyMethodDef _core_module_methods[] = {
     {"clear_noticeboard_thread", _core_clear_noticeboard_thread, METH_NOARGS,
      "clear_noticeboard_thread($module, /)"
      "\n--\n\nClears the registered noticeboard mutator thread."},
+    {"registry_register", _core_registry_register, METH_VARARGS,
+     "registry_register($module, key, blob, module_name, source, /)"
+     "\n--\n\nIdempotently store a marshalled behavior under a canonical "
+     "key. Returns the key."},
+    {"registry_lookup", _core_registry_lookup, METH_VARARGS,
+     "registry_lookup($module, key, /)"
+     "\n--\n\nLook up a behavior by key, returning (blob, module_name, "
+     "source) or None."},
     {"terminator_inc", _core_terminator_inc, METH_NOARGS,
      "terminator_inc($module, /)"
      "\n--\n\nIncrement the terminator. Returns new count or -1 if closed."},
@@ -5654,12 +5717,15 @@ static int _core_module_exec(PyObject *module) {
 
     noticeboard_init();
 
+    registry_init();
+
     terminator_init();
 
     boc_bq_init(&MAIN_PINNED_QUEUE);
 
     if (boc_sched_init(0) < 0) {
       noticeboard_destroy();
+      registry_destroy();
       PyMem_RawFree((void *)BOC_RECYCLE_QUEUE_TAIL);
       BOC_RECYCLE_QUEUE_TAIL = NULL;
       atomic_store_intptr(&BOC_RECYCLE_QUEUE_HEAD, 0);
@@ -5842,6 +5908,8 @@ void _core_module_free(void *module_ptr) {
     atomic_store_intptr(&BOC_RECYCLE_QUEUE_HEAD, 0);
 
     noticeboard_destroy();
+
+    registry_destroy();
 
     boc_sched_shutdown();
 

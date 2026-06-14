@@ -172,7 +172,7 @@ class Cown(Generic[T]):
 ```
 
 ```python
-class BOCModuleTransformer(ast.NodeTransformer):
+class MainModuleBinder(ast.NodeTransformer):
     """Prepares a main module for transpiling.
 
     This transformer collects the names of classes, functions, imports,
@@ -211,13 +211,13 @@ Use Sphinx `:param:` / `:type:` / `:return:` / `:rtype:` fields for parameter
 documentation. This is the single accepted style across the project.
 
 ```python
-def export_module(tree: ast.Module, path: str = None) -> ExportResult:
-    """Extract an AST as a BOC-enlightened module with generated behaviors.
+def bind_module(tree: ast.Module, path: str = None) -> MainBindings:
+    """Reduce a module to the bindings a worker needs.
 
     :param tree: The source tree
     :type tree: ast.Module
-    :return: An export result with code and metadata
-    :rtype: ExportResult
+    :return: A bindings result with code and metadata
+    :rtype: MainBindings
     """
 ```
 

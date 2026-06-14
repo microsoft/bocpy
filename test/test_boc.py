@@ -7,42 +7,20 @@ import sys
 import threading
 import time
 import traceback
-from typing import NamedTuple
 
 import pytest
 
 from bocpy import (Cown, drain, notice_write,
                    quiesce, receive, send, start, TIMEOUT, wait, when)
 from bocpy._core import CownCapsule
+from bocpy_test import collide_a, collide_b, dunders
+from bocpy_test.chained_global import schedule_chain, schedule_direct
+from bocpy_test.multiplier import GLOBAL_FACTOR, Multiplier
+from bocpy_test.philosophers import Fork, Philosopher
 
 RECEIVE_TIMEOUT = 10
 
 QUIESCE_TIMEOUT = 5
-
-
-GLOBAL_FACTOR = 7
-
-
-class Multiplier:
-    """Multiplies a cown's value by a module-level global inside a method."""
-
-    def multiply(self, x: Cown) -> Cown:
-        """Schedule a behavior that captures GLOBAL_FACTOR from module scope."""
-        factor = GLOBAL_FACTOR  # noqa: F841 — captured by @when below
-
-        @when(x)
-        def do_multiply(x):
-            return x.value * factor  # noqa: B023
-
-        return do_multiply
-
-    def multiply_direct(self, x: Cown) -> Cown:
-        """Schedule a behavior that captures GLOBAL_FACTOR directly."""
-        @when(x)
-        def do_multiply(x):
-            return x.value * GLOBAL_FACTOR
-
-        return do_multiply
 
 
 def simple(x: Cown) -> Cown:
@@ -92,40 +70,6 @@ class RaiseOnUnpickle:
     def __reduce__(self):
         """Return a reduce tuple whose loader raises on unpickle."""
         return (eval, ("1/0",))
-
-
-class Fork:
-    """Simple fork that tracks usage and remaining hunger."""
-
-    def __init__(self, hunger: int):
-        """Initialize with an initial hunger counter."""
-        self.hunger = hunger
-        self.uses = 0
-
-    def use(self):
-        """Increment use count when acquired."""
-        self.uses += 1
-
-
-class Philosopher(NamedTuple("Philosopher", [("index", int), ("left", Cown),
-                                             ("right", Cown), ("hunger", Cown)])):
-    """Philosopher that coordinates two forks and its hunger."""
-
-    def eat(self: "Philosopher"):
-        """Attempt to eat until hunger is satisfied."""
-        index = self.index
-
-        @when(self.left, self.right, self.hunger)
-        def take_bite(left, right, hunger):
-            left.value.use()
-            right.value.use()
-            hunger.value -= 1
-            if hunger.value > 0:
-                Philosopher(index, left, right, hunger).eat()
-            else:
-                @when()
-                def _():
-                    send("report", ("full", index))
 
 
 class Accumulator:
@@ -301,29 +245,26 @@ class TestBOC:
         assert y_after.unwrap() == 50
 
     def test_classes(self, num_philosophers=5, hunger=4):
-        """Simulate dining philosophers and verify fork usage."""
-        forks = [Cown(Fork(hunger)) for _ in range(num_philosophers)]
-        for idx in range(num_philosophers):
-            Philosopher.eat(Philosopher(idx, forks[idx-1], forks[idx], Cown(hunger)))
+        """Dining philosophers from an installed package resolve on workers.
 
-        num_eating = num_philosophers
-        while num_eating > 0:
-            match receive("report"):
-                case ["report", ("full", _)]:
-                    num_eating -= 1
-
-        readers = []
-        for f in forks:
-            @when(f)
-            def read_fork(f):
-                return (f.value.uses, 2 * f.value.hunger)
-
-            readers.append(read_fork)
+        ``Fork`` and ``Philosopher`` are defined in the ``bocpy_test``
+        package, not in this test module, so a worker resolves their
+        ``@when`` bodies through the imported-module branch of
+        ``Resolver._target_dict`` (it imports ``bocpy_test.philosophers``
+        rather than binding to the bindings module). Each fork is shared
+        by two philosophers, so after every philosopher empties its
+        hunger cown the fork's use count is ``2 * hunger``.
+        """
+        fork_cowns = [Cown(Fork(i)) for i in range(num_philosophers)]
+        hunger_cowns = [Cown(hunger) for _ in range(num_philosophers)]
+        for i, hunger_cown in enumerate(hunger_cowns):
+            Philosopher.eat(
+                Philosopher(i, fork_cowns[i-1], fork_cowns[i], hunger_cown))
 
         quiesce(QUIESCE_TIMEOUT)
-        for r in readers:
-            uses, expected = r.unwrap()
-            assert uses == expected
+        for f_cown, h_cown in zip(fork_cowns, hunger_cowns):
+            assert f_cown.unwrap().uses == 2 * hunger
+            assert h_cown.unwrap() == 0
 
     @pytest.mark.parametrize("n", [1, 10, 15])
     def test_variable_termination(self, n: int):
@@ -449,8 +390,8 @@ class TestBOC:
             val_to_add = i
 
             @when(acc)
-            def _(a):
-                a.value.add(val_to_add)  # noqa: B023
+            def _(a, val_to_add=val_to_add):
+                a.value.add(val_to_add)
 
         @when(acc)
         def read(a):
@@ -596,7 +537,12 @@ class TestUnwrap:
 
         @when(x)
         def boom(x):
-            assert x.value == 999, f"expected 999, got {x.value}"
+            # A bare ``assert`` would be pytest-rewritten to reference the
+            # module-global ``@pytest_ar`` helper, which the marshalled
+            # code object carries but the worker namespace lacks; raise
+            # explicitly so the body is self-contained across interpreters.
+            if x.value != 999:
+                raise AssertionError(f"expected 999, got {x.value}")
 
         quiesce(QUIESCE_TIMEOUT)
         with pytest.raises(AssertionError, match="expected 999, got 1"):
@@ -676,7 +622,16 @@ class TestUnwrap:
 
 
 class TestGlobalCapture:
-    """Tests for capturing module-level globals inside class methods."""
+    """Capturing a module-level global from an imported package's method.
+
+    ``Multiplier`` and ``GLOBAL_FACTOR`` live in ``bocpy_test.multiplier``,
+    so a worker resolves these behaviors through the imported-module
+    branch of ``Resolver._target_dict`` and binds their globals to that
+    module. ``multiply_direct`` reads ``GLOBAL_FACTOR`` as a free global,
+    proving the value resolves against the behavior's defining module
+    across the interpreter boundary -- not against the runtime's bindings
+    module.
+    """
 
     @classmethod
     def teardown_class(cls):
@@ -710,6 +665,77 @@ class TestGlobalCapture:
 
         quiesce(QUIESCE_TIMEOUT)
         assert result.unwrap() == value * GLOBAL_FACTOR
+
+
+class TestNonConstantModuleGlobal:
+    """A non-constant module global resolves for behaviors that read it.
+
+    Regression: the worker bindings reducer keeps imports, classes,
+    functions, and UPPERCASE constants but drops lowercase,
+    expression-valued module globals (``module_cache = dict(...)`` in
+    ``bocpy_test.chained_global``, mirroring the physics
+    ``shell_cache = geometry.ShellCache()``). A behavior defined in an
+    importable module must bind its globals to that module's *real*
+    namespace -- never to a reduced bindings copy -- so the global is
+    present. ``schedule_chain`` also proves a *chained* behavior (one
+    scheduled from inside another) resolves the same way, which is the
+    exact shape that surfaced as ``NameError: name 'shell_cache' is not
+    defined``.
+    """
+
+    @classmethod
+    def teardown_class(cls):
+        """Ensure runtime is drained after suite."""
+        wait()
+
+    def test_direct_behavior_reads_non_constant_global(self):
+        """A single behavior reads its lowercase, expression-valued global."""
+        x = Cown(1)
+        result = schedule_direct(x)
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert result.unwrap() == "module-level-value"
+
+    def test_chained_behavior_reads_non_constant_global(self):
+        """Both links of an in-module behavior chain read the dropped global."""
+        c1 = Cown(1)
+        c2 = Cown(2)
+        first = schedule_chain(c1, c2)
+
+        quiesce(QUIESCE_TIMEOUT)
+        # first holds the second behavior's result cown; unwrap twice.
+        assert first.unwrap().unwrap() == (
+            "module-level-value", "module-level-value")
+
+
+class TestCrossModuleIdenticalBody:
+    """Byte-identical bodies in two packages resolve to their own module.
+
+    ``collide_a`` and ``collide_b`` schedule behaviors whose bodies are
+    byte-identical and differ only in each module's ``OFFSET`` global.
+    The canonical behavior key excludes ``co_filename``, so the two
+    bodies share the code-identity half of their keys; only the folded-in
+    defining module separates them. If that fold were missing, the
+    process-global append-only registry would resolve the second body's
+    ``OFFSET`` against the first body's module, and both would return the
+    same value. Running both on workers and asserting divergent results
+    is the end-to-end regression guard for that collision.
+    """
+
+    @classmethod
+    def teardown_class(cls):
+        """Ensure runtime is drained after suite."""
+        wait()
+
+    def test_identical_bodies_bind_to_own_module_globals(self):
+        """Two identical bodies read their own module's OFFSET on a worker."""
+        a = collide_a.schedule_probe(Cown(5))
+        b = collide_b.schedule_probe(Cown(5))
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert a.unwrap() == 5 + collide_a.OFFSET
+        assert b.unwrap() == 5 + collide_b.OFFSET
+        assert collide_a.OFFSET != collide_b.OFFSET
 
 
 class TestCownAcquireDeserialiseFailure:
@@ -882,19 +908,19 @@ class TestCownInCown:
             outer = Cown(None)
 
             @when(outer)
-            def make(o):
-                inner = Cown(expected)  # noqa: B023
-                if shape == 0:  # noqa: B023
+            def make(o, expected=expected, shape=shape):
+                inner = Cown(expected)
+                if shape == 0:
                     o.value = [inner]
-                elif shape == 1:  # noqa: B023
+                elif shape == 1:
                     o.value = (inner,)
-                elif shape == 2:  # noqa: B023
+                elif shape == 2:
                     o.value = {"k": inner}
-                elif shape == 3:  # noqa: B023
+                elif shape == 3:
                     o.value = DataClassSlots(inner)
-                elif shape == 4:  # noqa: B023
+                elif shape == 4:
                     o.value = DictOnly(inner)
-                elif shape == 5:  # noqa: B023
+                elif shape == 5:
                     o.value = SlotsOnly(inner)
                 else:
                     o.value = Cown(inner)
@@ -960,8 +986,8 @@ class TestCownInCown:
         stash = {}
 
         @when(anchor)
-        def write_initial(a):
-            notice_write("k", inner)  # noqa: F821
+        def write_initial(a, inner=inner):
+            notice_write("k", inner)
 
         snap = quiesce(QUIESCE_TIMEOUT, noticeboard=True)
         stash["k"] = snap["k"]
@@ -1281,6 +1307,22 @@ class TestModuleDunderCapture:
         quiesce(QUIESCE_TIMEOUT)
         assert read_package.unwrap() == expected
 
+    def test_imported_package_behavior_reads_its_own_dunders(self):
+        """An imported-package behavior sees its defining module's dunders.
+
+        The sibling tests cover the bindings-module case (a behavior
+        defined in this test module reads ``test_boc``'s dunders). Here
+        the behavior is defined in ``bocpy_test.dunders`` and resolves on
+        a worker through the imported-module branch, so its globals bind
+        to that package module: ``__name__`` is the dotted module path
+        and ``__package__`` is the containing package, not the bindings
+        module's.
+        """
+        result = dunders.schedule_read_dunders(Cown(0))
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert result.unwrap() == ("bocpy_test.dunders", "bocpy_test")
+
 
 class TestCrossWorker:
     """Verify cross-worker scheduling and cown round-trip through XIData."""
@@ -1341,8 +1383,8 @@ class TestCrossWorker:
         probes = []
         for idx, cell in enumerate(ring):
             @when(cell)
-            def _probe(c):
-                return (idx, c)  # noqa: B023
+            def _probe(c, idx=idx):
+                return (idx, c)
 
             probes.append(_probe)
 
@@ -1386,14 +1428,14 @@ class TestInMemoryExport:
         wait()
 
     def test_traceback_resolves_via_linecache(self):
-        """A raising body's traceback shows the transpiled source line.
+        """A raising behavior's traceback points at its real source line.
 
-        The ``linecache`` registration in the worker bootstrap is the
-        only thing keeping tracebacks debuggable now that the source
-        is no longer on disk. We capture a worker-side traceback
-        string via ``traceback.format_exc()`` and assert it references
-        the synthetic ``<bocpy:NAME>`` filename — proof the bootstrap
-        registered the cache entry under that name.
+        Under the marshalled-code registry an importable behavior keeps
+        its original ``co_filename``, so a worker-side traceback resolves
+        against the real module file on disk via ``linecache`` — pointing
+        the user at the actual source line rather than a synthetic name.
+        (Interactive behaviors, which have no source file, are relabelled
+        to ``<behavior:KEY>`` instead; that path is covered separately.)
         """
         c = Cown(0)
         start(worker_count=2)
@@ -1408,8 +1450,11 @@ class TestInMemoryExport:
         quiesce(QUIESCE_TIMEOUT)
         tb_str = _b.unwrap()
 
-        assert "<bocpy:" in tb_str, (
-            f"traceback did not reference synthetic filename; got:\n{tb_str}"
+        assert __file__ in tb_str, (
+            f"traceback did not reference the real source file; got:\n{tb_str}"
+        )
+        assert 'raise RuntimeError("synthetic-from-test-traceback")' in tb_str, (
+            f"traceback did not show the real source line; got:\n{tb_str}"
         )
 
     def test_tricky_source_round_trips(self):
@@ -1647,13 +1692,29 @@ def times_two(fn):
 
 
 class TestDecoratorComposition:
-    """Decorators below @when should compose with the behavior body."""
+    """Decorators below @when should compose with the behavior body.
+
+    All three tests are ``xfail`` under the marshalled-code registry:
+    a below-`@when` decorator returns a wrapper that closes over the
+    undecorated function (``co_freevars`` non-empty) and typically takes
+    ``*args``/``**kwargs``, neither of which survives marshalling across
+    the sub-interpreter boundary. Re-introducing composition needs a
+    dedicated design: marshal the undecorated body plus an importable
+    decorator chain to re-apply on the worker. Until that lands, stacking
+    decorators below ``@when`` is unsupported.
+    """
 
     @classmethod
     def teardown_class(cls):
         """Ensure runtime is drained after suite."""
         wait()
 
+    @pytest.mark.xfail(
+        reason="below-@when decorator composition not supported under the "
+        "marshalled-code registry (the wrapper closes over the undecorated "
+        "body, which cannot be marshalled across interpreters)",
+        strict=True,
+    )
     def test_decorator_modifies_return_value(self):
         x = Cown(10)
 
@@ -1665,6 +1726,12 @@ class TestDecoratorComposition:
         quiesce(QUIESCE_TIMEOUT)
         assert doubled_plus_one.unwrap() == 21
 
+    @pytest.mark.xfail(
+        reason="below-@when decorator composition not supported under the "
+        "marshalled-code registry (the wrapper closes over the undecorated "
+        "body, which cannot be marshalled across interpreters)",
+        strict=True,
+    )
     def test_stacked_below_decorators_apply_in_order(self):
         """Stacked below-decorators compose innermost-first on the worker.
 
@@ -1683,13 +1750,19 @@ class TestDecoratorComposition:
         quiesce(QUIESCE_TIMEOUT)
         assert composed.unwrap() == 22
 
+    @pytest.mark.xfail(
+        reason="below-@when decorator composition not supported under the "
+        "marshalled-code registry (the wrapper closes over the undecorated "
+        "body, which cannot be marshalled across interpreters)",
+        strict=True,
+    )
     def test_below_decorator_inside_nested_when(self):
         """A nested ``@when`` body may itself carry a below-decorator."""
         x = Cown(10)
         y = Cown(7)
 
         @when(x)
-        def outer(x):
+        def outer(x, y=y):
             @when(y)
             @add_one
             def inner(y):
@@ -1735,3 +1808,122 @@ class TestLoopDefaultCapture:
 
         quiesce(QUIESCE_TIMEOUT)
         assert read.unwrap() == 99
+
+
+class TestGetCallerModule:
+    """``get_caller_module`` degrades gracefully on exotic frames.
+
+    The two-hop frame walk reads the scheduling caller's ``__name__``
+    and ``__file__``. A frame that lacks either (``exec`` against bare
+    globals, a stdin/``-c`` ``__main__``) must not raise; ``__name__``
+    falls back to ``"__main__"`` and a non-file ``__file__`` to ``None``
+    so the runtime takes the sourceless path.
+    """
+
+    @staticmethod
+    def _call_from(module_globals):
+        # get_caller_module walks ``f_back.f_back``; build two nested
+        # frames so ``outer``'s globals (``module_globals``) are what it
+        # reads.
+        from bocpy.behaviors import get_caller_module
+        src = ("def inner():\n"
+               "    return get_caller_module()\n"
+               "def outer():\n"
+               "    return inner()\n")
+        g = dict(module_globals)
+        g["get_caller_module"] = get_caller_module
+        exec(compile(src, "<exotic>", "exec"), g)
+        return g["outer"]()
+
+    def test_missing_name_falls_back_to_main(self):
+        name, file = self._call_from({})
+        assert name == "__main__"
+        assert file is None
+
+    def test_non_file_path_normalises_to_none(self):
+        name, file = self._call_from(
+            {"__name__": "weird", "__file__": "<stdin>"})
+        assert name == "weird"
+        assert file is None
+
+
+class TestSourcelessMainBehaviors:
+    """End-to-end behaviors defined in a ``__main__`` with no source file.
+
+    Covers the REPL / ``python -c`` / piped-stdin case where ``__main__``
+    has no readable file on disk, so the runtime reduces the live
+    namespace to its imports instead of parsing a file. A behavior
+    referencing an imported module must still resolve that module on a
+    worker.
+    """
+
+    def _run(self, args, stdin=None):
+        import subprocess
+        result = subprocess.run(
+            [sys.executable, *args],
+            input=stdin,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f"subprocess failed:\nSTDOUT:\n{result.stdout}\n"
+            f"STDERR:\n{result.stderr}"
+        )
+        return result.stdout
+
+    def test_dash_c_behavior_using_imported_module(self):
+        """``python -c`` (no ``__file__``) runs a behavior using ``math``."""
+        program = (
+            "import math\n"
+            "from bocpy import Cown, when, wait\n"
+            "c = Cown(9)\n"
+            "@when(c)\n"
+            "def root(c):\n"
+            "    return math.sqrt(c.value)\n"
+            "wait()\n"
+            "print('RESULT', root.unwrap())\n"
+        )
+        out = self._run(["-c", program])
+        assert "RESULT 3.0" in out
+
+    def test_piped_stdin_behavior_using_imported_module(self):
+        """Piped-stdin REPL (``__file__ == '<stdin>'``) runs a behavior."""
+        program = (
+            "import math\n"
+            "from bocpy import Cown, when, wait\n"
+            "c = Cown(21)\n"
+            "@when(c)\n"
+            "def dbl(c): return math.floor(c.value * 2.5)\n"
+            "\n"
+            "wait()\n"
+            "print('RESULT', dbl.unwrap())\n"
+        )
+        out = self._run([], stdin=program)
+        assert "RESULT 52" in out
+
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="readline is not part of the Windows stdlib",
+    )
+    def test_namespace_with_denied_repl_module(self):
+        """A denied REPL noise module is dropped, not propagated to a worker.
+
+        An interactive session injects modules the user never imported
+        (``readline``), and on pre-3.12 shared-GIL sub-interpreters
+        importing ``readline`` succeeds and blocks on the controlling
+        terminal. The synthesized bindings deny such modules outright, so
+        a behavior still resolves its real dependency (``math``).
+        """
+        program = (
+            "import readline\n"
+            "import math\n"
+            "from bocpy import Cown, when, wait\n"
+            "c = Cown(36)\n"
+            "@when(c)\n"
+            "def root(c):\n"
+            "    return math.sqrt(c.value)\n"
+            "wait()\n"
+            "print('RESULT', root.unwrap())\n"
+        )
+        out = self._run(["-c", program])
+        assert "RESULT 6.0" in out

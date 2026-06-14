@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bocpy"
-version = "0.10.0"
+version = "0.11.0"
 authors = [
     {name = "bocpy Team", email="bocpy@microsoft.com"}
 ]
@@ -89,7 +89,11 @@ bocpy-primes = "bocpy.examples.primes:main"
 bocpy-sketches = "bocpy.examples.sketches:main"
 
 [tool.setuptools]
-packages = ["bocpy", "bocpy.examples"]
+# ``packages`` is set in setup.py, not here, because the list is
+# build-conditional: the dev-only ``bocpy_test`` fixtures package is
+# appended for editable installs but gated out of distributed
+# wheels/sdists (mirroring the ``_internal_test`` C extension). See the
+# ``_packages`` comment in setup.py.
 include-package-data = false
 
 [tool.setuptools.package-dir]

@@ -148,7 +148,7 @@ def main():
     @when(onion, pepper, eggs, cheese, pan)
     def cook_omelette(onion: Cown[Ingredient], pepper: Cown[Ingredient],
                       eggs: Cown[Ingredient], cheese: Cown[Ingredient],
-                      pan: Cown[Cookware]):
+                      pan: Cown[Cookware], omelette=omelette):
         pan.value.cook(omelette, (onion.value, pepper.value, eggs.value, cheese.value))
 
     wait()

@@ -247,8 +247,8 @@ finalize.
   `.copilot/` or a sketch entry; otherwise git remembers.
 - **Apologetic stubs.** `# This is a stub; will be improved later.`
   If the function is a stub, that's already true.
-- **Generated-output noise** in transpiler tests and `export_module.py`
-  output that has been hand-copied into source comments.
+- **Generated-output noise** in transpiler tests — bindings-reducer output
+  that has been hand-copied into source comments.
 
 ## Guardrails
 
