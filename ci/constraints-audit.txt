@@ -143,9 +143,9 @@ charset-normalizer==3.4.7 \
     --hash=sha256:fbccdc05410c9ee21bbf16a35f4c1d16123dcdeb8a1d38f33654fa21d0234f79 \
     --hash=sha256:fea24543955a6a729c45a73fe90e08c743f0b3334bbf3201e6c4bc1b0c7fa464
     # via requests
-cyclonedx-python-lib==11.9.0 \
-    --hash=sha256:5d3b54834bbdfa2538b0e7eeda243f43c136d0a324d175fd8d6ec8685ee81f3c \
-    --hash=sha256:80620df4d11628458b7a17523b3f62be4663779babf51c82fe0ca7a32e3d0633
+cyclonedx-python-lib==11.10.0 \
+    --hash=sha256:d03d6ea271e26feaf123b8b1b34468a305f33a338c5763f56e397a8408f9b290 \
+    --hash=sha256:ffb9510b8d00a0896cfbe0a78b97c545d28f7d2a54e9d9dd5e5dc6e91ca9b375
     # via pip-audit
 defusedxml==0.7.1 \
     --hash=sha256:1bb3032db185915b62d7c6209c5a8792be6a32ab2fedacc84e01b52c51aa3e69 \
