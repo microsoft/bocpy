@@ -142,8 +142,8 @@ def test_dispatched_to_pending_increments_from_worker_dispatch():
     inners = [Cown(0) for _ in range(N)]
     for o, i in zip(outers, inners):
         @when(o)
-        def _(o):
-            @when(i)  # noqa: B023
+        def _(o, i=i):
+            @when(i)
             def _inner(i):
                 pass
 

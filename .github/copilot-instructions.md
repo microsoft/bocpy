@@ -21,8 +21,9 @@ User code (@when)
        │
        ▼
  Python layer (behaviors.py)
-   ├── @when decorator: captures closure vars, schedules behavior
-   │     directly from the caller's thread (no central queue hop)
+   ├── @when decorator: registers the behavior in the marshalled-code
+   │     registry and schedules it directly from the caller's thread
+   │     (no central queue hop)
    ├── Behaviors: runtime lifecycle, worker pool, terminator
    │     (no scheduler thread; scheduling and release run on the
    │      threads that need them — caller and worker)
@@ -33,8 +34,8 @@ User code (@when)
        │
        ▼
  Transpiler (transpiler.py)
-   └── AST transforms: extracts @when functions, rewrites closures
-       as explicit parameters, exports module for worker import
+   └── AST reduction: reduces __main__ to its bindings (imports,
+       classes, functions, constants) for worker import
        │
        ▼
  Worker (worker.py)
@@ -55,8 +56,10 @@ User code (@when)
 
 ### Key data flow
 
-1. `@when(cown_a, cown_b)` → transpiler extracts the decorated function and its
-   captured variables → exported as `__behavior__N` in a generated module.
+1. `@when(cown_a, cown_b)` decorates a function → `register_behavior`
+   content-addresses the code object into the marshalled-code registry under
+   a canonical hex key, and the trailing default-valued parameters are
+   snapshotted as captures.
 2. `whencall` (caller's thread) increments the C terminator and calls
    `_core.behavior_schedule`, which performs two-phase locking (2PL) over
    the sorted cown IDs in C, releasing the GIL across the lock-free link
@@ -64,8 +67,9 @@ User code (@when)
 3. When all cowns are acquired, `behavior_resolve_one` enqueues the
    `BehaviorCapsule` directly to the `boc_worker` queue — no central
    scheduler hop.
-4. A worker pops the capsule, executes `__behavior__N` with exclusive access
-   to the cowns, then on the same worker thread calls
+4. A worker pops the capsule, resolves the behavior function from the
+   registry by its hex key (via the per-interpreter `Resolver`), executes it
+   with exclusive access to the cowns, then on the same worker thread calls
    `behavior_release_all` (MCS unlink + handoff to the next behavior
    waiting on each cown) and `terminator_dec`.
 5. Releasing a cown may resolve the next waiting behavior, which is
@@ -80,7 +84,7 @@ User code (@when)
 |--------|---------|
 | `Cown[T]` | Typed wrapper for concurrently-owned data (with `.value` and `.exception` properties) |
 | `@when(*cowns)` | Schedule a behavior with exclusive access to the listed cowns |
-| `whencall(thunk, args, captures)` | Lower-level form of `@when` used by the transpiler; schedules a named thunk against cowns and capture values |
+| `whencall(func, args, captures)` | Lower-level form of `@when`; registers and schedules a behavior function against cowns and capture values |
 | `send(tag, contents)` | Send a message to a tag (lock-free) |
 | `receive(tags, timeout, after)` | Selective receive; blocks or times out |
 | `drain(tags)` | Clear all queued messages for the given tag(s) |
@@ -104,7 +108,7 @@ User code (@when)
 | `src/bocpy/__init__.py` | Public re-exports |
 | `src/bocpy/__init__.pyi` | Type stubs (Sphinx-style docstrings) |
 | `src/bocpy/behaviors.py` | `Cown`, `@when`, `Behaviors` scheduler, runtime lifecycle |
-| `src/bocpy/transpiler.py` | AST transformers for `@when` extraction and module export |
+| `src/bocpy/transpiler.py` | AST reduction of `__main__` to its bindings module for worker import |
 | `src/bocpy/worker.py` | Sub-interpreter worker loop |
 | `src/bocpy/_core.c` | Cown/behavior capsules, 2PL requests, MPSC message queues |
 | `src/bocpy/_math.c` | Dense matrix implementation |
@@ -184,39 +188,34 @@ C extensions are compiled by setuptools from `_core.c` and `_math.c` during
 `pip install`. Re-installing in a fresh venv triggers a rebuild against that
 interpreter's headers.
 
-## Inspecting Transpiler Output
+## Inspecting the Worker Bindings Module
 
-`@when` is implemented by an AST transformer (`src/bocpy/transpiler.py`) that
-extracts each decorated function into a top-level `__behavior__N` definition
-and rewrites the call site as `whencall('__behavior__N', cowns, captures)`.
-The captures tuple is built **at schedule time**, so loop variables are
-snapshotted by value. Two spellings of the loop-snapshot idiom are
-supported transparently: just reference the loop variable in the body, or
-write `def b(c, i=i)` and let the transpiler hoist the default into a
-capture. Trailing positional parameters beyond the cown count are also
-auto-captured by name (`def b(c, factor)` captures `factor`). The
-transpiler also recognises aliased decorators — `from bocpy import when as
-boc_when` and `import bocpy [as alias]` followed by `@bocpy.when(...)` or
-`@alias.when(...)` — provided the aliasing import is at module level.
+`@when` is a **runtime decorator** (`src/bocpy/behaviors.py`). It content-
+addresses the decorated function's code object into the marshalled-code
+registry and dispatches it to workers by hex key — there is no
+`__behavior__N` extraction or call-site rewriting any more.
 
-When debugging behavior dispatch, capture resolution, parameter-count
-mismatches, or anything else that depends on the transpiler's output, use the
-`export_module.py` tool at the repo root:
+Captures are the decorated function's **trailing parameters**: every
+parameter beyond the cown count must carry a default value, and those
+defaults are snapshotted at schedule time (so `def b(c, i=i)` captures the
+loop value). A capture-count mismatch raises `TypeError` at decoration.
 
-```bash
-python export_module.py path/to/your_module.py -o .copilot/export.py
-cat .copilot/export.py
+The transpiler (`src/bocpy/transpiler.py`) now only reduces the `__main__`
+module to a **bindings module** — its imports, classes, module-level
+functions, and UPPERCASE constants — which worker sub-interpreters import so
+a behavior's free globals resolve. It no longer rewrites call sites or
+extracts behaviors.
+
+To inspect that bindings module, call `bind_file` in a REPL:
+
+```python
+from bocpy.transpiler import bind_file
+print(bind_file("path/to/your_module.py").code)
 ```
 
-The exported module is exactly what worker interpreters import. It shows:
-
-- which names are behavior parameters vs. captures,
-- the order of arguments to each `whencall(...)`,
-- how class/function references are resolved at module level, and
-- how `__file__` and module dunders are rewritten.
-
-Reach for this tool whenever a `@when` body misbehaves in a way that is not
-explained by the source as written.
+The bindings module is exactly what worker interpreters import. Reach for it
+whenever a behavior's global, class, or constant fails to resolve on a
+worker in a way that is not explained by the source as written.
 
 ---
 

@@ -37,8 +37,8 @@ def _read_back(cowns):
     readers = []
     for idx, c in enumerate(cowns):
         @when(c)
-        def _(c):
-            return (idx, c.value.count)  # noqa: B023
+        def _(c, idx=idx):
+            return (idx, c.value.count)
         readers.append(_)
     return readers
 
@@ -445,8 +445,8 @@ class TestWorkerErrorPath:
         readers = []
         for i, c in enumerate(followup_cowns):
             @when(c)
-            def _(c):
-                return i  # noqa: B023
+            def _(c, i=i):
+                return i
             readers.append(_)
 
         quiesce(QUIESCE_TIMEOUT)

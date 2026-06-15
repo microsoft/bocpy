@@ -44,7 +44,7 @@ jobs:
       - name: Run flake8
         # ``--filename`` opts the walker into .pyi stubs, which flake8
         # otherwise skips silently (default is ``*.py`` only).
-        run: flake8 --filename='*.py,*.pyi' src/bocpy test examples scripts
+        run: flake8 --filename='*.py,*.pyi' src/bocpy src/bocpy_test test examples scripts
 
   docs:
     runs-on: ubuntu-latest

@@ -210,4 +210,5 @@ __marimo__/
 .env*
 .vscode
 .copilot
+.sketches
 results

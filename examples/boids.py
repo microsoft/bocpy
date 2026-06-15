@@ -190,7 +190,8 @@ class CellData(NamedTuple("CellData", [("cell", Cell), ("boids", tuple[int]),
         num_boids = len(boids)
         if num_boids == 1:
             @when(self.positions, self.velocities)
-            def single_cell(positions: Cown[Matrix], velocities: Cown[Matrix]):
+            def single_cell(positions: Cown[Matrix], velocities: Cown[Matrix],
+                            height=height, width=width):
                 pos = positions.value
                 vel = velocities.value
                 limit_speed(vel)
@@ -201,7 +202,8 @@ class CellData(NamedTuple("CellData", [("cell", Cell), ("boids", tuple[int]),
             return single_cell
 
         @when(positions, velocities)
-        def multi_cell(positions: list[Cown[Matrix]], velocities: list[Cown[Matrix]]):
+        def multi_cell(positions: list[Cown[Matrix]], velocities: list[Cown[Matrix]],
+                       height=height, num_boids=num_boids, width=width):
             batch_positions = Matrix.concat([c.value for c in positions])
             batch_velocities = Matrix.concat([c.value for c in velocities])
 
@@ -332,7 +334,7 @@ class Simulation:
         self.num_behaviors = len(cells)
 
         @when(results, self.positions_cown, self.velocities_cown)
-        def _writeback(per_cell, all_pos, all_vel):
+        def _writeback(per_cell, all_pos, all_vel, boid_indices=boid_indices):
             pos_mat = all_pos.value
             vel_mat = all_vel.value
             for boids, result in zip(boid_indices, per_cell):

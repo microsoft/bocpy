@@ -1,3 +1,93 @@
+## 2026-06-14 - Version 0.11.0
+A behavior-dispatch release. `@when` becomes a **runtime decorator backed by
+a content-addressed marshalled-code registry** instead of a transpile-time
+call-site rewrite. A behavior's code object is marshalled once, stored under a
+hex content-hash key, and resolved by value inside each worker
+sub-interpreter — so behaviors may now live in **any importable module**, not
+just `__main__`. The transpiler shrinks to a bindings reducer that exposes the
+defining module's imports, classes, functions, and constants to workers, and
+captures are now declared explicitly as trailing default parameters.
+
+**New Features**
+
+- **Cross-module behaviors** — a `@when` body defined in any importable
+  module now resolves on workers via the marshalled-code registry, lifting
+  the previous `__main__`-only restriction. A new worker-importable
+  `bocpy_test` fixtures package exercises cross-module resolution, dunder
+  handling, key collisions, and chained-global cases.
+- **Behaviors in the REPL, `python -c`, and piped stdin** — a `@when` body
+  defined in a `__main__` with no source file on disk now runs on workers.
+  The runtime reduces the live interactive namespace to its imported modules
+  (each guarded so an environment module that cannot load in a
+  sub-interpreter, such as `readline`, is skipped rather than fatal), and an
+  interactive behavior is validated at decoration to reference only builtins,
+  imported modules, and explicit captures.
+- **`whencall(func, args, captures)`** — the lower-level escape hatch behind
+  `@when`: registers a behavior function against cowns and explicit capture
+  values without the decorator sugar.
+
+**Breaking Changes**
+
+- **`@when` behaviors must declare their captures explicitly.** Implicit
+  capture of enclosing-scope variables as free variables is no longer
+  supported: a `@when` body may only reference its cown parameters, the
+  values it captures as trailing parameters, and names resolvable at the
+  defining module's scope (imports, module-level classes/functions,
+  constants, and builtins). Capture an enclosing local by adding a
+  trailing parameter with a same-named default — the canonical
+  `name=name` recipe:
+
+  ```python
+  # before — factor captured implicitly from the enclosing frame
+  @when(x)
+  def b(x):
+      return x.value * factor
+
+  # after — factor captured explicitly
+  @when(x)
+  def b(x, factor=factor):
+      return x.value * factor
+  ```
+
+  The loop-snapshot form `def b(c, i=i)` and the rename form
+  `def b(c, x=y)` continue to work unchanged. This is the migration that
+  lets a behavior's code object be marshalled and resolved by value
+  across worker sub-interpreters.
+
+**Improvements**
+
+- **Decoration-time capture validation** — `@when` now rejects malformed
+  behaviors where the mistake is made, with actionable messages: a bare
+  trailing parameter (no default) raises `TypeError` naming the cown/param
+  counts; a body closing over an enclosing-function local raises
+  `SyntaxError` naming the variable and suggesting the `name=name` fix; and
+  `async def` / generator behaviors raise `SyntaxError`. Computed defaults
+  (`k=expensive()`) are allowed and snapshotted once at schedule time.
+- **Interactive traceback labels** — behaviors defined interactively are
+  relabelled `<behavior:hash>` so two distinct interactive behaviors no
+  longer collide under a shared `<stdin>` / `<string>` filename.
+
+**Documentation**
+
+- Reworded the :doc:`c_abi` and `messaging` pages and the downstream
+  consumer template to describe the **worker bindings module** and bindings
+  reducer, replacing the retired transpile-and-rewrite vocabulary.
+
+**Tests**
+
+- New `test_registry.py` covering registry round-trips, key derivation,
+  capture validation, and `Resolver` dispatch. `test_transpiler.py` rewritten
+  for the bindings reducer; the dead constant-tracking machinery and its
+  tests were removed.
+
+**Internal**
+
+- New `boc_registry.c` / `boc_registry.h` C subsystem storing marshalled code
+  objects under opaque hex keys. The transpiler is reduced to a bindings
+  reducer (`MainBindings` / `bind_*`); the legacy call-site rewriter, skeleton
+  fallback, and `export_module.py` were removed in a clean cut. Behavior keys
+  are content-addressed with length-prefixed framing and 128-bit truncation.
+
 ## 2026-06-08 - Version 0.10.0
 A result-reading and documentation release. `Cown.unwrap()` replaces
 ad-hoc context-manager reads of behavior results with a single

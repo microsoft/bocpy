@@ -236,16 +236,15 @@ In practice this means:
   — the pickle fallback cannot resolve them by qualified name from any
   interpreter, and they have no XIData handler.
 
-Inside ``@when`` behaviors the :ref:`transpiler <api>` handles the
-import-side of this automatically: it rewrites the decorated module so
-each worker imports the same set of names the caller had in scope, and
-any class referenced by a behavior is therefore resolvable on the worker
-side. When you use ``send`` / ``receive`` from a *plain* thread, a
-sub-interpreter spawned outside the behavior runtime, or from inside a
-behavior body but with a type that was not part of the captured
-environment, **you are responsible for ensuring the class is importable
-on the receiver** (or for registering an XIData handler that bypasses
-pickle entirely).
+Inside ``@when`` behaviors the runtime handles the import-side of this
+automatically: each worker imports the same module-level names the caller
+had in scope (its imports, classes, functions, and constants), so any
+class referenced by a behavior is resolvable on the worker side. When you
+use ``send`` / ``receive`` from a *plain* thread, a sub-interpreter spawned
+outside the behavior runtime, or from inside a behavior body but with a
+type that was not part of the captured environment, **you are responsible
+for ensuring the class is importable on the receiver** (or for registering
+an XIData handler that bypasses pickle entirely).
 
 The simplest way to satisfy the pickle path is to define message payload
 types at module scope in a module that every participating interpreter

@@ -1305,28 +1305,25 @@ def when(*cowns):
 
     This decorator takes a list of zero or more cown objects, which will be
     passed in the order in which they were provided to the decorated function.
-    The function itself is extracted and run as a behavior once all the cowns
-    are available (i.e., not acquired by other behaviors).  Behaviors are
-    scheduled such that deadlock will not occur.
+    The function is registered at decoration time and run as a behavior once
+    all the cowns are available (i.e., not acquired by other behaviors).
+    Behaviors are scheduled such that deadlock will not occur.
 
     The function itself will be replaced by a :class:`Cown` which will hold
     the result of executing the behavior.  This :class:`Cown` can be used for
     further coordination.
 
-    Decorators **below** ``@when`` compose with the behavior body and run
-    on the worker (e.g. ``@when(x) @my_decorator def f(x): ...``).
-    Decorators **above** ``@when`` are not supported and will raise a
-    ``SyntaxError`` at transpile time.  ``async def`` functions are also
-    rejected — there is no event loop on workers to drive coroutines.
-    ``@staticmethod`` / ``@classmethod`` / ``@property`` below ``@when``
-    are also rejected because the generated behavior runs as a
-    module-level function, where these descriptors are not callable.
+    A behavior runs in a separate interpreter, so it **cannot capture values
+    by closure**. Every parameter beyond the cown count must be a *capture*:
+    a trailing parameter carrying a default value, which is snapshotted at
+    schedule time. Use the ``x=x`` idiom to capture a surrounding value (for
+    example a loop variable: ``def b(c, i=i): ...``). A bare extra parameter
+    (``def b(c, factor): ...``) or a closure over a free variable raises an
+    error at decoration time, naming the offending value.
 
-    .. note::
-
-       The transpiler matches ``@when`` by literal name. Aliasing the
-       import (``from bocpy import when as boc_when``) is not
-       supported — the rewrite will not fire and the worker will fail.
+    ``async def`` and generator functions are rejected — there is no event
+    loop on workers to drive coroutines, and a behavior runs to completion as
+    a plain function.
 
     :param cowns: Zero or more :class:`Cown` objects or ``list[Cown]`` groups
         to acquire before running the decorated function.  Each argument
@@ -1365,17 +1362,25 @@ def start(**kwargs):
     """
 
 
-def whencall(thunk: str, args: list[Union[Cown, list[Cown]]], captures: list[Any]) -> Cown:
-    """Invoke a behavior by name with cown args and captured values.
+def whencall(func: Callable[..., Any], args: list[Union[Cown, list[Cown]]], captures: list[Any]) -> Cown:
+    """Schedule ``func`` as a behavior over ``args`` with ``captures``.
 
-    :param thunk: The name of the exported behavior function to call.
-    :type thunk: str
+    ``whencall`` is the explicit escape hatch for scheduling a
+    behavior without the :func:`when` decorator. ``func`` is registered
+    under the marshalled-code registry's canonical key and scheduled over
+    the cowns in ``args``. Passing a string raises a migration
+    ``TypeError``: the old dispatch-by-thunk-name form was removed when
+    ``@when`` became a runtime decorator.
+
+    :param func: The behavior function object to schedule.
+    :type func: Callable[..., Any]
     :param args: The cown arguments (or lists of cowns) to pass.
     :type args: list[Union[Cown, list[Cown]]]
     :param captures: Closed-over values to pass to the behavior.
     :type captures: list[Any]
     :return: A :class:`Cown` that will hold the behavior's return value.
     :rtype: Cown
+    :raises TypeError: If ``func`` is a string (removed thunk-name form).
     """
 
 

@@ -1397,7 +1397,7 @@ class TestCross:
         other = Matrix(1, 4, [5.0, 6.0, 7.0, 8.0])
 
         @when(a)
-        def result(a):  # noqa: D401 — short behavior
+        def result(a, other=other):  # noqa: D401 — short behavior
             """Trigger a NotImplementedError from inside a behavior."""
             a.value.cross(other)
 
@@ -4645,7 +4645,7 @@ class TestVectorMethodsInCown:
         b = Matrix(1, 3, [4.0, 5.0, 6.0])
 
         @when(a)
-        def result(a):
+        def result(a, b=b):
             return a.value.vecdot(b)
 
         quiesce(QUIESCE_TIMEOUT)
@@ -4690,7 +4690,7 @@ class TestVectorMethodsInCown:
         b = Matrix(1, 3, [4.0, 5.0, 6.0])
 
         @when(a)
-        def result(a):
+        def result(a, b=b):
             out = a.value.cross(b)
             return (out[0, 0], out[0, 1], out[0, 2])
 

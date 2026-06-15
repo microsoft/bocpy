@@ -36,12 +36,27 @@ _build_internal_tests = (
     and not _building_distribution
 )
 
+# ``bocpy_test`` is a dev-only test-support package (third-party behavior
+# fixtures whose bodies must be importable on every interpreter, including
+# the worker sub-interpreters that run them). Installing it editably puts
+# it on the site/.pth-driven ``sys.path`` that fresh sub-interpreters
+# re-process at init, which a ``test/`` directory -- only on pytest's
+# main-interpreter path -- never achieves. Like ``_internal_test`` it must
+# NOT ship in distributed wheels/sdists, so it is added to ``packages``
+# only when setuptools is not producing a release artifact. ``pip install
+# -e .`` runs the PEP 660 ``editable_wheel`` command (not ``bdist_wheel``),
+# so the dev install still picks it up.
+_packages = ["bocpy", "bocpy.examples"]
+if not _building_distribution:
+    _packages.append("bocpy_test")
+
 _headers = [
     "src/bocpy/include/bocpy/bocpy.h",
     "src/bocpy/include/bocpy/xidata.h",
     "src/bocpy/boc_compat.h",
     "src/bocpy/boc_cown.h",
     "src/bocpy/boc_noticeboard.h",
+    "src/bocpy/boc_registry.h",
     "src/bocpy/boc_sched.h",
     "src/bocpy/boc_tags.h",
     "src/bocpy/boc_terminator.h",
@@ -93,7 +108,8 @@ _ext_modules = [
     Extension(
         name="bocpy._core",
         sources=["src/bocpy/_core.c", "src/bocpy/boc_compat.c", "src/bocpy/boc_noticeboard.c",
-                 "src/bocpy/boc_sched.c", "src/bocpy/boc_tags.c", "src/bocpy/boc_terminator.c"],
+                 "src/bocpy/boc_registry.c", "src/bocpy/boc_sched.c", "src/bocpy/boc_tags.c",
+                 "src/bocpy/boc_terminator.c"],
         depends=_headers,
         include_dirs=_include_dirs,
     ),
@@ -118,6 +134,7 @@ if _build_internal_tests:
                 "src/bocpy/_core.c",
                 "src/bocpy/boc_compat.c",
                 "src/bocpy/boc_noticeboard.c",
+                "src/bocpy/boc_registry.c",
                 "src/bocpy/boc_sched.c",
                 "src/bocpy/boc_tags.c",
                 "src/bocpy/boc_terminator.c",
@@ -131,4 +148,5 @@ setup(
     long_description=_readme,
     long_description_content_type="text/markdown",
     ext_modules=_ext_modules,
+    packages=_packages,
 )

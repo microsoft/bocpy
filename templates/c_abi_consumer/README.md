@@ -74,8 +74,8 @@ Two corollaries for downstream code:
    in the exec slot. Mirror this pattern for your own types.
 2. Any test or `@when`-scheduling code that reconstructs your types
    in a worker must contain a top-level `import` of your extension.
-   The transpiler propagates module-scope imports into worker
-   interpreters; runtime helpers like `pytest.importorskip` are
+   The worker bindings module propagates module-scope imports into
+   worker interpreters; runtime helpers like `pytest.importorskip` are
    invisible to it.
 
 See the bocpy C-ABI documentation ("Consumer modules and worker

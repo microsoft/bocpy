@@ -4,11 +4,11 @@
 # so the build resolves headers against the bocpy install actually
 # being tested. See README.md.
 #
-# The compatible-release bound (~=0.10) keeps the template aligned with
+# The compatible-release bound (~=0.11) keeps the template aligned with
 # the public C ABI it was authored against; bump it in lock-step with
 # ``[project].version`` in the root ``pyproject.toml`` (see the
 # ``finalize-pr`` skill).
-requires = ["setuptools", "wheel", "bocpy~=0.10"]
+requires = ["setuptools", "wheel", "bocpy~=0.11"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -16,4 +16,4 @@ name = "bocpy-c-abi-consumer"
 version = "0.0.0"
 description = "Smoke test and canonical downstream template for the bocpy public C ABI."
 requires-python = ">=3.10"
-dependencies = ["bocpy~=0.10"]
+dependencies = ["bocpy~=0.11"]

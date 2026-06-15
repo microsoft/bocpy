@@ -31,7 +31,7 @@ def parallel(n: int) -> Cown:
 def check(message: str, f: Cown, value: int):
     """Validate a computed Fibonacci value against the sequential result."""
     @when(f)
-    def do_check(f: Cown[int]):
+    def do_check(f: Cown[int], message=message, value=value):
         print(f"{message}: {f.value} (expected: {value})")
 
 

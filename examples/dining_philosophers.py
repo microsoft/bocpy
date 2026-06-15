@@ -30,7 +30,8 @@ class Philosopher(NamedTuple("Philosopher", [("index", int), ("left", Cown),
 
         # BOC acquires both forks atomically in cown-id order, so the classic deadlock cannot occur.
         @when(self.left, self.right, self.hunger)
-        def take_bite(left: Cown[Fork], right: Cown[Fork], hunger: Cown[int]):
+        def take_bite(left: Cown[Fork], right: Cown[Fork], hunger: Cown[int],
+                      index=index):
             left.value.use()
             right.value.use()
             print(f"Philosopher {index} has taken a bite")

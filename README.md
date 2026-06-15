@@ -200,7 +200,7 @@ def order_meal(exclude: str):
     order = Cown(None)
 
     @when(order)
-    def _(order):
+    def _(order, exclude=exclude):
         logger = logging.getLogger("greasy_spoon")
         logger.info("We have...")
         for dish in menu():

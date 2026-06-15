@@ -382,7 +382,7 @@ load the module inside worker sub-interpreters:
 
 A single-phase ``PyModule_Create`` module that registers from
 ``PyInit`` will load fine in the main interpreter but cannot satisfy
-``Py_MOD_PER_INTERPRETER_GIL_SUPPORTED``; if a transpiled ``@when``
+``Py_MOD_PER_INTERPRETER_GIL_SUPPORTED``; if a worker ``@when``
 body imports it, the worker sub-interpreter import will not run the
 registration and the consumer callback will see no type registered
 in its registry. See ``templates/c_abi_consumer/src/_bocpy_probe.c`` for
@@ -462,11 +462,11 @@ extension. Any consumer module whose XIData wrappers will travel into
 a ``@when`` body must be **imported at module scope** in the file the
 worker exec'd from.
 
-The transpiler propagates module-scope ``import`` statements into the
-exported per-worker module, but it does **not** see runtime imports
+The worker bindings module propagates module-scope ``import``
+statements, but it does **not** see runtime imports
 (``importlib.import_module(...)``, ``pytest.importorskip(...)``,
 ``__import__(...)`` from inside a function, …). A worker that imports
-the transpiled body without the consumer extension will load the
+the bindings module without the consumer extension will load the
 shared object via the OS loader but skip the per-interpreter exec
 slot, leaving its ``LOCAL_STATE`` (or equivalent module-state cache)
 NULL. The consumer callback will then segfault on the first reconstruction.
@@ -475,7 +475,7 @@ Practical rule for downstream authors:
 
 * Use a top-level ``import _your_extension`` in any test or example
   file that schedules ``@when`` bodies which observe your extension's
-  types. ``pytest.importorskip`` is not transpiler-visible.
+  types. ``pytest.importorskip`` is not visible to the bindings reducer.
 * Mirror the per-interpreter state pattern (heap-allocated type from
   ``PyType_FromModuleAndSpec``, per-module state, ``thread_local``
   cache primed in the exec slot) shown in

@@ -247,7 +247,7 @@ class TestNoticeboardBoundary:
         long_key = "k" * 63
 
         @when(x)
-        def step1(x):
+        def step1(x, long_key=long_key):
             notice_write(long_key, "ok")
 
         snap = quiesce(QUIESCE_TIMEOUT, noticeboard=True)
@@ -259,7 +259,7 @@ class TestNoticeboardBoundary:
         too_long = "k" * 64
 
         @when(x)
-        def probe(x):
+        def probe(x, too_long=too_long):
             notice_write(too_long, "fail")
 
         quiesce(QUIESCE_TIMEOUT)
@@ -367,7 +367,7 @@ class TestNoticeboardUTF8:
         key_63 = "a" * 60 + "€"
 
         @when(x)
-        def step1(x):
+        def step1(x, key_63=key_63):
             notice_write(key_63, "ok")
 
         snap = quiesce(QUIESCE_TIMEOUT, noticeboard=True)
@@ -379,7 +379,7 @@ class TestNoticeboardUTF8:
         key_64 = "a" * 61 + "€"
 
         @when(x)
-        def probe(x):
+        def probe(x, key_64=key_64):
             notice_write(key_64, "fail")
 
         quiesce(QUIESCE_TIMEOUT)

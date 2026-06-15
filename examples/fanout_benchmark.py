@@ -85,7 +85,7 @@ def schedule_child(consumer_cown: Cown, child_iters: int) -> None:
     :param child_iters: Inner-loop matmul iterations, captured.
     """
     @when(consumer_cown)
-    def _child(c):
+    def _child(c, child_iters=child_iters):
         for _ in range(child_iters):
             c.value = c.value @ c.value
 

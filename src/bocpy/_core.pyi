@@ -94,3 +94,38 @@ def physical_cpu_count() -> int:
     :return: Physical core count, or 0 on failure.
     :rtype: int
     """
+
+
+def registry_register(key: str, blob: bytes, module_name: str,
+                      source: str | None) -> str:
+    """Idempotently store a marshalled behavior under a canonical key.
+
+    The ``key`` is the recursive canonical content digest computed
+    in Python over the behavior code object's semantic fields; C
+    treats it as an opaque interned string. Writable from any
+    interpreter, including worker sub-interpreters scheduling nested
+    behaviors. Re-registering an existing key keeps the first stored
+    blob (intended dedup of structurally-identical behaviors).
+
+    :param key: Canonical hex key for the behavior.
+    :param blob: ``marshal.dumps`` of the behavior's code object.
+    :param module_name: Module the behavior's globals bind to.
+    :param source: Optional source text (stored only; not
+        rendered on the worker).
+    :return: The ``key``, unchanged.
+    :rtype: str
+    """
+
+
+def registry_lookup(key: str) -> tuple[bytes, str, str | None] | None:
+    """Look up a behavior by key, rebuilding objects in the caller.
+
+    Rebuilds fresh :class:`bytes` / :class:`str` in the calling
+    interpreter from the stored raw buffers (sub-interpreters share
+    the C heap but not Python objects).
+
+    :param key: Canonical hex key for the behavior.
+    :return: A ``(blob, module_name, source)`` tuple on a hit, or
+        ``None`` on a miss.
+    :rtype: tuple[bytes, str, str | None] | None
+    """

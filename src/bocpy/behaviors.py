@@ -11,10 +11,17 @@ C-level read-modify-write stays consistent without forcing behaviors
 to block on a mutex.
 """
 
+import builtins
+import dis
+import enum
+import hashlib
+import importlib
 import inspect
 import linecache
 import logging
+import marshal
 import os
+import struct
 import sys
 from textwrap import dedent
 import threading
@@ -24,7 +31,7 @@ from types import MappingProxyType
 from typing import Any, Callable, Generic, Mapping, NamedTuple, Optional, TypeVar, Union
 
 from . import _core, set_tags
-from .transpiler import BehaviorInfo, export_main, export_module_from_file
+from .transpiler import bind_file, bind_main
 
 try:
     import _interpreters as interpreters
@@ -142,7 +149,6 @@ class Cown(Generic[T]):
            bytes; the leak surface only applies to third-party code
            that calls ``pickle.dumps(cown)`` directly.
         """
-        logging.debug("initialising Cown with value: %r", value)
         if isinstance(value, _core.CownCapsule):
             self.impl = value
         else:
@@ -590,6 +596,94 @@ _WAIT_PUMP_POLL_MS = 50
 WORKER_MAIN_END = "# END boc_export"
 
 
+class BehaviorResolveError(RuntimeError):
+    """A registered behavior's defining module is not importable in a worker.
+
+    Raised by :class:`Resolver` when a behavior resolved from the
+    marshalled-code registry names a defining module that cannot be
+    imported in the worker sub-interpreter. The producing interpreter's
+    decoration-time ``find_spec`` check is necessary but not
+    authoritative (single-phase-init C extensions, divergent
+    ``sys.path``/cwd, import-time side effects), so this is the real
+    importability check. The original failure is chained via ``from``.
+    """
+
+
+class Resolver:
+    """Attribute proxy that resolves behavior thunks for one interpreter.
+
+    Wraps the interpreter's embedded bindings module. Attribute access
+    consults the marshalled-code registry: a thunk name is a registry
+    hex key, and the resolved function's globals bind into either the
+    bindings module's namespace (for ``__main__``- or bindings-targeted
+    behaviors) or the behavior's real defining module. A function
+    resolved from the registry is cached on the instance via
+    ``setattr``, so the next C-level ``PyObject_GetAttrString`` for the
+    same key hits it directly without re-entering :meth:`__getattr__`.
+    """
+
+    def __init__(self, bindings: types.ModuleType, modname: str):
+        """Wrap ``bindings`` for the interpreter named ``modname``.
+
+        :param bindings: The embedded bindings module whose namespace
+            backs ``__main__``- and bindings-targeted behaviors.
+        :type bindings: types.ModuleType
+        :param modname: The bindings module's name; behaviors whose
+            target module matches this (or ``__main__``) bind into the
+            bindings module's namespace rather than importing a separate
+            module.
+        :type modname: str
+        """
+        # Set on the instance dict, so neither attribute routes through
+        # __getattr__ (which only fires on a normal-lookup miss).
+        self._bindings = bindings
+        self._modname = modname
+
+    def __getattr__(self, name: str):
+        """Resolve ``name`` from the marshalled-code registry.
+
+        :param name: The behavior thunk name (a registry hex key).
+        :type name: str
+        :raises AttributeError: if ``name`` is not a registered key.
+        :raises BehaviorResolveError: if a registry-resolved behavior's
+            defining module cannot be imported in this interpreter.
+        """
+        entry = _core.registry_lookup(name)
+        if entry is None:
+            raise AttributeError(
+                f"no registered behavior for key {name!r}"
+            )
+        blob, target_modname, _source = entry
+        code = marshal.loads(blob)
+        module_dict = self._target_dict(name, target_modname)
+        fn = types.FunctionType(code, module_dict, name)
+        setattr(self, name, fn)
+        logging.debug("Resolver:registry-hit key=%s target=%s",
+                      name, target_modname)
+        return fn
+
+    def _target_dict(self, name: str, target_modname: str) -> dict:
+        """Return the global namespace a resolved behavior binds into.
+
+        :param name: The behavior thunk name (for the error message).
+        :type name: str
+        :param target_modname: The behavior's defining module name.
+        :type target_modname: str
+        :raises BehaviorResolveError: if ``target_modname`` is not the
+            bindings module and cannot be imported in this interpreter.
+        """
+        if target_modname in ("__main__", self._modname):
+            return self._bindings.__dict__
+        try:
+            module = importlib.import_module(target_modname)
+        except Exception as exc:
+            raise BehaviorResolveError(
+                f"behavior {name}: defining module {target_modname!r} is "
+                f"not importable in a worker sub-interpreter"
+            ) from exc
+        return module.__dict__
+
+
 class Behaviors:
     """Coordinator that starts workers and schedules behaviors."""
 
@@ -604,8 +698,7 @@ class Behaviors:
         self.worker_script = None
         self.classes = set()
         self.worker_threads = []
-        self.behavior_lookup: Mapping[int, BehaviorInfo] = {}
-        # Main-side namespace of transpiled __behavior__N thunks; pump resolves pinned bodies against it.
+        # Resolver that materialises behavior thunks from the registry; pump resolves pinned bodies against it.
         self.export_module: Optional[types.ModuleType] = None
         self.logger = logging.getLogger("behaviors")
         self.logger.debug("behaviors init")
@@ -627,37 +720,6 @@ class Behaviors:
         self._prior_bocmain: Optional[types.ModuleType] = None
         # (name, path) of the module pinned by start(); used to detect mismatched re-start requests.
         self._started_module: Optional[tuple[str, str]] = None
-
-    def lookup_behavior(self, line_number: int,  max_decorator_stack=32) -> BehaviorInfo:
-        """Resolve behavior info from a source line number.
-
-        ``behavior_lookup`` is keyed by the line of the ``@when(...)``
-        decorator as it appears in the AST. The runtime frame line we
-        get from ``inspect.currentframe().f_back.f_lineno`` depends on
-        the CPython version:
-
-        - Python >= 3.11 attributes each decorator's application to
-          that decorator's own source line, so the frame line equals
-          the lookup key.
-        - Python <= 3.10 attributes all decorator applications on a
-          ``def`` to the ``def`` line itself, so the frame line is
-          ``def_line``, which is ``len(decorators)`` greater than the
-          ``@when`` decorator's line.
-
-        Walking from ``line_number`` downward to the largest key
-        ``<= line_number`` covers both cases for any decorator stack
-        height. We bound the walk so a stale frame deep in unrelated
-        code cannot silently mis-resolve to a distant earlier
-        behavior.
-        """
-        if line_number in self.behavior_lookup:
-            return self.behavior_lookup[line_number]
-
-        for offset in range(1, max_decorator_stack + 1):
-            if line_number - offset in self.behavior_lookup:
-                return self.behavior_lookup[line_number - offset]
-
-        return None
 
     def teardown_workers(self):
         """Joins the worker threads and destroys the worker subinterpreters."""
@@ -918,10 +980,10 @@ class Behaviors:
         """Export the target module and spin up workers and the noticeboard thread.
 
         :param module: Optional ``(module_name, source_path)`` tuple
-            identifying the user module to transpile and export.
-            ``None`` (the default) exports ``__main__`` instead, which
-            is the case auto-triggered by the first ``@when`` call in a
-            script.
+            identifying the user module to reduce to its bindings and
+            export. ``None`` (the default) exports ``__main__`` instead,
+            which is the case auto-triggered by the first ``@when`` call
+            in a script.
         :type module: Optional[tuple[str, str]]
         """
         path = os.path.join(os.path.dirname(__file__), "worker.py")
@@ -931,11 +993,11 @@ class Behaviors:
 
         worker_script = worker_script.replace("logging.NOTSET", str(logging.getLogger().level))
 
-        if module is None:
-            export = export_main()
-            module_name = "__main__"
+        if module is None or module[1] is None:
+            # No source file on disk (REPL, ``python -c``, ``exec``):
+            # reduce the named module's live namespace instead of parsing.
+            module_name = "__main__" if module is None else module[0]
         else:
-            export = export_module_from_file(module[1])
             module_name = f"{module[0]}"
 
         # module_name is interpolated into worker source; reject non-dotted-identifier names to block injection.
@@ -945,12 +1007,24 @@ class Behaviors:
                 f"got {module_name!r}"
             )
 
-        self.behavior_lookup = export.behaviors
+        if module is None or module[1] is None:
+            export = bind_main(module_name)
+        else:
+            export = bind_file(module[1])
+
+        # A behavior reads module dunders (e.g. __package__) as globals,
+        # so the bindings module standing in for the user module on each
+        # interpreter must carry the producing module's __package__ value
+        # (a fresh ModuleType defaults it to None, which would not match).
+        producer_modname = "__main__" if module is None else module[0]
+        producer_mod = sys.modules.get(producer_modname)
+        producer_package = getattr(producer_mod, "__package__", None)
 
         main_export_name = f"__bocpy_main_export__{module_name}"
         main_export_file = f"<bocpy:main:{module_name}>"
         main_export = types.ModuleType(main_export_name)
         main_export.__file__ = main_export_file
+        main_export.__package__ = producer_package
         linecache.cache[main_export_file] = (
             len(export.code), None,
             export.code.splitlines(keepends=True),
@@ -961,9 +1035,10 @@ class Behaviors:
             compile(export.code, main_export_file, "exec"),
             main_export.__dict__,
         )
-        self.export_module = main_export
+        # The main interpreter resolves pinned/pump behaviors through the same registry-backed Resolver seam as workers.
+        self.export_module = Resolver(main_export, module_name)
 
-        # repr() embeds the transpiled source as a literal; repr(module_name) blocks quote/backslash break-out.
+        # repr() embeds the bindings-module source as a literal; repr(module_name) blocks quote/backslash break-out.
         src_literal = repr(export.code)
         bocmain_alias = "__bocmain__" if module_name == "__main__" else module_name
         sysmod_key = repr(bocmain_alias)
@@ -976,12 +1051,15 @@ class Behaviors:
             "import linecache",
             "import traceback as _bocpy_tb",
             "import types",
+            # Workers resolve thunks through the same Resolver seam as main.
+            "from bocpy.behaviors import Resolver",
             # Bind the module name outside the try so the diagnostic can name it even if the src literal fails.
             f"_bocpy_modname = {sysmod_key}",
             "try:",
             f"    _bocpy_src = {src_literal}",
             "    _bocpy_mod = types.ModuleType(_bocpy_modname)",
             f"    _bocpy_mod.__file__ = {linecache_key}",
+            f"    _bocpy_mod.__package__ = {producer_package!r}",
             (
                 "    linecache.cache["
                 f"{linecache_key}"
@@ -994,7 +1072,7 @@ class Behaviors:
                 f"{linecache_key}, 'exec'), _bocpy_mod.__dict__)"
             ),
             "    sys.modules[_bocpy_modname] = _bocpy_mod",
-            "    boc_export = _bocpy_mod",
+            "    boc_export = Resolver(_bocpy_mod, _bocpy_modname)",
             "except BaseException as _bocpy_boot_ex:",
             "    _bocpy_boot_msg = (",
             "        'worker bootstrap failed loading user module '",
@@ -1470,8 +1548,307 @@ class Behaviors:
         self.stop()
 
 
-def whencall(thunk: str, args: list[Union[Cown, list[Cown]]], captures: list[Any]) -> Cown:
-    """Invoke a behavior by name with cown args and captured values."""
+# Maps a behavior's (original code object, defining module) to its canonical
+# registry key. Hitting the memo skips re-marshalling, re-validating, and
+# re-interning a behavior already registered this session -- the hot path for
+# a behavior scheduled in a loop reuses one code object, so iter 2+ are free.
+# The module is part of the key because CPython code-object equality excludes
+# co_filename but includes co_firstlineno: two byte-identical bodies on the
+# same line of different modules are value-equal, so keying on the code object
+# alone would alias them and return the first module's key for the second.
+_CODE_KEY_MEMO: dict[tuple[types.CodeType, Optional[str]], str] = {}
+
+# Storing behavior source text is opt-in: capturing it costs a per-behavior
+# filesystem read and permanent registry retention, so set
+# ``BOCPY_STORE_BEHAVIOR_SOURCE=1`` to record it for future traceback display.
+_STORE_BEHAVIOR_SOURCE: bool = os.environ.get("BOCPY_STORE_BEHAVIOR_SOURCE") == "1"
+
+
+class Origin(enum.Enum):
+    """Where a behavior was defined, governing how a worker resolves it.
+
+    :cvar IMPORTABLE: Defined in a non-``__main__`` module that
+        ``importlib`` can find; a worker re-imports that module and binds
+        the behavior's globals to it.
+    :cvar MAIN_WITH_SOURCE: Defined in ``__main__`` backed by a readable
+        source file; a worker binds against the ``__main__`` bindings module.
+    :cvar INTERACTIVE: Defined with no importable/source-backed home
+        (REPL, ``exec`` of a string, a synthetic module). Subject to the
+        self-containment boundary so a worker can run it from builtins,
+        re-importable modules, and explicit captures alone.
+    """
+
+    IMPORTABLE = "importable"
+    MAIN_WITH_SOURCE = "main_with_source"
+    INTERACTIVE = "interactive"
+
+
+def _feed_code(digest, code: types.CodeType) -> None:
+    """Mix ``code``'s semantic fields into ``digest`` (recursing nested code).
+
+    Source-position fields (``co_filename``, ``co_firstlineno``, and the
+    line table) are deliberately excluded so a behavior's identity is
+    independent of where it was defined and of the interactive
+    ``co_filename`` relabel applied for traceback display.
+
+    Each variable-length field is length-prefixed so field boundaries
+    are unambiguous: two distinct ``(scalars, co_code, ...)`` splits can
+    never produce the same digest input stream.
+
+    Feeding constants through ``marshal.dumps`` makes the digest mildly
+    interning-sensitive (``marshal`` records a string's interned state in
+    its type byte). We accept this: the producer's key is authoritative
+    and travels with the dispatch capsule, so a worker resolves by it
+    rather than recomputing. The only recompute path (a nested ``@when``)
+    can at worst append a duplicate registry entry, freed at shutdown.
+    """
+    def _feed_bytes(data: bytes) -> None:
+        digest.update(struct.pack("<Q", len(data)))
+        digest.update(data)
+
+    for scalar in (code.co_argcount, code.co_posonlyargcount,
+                   code.co_kwonlyargcount, code.co_nlocals,
+                   code.co_stacksize, code.co_flags):
+        _feed_bytes(repr(scalar).encode("utf-8"))
+    _feed_bytes(code.co_code)
+    for names in (code.co_names, code.co_varnames,
+                  code.co_freevars, code.co_cellvars):
+        _feed_bytes(repr(names).encode("utf-8"))
+    _feed_bytes(code.co_name.encode("utf-8"))
+    # co_qualname is 3.11+; fall back to co_name on the 3.10 floor.
+    _feed_bytes(getattr(code, "co_qualname", code.co_name).encode("utf-8"))
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            digest.update(b"\x00<code>\x00")
+            _feed_code(digest, const)
+        else:
+            _feed_bytes(marshal.dumps(const))
+
+
+def _canonical_key(code: types.CodeType,
+                   target_modname: Optional[str] = None) -> str:
+    """Return the canonical content-addressed key for a behavior code object.
+
+    The key is a truncated SHA-256 over the code object's semantic
+    fields. It is identical on the producing and worker
+    interpreters, stable across the nested-``@when`` re-marshal, and
+    unchanged by the interactive ``co_filename`` relabel -- so the
+    ``<behavior:{key}>`` label baked into a relabelled blob equals the
+    registry key and the dispatch thunk by construction.
+
+    The digest is truncated to 32 hex chars (128 bits): wide enough that
+    a same-module body collision (the only class the keep-first registry
+    cannot detect) is far below any practical concern.
+
+    When ``target_modname`` is given it is mixed into the digest so the
+    *registry* key captures the resolution environment, not just the
+    code. A behavior's dispatch identity is its code **plus** the module
+    namespace its globals resolve against: two byte-identical bodies in
+    different modules are not interchangeable (each reads its own
+    module's globals), so they must key distinctly. Omitting the module
+    (the default) yields the pure code-identity key -- used to assert
+    that identity is independent of where a behavior was defined.
+    """
+    digest = hashlib.sha256()
+    _feed_code(digest, code)
+    if target_modname is not None:
+        digest.update(b"\x00<module>\x00")
+        digest.update(target_modname.encode("utf-8"))
+    return digest.hexdigest()[:32]
+
+
+def classify_behavior_origin(func) -> Origin:
+    """Classify where ``func`` was defined.
+
+    :returns: :attr:`Origin.IMPORTABLE` for a behavior in a non-main
+        module that ``importlib`` can locate (a decoration-time
+        importability check, refined authoritatively on the worker);
+        :attr:`Origin.MAIN_WITH_SOURCE` for a ``__main__`` behavior with
+        a readable source file; :attr:`Origin.INTERACTIVE` otherwise.
+    """
+    module = func.__module__
+    if module is not None and module != "__main__":
+        # If the module is already loaded in this interpreter, its
+        # globals are available here -- whether that is the real import
+        # (producer side) or a worker's synthetic bindings module (whose
+        # ``__spec__`` is None, which makes ``find_spec`` *raise*). Either
+        # way the behavior's globals resolve, so classify it importable.
+        # ``find_spec`` is only the fallback for a not-yet-imported
+        # module. The authoritative importability check happens on the
+        # worker in :meth:`Resolver._target_dict`.
+        if sys.modules.get(module) is not None:
+            return Origin.IMPORTABLE
+        try:
+            spec = importlib.util.find_spec(module)
+        except Exception:
+            # find_spec imports parent packages; a broken __init__ can
+            # raise any exception type. Classification is best-effort
+            # (the authoritative check runs on the worker), so never let
+            # it crash decoration -- fall back to interactive.
+            spec = None
+        if spec is not None:
+            return Origin.IMPORTABLE
+        return Origin.INTERACTIVE
+    filename = func.__code__.co_filename
+    if module == "__main__" and filename and os.path.isfile(filename):
+        return Origin.MAIN_WITH_SOURCE
+    return Origin.INTERACTIVE
+
+
+def _validate_behavior_shape(func) -> None:
+    """Reject behaviors a worker cannot run as a plain marshalled function.
+
+    Rejects ``async def`` / generator / coroutine bodies and any body
+    that closes over a free variable (the value would be lost crossing
+    the interpreter boundary), naming the offending variable and the
+    ``x=x`` capture fix.
+    """
+    code = func.__code__
+    bad_flags = (inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR
+                 | inspect.CO_ITERABLE_COROUTINE)
+    if code.co_flags & bad_flags:
+        raise SyntaxError(
+            f"@when behavior {code.co_name!r} is an async function; @when "
+            f"does not support async functions."
+        )
+    if code.co_flags & inspect.CO_GENERATOR:
+        raise SyntaxError(
+            f"@when behavior {code.co_name!r} is a generator function; @when "
+            f"does not support generator functions."
+        )
+    if code.co_freevars:
+        name = code.co_freevars[0]
+        raise SyntaxError(
+            f"@when behavior {code.co_name!r} closes over {name!r}; a "
+            f"behavior runs in another interpreter and cannot capture "
+            f"via closure. Pass it explicitly as a trailing parameter "
+            f"with a default, e.g. ``{name}={name}``."
+        )
+
+
+def _capture_names(func) -> set:
+    """Return the names of ``func``'s trailing default-valued parameters."""
+    code = func.__code__
+    n_defaults = len(func.__defaults__ or ())
+    argcount = code.co_argcount
+    return set(code.co_varnames[argcount - n_defaults:argcount])
+
+
+def _referenced_globals(code: types.CodeType) -> set:
+    """Return the set of global names ``code`` references (recursing nested).
+
+    Uses ``dis`` to read the operands of ``{LOAD,STORE,DELETE}_GLOBAL``
+    which yields the real global names -- unlike ``co_names``,
+    which also lists attribute names and would mistake ``math`` in
+    ``math.sqrt`` plus ``sqrt`` for two globals.
+    """
+    names = set()
+    for instr in dis.get_instructions(code):
+        if instr.opname in ("LOAD_GLOBAL", "STORE_GLOBAL", "DELETE_GLOBAL"):
+            names.add(instr.argval)
+    for const in code.co_consts:
+        if isinstance(const, types.CodeType):
+            names |= _referenced_globals(const)
+    return names
+
+
+def _validate_interactive_globals(func) -> None:
+    """Enforce the REPL/``exec`` self-containment boundary.
+
+    An :attr:`Origin.INTERACTIVE` behavior has no bindings module on the
+    worker, so it may reference only builtins, re-importable modules, and
+    its explicit captures. A reference to any other global (an
+    interactively-defined helper, class, or variable) is rejected at
+    decoration time, naming the symbol.
+    """
+    referenced = _referenced_globals(func.__code__)
+    fn_globals = func.__globals__
+    module_typed = {n for n in referenced
+                    if isinstance(fn_globals.get(n), types.ModuleType)}
+    allowed = set(dir(builtins)) | module_typed | _capture_names(func)
+    unresolved = referenced - allowed
+    if unresolved:
+        name = sorted(unresolved)[0]
+        raise NameError(
+            f"@when behavior references interactively-defined name "
+            f"{name!r}; move it into an importable module or pass it as "
+            f"a capture."
+        )
+
+
+def register_behavior(func) -> str:
+    """Marshal ``func`` into the registry and return its canonical key.
+
+    Idempotent and memoised on the behavior's original code object: a
+    repeat call (e.g. a loop body scheduled many times) returns the
+    cached key without re-validating or re-marshalling. On a first
+    sighting the behavior's shape is validated, its origin classified,
+    its canonical key computed from the *original* code, and -- for
+    interactive behaviors only -- its ``co_filename`` relabelled to
+    ``<behavior:{key}>`` for traceback display before marshalling. Any
+    available source text is stored alongside the blob (stored only; not
+    yet rendered on the worker).
+    """
+    orig = func.__code__
+    memo_key = (orig, func.__module__)
+    key = _CODE_KEY_MEMO.get(memo_key)
+    if key is not None:
+        return key
+
+    _validate_behavior_shape(func)
+    origin = classify_behavior_origin(func)
+    # A behavior whose globals lack ``__name__`` reports ``__module__`` as
+    # None; normalise it to ``__main__`` so the key folding and the C
+    # ``registry_register`` (which rejects a non-str module) stay consistent
+    # and the worker binds it to the bindings namespace like other
+    # source-less behaviors.
+    module_name = func.__module__ if func.__module__ is not None else "__main__"
+    # Fold the resolution-target module into the registry key: two
+    # byte-identical bodies in different modules resolve their globals
+    # against different namespaces, so they must key distinctly or the
+    # process-global append-only registry would bind the shared key to
+    # whichever module registered first and mis-resolve the rest.
+    key = _canonical_key(orig, module_name)
+
+    if origin is Origin.INTERACTIVE:
+        _validate_interactive_globals(func)
+        # Relabel the top-level frame for display only. The key was
+        # computed from orig and excludes co_filename, so the label
+        # equals the key and the dispatch thunk by construction.
+        code = orig.replace(co_filename=f"<behavior:{key}>")
+    else:
+        code = orig
+
+    source = None
+    if _STORE_BEHAVIOR_SOURCE:
+        try:
+            source = inspect.getsource(func)
+        except (OSError, TypeError):
+            source = None
+
+    _core.registry_register(key, marshal.dumps(code), module_name, source)
+    _CODE_KEY_MEMO[memo_key] = key
+    return key
+
+
+def whencall(func, args: list[Union[Cown, list[Cown]]], captures: list[Any]) -> Cown:
+    """Schedule ``func`` as a behavior over ``args`` with ``captures``.
+
+    ``func`` is the behavior function object; it is registered and
+    scheduled under the marshalled-code registry's canonical key.
+    Passing a string raises a migration ``TypeError`` -- the old
+    thunk-name form was removed when ``@when`` became a runtime
+    decorator. ``whencall`` remains the explicit escape hatch for
+    scheduling without the decorator.
+    """
+    if isinstance(func, str):
+        raise TypeError(
+            "whencall() takes a behavior function, not a thunk name. Pass "
+            "the @when-decorated function object directly; the string-thunk "
+            "form was removed when @when became a runtime decorator."
+        )
+
+    key = register_behavior(func)
     result = Cown(None)
 
     cowns = []
@@ -1493,11 +1870,7 @@ def whencall(thunk: str, args: list[Union[Cown, list[Cown]]], captures: list[Any
 
         group_id += 1
 
-    behavior = _core.BehaviorCapsule(thunk, result.impl, cowns, captures)
-    logging.debug(
-        "whencall:behavior=Behavior(thunk=%s, result=%r, args=%r, captures=%r)",
-        thunk, result, args, captures,
-    )
+    behavior = _core.BehaviorCapsule(key, result.impl, cowns, captures)
     # Take the terminator hold before scheduling so a concurrent stop()/terminator_close() refuses the schedule
     # rather than racing teardown; the matching dec runs on the worker thread once the body completes.
     if _core.terminator_inc() < 0:
@@ -1511,10 +1884,23 @@ def whencall(thunk: str, args: list[Union[Cown, list[Cown]]], captures: list[Any
 
 
 def get_caller_module():
-    """Get the caller's module name and file path."""
+    """Get the caller's module name and file path.
+
+    The file path is ``None`` for a caller with no source file on disk
+    (the REPL, ``python -c``, or an ``exec``-ed ``__main__``): a missing
+    ``__file__`` or one that is not a real file (e.g. ``<stdin>``)
+    normalises to ``None``, and the runtime then reduces the live
+    namespace instead of parsing a file.
+
+    A frame with no ``__name__`` (e.g. ``exec`` against empty globals)
+    falls back to ``"__main__"``, matching ``register_behavior``'s
+    treatment of a ``None`` ``func.__module__``.
+    """
     frame = inspect.currentframe().f_back.f_back
-    name = frame.f_globals["__name__"]
-    file = frame.f_globals["__file__"]
+    name = frame.f_globals.get("__name__", "__main__")
+    file = frame.f_globals.get("__file__")
+    if file is not None and not os.path.isfile(file):
+        file = None
     return (name, file)
 
 
@@ -1523,9 +1909,6 @@ def start(worker_count: Optional[int] = None,
     """Start the behavior runtime: worker pool plus noticeboard thread.
 
     Idempotent: bare ``start()`` on a running runtime is a silent no-op; mismatched ``worker_count``/``module`` raise.
-
-    The runtime distributes scheduling (2PL link/release) across
-    caller and worker threads; there is no central scheduler thread.
 
     The runtime distributes scheduling (2PL link/release) across
     caller and worker threads; there is no central scheduler thread.
@@ -1583,60 +1966,51 @@ def when(*cowns):
     """Decorator to schedule a function as a behavior using given cowns.
 
     This decorator takes a list of zero or more cown objects, which will be passed in the order
-    in which they were provided to the decorated function. The function itself is extracted and
-    run as a behavior once all the cowns are available (i.e., not acquired by other behaviors).
-    Behaviors are scheduled such that deadlock will not occur.
+    in which they were provided to the decorated function. The function is registered at
+    decoration time and run as a behavior once all the cowns are available (i.e., not acquired
+    by other behaviors). Behaviors are scheduled such that deadlock will not occur.
 
     The function itself will be replaced by a Cown which will hold the
     result of executing the behavior. This Cown can be used for further
     coordination.
 
-    The transpiler recognises module-level aliases for the decorator,
-    so ``from bocpy import when as boc_when`` and ``@boc_when(...)``,
-    as well as ``import bocpy [as alias]`` followed by
-    ``@bocpy.when(...)`` / ``@alias.when(...)``, are all supported.
-    Aliases declared inside a function body are not tracked.
+    A behavior runs in a separate interpreter, so it cannot capture values
+    by closure. Every parameter beyond the cown count must be a capture: a
+    trailing parameter with a default value, snapshotted at schedule time
+    (use the ``x=x`` idiom). A bare extra parameter or a closure over a free
+    variable raises an error at decoration time. ``@when`` is an ordinary
+    runtime decorator, so aliasing the import (``from bocpy import when as
+    boc_when``) works like any other name.
     """
 
     def when_factory(func):
-        when_frame = inspect.currentframe().f_back
-
         if BEHAVIORS is None and _core.is_primary():
             start(module=get_caller_module())
 
-        logging.debug("when:start")
-        binfo = BEHAVIORS.lookup_behavior(when_frame.f_lineno)
-        if binfo is None:
-            print("Behavior not found at line", when_frame.f_lineno)
-            print(BEHAVIORS.behavior_lookup)
-            return None
+        code = func.__code__
+        n_cowns = len(cowns)
+        n_params = code.co_argcount
+        defaults = func.__defaults__ or ()
+        n_captures = len(defaults)
 
-        logging.debug("when:behavior=%s", binfo)
-        captures = []
-        for name in binfo.captures:
-            frame = when_frame
-            found = False
-            while frame is not None:
-                if name in frame.f_locals:
-                    val = frame.f_locals[name]
-                    captures.append(val)
-                    found = True
-                    break
+        if n_params - n_cowns != n_captures:
+            if n_params < n_cowns:
+                raise TypeError(
+                    f"@when behavior {code.co_name!r} takes {n_params} "
+                    f"parameter(s) but @when lists {n_cowns} cown(s): add "
+                    f"the missing cown parameter(s) so each cown has a "
+                    f"corresponding positional parameter."
+                )
+            n_extra = n_params - n_cowns
+            raise TypeError(
+                f"@when behavior {code.co_name!r} takes {n_params} "
+                f"parameter(s) for {n_cowns} cown(s): the {n_extra} "
+                f"parameter(s) beyond the cown count must each be a "
+                f"capture with a default value (e.g. ``x=x``); got "
+                f"{n_captures} default(s)."
+            )
 
-                if name in frame.f_globals:
-                    val = frame.f_globals[name]
-                    captures.append(val)
-                    found = True
-                    break
-
-                frame = frame.f_back
-
-            if not found:
-                raise RuntimeError(f"Cannot resolve capture: {name}")
-
-        result = whencall(binfo.name, cowns, captures)
-
-        logging.debug("when:end")
+        result = whencall(func, list(cowns), list(defaults))
 
         return result
 

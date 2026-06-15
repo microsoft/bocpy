@@ -220,8 +220,8 @@ class TestPinnedCownsAutoDrain:
         pc = PinnedCown([])
         for i in range(4):
             @when(pc)
-            def _body(pc):
-                pc.value.append(i)  # noqa: B023
+            def _body(pc, i=i):
+                pc.value.append(i)
 
         @when(pc)
         def _final(pc):
@@ -248,7 +248,7 @@ class TestPinnedCownsAutoDrain:
         v_id = id(v)
 
         @when(pc)
-        def _body(pc):
+        def _body(pc, v_id=v_id):
             id_matches = id(pc.value) == v_id
             pc.value.append("post-acquire")
             return (id_matches, list(pc.value))
@@ -521,7 +521,7 @@ class TestPinnedRoundTrip:
         unrelated = Cown(0)
 
         @when(unrelated)
-        def _ship(u):
+        def _ship(u, pc=pc):
             @when(pc)
             def _on_main(pc):
                 pc.value.append("main-ran")
@@ -649,7 +649,7 @@ class TestPinnedRoundTrip:
         sentinel = PinnedCown(None)
 
         @when(sentinel)
-        def _inspect(_s):
+        def _inspect(_s, pc=pc):
             return sorted(pc.value)
 
         quiesce(QUIESCE_TIMEOUT)

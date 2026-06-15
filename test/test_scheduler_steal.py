@@ -69,7 +69,7 @@ def _fanout_kickoff(c_pin, work_cowns):
     steal from it.
     """
     @when(c_pin)
-    def _(c_pin):
+    def _(c_pin, work_cowns=work_cowns):
         for wc in work_cowns:
             @when(wc)
             def _(wc):
