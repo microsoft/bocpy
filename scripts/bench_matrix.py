@@ -298,6 +298,48 @@ def bench_vecdot(results: list[dict[str, float]]) -> None:
     _print_row(results[-1])
 
 
+def bench_fma(results: list[dict[str, float]]) -> None:
+    """Bench fma(b, c) vs a*b + c.
+
+    On the shipped x86-64 SSE2 build libc ``fma()`` is an unvectorisable
+    libcall, so ``a*b + c`` is expected to win on throughput there -- fma's
+    headline is accuracy (single rounding), not speed. A hardware-FMA host
+    (arm64, or x86-64 built with ``-mfma``) is where any throughput claim
+    must be measured.
+    """
+    _print_section("fma(b, c) vs a*b + c (accuracy primitive; libcall on SSE2)")
+
+    for rows, cols in [(1000, 3), (256, 256)]:
+        a = _make_matrix(rows, cols, seed=40)
+        b = _make_matrix(rows, cols, seed=41)
+        c = _make_matrix(rows, cols, seed=42)
+        label = f"{rows}x{cols}"
+        results.append(measure(
+            f"fma(b, c)              matrix b,c {label}",
+            lambda a=a, b=b, c=c: a.fma(b, c),
+        ))
+        _print_row(results[-1])
+        results.append(measure(
+            f"a*b + c                matrix b,c {label}",
+            lambda a=a, b=b, c=c: a * b + c,
+        ))
+        _print_row(results[-1])
+
+    a = _make_matrix(256, 256, seed=40)
+    b = _make_matrix(256, 256, seed=41)
+    c = _make_matrix(256, 256, seed=42)
+    results.append(measure(
+        "fma(b, c, in_place)    matrix b,c 256x256",
+        lambda a=a, b=b, c=c: a.fma(b, c, in_place=True),
+    ))
+    _print_row(results[-1])
+    results.append(measure(
+        "fma(2.0, 1.0)          scalar b,c 256x256",
+        lambda a=a: a.fma(2.0, 1.0),
+    ))
+    _print_row(results[-1])
+
+
 def bench_cross(results: list[dict[str, float]]) -> None:
     """Bench cross across scalar and batch shapes."""
     _print_section("cross at 1x3, 1000x2 (2D row batch), 1000x3 (3D row batch), 3x1000 (3D col batch)")
@@ -624,22 +666,79 @@ def bench_transpose(results: list[dict[str, float]]) -> None:
     _print_row(results[-1])
 
 
-def bench_select(results: list[dict[str, float]]) -> None:
-    """Bench row and column gather across small and large index lists."""
-    _print_section("select (row / column gather)")
+def bench_take(results: list[dict[str, float]]) -> None:
+    """Bench row and column gather across wide, narrow, and column cases.
+
+    The shared ``gather_axis`` helper copies each selected row with
+    ``memcpy`` (source and destination rows are both contiguous); the
+    wide row case (1000x100) is where that path dominates. The narrow-C
+    row case (1000x3) isolates the per-index unbox + bounds-check cost,
+    a larger fraction of the work when each copied row is short. Column
+    gather stays element-wise (inherently strided) and confirms no
+    regression there.
+    """
+    _print_section("take (row / column gather)")
 
     shape = (1000, 100)
     m = _make_matrix(*shape, seed=108)
     row_idx = list(range(0, 1000, 10))
     col_idx = list(range(0, 100, 2))
     results.append(measure(
-        f"select rows (100/1000)  shape={shape}",
-        lambda m=m, i=row_idx: m.select(i, 0),
+        f"take rows (100/1000)    shape={shape}",
+        lambda m=m, i=row_idx: m.take(i, 0),
     ))
     _print_row(results[-1])
     results.append(measure(
-        f"select cols (50/100)    shape={shape}",
-        lambda m=m, i=col_idx: m.select(i, 1),
+        f"take cols (50/100)      shape={shape}",
+        lambda m=m, i=col_idx: m.take(i, 1),
+    ))
+    _print_row(results[-1])
+
+    narrow = _make_matrix(1000, 3, seed=51)
+    results.append(measure(
+        "take rows (narrow C)    shape=(1000, 3) -> 100 rows",
+        lambda m=narrow, i=row_idx: m.take(i, 0),
+    ))
+    _print_row(results[-1])
+
+
+def bench_scatter(results: list[dict[str, float]]) -> None:
+    """Bench list-key scatter assignment (rows vs columns, fill vs matrix).
+
+    Row scatter writes each selected destination row with a contiguous
+    ``memcpy`` (the headline write-side path); column scatter is strided.
+    The augmented ``m[[...]] += v`` case measures the gather -> in-place op
+    -> scatter triple pass against the plain single scatter; if that ratio
+    is large *and* the form is hot, that is the signal to revisit the
+    deferred fused single-pass kernel.
+    """
+    _print_section("scatter (row / column assignment)")
+
+    shape = (1000, 100)
+    row_idx = list(range(0, 1000, 10))
+    col_idx = list(range(0, 100, 2))
+    rows_rhs = _make_matrix(len(row_idx), 100, seed=110)
+    cols_rhs = _make_matrix(1000, len(col_idx), seed=111)
+
+    m = _make_matrix(*shape, seed=112)
+    results.append(measure(
+        f"scatter rows = scalar    shape={shape}",
+        lambda m=m, i=row_idx: m.__setitem__(i, 0.5),
+    ))
+    _print_row(results[-1])
+    results.append(measure(
+        f"scatter rows = matrix    shape={shape} (memcpy)",
+        lambda m=m, i=row_idx, v=rows_rhs: m.__setitem__(i, v),
+    ))
+    _print_row(results[-1])
+    results.append(measure(
+        f"scatter cols = matrix    shape={shape} (strided)",
+        lambda m=m, i=col_idx, v=cols_rhs: m.__setitem__((slice(None), i), v),
+    ))
+    _print_row(results[-1])
+    results.append(measure(
+        f"scatter rows += scalar   shape={shape} (triple pass)",
+        lambda m=m, i=row_idx: m.__setitem__(i, m[i] + 0.5),
     ))
     _print_row(results[-1])
 
@@ -827,7 +926,8 @@ def main(argv: list[str] | None = None) -> int:
     bench_binary_arithmetic(results)
     bench_matmul(results)
     bench_transpose(results)
-    bench_select(results)
+    bench_take(results)
+    bench_scatter(results)
     bench_copy_clip_allclose(results)
     bench_construction(results)
     bench_factories(results)
@@ -836,6 +936,7 @@ def main(argv: list[str] | None = None) -> int:
     bench_magnitude_squared(results)
     bench_negate(results)
     bench_vecdot(results)
+    bench_fma(results)
     bench_cross(results)
     bench_normalize(results)
     bench_perpendicular(results)

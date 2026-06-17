@@ -1,6 +1,7 @@
 """Tests for the bocpy Matrix class using fuzzed inputs across multiple sizes."""
 
 import copy
+from fractions import Fraction
 import math
 import pickle
 import random
@@ -12,6 +13,21 @@ import pytest
 from bocpy import Cown, Matrix, quiesce, wait, when
 
 QUIESCE_TIMEOUT = 5
+
+
+def ref_fma(a, b, c):
+    """Correctly-rounded ``a * b + c`` reference, matching C99 ``fma``.
+
+    ``math.fma`` is only available on CPython 3.13+, but the suite must run
+    on the supported 3.10-3.12 legs too. Exact rational arithmetic followed
+    by a single round-to-nearest (``float(Fraction)`` rounds half-to-even,
+    the same rule as IEEE-754) reproduces the single-rounding ``fma`` result
+    bit-for-bit for finite operands whose exact ``a * b + c`` lies within
+    double's range. (An exact result above ``DBL_MAX`` raises ``OverflowError``
+    here where C99 ``fma`` returns an infinity; the test inputs stay well
+    inside range, so this boundary never bites.)
+    """
+    return float(Fraction(a) * Fraction(b) + Fraction(c))
 
 
 MATRIX_SIZES = [
@@ -395,7 +411,7 @@ class TestOneByOneBroadcast:
         """``1x1 op= MxN`` would change the operand shape and is rejected."""
         a = Matrix(1, 1, 5.0)
         b = Matrix(2, 3, [1, 2, 3, 4, 5, 6])
-        with pytest.raises(NotImplementedError,
+        with pytest.raises(ValueError,
                            match="in-place scalar broadcast"):
             a += b
 
@@ -640,7 +656,7 @@ class TestMagnitudeSquared:
 
     def test_invalid_axis_raises(self, mat):
         """Out-of-range axis surfaces the same error as `magnitude`."""
-        with pytest.raises(NotImplementedError, match="axis must be -2, -1, 0, or 1"):
+        with pytest.raises(ValueError, match="axis must be -2, -1, 0, or 1"):
             mat.magnitude_squared(2)
 
 
@@ -766,21 +782,21 @@ class TestVecdot:
         """Mismatched vector lengths surface the dimension-mismatch error."""
         a = Matrix(1, 2, [1.0, 2.0])
         b = Matrix(1, 3, [3.0, 4.0, 5.0])
-        with pytest.raises(NotImplementedError, match=r"vecdot: lhs \d+x\d+ incompatible with rhs \d+x\d+"):
+        with pytest.raises(ValueError, match=r"vecdot: lhs \d+x\d+ incompatible with rhs \d+x\d+"):
             a.vecdot(b)
 
     def test_incompatible_matrix_shapes_raises(self):
         """Incompatible matrix shapes (no broadcast match) surface the same error."""
         a = Matrix(2, 3, [1.0] * 6)
         b = Matrix(4, 5, [1.0] * 20)
-        with pytest.raises(NotImplementedError, match=r"vecdot: lhs \d+x\d+ incompatible with rhs \d+x\d+"):
+        with pytest.raises(ValueError, match=r"vecdot: lhs \d+x\d+ incompatible with rhs \d+x\d+"):
             a.vecdot(b)
 
     def test_invalid_axis_raises(self):
         """Out-of-range axis surfaces the same error as `magnitude`."""
         a = Matrix(1, 3, [1.0, 2.0, 3.0])
         b = Matrix(1, 3, [4.0, 5.0, 6.0])
-        with pytest.raises(NotImplementedError, match="axis must be -2, -1, 0, or 1"):
+        with pytest.raises(ValueError, match="axis must be -2, -1, 0, or 1"):
             a.vecdot(b, 2)
 
     def test_axis_wrong_type_raises(self):
@@ -878,6 +894,217 @@ class TestVecdot:
         a = Matrix(1, 3, [1.0, 2.0, 3.0])
         b = Matrix(1, 3, [4.0, 5.0, 6.0])
         assert a.vecdot(b, axis=None) == pytest.approx(a.vecdot(b))
+
+
+class TestFma:
+    """Tests for `fma(b, c, /, in_place=False)` single-rounding multiply-add."""
+
+    def test_exact_small(self):
+        """A hand-computed 2x2 matches a single-rounding fma cell-by-cell."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        b = Matrix(2, 2, [10.0, 20.0, 30.0, 40.0])
+        c = Matrix(2, 2, [0.5, 0.5, 0.5, 0.5])
+        out = a.fma(b, c)
+        for i in range(2):
+            for j in range(2):
+                assert out[i, j] == ref_fma(a[i, j], b[i, j], c[i, j])
+
+    def test_parity_same_shape(self, shape, rng):
+        """fma(b, c) is close to a*b + c for same-shape matrix operands."""
+        rows, cols = shape
+        n = rows * cols
+        a = Matrix(rows, cols, [rng.uniform(-100, 100) for _ in range(n)])
+        b = Matrix(rows, cols, [rng.uniform(-100, 100) for _ in range(n)])
+        c = Matrix(rows, cols, [rng.uniform(-100, 100) for _ in range(n)])
+        # One rounding vs two: compare with allclose, never ==.
+        assert Matrix.allclose(a.fma(b, c), a * b + c)
+
+    def test_exact_matches_math_fma_fuzz(self, shape, rng):
+        """Every cell of fma(b, c) equals a single-rounding reference fma."""
+        rows, cols = shape
+        n = rows * cols
+        av = [rng.uniform(-100, 100) for _ in range(n)]
+        bv = [rng.uniform(-100, 100) for _ in range(n)]
+        cv = [rng.uniform(-100, 100) for _ in range(n)]
+        a = Matrix(rows, cols, av)
+        b = Matrix(rows, cols, bv)
+        c = Matrix(rows, cols, cv)
+        out = a.fma(b, c)
+        for i in range(rows):
+            for j in range(cols):
+                k = i * cols + j
+                assert out[i, j] == ref_fma(av[k], bv[k], cv[k])
+
+    def test_scalar_both(self):
+        """Scalar b and c broadcast across every cell."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        out = a.fma(2.0, 1.0)
+        for i in range(2):
+            for j in range(2):
+                assert out[i, j] == ref_fma(a[i, j], 2.0, 1.0)
+
+    def test_scalar_1x1_is_scalar(self):
+        """A 1x1 matrix operand broadcasts like a scalar."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        b = Matrix(1, 1, [2.0])
+        c = Matrix(1, 1, [1.0])
+        out = a.fma(b, c)
+        for i in range(2):
+            for j in range(2):
+                assert out[i, j] == ref_fma(a[i, j], 2.0, 1.0)
+
+    def test_headline_mx_plus_b(self):
+        """The m*x + b headline form: full multiplier, scalar addend."""
+        m = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        x = Matrix(2, 3, [2.0, 2.0, 2.0, 3.0, 3.0, 3.0])
+        out = m.fma(x, 1.0)
+        assert Matrix.allclose(out, m * x + 1.0)
+
+    def test_mixed_scalar_b_matrix_c(self):
+        """A scalar b with a matrix c routes through the one kernel."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        c = Matrix(2, 2, [10.0, 20.0, 30.0, 40.0])
+        out = a.fma(2.0, c)
+        for i in range(2):
+            for j in range(2):
+                assert out[i, j] == ref_fma(a[i, j], 2.0, c[i, j])
+
+    def test_mixed_matrix_b_scalar_c(self):
+        """A matrix b with a scalar c routes through the one kernel."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        b = Matrix(2, 2, [10.0, 20.0, 30.0, 40.0])
+        out = a.fma(b, 3.0)
+        for i in range(2):
+            for j in range(2):
+                assert out[i, j] == ref_fma(a[i, j], b[i, j], 3.0)
+
+    def test_in_place_returns_self(self):
+        """in_place=True writes into self and returns it; b/c unchanged."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        b = Matrix(2, 2, [10.0, 20.0, 30.0, 40.0])
+        c = Matrix(2, 2, [0.5, 0.5, 0.5, 0.5])
+        b_before = [b[i, j] for i in range(2) for j in range(2)]
+        c_before = [c[i, j] for i in range(2) for j in range(2)]
+        expected = [ref_fma(a[i, j], b[i, j], c[i, j])
+                    for i in range(2) for j in range(2)]
+        out = a.fma(b, c, in_place=True)
+        assert out is a
+        assert [a[i, j] for i in range(2) for j in range(2)] == expected
+        assert [b[i, j] for i in range(2) for j in range(2)] == b_before
+        assert [c[i, j] for i in range(2) for j in range(2)] == c_before
+
+    def test_in_place_keyword_matches_copy(self, shape, rng):
+        """in_place result equals the copy result, leaving operands intact."""
+        rows, cols = shape
+        n = rows * cols
+        av = [rng.uniform(-50, 50) for _ in range(n)]
+        a_copy = Matrix(rows, cols, av)
+        a_ip = Matrix(rows, cols, av)
+        b = Matrix(rows, cols, [rng.uniform(-50, 50) for _ in range(n)])
+        c = Matrix(rows, cols, [rng.uniform(-50, 50) for _ in range(n)])
+        copied = a_copy.fma(b, c)
+        a_ip.fma(b, c, in_place=True)
+        assert Matrix.allclose(a_ip, copied)
+
+    def test_rejects_broadcast_b(self):
+        """A b matrix of incompatible shape raises ValueError."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        bad = Matrix(3, 3, [float(i) for i in range(9)])
+        with pytest.raises(ValueError,
+                           match=r"fma: b shape 3x3 incompatible with self 2x2"):
+            a.fma(bad, 1.0)
+
+    def test_rejects_broadcast_c(self):
+        """A c matrix of incompatible shape raises ValueError."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        bad = Matrix(1, 3, [1.0, 2.0, 3.0])
+        with pytest.raises(ValueError,
+                           match=r"fma: c shape 1x3 incompatible with self 2x2"):
+            a.fma(2.0, bad)
+
+    def test_rejects_broadcast_leaves_self_unmodified(self):
+        """A rejected operand allocates nothing and leaves self untouched."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        before = [a[i, j] for i in range(2) for j in range(2)]
+        bad = Matrix(3, 3, [float(i) for i in range(9)])
+        with pytest.raises(ValueError):
+            a.fma(2.0, bad, in_place=True)
+        assert [a[i, j] for i in range(2) for j in range(2)] == before
+
+    def test_rejects_bad_type_b(self):
+        """A non-numeric, non-matrix b raises TypeError."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        with pytest.raises(TypeError,
+                           match=r"fma: b must be a Matrix or a real number"):
+            a.fma("x", 1.0)
+
+    def test_rejects_bad_type_c(self):
+        """A non-numeric, non-matrix c raises TypeError."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        with pytest.raises(TypeError,
+                           match=r"fma: c must be a Matrix or a real number"):
+            a.fma(1.0, object())
+
+    def test_operand_aliases_self(self, shape, rng):
+        """fma(a, c), fma(b, a) and fma(a, a) read each cell only once."""
+        rows, cols = shape
+        n = rows * cols
+        av = [rng.uniform(-20, 20) for _ in range(n)]
+        cv = [rng.uniform(-20, 20) for _ in range(n)]
+        a1 = Matrix(rows, cols, av)
+        c1 = Matrix(rows, cols, cv)
+        # b aliases self.
+        assert Matrix.allclose(a1.fma(a1, c1), a1 * a1 + c1)
+        a2 = Matrix(rows, cols, av)
+        # c aliases self.
+        assert Matrix.allclose(a2.fma(c1, a2), c1 * a2 + a2)
+        a3 = Matrix(rows, cols, av)
+        # both operands alias self, in place.
+        ref = Matrix(rows, cols, av)
+        out = a3.fma(a3, a3, in_place=True)
+        assert out is a3
+        assert Matrix.allclose(a3, ref * ref + ref)
+
+    def test_keyword_in_place_false_is_copy(self):
+        """Explicit in_place=False returns a distinct matrix."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        before = [a[i, j] for i in range(2) for j in range(2)]
+        out = a.fma(2.0, 1.0, in_place=False)
+        assert out is not a
+        assert [a[i, j] for i in range(2) for j in range(2)] == before
+
+    def test_boc_roundtrip(self):
+        """fma runs inside a @when behavior over a Cown[Matrix]."""
+        a = Cown(Matrix(2, 2, [1.0, 2.0, 3.0, 4.0]))
+        b = Matrix(2, 2, [10.0, 20.0, 30.0, 40.0])
+        c = Matrix(2, 2, [0.5, 1.5, 2.5, 3.5])
+
+        @when(a)
+        def result(a, b=b, c=c):  # noqa: D401 — short behavior
+            """Compute fma inside a behavior and return the result."""
+            return a.value.fma(b, c)
+
+        wait()
+        assert result.exception is False
+        expected = Matrix(2, 2, [ref_fma(v, w, x) for v, w, x in zip(
+            [1.0, 2.0, 3.0, 4.0], [10.0, 20.0, 30.0, 40.0],
+            [0.5, 1.5, 2.5, 3.5])])
+        assert Matrix.allclose(result.value, expected)
+
+    def test_not_acquired_raises(self):
+        """fma on a cown-resident (unacquired) matrix raises RuntimeError."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        Cown(m)
+        with pytest.raises(RuntimeError):
+            m.fma(2.0, 1.0)
+
+    def test_operand_not_acquired_raises(self):
+        """An unacquired matrix operand raises RuntimeError."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        b = Matrix(2, 2, [10.0, 20.0, 30.0, 40.0])
+        Cown(b)
+        with pytest.raises(RuntimeError):
+            a.fma(b, 1.0)
 
 
 class TestCross:
@@ -1243,7 +1470,7 @@ class TestCross:
         """Cross is anticommutative; reverse broadcast (vec.cross(batch)) is rejected."""
         a = Matrix(1, 3, [1.0, 2.0, 3.0])
         b = Matrix(5, 3, [float(i) for i in range(15)])
-        with pytest.raises(NotImplementedError,
+        with pytest.raises(ValueError,
                            match=r"cross: .* incompatible with rhs \d+x\d+"):
             a.cross(b)
 
@@ -1251,7 +1478,7 @@ class TestCross:
         """Broadcast other must have the matching flat size (2 or 3)."""
         a = Matrix(5, 3, [float(i) for i in range(15)])
         b = Matrix(1, 2, [1.0, 2.0])
-        with pytest.raises(NotImplementedError,
+        with pytest.raises(ValueError,
                            match=r"cross: .* incompatible with rhs \d+x\d+"):
             a.cross(b)
 
@@ -1259,7 +1486,7 @@ class TestCross:
         """Non-vector other with matching size still rejected (no inferred shape)."""
         a = Matrix(5, 3, [float(i) for i in range(15)])
         b = Matrix(3, 3, [float(i) for i in range(9)])
-        with pytest.raises(NotImplementedError,
+        with pytest.raises(ValueError,
                            match=r"cross: .* incompatible with rhs \d+x\d+"):
             a.cross(b)
 
@@ -1358,36 +1585,36 @@ class TestCross:
 
     @pytest.mark.parametrize("rows,cols", [(1, 4), (4, 1), (1, 1), (1, 5), (4, 4), (4, 5)])
     def test_invalid_shape_raises(self, rows, cols):
-        """Shapes that aren't 1x2/2x1/Nx2/2xN/1x3/3x1/Nx3/3xN raise NotImplementedError."""
+        """Shapes that aren't 1x2/2x1/Nx2/2xN/1x3/3x1/Nx3/3xN raise ValueError."""
         n = rows * cols
         a = Matrix(rows, cols, [float(i) for i in range(n)])
         b = Matrix(rows, cols, [float(i + 1) for i in range(n)])
         with pytest.raises(
-                NotImplementedError,
+                ValueError,
                 match="cross requires a 2D or 3D vector or Nx2 or 2xN or Nx3 or 3xN matrix"):
             a.cross(b)
 
     def test_invalid_axis_raises(self):
-        """axis outside {None, 0, 1, -1, -2} raises NotImplementedError."""
+        """axis outside {None, 0, 1, -1, -2} raises ValueError."""
         a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
         b = Matrix(2, 2, [5.0, 6.0, 7.0, 8.0])
-        with pytest.raises(NotImplementedError,
+        with pytest.raises(ValueError,
                            match="axis must be -2, -1, 0, or 1"):
             a.cross(b, axis=2)
 
     def test_size_mismatch_scalar_2d_raises(self):
-        """2D-scalar self with size-3 other raises NotImplementedError."""
+        """2D-scalar self with size-3 other raises ValueError."""
         a = Matrix(1, 2, [1.0, 2.0])
         b = Matrix(1, 3, [3.0, 4.0, 5.0])
-        with pytest.raises(NotImplementedError,
+        with pytest.raises(ValueError,
                            match=r"cross: 2D vector lhs \d+x\d+ incompatible with rhs \d+x\d+"):
             a.cross(b)
 
     def test_size_mismatch_batch_raises(self):
-        """Batch self with mismatched-shape other raises NotImplementedError."""
+        """Batch self with mismatched-shape other raises ValueError."""
         a = Matrix(5, 3, [float(i) for i in range(15)])
         b = Matrix(7, 3, [float(i) for i in range(21)])
-        with pytest.raises(NotImplementedError,
+        with pytest.raises(ValueError,
                            match=r"cross: Nx3 batch lhs \d+x\d+ incompatible with rhs \d+x\d+"):
             a.cross(b)
 
@@ -1398,12 +1625,12 @@ class TestCross:
 
         @when(a)
         def result(a, other=other):  # noqa: D401 — short behavior
-            """Trigger a NotImplementedError from inside a behavior."""
+            """Trigger a ValueError from inside a behavior."""
             a.value.cross(other)
 
         wait()
         assert result.exception is True
-        assert isinstance(result.value, NotImplementedError)
+        assert isinstance(result.value, ValueError)
         assert "cross requires a 2D or 3D vector" in str(result.value)
 
 
@@ -1491,9 +1718,9 @@ class TestNormalize:
             assert v[0, 2] == 3.0
 
     def test_invalid_axis_raises(self, in_place_mode):
-        """axis=2 raises NotImplementedError with the canonical message."""
+        """axis=2 raises ValueError with the canonical message."""
         mat = Matrix(2, 2, [1.0, 0.0, 0.0, 1.0])
-        with pytest.raises(NotImplementedError,
+        with pytest.raises(ValueError,
                            match="axis must be -2, -1, 0, or 1"):
             mat.normalize(axis=2, in_place=in_place_mode)
 
@@ -1701,14 +1928,14 @@ class TestPerpendicular:
         """Any shape that is not a 2D vector or N-by-2/2-by-N raises."""
         n = rows * cols
         m = Matrix(rows, cols, [float(i) for i in range(n)])
-        with pytest.raises(NotImplementedError,
+        with pytest.raises(ValueError,
                            match="perpendicular requires a 2D vector or Nx2 or 2xN matrix"):
             m.perpendicular(in_place=in_place_mode)
 
     def test_invalid_axis_raises(self, in_place_mode):
-        """Out-of-range axis raises NotImplementedError."""
+        """Out-of-range axis raises ValueError."""
         m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
-        with pytest.raises(NotImplementedError,
+        with pytest.raises(ValueError,
                            match="axis must be -2, -1, 0, or 1"):
             m.perpendicular(axis=2, in_place=in_place_mode)
 
@@ -1844,17 +2071,17 @@ class TestAngle:
 
     @pytest.mark.parametrize("rows,cols", [(3, 3), (1, 5), (5, 1), (3, 4), (1, 1)])
     def test_invalid_shape_raises(self, rows, cols):
-        """Non 2D-vector shapes raise NotImplementedError."""
+        """Non 2D-vector shapes raise ValueError."""
         n = rows * cols
         m = Matrix(rows, cols, [float(i) for i in range(n)])
-        with pytest.raises(NotImplementedError,
+        with pytest.raises(ValueError,
                            match="angle requires a 2D vector or Nx2 or 2xN matrix"):
             m.angle()
 
     def test_invalid_axis_raises(self):
-        """Out-of-range axis raises NotImplementedError."""
+        """Out-of-range axis raises ValueError."""
         m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
-        with pytest.raises(NotImplementedError,
+        with pytest.raises(ValueError,
                            match="axis must be -2, -1, 0, or 1"):
             m.angle(axis=2)
 
@@ -1919,7 +2146,7 @@ class TestAxisDecoder:
     def test_former_sentinel_no_longer_silent(self, factory, method):
         """``axis=-1000`` raises rather than being silently treated as a no-axis sentinel."""
         mat = factory()
-        with pytest.raises(NotImplementedError, match="axis must be -2, -1, 0, or 1"):
+        with pytest.raises(ValueError, match="axis must be -2, -1, 0, or 1"):
             getattr(mat, method)(axis=-1000)
 
     @pytest.mark.parametrize("factory,method", _AXIS_METHODS,
@@ -1983,7 +2210,7 @@ class TestAxisDecoder:
     @pytest.mark.parametrize("bad_axis,expected_exc,expected_match", [
         (True, TypeError, "bool"),
         (2**32, OverflowError, "out of int range|too large to convert"),
-        (-1000, NotImplementedError, "axis must be -2, -1, 0, or 1"),
+        (-1000, ValueError, "axis must be -2, -1, 0, or 1"),
     ], ids=["bool", "overflow", "sentinel"])
     def test_rejected_axis_does_not_mutate_in_place(
             self, method, bad_axis, expected_exc, expected_match):
@@ -2014,7 +2241,7 @@ class TestShapeDisambiguation:
     def test_1x2_axis0_rejected(self, method):
         """``1x2`` is row-oriented; ``axis=0`` contradicts and raises."""
         m = Matrix(1, 2, [1.0, 2.0])
-        with pytest.raises(NotImplementedError,
+        with pytest.raises(ValueError,
                            match=f"{method} requires a 2D vector or Nx2 or 2xN matrix"):
             getattr(m, method)(axis=0)
 
@@ -2022,7 +2249,7 @@ class TestShapeDisambiguation:
     def test_2x1_axis1_rejected(self, method):
         """``2x1`` is column-oriented; ``axis=1`` contradicts and raises."""
         m = Matrix(2, 1, [1.0, 2.0])
-        with pytest.raises(NotImplementedError,
+        with pytest.raises(ValueError,
                            match=f"{method} requires a 2D vector or Nx2 or 2xN matrix"):
             getattr(m, method)(axis=1)
 
@@ -2030,7 +2257,7 @@ class TestShapeDisambiguation:
     def test_Nx2_axis0_rejected(self, method):  # noqa: N802 (shape name)
         """``Nx2`` with ``N>2`` is row-oriented; ``axis=0`` contradicts and raises."""
         m = Matrix(5, 2, [float(i) for i in range(10)])
-        with pytest.raises(NotImplementedError,
+        with pytest.raises(ValueError,
                            match=f"{method} requires a 2D vector or Nx2 or 2xN matrix"):
             getattr(m, method)(axis=0)
 
@@ -2038,7 +2265,7 @@ class TestShapeDisambiguation:
     def test_2xN_axis1_rejected(self, method):  # noqa: N802 (shape name)
         """``2xN`` with ``N>2`` is column-oriented; ``axis=1`` contradicts and raises."""
         m = Matrix(2, 5, [float(i) for i in range(10)])
-        with pytest.raises(NotImplementedError,
+        with pytest.raises(ValueError,
                            match=f"{method} requires a 2D vector or Nx2 or 2xN matrix"):
             getattr(m, method)(axis=1)
 
@@ -2046,56 +2273,56 @@ class TestShapeDisambiguation:
         """1x2 scalar 2D rejects ``axis=0``."""
         a = Matrix(1, 2, [1.0, 2.0])
         b = Matrix(1, 2, [3.0, 4.0])
-        with pytest.raises(NotImplementedError, match="cross requires a 2D or 3D vector"):
+        with pytest.raises(ValueError, match="cross requires a 2D or 3D vector"):
             a.cross(b, axis=0)
 
     def test_cross_2x1_axis1_rejected(self):
         """2x1 scalar 2D rejects ``axis=1``."""
         a = Matrix(2, 1, [1.0, 2.0])
         b = Matrix(2, 1, [3.0, 4.0])
-        with pytest.raises(NotImplementedError, match="cross requires a 2D or 3D vector"):
+        with pytest.raises(ValueError, match="cross requires a 2D or 3D vector"):
             a.cross(b, axis=1)
 
     def test_cross_1x3_axis0_rejected(self):
         """1x3 scalar 3D rejects ``axis=0``."""
         a = Matrix(1, 3, [1.0, 2.0, 3.0])
         b = Matrix(1, 3, [4.0, 5.0, 6.0])
-        with pytest.raises(NotImplementedError, match="cross requires a 2D or 3D vector"):
+        with pytest.raises(ValueError, match="cross requires a 2D or 3D vector"):
             a.cross(b, axis=0)
 
     def test_cross_3x1_axis1_rejected(self):
         """3x1 scalar 3D rejects ``axis=1``."""
         a = Matrix(3, 1, [1.0, 2.0, 3.0])
         b = Matrix(3, 1, [4.0, 5.0, 6.0])
-        with pytest.raises(NotImplementedError, match="cross requires a 2D or 3D vector"):
+        with pytest.raises(ValueError, match="cross requires a 2D or 3D vector"):
             a.cross(b, axis=1)
 
     def test_cross_Nx2_axis0_rejected(self):  # noqa: N802 (shape name)
         """Nx2 batch (N>3) is row-oriented; ``axis=0`` contradicts."""
         a = Matrix(5, 2, [float(i) for i in range(10)])
         b = Matrix(5, 2, [float(i) for i in range(10)])
-        with pytest.raises(NotImplementedError, match="cross requires a 2D or 3D vector"):
+        with pytest.raises(ValueError, match="cross requires a 2D or 3D vector"):
             a.cross(b, axis=0)
 
     def test_cross_2xN_axis1_rejected(self):  # noqa: N802 (shape name)
         """2xN batch (N>3) is column-oriented; ``axis=1`` contradicts."""
         a = Matrix(2, 5, [float(i) for i in range(10)])
         b = Matrix(2, 5, [float(i) for i in range(10)])
-        with pytest.raises(NotImplementedError, match="cross requires a 2D or 3D vector"):
+        with pytest.raises(ValueError, match="cross requires a 2D or 3D vector"):
             a.cross(b, axis=1)
 
     def test_cross_Nx3_axis0_rejected(self):  # noqa: N802 (shape name)
         """Nx3 batch (N>2) is row-oriented; ``axis=0`` contradicts."""
         a = Matrix(5, 3, [float(i) for i in range(15)])
         b = Matrix(5, 3, [float(i) for i in range(15)])
-        with pytest.raises(NotImplementedError, match="cross requires a 2D or 3D vector"):
+        with pytest.raises(ValueError, match="cross requires a 2D or 3D vector"):
             a.cross(b, axis=0)
 
     def test_cross_3xN_axis1_rejected(self):  # noqa: N802 (shape name)
         """3xN batch (N>2) is column-oriented; ``axis=1`` contradicts."""
         a = Matrix(3, 5, [float(i) for i in range(15)])
         b = Matrix(3, 5, [float(i) for i in range(15)])
-        with pytest.raises(NotImplementedError, match="cross requires a 2D or 3D vector"):
+        with pytest.raises(ValueError, match="cross requires a 2D or 3D vector"):
             a.cross(b, axis=1)
 
     def test_2x2_both_axes_accepted(self):
@@ -2340,122 +2567,894 @@ class TestEdgeCases:
         assert Matrix.allclose(lhs, rhs)
 
 
-class TestSelect:
-    """Tests for Matrix.select() — row and column sub-selection."""
+class TestTake:
+    """Tests for Matrix.take() — row and column sub-selection."""
 
-    def test_select_rows_with_list(self, mat, shape):
-        """select([indices], axis=0) returns the requested rows."""
+    def test_take_rows_with_list(self, mat, shape):
+        """take([indices], axis=0) returns the requested rows."""
         rows, cols = shape
         if rows < 2:
             pytest.skip("need at least 2 rows")
         indices = [0, rows - 1]
-        result = mat.select(indices)
+        result = mat.take(indices)
         assert result.rows == len(indices)
         assert result.columns == cols
         for out_r, src_r in enumerate(indices):
             for c in range(cols):
                 assert result[out_r, c] == pytest.approx(mat[src_r, c])
 
-    def test_select_rows_with_tuple(self, mat, shape):
-        """select((indices,), axis=0) also accepts a tuple."""
+    def test_take_rows_with_tuple(self, mat, shape):
+        """take((indices,), axis=0) also accepts a tuple."""
         rows, cols = shape
         if rows < 3:
             pytest.skip("need at least 3 rows")
         indices = (1, 0, 2)
-        result = mat.select(indices)
+        result = mat.take(indices)
         assert result.rows == len(indices)
         for out_r, src_r in enumerate(indices):
             for c in range(cols):
                 assert result[out_r, c] == pytest.approx(mat[src_r, c])
 
-    def test_select_columns_with_list(self, mat, shape):
-        """select([indices], axis=1) returns the requested columns."""
+    def test_take_columns_with_list(self, mat, shape):
+        """take([indices], axis=1) returns the requested columns."""
         rows, cols = shape
         if cols < 2:
             pytest.skip("need at least 2 columns")
         indices = [cols - 1, 0]
-        result = mat.select(indices, 1)
+        result = mat.take(indices, 1)
         assert result.rows == rows
         assert result.columns == len(indices)
         for r in range(rows):
             for out_c, src_c in enumerate(indices):
                 assert result[r, out_c] == pytest.approx(mat[r, src_c])
 
-    def test_select_columns_with_tuple(self, mat, shape):
-        """select((indices,), axis=1) also accepts a tuple."""
+    def test_take_columns_with_tuple(self, mat, shape):
+        """take((indices,), axis=1) also accepts a tuple."""
         rows, cols = shape
         if cols < 3:
             pytest.skip("need at least 3 columns")
         indices = (2, 0, 1)
-        result = mat.select(indices, 1)
+        result = mat.take(indices, 1)
         assert result.columns == len(indices)
         for r in range(rows):
             for out_c, src_c in enumerate(indices):
                 assert result[r, out_c] == pytest.approx(mat[r, src_c])
 
-    def test_select_negative_axis(self, mat, shape):
+    def test_take_negative_axis(self, mat, shape):
         """axis=-1 should behave like axis=1 (columns)."""
         rows, cols = shape
         if cols < 2:
             pytest.skip("need at least 2 columns")
         indices = [0, cols - 1]
-        result_pos = mat.select(indices, 1)
-        result_neg = mat.select(indices, -1)
+        result_pos = mat.take(indices, 1)
+        result_neg = mat.take(indices, -1)
         assert Matrix.allclose(result_pos, result_neg)
 
-    def test_select_duplicate_indices(self, mat, shape):
+    def test_take_duplicate_indices(self, mat, shape):
         """Duplicate indices should duplicate the corresponding rows."""
         rows, cols = shape
         indices = [0, 0, 0]
-        result = mat.select(indices, 0)
+        result = mat.take(indices, 0)
         assert result.rows == 3
         for r in range(3):
             for c in range(cols):
                 assert result[r, c] == pytest.approx(mat[0, c])
 
-    def test_select_single_row(self, mat, shape):
-        """Selecting a single row returns a 1xcols matrix."""
+    def test_take_single_row(self, mat, shape):
+        """Taking a single row returns a 1xcols matrix."""
         rows, cols = shape
-        result = mat.select([0])
+        result = mat.take([0])
         assert result.rows == 1
         assert result.columns == cols
         for c in range(cols):
             assert result[0, c] == pytest.approx(mat[0, c])
 
-    def test_select_single_column(self, mat, shape):
-        """Selecting a single column returns a rowsx1 matrix."""
+    def test_take_single_column(self, mat, shape):
+        """Taking a single column returns a rowsx1 matrix."""
         rows, cols = shape
-        result = mat.select([0], 1)
+        result = mat.take([0], 1)
         assert result.rows == rows
         assert result.columns == 1
         for r in range(rows):
             assert result[r, 0] == pytest.approx(mat[r, 0])
 
-    def test_select_all_rows_preserves_matrix(self, mat, shape):
-        """Selecting all rows in order yields an equal matrix."""
+    def test_take_all_rows_preserves_matrix(self, mat, shape):
+        """Taking all rows in order yields an equal matrix."""
         rows, cols = shape
         indices = list(range(rows))
-        result = mat.select(indices)
+        result = mat.take(indices)
         assert Matrix.allclose(result, mat)
 
-    def test_select_all_columns_preserves_matrix(self, mat, shape):
-        """Selecting all columns in order yields an equal matrix."""
+    def test_take_all_columns_preserves_matrix(self, mat, shape):
+        """Taking all columns in order yields an equal matrix."""
         rows, cols = shape
         indices = list(range(cols))
-        result = mat.select(indices, 1)
+        result = mat.take(indices, 1)
         assert Matrix.allclose(result, mat)
 
-    def test_select_empty_indices_returns_none(self):
-        """Selecting with an empty list returns None."""
+    def test_take_empty_indices_raises(self):
+        """Taking with an empty list raises IndexError (Option A)."""
         m = Matrix(3, 3, 1.0)
-        result = m.select([])
-        assert result is None
+        with pytest.raises(IndexError):
+            m.take([])
+        with pytest.raises(IndexError):
+            m.take([], 1)
 
-    def test_select_invalid_axis_raises(self):
+    def test_take_negative_index(self, mat, shape):
+        """A negative index counts from the end of the axis."""
+        rows, cols = shape
+        last_row = mat.take([-1], 0)
+        assert last_row.rows == 1
+        for c in range(cols):
+            assert last_row[0, c] == pytest.approx(mat[rows - 1, c])
+        last_col = mat.take([-1], 1)
+        assert last_col.columns == 1
+        for r in range(rows):
+            assert last_col[r, 0] == pytest.approx(mat[r, cols - 1])
+
+    def test_take_out_of_range_raises(self, mat, shape):
+        """An out-of-range index raises IndexError naming the value and dim."""
+        rows, cols = shape
+        with pytest.raises(IndexError) as excinfo:
+            mat.take([rows], 0)
+        message = str(excinfo.value)
+        assert str(rows) in message
+        assert "row" in message
+        with pytest.raises(IndexError) as excinfo:
+            mat.take([cols], 1)
+        message = str(excinfo.value)
+        assert str(cols) in message
+        assert "column" in message
+
+    def test_take_negative_boundary(self, mat, shape):
+        """``-len`` is the first element; ``-len-1`` is out of range."""
+        rows, cols = shape
+        first_row = mat.take([-rows], 0)
+        for c in range(cols):
+            assert first_row[0, c] == pytest.approx(mat[0, c])
+        with pytest.raises(IndexError):
+            mat.take([-rows - 1], 0)
+        first_col = mat.take([-cols], 1)
+        for r in range(rows):
+            assert first_col[r, 0] == pytest.approx(mat[r, 0])
+        with pytest.raises(IndexError):
+            mat.take([-cols - 1], 1)
+
+    def test_take_overflow_raises(self):
+        """A value beyond Py_ssize_t raises OverflowError, not IndexError."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(OverflowError):
+            m.take([10**100], 0)
+        with pytest.raises(OverflowError):
+            m.take([10**100], 1)
+
+    def test_take_bool_item(self):
+        """bool items resolve as 0/1 (bool is an int subclass)."""
+        m = Matrix(3, 3, 0.0)
+        for r in range(3):
+            for c in range(3):
+                m[r, c] = float(r * 3 + c)
+        result = m.take([True, False], 0)
+        assert result.rows == 2
+        for c in range(3):
+            assert result[0, c] == pytest.approx(m[1, c])
+            assert result[1, c] == pytest.approx(m[0, c])
+
+    def test_take_bad_type_raises(self):
+        """A non-int item raises TypeError."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(TypeError):
+            m.take(["x"], 0)
+
+    def test_take_int_subscript_parity(self):
+        """The scalar-int subscript path shares take's boundary outcomes."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(IndexError):
+            _ = m[-4, 0]
+        with pytest.raises(OverflowError):
+            _ = m[10**100, 0]
+
+    def test_take_invalid_axis_raises(self):
         """axis >= 2 should raise KeyError."""
         m = Matrix(3, 3, 1.0)
         with pytest.raises(KeyError):
-            m.select([0], 2)
+            m.take([0], 2)
+
+    def test_take_axis_below_neg2_raises(self):
+        """An out-of-range negative axis (<= -3) raises KeyError, not a column take."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(KeyError):
+            m.take([0], -3)
+
+
+class TestFancyIndexing:
+    """List-key gather through __getitem__ (rows and columns)."""
+
+    def test_getitem_list_rows_matches_take(self, mat, shape):
+        """m[[r0, r1]] gathers rows, matching take(..., 0)."""
+        rows, cols = shape
+        indices = [0, rows - 1]
+        result = mat[indices]
+        assert result.rows == len(indices)
+        assert result.columns == cols
+        assert Matrix.allclose(result, mat.take(indices, 0))
+
+    def test_getitem_rows_explicit_full_slice(self, mat, shape):
+        """m[[r], :] is the same as m[[r]]."""
+        rows, cols = shape
+        indices = [0, rows - 1] if rows > 1 else [0]
+        assert Matrix.allclose(mat[indices, :], mat[indices])
+
+    def test_getitem_list_cols_matches_take(self, mat, shape):
+        """m[:, [c0, c1]] gathers columns, matching take(..., 1)."""
+        rows, cols = shape
+        indices = [cols - 1, 0] if cols > 1 else [0]
+        result = mat[:, indices]
+        assert result.rows == rows
+        assert result.columns == len(indices)
+        assert Matrix.allclose(result, mat.take(indices, 1))
+
+    def test_getitem_negative(self, mat, shape):
+        """A negative list index counts from the end."""
+        rows, cols = shape
+        result = mat[[-1]]
+        for c in range(cols):
+            assert result[0, c] == pytest.approx(mat[rows - 1, c])
+
+    def test_getitem_duplicates(self, mat, shape):
+        """Duplicate list indices repeat the row."""
+        rows, cols = shape
+        result = mat[[0, 0, 0]]
+        assert result.rows == 3
+        for r in range(3):
+            for c in range(cols):
+                assert result[r, c] == pytest.approx(mat[0, c])
+
+    def test_getitem_out_of_range(self, mat, shape):
+        """An out-of-range list index raises IndexError naming value+dim."""
+        rows, cols = shape
+        with pytest.raises(IndexError) as excinfo:
+            _ = mat[[rows]]
+        message = str(excinfo.value)
+        assert str(rows) in message
+        assert "row" in message
+        with pytest.raises(IndexError) as excinfo:
+            _ = mat[:, [cols]]
+        message = str(excinfo.value)
+        assert str(cols) in message
+        assert "column" in message
+
+    def test_getitem_empty_list_raises(self):
+        """An empty list key raises IndexError (Option A)."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(IndexError):
+            _ = m[[]]
+        with pytest.raises(IndexError):
+            _ = m[:, []]
+
+    def test_getitem_tuple_is_2d_not_gather(self):
+        """m[(0, 0)] returns a float (tuple is 2-D indexing, not gather)."""
+        m = Matrix(3, 3, 0.0)
+        m[1, 2] = 7.0
+        value = m[(1, 2)]
+        assert isinstance(value, float)
+        assert value == pytest.approx(7.0)
+
+    def test_getitem_2d_slice_unchanged(self):
+        """m[0:2, 1:3] still returns the legacy 2-D sub-matrix."""
+        m = Matrix(3, 3, 0.0)
+        for r in range(3):
+            for c in range(3):
+                m[r, c] = float(r * 3 + c)
+        sub = m[0:2, 1:3]
+        assert sub.rows == 2
+        assert sub.columns == 2
+        assert sub[0, 0] == pytest.approx(1.0)
+        assert sub[1, 1] == pytest.approx(5.0)
+
+    def test_getitem_singleton_list_returns_matrix(self):
+        """m[[0]] always yields a Matrix; m[0]/m[0,0] yields a float."""
+        m = Matrix(1, 1, 3.0)
+        gathered = m[[0]]
+        assert isinstance(gathered, Matrix)
+        assert gathered.rows == 1
+        assert gathered.columns == 1
+        assert isinstance(m[0, 0], float)
+
+    def test_getitem_paired_list_unsupported(self):
+        """m[[r], [c]] (paired lists) raises IndexError."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(IndexError):
+            _ = m[[0, 1], [0, 1]]
+
+    def test_getitem_mixed_list_int_unsupported(self):
+        """m[[r], c] (list with int) raises IndexError."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(IndexError):
+            _ = m[[0], 1]
+
+    def test_getitem_partial_slice_list_unsupported(self):
+        """A list paired with a non-full slice raises IndexError."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(IndexError):
+            _ = m[1:3, [0]]
+        with pytest.raises(IndexError):
+            _ = m[[0], 0:2]
+
+    def test_getitem_bad_type_raises(self):
+        """A list with a non-int item raises TypeError."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(TypeError):
+            _ = m[["x"]]
+
+    def test_getitem_boc_roundtrip(self):
+        """List gather runs inside a @when behavior over a Cown[Matrix]."""
+        a = Cown(Matrix(3, 2, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
+
+        @when(a)
+        def result(a):  # noqa: D401 — short behavior
+            """Gather rows inside a behavior and return the result."""
+            return a.value[[2, 0]]
+
+        wait()
+        assert result.exception is False
+        expected = Matrix(2, 2, [5.0, 6.0, 1.0, 2.0])
+        assert Matrix.allclose(result.value, expected)
+
+    def test_getitem_fuzz_permutation(self, mat, shape, rng):
+        """A random row permutation matches a manually assembled matrix."""
+        rows, cols = shape
+        perm = list(range(rows))
+        rng.shuffle(perm)
+        result = mat[perm]
+        assert result.rows == rows
+        assert result.columns == cols
+        for out_r, src_r in enumerate(perm):
+            for c in range(cols):
+                assert result[out_r, c] == pytest.approx(mat[src_r, c])
+
+
+def _snapshot(m, rows, cols):
+    """Return a flat list snapshot of a matrix's elements."""
+    return [m[r, c] for r in range(rows) for c in range(cols)]
+
+
+class TestScatter:
+    """List-key scatter assignment through __setitem__ (rows and columns)."""
+
+    def test_scatter_rows_scalar(self):
+        """m[[rows]] = scalar fills the selected rows."""
+        m = Matrix(3, 2, 0.0)
+        m[[0, 2]] = 5.0
+        for c in range(2):
+            assert m[0, c] == pytest.approx(5.0)
+            assert m[1, c] == pytest.approx(0.0)
+            assert m[2, c] == pytest.approx(5.0)
+
+    def test_scatter_rows_matrix(self):
+        """m[[rows]] = matrix copies each source row (memcpy path)."""
+        m = Matrix(3, 2, 0.0)
+        rhs = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        m[[2, 0]] = rhs
+        assert m[2, 0] == pytest.approx(1.0)
+        assert m[2, 1] == pytest.approx(2.0)
+        assert m[0, 0] == pytest.approx(3.0)
+        assert m[0, 1] == pytest.approx(4.0)
+        assert m[1, 0] == pytest.approx(0.0)
+
+    def test_scatter_cols_scalar(self):
+        """m[:, [cols]] = scalar fills the selected columns."""
+        m = Matrix(2, 3, 0.0)
+        m[:, [0, 2]] = 7.0
+        for r in range(2):
+            assert m[r, 0] == pytest.approx(7.0)
+            assert m[r, 1] == pytest.approx(0.0)
+            assert m[r, 2] == pytest.approx(7.0)
+
+    def test_scatter_cols_matrix(self):
+        """m[:, [cols]] = matrix copies each source column (strided)."""
+        m = Matrix(2, 3, 0.0)
+        rhs = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        m[:, [2, 0]] = rhs
+        assert m[0, 2] == pytest.approx(1.0)
+        assert m[0, 0] == pytest.approx(2.0)
+        assert m[1, 2] == pytest.approx(3.0)
+        assert m[1, 0] == pytest.approx(4.0)
+        assert m[0, 1] == pytest.approx(0.0)
+
+    def test_scatter_rows_explicit_slice(self):
+        """m[[rows], :] = v is the same as m[[rows]] = v."""
+        a = Matrix(3, 2, 0.0)
+        b = Matrix(3, 2, 0.0)
+        a[[0, 1]] = 4.0
+        b[[0, 1], :] = 4.0
+        assert Matrix.allclose(a, b)
+
+    def test_scatter_then_gather_roundtrip(self, mat, shape):
+        """A scatter then a gather of the same rows returns the RHS."""
+        rows, cols = shape
+        indices = [0, rows - 1] if rows > 1 else [0]
+        rhs = Matrix(len(indices), cols,
+                     [float(i) for i in range(len(indices) * cols)])
+        mat[indices] = rhs
+        assert Matrix.allclose(mat[indices], rhs)
+
+    def test_scatter_negative_index(self):
+        """A negative list index assigns from the end."""
+        m = Matrix(3, 2, 0.0)
+        m[[-1]] = 9.0
+        for c in range(2):
+            assert m[2, c] == pytest.approx(9.0)
+            assert m[0, c] == pytest.approx(0.0)
+
+    def test_scatter_oob_message_matches_gather(self):
+        """Read and write OOB share the resolver and the message."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(IndexError) as read_exc:
+            _ = m[[3]]
+        with pytest.raises(IndexError) as write_exc:
+            m[[3]] = 1.0
+        assert str(read_exc.value) == str(write_exc.value)
+
+    def test_scatter_duplicate_last_write_wins(self):
+        """m[[1, 1]] = matrix leaves row 1 equal to the last source row."""
+        m = Matrix(2, 2, 0.0)
+        rhs = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        m[[1, 1]] = rhs
+        assert m[1, 0] == pytest.approx(3.0)
+        assert m[1, 1] == pytest.approx(4.0)
+
+    def test_scatter_iadd_duplicate_adds_once(self):
+        """m[[0, 0]] += v increments row 0 once (last-write-wins)."""
+        m = Matrix(2, 2, [1.0, 1.0, 1.0, 1.0])
+        m[[0, 0]] += 5.0
+        for c in range(2):
+            assert m[0, c] == pytest.approx(6.0)
+            assert m[1, c] == pytest.approx(1.0)
+
+    def test_iadd_whole_matrix_sanity(self):
+        """m += scalar works (the slot the augmented scatter relies on)."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        m += 1.0
+        assert Matrix.allclose(m, Matrix(2, 2, [2.0, 3.0, 4.0, 5.0]))
+
+    def test_scatter_augmented_ops_rows(self):
+        """+= -= *= /= on a row selection match gather + manual op."""
+        for op, fn in (
+            ("+=", lambda a, b: a + b),
+            ("-=", lambda a, b: a - b),
+            ("*=", lambda a, b: a * b),
+            ("/=", lambda a, b: a / b),
+        ):
+            m = Matrix(3, 2, [float(v) for v in range(1, 7)])
+            expected = [
+                [fn(m[r, c], 2.0) for c in range(2)] if r in (0, 2)
+                else [m[r, c] for c in range(2)]
+                for r in range(3)
+            ]
+            if op == "+=":
+                m[[0, 2]] += 2.0
+            elif op == "-=":
+                m[[0, 2]] -= 2.0
+            elif op == "*=":
+                m[[0, 2]] *= 2.0
+            else:
+                m[[0, 2]] /= 2.0
+            for r in range(3):
+                for c in range(2):
+                    assert m[r, c] == pytest.approx(expected[r][c])
+
+    def test_scatter_augmented_op_cols(self):
+        """m[:, [c]] *= v matches gather + manual op on that column."""
+        m = Matrix(2, 3, [float(v) for v in range(1, 7)])
+        expected = [[m[r, c] * 3.0 if c == 1 else m[r, c]
+                     for c in range(3)] for r in range(2)]
+        m[:, [1]] *= 3.0
+        for r in range(2):
+            for c in range(3):
+                assert m[r, c] == pytest.approx(expected[r][c])
+
+    def test_scatter_oob_leaves_matrix_unmodified(self):
+        """A bad index found in phase 1 aborts before any write."""
+        m = Matrix(3, 3, 1.0)
+        before = _snapshot(m, 3, 3)
+        with pytest.raises(IndexError):
+            m[[0, 99]] = 5.0
+        assert _snapshot(m, 3, 3) == before
+
+    def test_scatter_shape_mismatch_leaves_unmodified(self):
+        """A wrong-shaped RHS found in phase 2 aborts before any write."""
+        m = Matrix(3, 3, 1.0)
+        before = _snapshot(m, 3, 3)
+        with pytest.raises(ValueError):
+            m[[0, 1]] = Matrix(3, 3, 2.0)
+        assert _snapshot(m, 3, 3) == before
+
+    def test_scatter_shape_mismatch_message(self):
+        """The shape-mismatch ValueError names both shapes."""
+        m = Matrix(4, 3, 1.0)
+        with pytest.raises(ValueError) as excinfo:
+            m[[0, 1]] = Matrix(3, 3, 2.0)
+        message = str(excinfo.value)
+        assert "3x3" in message
+        assert "2x3" in message
+
+    @pytest.mark.parametrize("count", [64, 65, 100])
+    def test_scatter_count_64_65_100_rows(self, count):
+        """Row scatter exercises the stack/heap index-buffer boundary."""
+        m = Matrix(3, 2, 0.0)
+        idx = [1] * count
+        rhs = Matrix(count, 2, [float(i) for i in range(count * 2)])
+        m[idx] = rhs
+        assert m[1, 0] == pytest.approx(float((count - 1) * 2))
+        assert m[1, 1] == pytest.approx(float((count - 1) * 2 + 1))
+        for c in range(2):
+            assert m[0, c] == pytest.approx(0.0)
+            assert m[2, c] == pytest.approx(0.0)
+
+    @pytest.mark.parametrize("count", [64, 65, 100])
+    def test_scatter_count_64_65_100_cols(self, count):
+        """Column scatter exercises the stack/heap index-buffer boundary."""
+        m = Matrix(2, 3, 0.0)
+        idx = [1] * count
+        rhs = Matrix(2, count, [float(i) for i in range(2 * count)])
+        m[:, idx] = rhs
+        assert m[0, 1] == pytest.approx(float(count - 1))
+        assert m[1, 1] == pytest.approx(float(2 * count - 1))
+        for r in range(2):
+            assert m[r, 0] == pytest.approx(0.0)
+            assert m[r, 2] == pytest.approx(0.0)
+
+    def test_scatter_non_int_item(self):
+        """A non-int list item raises TypeError (incl. heap-sized lists)."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(TypeError):
+            m[[0, 1.5]] = 1.0
+        with pytest.raises(TypeError):
+            m[[0, None]] = 1.0
+        with pytest.raises(TypeError):
+            m[[0] * 70 + [1.5]] = 1.0
+
+    def test_scatter_bool_item(self):
+        """Bool list items are accepted as 1/0."""
+        m = Matrix(2, 2, 0.0)
+        m[[True, False]] = 3.0
+        for c in range(2):
+            assert m[0, c] == pytest.approx(3.0)
+            assert m[1, c] == pytest.approx(3.0)
+
+    def test_scatter_cols_single_row(self):
+        """Column scatter degenerates correctly when R == 1."""
+        m = Matrix(1, 3, 0.0)
+        m[:, [0, 2]] = Matrix(1, 2, [4.0, 5.0])
+        assert m[0, 0] == pytest.approx(4.0)
+        assert m[0, 2] == pytest.approx(5.0)
+        assert m[0, 1] == pytest.approx(0.0)
+
+    def test_scatter_1x1_matrix_as_scalar(self):
+        """A 1x1 matrix RHS broadcasts like a scalar."""
+        m = Matrix(3, 2, 0.0)
+        m[[0, 1]] = Matrix(1, 1, 8.0)
+        for c in range(2):
+            assert m[0, c] == pytest.approx(8.0)
+            assert m[1, c] == pytest.approx(8.0)
+
+    def test_scatter_empty_list_raises(self):
+        """An empty list key raises IndexError (Option A)."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(IndexError):
+            m[[]] = 1.0
+        with pytest.raises(IndexError):
+            m[:, []] = 1.0
+
+    def test_scatter_paired_list_unsupported(self):
+        """m[[r], [c]] = v raises IndexError."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(IndexError):
+            m[[0, 1], [0, 1]] = 1.0
+
+    def test_scatter_mixed_list_int_unsupported(self):
+        """m[[r], c] = v raises IndexError."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(IndexError):
+            m[[0], 1] = 1.0
+
+    def test_scatter_partial_slice_list_unsupported(self):
+        """A list paired with a non-full slice raises IndexError."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(IndexError):
+            m[1:3, [0]] = 1.0
+        with pytest.raises(IndexError):
+            m[[0], 0:2] = 1.0
+
+    def test_scatter_bad_rhs_type(self):
+        """A non-numeric, non-matrix RHS raises TypeError."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(TypeError):
+            m[[0]] = "x"
+
+    def test_scatter_2d_assignment_unchanged(self):
+        """Legacy int/slice/tuple assignment is unaffected."""
+        m = Matrix(3, 3, 0.0)
+        m[1, 2] = 5.0
+        assert m[1, 2] == pytest.approx(5.0)
+        m[0:2, 0:2] = 7.0
+        for r in range(2):
+            for c in range(2):
+                assert m[r, c] == pytest.approx(7.0)
+
+    def test_scatter_not_acquired_raises(self):
+        """Scatter on a cown-resident (unacquired) matrix raises."""
+        m = Matrix(3, 2, 1.0)
+        Cown(m)
+        with pytest.raises(RuntimeError):
+            m[[0]] = 1.0
+
+    def test_scatter_rhs_not_acquired_raises(self):
+        """A cown-resident RHS matrix raises (ownership gate)."""
+        m = Matrix(3, 2, 1.0)
+        rhs = Matrix(1, 2, 2.0)
+        Cown(rhs)
+        with pytest.raises(RuntimeError):
+            m[[0]] = rhs
+
+    def test_scatter_boc_roundtrip(self):
+        """Scatter runs inside a @when behavior over a Cown[Matrix]."""
+        a = Cown(Matrix(3, 2, 0.0))
+
+        @when(a)
+        def result(a):  # noqa: D401 — short behavior
+            """Scatter rows and a column inside a behavior."""
+            a.value[[0, 2]] = 5.0
+            a.value[:, [1]] = Matrix(3, 1, [7.0, 8.0, 9.0])
+            return a.value[[0, 1, 2]]
+
+        wait()
+        assert result.exception is False
+        expected = Matrix(3, 2, [5.0, 7.0, 0.0, 8.0, 5.0, 9.0])
+        assert Matrix.allclose(result.value, expected)
+
+    def test_scatter_fuzz(self, mat, shape, rng):
+        """A random permutation scatter then gather returns the RHS."""
+        rows, cols = shape
+        perm = list(range(rows))
+        rng.shuffle(perm)
+        rhs = Matrix(rows, cols,
+                     [rng.uniform(-50, 50) for _ in range(rows * cols)])
+        mat[perm] = rhs
+        assert Matrix.allclose(mat[perm], rhs)
+
+    def test_scatter_self_alias_swaps_rows(self):
+        """A self-aliased row scatter permutes from pre-write values."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        m[[1, 0]] = m
+        assert Matrix.allclose(m, Matrix(2, 2, [3.0, 4.0, 1.0, 2.0]))
+
+    def test_scatter_self_alias_swaps_cols(self):
+        """A self-aliased column scatter permutes from pre-write values."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        m[:, [1, 0]] = m
+        assert Matrix.allclose(m, Matrix(2, 2, [2.0, 1.0, 4.0, 3.0]))
+
+    def test_scatter_self_alias_identity_unchanged(self):
+        """A self-aliased identity scatter leaves the matrix unchanged."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        m[[0, 1]] = m
+        assert Matrix.allclose(m, Matrix(2, 2, [1.0, 2.0, 3.0, 4.0]))
+
+
+class TestPut:
+    """Explicit put() method — the write-side counterpart of take()."""
+
+    def test_put_rows_scalar(self):
+        """put(rows, scalar) fills the selected rows."""
+        m = Matrix(3, 2, 0.0)
+        m.put([0, 2], 5.0)
+        for c in range(2):
+            assert m[0, c] == pytest.approx(5.0)
+            assert m[1, c] == pytest.approx(0.0)
+            assert m[2, c] == pytest.approx(5.0)
+
+    def test_put_rows_matrix(self):
+        """put(rows, matrix) copies each source row."""
+        m = Matrix(3, 2, 0.0)
+        rhs = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        m.put([2, 0], rhs)
+        assert m[2, 0] == pytest.approx(1.0)
+        assert m[0, 0] == pytest.approx(3.0)
+
+    def test_put_cols_matrix(self):
+        """put(cols, matrix, axis=1) copies each source column."""
+        m = Matrix(2, 3, 0.0)
+        rhs = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        m.put([2, 0], rhs, axis=1)
+        assert m[0, 2] == pytest.approx(1.0)
+        assert m[0, 0] == pytest.approx(2.0)
+        assert m[1, 2] == pytest.approx(3.0)
+        assert m[1, 0] == pytest.approx(4.0)
+
+    def test_put_matches_subscript_rows(self, mat, shape):
+        """put(rows, v) equals m[rows] = v."""
+        rows, cols = shape
+        indices = [0, rows - 1] if rows > 1 else [0]
+        a = mat.copy()
+        b = mat.copy()
+        rhs = Matrix(len(indices), cols,
+                     [float(i) for i in range(len(indices) * cols)])
+        a.put(indices, rhs)
+        b[indices] = rhs
+        assert Matrix.allclose(a, b)
+
+    def test_put_matches_subscript_cols(self, mat, shape):
+        """put(cols, v, axis=1) equals m[:, cols] = v."""
+        rows, cols = shape
+        indices = [0, cols - 1] if cols > 1 else [0]
+        a = mat.copy()
+        b = mat.copy()
+        rhs = Matrix(rows, len(indices),
+                     [float(i) for i in range(rows * len(indices))])
+        a.put(indices, rhs, axis=1)
+        b[:, indices] = rhs
+        assert Matrix.allclose(a, b)
+
+    def test_put_returns_self(self):
+        """put returns self to allow chaining."""
+        m = Matrix(3, 2, 0.0)
+        result = m.put([0], 1.0)
+        assert result is m
+
+    def test_put_negative_axis(self):
+        """A negative axis maps -1 to columns."""
+        m = Matrix(2, 3, 0.0)
+        m.put([0], 9.0, axis=-1)
+        for r in range(2):
+            assert m[r, 0] == pytest.approx(9.0)
+            assert m[r, 1] == pytest.approx(0.0)
+
+    def test_put_negative_index(self):
+        """A negative row index assigns from the end."""
+        m = Matrix(3, 2, 0.0)
+        m.put([-1], 7.0)
+        for c in range(2):
+            assert m[2, c] == pytest.approx(7.0)
+
+    def test_put_1x1_as_scalar(self):
+        """A 1x1 matrix value broadcasts like a scalar."""
+        m = Matrix(3, 2, 0.0)
+        m.put([0, 1], Matrix(1, 1, 8.0))
+        for c in range(2):
+            assert m[0, c] == pytest.approx(8.0)
+            assert m[1, c] == pytest.approx(8.0)
+
+    def test_put_empty_raises(self):
+        """An empty index list raises IndexError."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(IndexError):
+            m.put([], 1.0)
+
+    def test_put_out_of_range_raises(self):
+        """An out-of-range index raises IndexError and writes nothing."""
+        m = Matrix(3, 3, 1.0)
+        before = _snapshot(m, 3, 3)
+        with pytest.raises(IndexError):
+            m.put([0, 99], 5.0)
+        assert _snapshot(m, 3, 3) == before
+
+    def test_put_shape_mismatch_raises(self):
+        """A wrong-shaped matrix value raises ValueError and writes nothing."""
+        m = Matrix(3, 3, 1.0)
+        before = _snapshot(m, 3, 3)
+        with pytest.raises(ValueError):
+            m.put([0, 1], Matrix(3, 3, 2.0))
+        assert _snapshot(m, 3, 3) == before
+
+    def test_put_invalid_axis_raises(self):
+        """axis >= 2 raises KeyError, matching take()."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(KeyError):
+            m.put([0], 1.0, 2)
+
+    def test_put_axis_below_neg2_raises(self):
+        """An out-of-range negative axis (<= -3) raises KeyError, not a column put."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(KeyError):
+            m.put([0], 1.0, -3)
+
+    def test_put_bad_value_type_raises(self):
+        """A non-numeric, non-matrix value raises TypeError."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(TypeError):
+            m.put([0], "x")
+
+    def test_put_accumulate_scalar_rows(self):
+        """accumulate=True folds a scalar additively over duplicate rows."""
+        m = Matrix(3, 2, 1.0)
+        m.put([0, 0, 2], 2.0, accumulate=True)
+        assert Matrix.allclose(
+            m, Matrix(3, 2, [5.0, 5.0, 1.0, 1.0, 3.0, 3.0]))
+
+    def test_put_accumulate_matrix_rows(self):
+        """accumulate=True adds matching value rows into duplicate rows."""
+        m = Matrix(2, 2, 0.0)
+        v = Matrix(3, 2, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        m.put([0, 0, 1], v, accumulate=True)
+        # row 0 gets v rows 0 and 1; row 1 gets v row 2.
+        assert Matrix.allclose(m, Matrix(2, 2, [4.0, 6.0, 5.0, 6.0]))
+
+    def test_put_accumulate_scalar_cols(self):
+        """accumulate=True folds a scalar additively over duplicate columns."""
+        m = Matrix(2, 3, 1.0)
+        m.put([1, 1], 2.0, axis=1, accumulate=True)
+        assert Matrix.allclose(
+            m, Matrix(2, 3, [1.0, 5.0, 1.0, 1.0, 5.0, 1.0]))
+
+    def test_put_accumulate_matrix_cols(self):
+        """accumulate=True adds matching value columns into duplicate cols."""
+        m = Matrix(2, 2, 0.0)
+        v = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        m.put([0, 0, 1], v, axis=1, accumulate=True)
+        # col 0 gets v cols 0 and 1; col 1 gets v col 2.
+        assert Matrix.allclose(m, Matrix(2, 2, [3.0, 3.0, 9.0, 6.0]))
+
+    def test_put_accumulate_default_is_last_write_wins(self):
+        """Without accumulate, duplicate indices remain last-write-wins."""
+        m = Matrix(3, 2, 1.0)
+        m.put([0, 0], 2.0)
+        assert Matrix.allclose(
+            m, Matrix(3, 2, [2.0, 2.0, 1.0, 1.0, 1.0, 1.0]))
+
+    def test_put_accumulate_self_alias(self):
+        """A self-aliased accumulate reads pre-write values via the snapshot."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        m.put([0, 1], m, accumulate=True)
+        # Each row doubles; the snapshot keeps reads stable under aliasing.
+        assert Matrix.allclose(m, Matrix(2, 2, [2.0, 4.0, 6.0, 8.0]))
+
+    def test_put_accumulate_self_alias_cols(self):
+        """A self-aliased column accumulate reads stable pre-write columns."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        m.put([0, 1], m, axis=1, accumulate=True)
+        # Each column doubles; the snapshot keeps reads stable under aliasing.
+        assert Matrix.allclose(m, Matrix(2, 2, [2.0, 4.0, 6.0, 8.0]))
+
+    def test_put_accumulate_self_alias_1x1(self):
+        """A 1x1 self-slice accumulates as a scalar (captured pre-write)."""
+        m = Matrix(1, 1, [3.0])
+        m.put([0], m, accumulate=True)
+        # The 1x1 RHS is read as a scalar before the write, so this doubles.
+        assert Matrix.allclose(m, Matrix(1, 1, [6.0]))
+
+    def test_put_accumulate_order_preserving(self):
+        """Folds happen in index-list order, giving a bit-exact result."""
+        m = Matrix(1, 1, [0.0])
+        # Left-to-right: ((0 + 1e16) + 1.0) + -1e16 == 0.0, but a reordered
+        # or contraction-fused fold would not cancel exactly.
+        v = Matrix(3, 1, [1e16, 1.0, -1e16])
+        m.put([0, 0, 0], v, accumulate=True)
+        assert m[0, 0] == 0.0
+
+    def test_put_not_acquired_raises(self):
+        """put on a cown-resident matrix raises."""
+        m = Matrix(3, 2, 1.0)
+        Cown(m)
+        with pytest.raises(RuntimeError):
+            m.put([0], 1.0)
+
+    def test_put_boc_roundtrip(self):
+        """put runs inside a @when behavior over a Cown[Matrix]."""
+        a = Cown(Matrix(3, 2, 0.0))
+
+        @when(a)
+        def result(a):  # noqa: D401 — short behavior
+            """Put rows and a column inside a behavior."""
+            a.value.put([0, 2], 5.0)
+            a.value.put([1], Matrix(3, 1, [7.0, 8.0, 9.0]), axis=1)
+            return a.value.copy()
+
+        wait()
+        assert result.exception is False
+        expected = Matrix(3, 2, [5.0, 7.0, 0.0, 8.0, 5.0, 9.0])
+        assert Matrix.allclose(result.value, expected)
 
 
 VECTOR_LENGTHS = [1, 3, 5, 10, 32]
@@ -2669,7 +3668,7 @@ class TestVectorBroadcastArithmetic:
         """Mismatched non-broadcastable shapes raise an error."""
         a = Matrix(3, 4)
         b = Matrix(2, 5)
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(ValueError):
             _ = a + b
 
 
@@ -2980,7 +3979,7 @@ class TestClip:
     """Tests for the clip() method."""
 
     def test_clip_two_args(self, mat, shape, random_values):
-        """clip(minval, maxval) clamps every element."""
+        """clip(min, max) clamps every element to [min, max]."""
         rows, cols = shape
         lo, hi = -25.0, 25.0
         c = mat.clip(lo, hi)
@@ -2992,18 +3991,43 @@ class TestClip:
                 expected = max(lo, min(hi, v))
                 assert c[i, j] == pytest.approx(expected)
 
-    def test_clip_one_arg(self, shape, rng):
-        """clip(maxval) clamps to [0, maxval]."""
+    def test_clip_min_only(self, shape, rng):
+        """clip(min=lo) clamps only below, leaving the upper end unbounded."""
+        rows, cols = shape
+        vals = [rng.uniform(-10, 10) for _ in range(rows * cols)]
+        m = Matrix(rows, cols, vals)
+        lo = -2.0
+        c = m.clip(min=lo)
+        for i in range(rows):
+            for j in range(cols):
+                v = vals[i * cols + j]
+                assert c[i, j] == pytest.approx(max(lo, v))
+
+    def test_clip_max_only(self, shape, rng):
+        """clip(max=hi) clamps only above, leaving the lower end unbounded."""
         rows, cols = shape
         vals = [rng.uniform(-10, 10) for _ in range(rows * cols)]
         m = Matrix(rows, cols, vals)
         hi = 5.0
-        c = m.clip(hi)
+        c = m.clip(max=hi)
         for i in range(rows):
             for j in range(cols):
                 v = vals[i * cols + j]
-                expected = max(0.0, min(hi, v))
-                assert c[i, j] == pytest.approx(expected)
+                assert c[i, j] == pytest.approx(min(hi, v))
+
+    def test_clip_first_positional_is_min(self, shape):
+        """The single positional argument is the lower bound (NumPy order)."""
+        rows, cols = shape
+        m = Matrix(rows, cols, -5.0)
+        c = m.clip(0.0)
+        expected = Matrix(rows, cols, 0.0)
+        assert Matrix.allclose(c, expected)
+
+    def test_clip_no_bounds_raises(self):
+        """clip() with neither bound raises ValueError."""
+        m = Matrix(2, 2, 1.0)
+        with pytest.raises(ValueError):
+            m.clip()
 
     def test_clip_no_change(self, shape):
         """Values already within range are unchanged."""
@@ -3030,7 +4054,7 @@ class TestClip:
         assert Matrix.allclose(c, expected)
 
     def test_clip_invalid_range(self):
-        """clip() raises AssertionError when maxval < minval."""
+        """clip() raises AssertionError when max < min."""
         m = Matrix(2, 2, 1.0)
         with pytest.raises(AssertionError):
             m.clip(10.0, 0.0)
@@ -3236,6 +4260,11 @@ class TestVector:
         assert v.columns == 3
         for i in range(3):
             assert v[0, i] == pytest.approx(vals[i])
+
+    def test_vector_empty_raises(self):
+        """Matrix.vector([]) cannot form a matrix and raises ValueError."""
+        with pytest.raises(ValueError):
+            Matrix.vector([])
 
 
 class TestConcat:
@@ -3492,9 +4521,9 @@ class TestArgExtreme:
             assert result[r, 0] == _flat_argextreme(row, want_max)
 
     def test_argmin_invalid_axis_raises(self):
-        """An out-of-range axis raises NotImplementedError."""
+        """An out-of-range axis raises ValueError."""
         m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(ValueError):
             m.argmin(axis=2)
 
     def test_argextreme_nan_in_middle_is_skipped(self):
@@ -3597,14 +4626,14 @@ class TestOuterBroadcast:
         """In-place outer broadcast would change shape and is rejected."""
         col = Matrix(3, 1, [1.0, 2.0, 3.0])
         row = Matrix(1, 4, [1.0, 2.0, 3.0, 4.0])
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(ValueError):
             col *= row
 
     def test_incompatible_shapes_still_raise(self):
         """A row vector whose width mismatches a full matrix still raises."""
         a = Matrix(1, 3, [1.0, 2.0, 3.0])
         b = Matrix(2, 4, 1.0)
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(ValueError):
             _ = a * b
 
 
@@ -4403,7 +5432,7 @@ class TestMatmulErrors:
         """@ raises when inner dimensions don't match."""
         a = Matrix(2, 3)
         b = Matrix(4, 2)
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(ValueError):
             _ = a @ b
 
 
@@ -4783,3 +5812,709 @@ class TestVectorMethodsInCown:
         assert r0 == pytest.approx(-1.0)
         assert r1 == pytest.approx(2.0)
         assert r2 == pytest.approx(-3.0)
+
+
+def _flat(m):
+    """Row-major flat list of a matrix's elements."""
+    rows, cols = m.rows, m.columns
+    return [m[i, j] for i in range(rows) for j in range(cols)]
+
+
+class TestSqrt:
+    """Element-wise square root."""
+
+    def test_sqrt_matches_math(self, shape, rng):
+        """sqrt() matches math.sqrt element-wise for non-negative inputs."""
+        rows, cols = shape
+        vals = [rng.uniform(0, 100) for _ in range(rows * cols)]
+        m = Matrix(rows, cols, vals)
+        result = m.sqrt()
+        for i in range(rows):
+            for j in range(cols):
+                assert result[i, j] == pytest.approx(math.sqrt(vals[i * cols + j]))
+
+    def test_sqrt_negative_is_nan(self):
+        """Negative elements yield NaN rather than raising."""
+        m = Matrix(1, 3, [-1.0, -4.0, 9.0])
+        result = m.sqrt()
+        assert math.isnan(result[0, 0])
+        assert math.isnan(result[0, 1])
+        assert result[0, 2] == pytest.approx(3.0)
+
+    def test_sqrt_zero(self):
+        """sqrt(0) is 0."""
+        m = Matrix(1, 1, [0.0])
+        assert m.sqrt()[0, 0] == pytest.approx(0.0)
+
+    def test_sqrt_out_of_place_preserves_source(self, shape, rng):
+        """Default sqrt() returns a new matrix and leaves the source intact."""
+        rows, cols = shape
+        vals = [rng.uniform(0, 100) for _ in range(rows * cols)]
+        m = Matrix(rows, cols, vals)
+        _ = m.sqrt()
+        for i in range(rows):
+            for j in range(cols):
+                assert m[i, j] == pytest.approx(vals[i * cols + j])
+
+    def test_sqrt_in_place(self, shape, rng):
+        """sqrt(in_place=True) mutates self and returns it."""
+        rows, cols = shape
+        vals = [rng.uniform(0, 100) for _ in range(rows * cols)]
+        m = Matrix(rows, cols, vals)
+        result = m.sqrt(in_place=True)
+        assert result is m
+        for i in range(rows):
+            for j in range(cols):
+                assert m[i, j] == pytest.approx(math.sqrt(vals[i * cols + j]))
+
+
+COMPARE_OPS = [
+    ("less", lambda a, b: a < b),
+    ("less_equal", lambda a, b: a <= b),
+    ("greater", lambda a, b: a > b),
+    ("greater_equal", lambda a, b: a >= b),
+    ("equal", lambda a, b: a == b),
+    ("not_equal", lambda a, b: a != b),
+]
+
+
+class TestComparisonMasks:
+    """Element-wise comparison methods producing 0/1 mask matrices."""
+
+    @pytest.mark.parametrize("name,ref", COMPARE_OPS, ids=[o[0] for o in COMPARE_OPS])
+    def test_same_shape(self, name, ref, shape, rng):
+        """Each mask method matches Python's element-wise comparison."""
+        rows, cols = shape
+        # Overlapping integer-valued draws so ties exercise == / <= / >=.
+        a_vals = [float(rng.randint(0, 5)) for _ in range(rows * cols)]
+        b_vals = [float(rng.randint(0, 5)) for _ in range(rows * cols)]
+        a = Matrix(rows, cols, a_vals)
+        b = Matrix(rows, cols, b_vals)
+        result = getattr(a, name)(b)
+        assert result.rows == rows
+        assert result.columns == cols
+        for i in range(rows):
+            for j in range(cols):
+                expected = 1.0 if ref(a_vals[i * cols + j], b_vals[i * cols + j]) else 0.0
+                assert result[i, j] == expected
+
+    @pytest.mark.parametrize("name,ref", COMPARE_OPS, ids=[o[0] for o in COMPARE_OPS])
+    def test_scalar(self, name, ref, shape, rng):
+        """Mask methods broadcast a scalar against every element."""
+        rows, cols = shape
+        a_vals = [float(rng.randint(0, 5)) for _ in range(rows * cols)]
+        a = Matrix(rows, cols, a_vals)
+        scalar = 3.0
+        result = getattr(a, name)(scalar)
+        for i in range(rows):
+            for j in range(cols):
+                expected = 1.0 if ref(a_vals[i * cols + j], scalar) else 0.0
+                assert result[i, j] == expected
+
+    @pytest.mark.parametrize("name,ref", COMPARE_OPS, ids=[o[0] for o in COMPARE_OPS])
+    def test_row_vector_broadcast(self, name, ref):
+        """Mask methods broadcast a 1xN row vector across rows."""
+        a = Matrix(2, 3, [1.0, 5.0, 3.0, 4.0, 2.0, 3.0])
+        v = Matrix(1, 3, [3.0, 3.0, 3.0])
+        result = getattr(a, name)(v)
+        for i in range(2):
+            for j in range(3):
+                expected = 1.0 if ref(a[i, j], v[0, j]) else 0.0
+                assert result[i, j] == expected
+
+    @pytest.mark.parametrize("name,ref", COMPARE_OPS, ids=[o[0] for o in COMPARE_OPS])
+    def test_column_vector_broadcast(self, name, ref):
+        """Mask methods broadcast an Mx1 column vector across columns."""
+        a = Matrix(3, 2, [1.0, 5.0, 3.0, 4.0, 2.0, 3.0])
+        v = Matrix(3, 1, [3.0, 3.0, 3.0])
+        result = getattr(a, name)(v)
+        for i in range(3):
+            for j in range(2):
+                expected = 1.0 if ref(a[i, j], v[i, 0]) else 0.0
+                assert result[i, j] == expected
+
+    @pytest.mark.parametrize("name,ref", COMPARE_OPS, ids=[o[0] for o in COMPARE_OPS])
+    def test_one_by_one_broadcast(self, name, ref, shape, rng):
+        """A 1x1 matrix broadcasts like a scalar in mask methods."""
+        rows, cols = shape
+        a_vals = [float(rng.randint(0, 5)) for _ in range(rows * cols)]
+        a = Matrix(rows, cols, a_vals)
+        scalar = 3.0
+        result = getattr(a, name)(Matrix(1, 1, [scalar]))
+        for i in range(rows):
+            for j in range(cols):
+                expected = 1.0 if ref(a_vals[i * cols + j], scalar) else 0.0
+                assert result[i, j] == expected
+
+    def test_nan_less_is_zero(self):
+        """NaN comparisons follow IEEE: ordered ops yield 0, not_equal yields 1."""
+        nan = float("nan")
+        a = Matrix(1, 2, [nan, 1.0])
+        assert a.less(0.0)[0, 0] == 0.0
+        assert a.less_equal(0.0)[0, 0] == 0.0
+        assert a.greater(0.0)[0, 0] == 0.0
+        assert a.greater_equal(0.0)[0, 0] == 0.0
+        assert a.equal(nan)[0, 0] == 0.0
+        assert a.not_equal(nan)[0, 0] == 1.0
+
+    def test_masks_are_zero_or_one(self, shape, rng):
+        """Every mask element is exactly 0.0 or 1.0."""
+        rows, cols = shape
+        a = Matrix(rows, cols, [rng.uniform(-9, 9) for _ in range(rows * cols)])
+        b = Matrix(rows, cols, [rng.uniform(-9, 9) for _ in range(rows * cols)])
+        for name, _ in COMPARE_OPS:
+            for v in _flat(getattr(a, name)(b)):
+                assert v in (0.0, 1.0)
+
+
+RICHCOMPARE_OPS = [
+    ("lt", lambda a, b: a < b),
+    ("le", lambda a, b: a <= b),
+    ("gt", lambda a, b: a > b),
+    ("ge", lambda a, b: a >= b),
+    ("eq", lambda a, b: a == b),
+    ("ne", lambda a, b: a != b),
+]
+
+
+class TestLexicographicCompare:
+    """Operators (<, <=, >, >=, ==, !=) return a single lexicographic bool."""
+
+    @pytest.mark.parametrize("name,op", RICHCOMPARE_OPS, ids=[o[0] for o in RICHCOMPARE_OPS])
+    def test_matches_list_ordering(self, name, op, shape, rng):
+        """Operator result matches Python list comparison of flat elements."""
+        rows, cols = shape
+        a_vals = [float(rng.randint(0, 3)) for _ in range(rows * cols)]
+        b_vals = [float(rng.randint(0, 3)) for _ in range(rows * cols)]
+        a = Matrix(rows, cols, a_vals)
+        b = Matrix(rows, cols, b_vals)
+        assert op(a, b) is op(a_vals, b_vals)
+
+    def test_equal_same_values(self, shape, rng):
+        """Equal-valued same-shape matrices compare equal."""
+        rows, cols = shape
+        vals = [rng.uniform(-9, 9) for _ in range(rows * cols)]
+        a = Matrix(rows, cols, list(vals))
+        b = Matrix(rows, cols, list(vals))
+        assert a == b
+        assert not (a != b)
+        assert a <= b
+        assert a >= b
+        assert not (a < b)
+        assert not (a > b)
+
+    def test_first_difference_decides(self):
+        """The first differing element decides, later elements ignored."""
+        a = Matrix(1, 3, [1.0, 9.0, 9.0])
+        b = Matrix(1, 3, [2.0, 0.0, 0.0])
+        assert a < b
+        assert not (a > b)
+
+    @pytest.mark.parametrize("name,op", RICHCOMPARE_OPS, ids=[o[0] for o in RICHCOMPARE_OPS])
+    def test_scalar_lexicographic(self, name, op):
+        """Scalar comparison broadcasts and decides on element 0 unless tied."""
+        a = Matrix(1, 3, [5.0, 1.0, 1.0])
+        assert op(a, 5.0) is op([5.0, 1.0, 1.0], [5.0, 5.0, 5.0])
+
+    def test_eq_ne_shape_mismatch_no_raise(self):
+        """== / != return False / True on a shape mismatch without raising."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        c = Matrix(1, 4, [1.0, 2.0, 3.0, 4.0])
+        assert (a == c) is False
+        assert (a != c) is True
+
+    def test_eq_same_values_different_shape_not_equal(self):
+        """Same flat data but different shape is not equal."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        c = Matrix(1, 4, [1.0, 2.0, 3.0, 4.0])
+        assert a != c
+
+    @pytest.mark.parametrize("op", [
+        lambda a, b: a < b,
+        lambda a, b: a <= b,
+        lambda a, b: a > b,
+        lambda a, b: a >= b,
+    ])
+    def test_ordering_shape_mismatch_raises(self, op):
+        """Ordering operators raise ValueError on a matrix shape mismatch."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        c = Matrix(1, 4, [1.0, 2.0, 3.0, 4.0])
+        with pytest.raises(ValueError):
+            op(a, c)
+
+    def test_eq_non_matrix_is_false(self):
+        """== against a non-matrix, non-scalar returns False (NotImplemented)."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        assert (a == "hello") is False
+        assert (a != "hello") is True
+        assert (a == object()) is False
+
+    def test_in_list_uses_equality(self):
+        """A matrix can be found in a list via value equality."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        b = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        assert a in [Matrix(2, 2, [0.0, 0.0, 0.0, 0.0]), b]
+
+    def test_unhashable(self):
+        """Defining value equality makes Matrix unhashable (mutable type)."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        with pytest.raises(TypeError):
+            hash(a)
+        with pytest.raises(TypeError):
+            _ = {a}
+
+    def test_one_by_one_not_scalar_in_ordering(self):
+        """A 1x1 matrix only compares against another 1x1, not a larger shape."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        one = Matrix(1, 1, [2.0])
+        with pytest.raises(ValueError):
+            _ = a < one
+        # 1x1 vs 1x1 is fine.
+        assert Matrix(1, 1, [1.0]) < Matrix(1, 1, [2.0])
+
+
+class TestWhere:
+    """numpy-like Matrix.where(mask, a, b)."""
+
+    def test_matrix_operands(self, shape, rng):
+        """where selects a where mask is non-zero and b elsewhere."""
+        rows, cols = shape
+        mask_vals = [float(rng.randint(0, 1)) for _ in range(rows * cols)]
+        a_vals = [rng.uniform(-9, 9) for _ in range(rows * cols)]
+        b_vals = [rng.uniform(-9, 9) for _ in range(rows * cols)]
+        mask = Matrix(rows, cols, mask_vals)
+        a = Matrix(rows, cols, a_vals)
+        b = Matrix(rows, cols, b_vals)
+        result = Matrix.where(mask, a, b)
+        assert result.rows == rows
+        assert result.columns == cols
+        for i in range(rows):
+            for j in range(cols):
+                k = i * cols + j
+                expected = a_vals[k] if mask_vals[k] != 0.0 else b_vals[k]
+                assert result[i, j] == pytest.approx(expected)
+
+    def test_scalar_a(self, shape, rng):
+        """where accepts a scalar for a, broadcast against the mask."""
+        rows, cols = shape
+        mask_vals = [float(rng.randint(0, 1)) for _ in range(rows * cols)]
+        b_vals = [rng.uniform(-9, 9) for _ in range(rows * cols)]
+        mask = Matrix(rows, cols, mask_vals)
+        b = Matrix(rows, cols, b_vals)
+        result = Matrix.where(mask, 99.0, b)
+        for i in range(rows):
+            for j in range(cols):
+                k = i * cols + j
+                expected = 99.0 if mask_vals[k] != 0.0 else b_vals[k]
+                assert result[i, j] == pytest.approx(expected)
+
+    def test_scalar_both(self):
+        """where accepts scalars for both a and b."""
+        mask = Matrix(2, 2, [1.0, 0.0, 0.0, 1.0])
+        result = Matrix.where(mask, 1.0, 0.0)
+        assert _flat(result) == [1.0, 0.0, 0.0, 1.0]
+
+    def test_mask_from_comparison(self):
+        """A mask produced by a comparison method drives the selection."""
+        a = Matrix(1, 4, [1.0, 5.0, 2.0, 8.0])
+        result = Matrix.where(a.greater(3.0), a, 0.0)
+        assert _flat(result) == [0.0, 5.0, 0.0, 8.0]
+
+    def test_nan_mask_selects_a(self):
+        """A NaN mask element is non-zero and selects a."""
+        mask = Matrix(1, 2, [float("nan"), 0.0])
+        result = Matrix.where(mask, 1.0, 2.0)
+        assert _flat(result) == [1.0, 2.0]
+
+    def test_shape_mismatch_raises(self):
+        """A matrix operand whose shape differs from the mask raises."""
+        mask = Matrix(2, 2, [1.0, 0.0, 0.0, 1.0])
+        wrong = Matrix(1, 4, [1.0, 2.0, 3.0, 4.0])
+        with pytest.raises(ValueError):
+            Matrix.where(mask, wrong, 0.0)
+        with pytest.raises(ValueError):
+            Matrix.where(mask, 0.0, wrong)
+
+    def test_one_by_one_not_scalar(self):
+        """A 1x1 matrix operand must match the mask shape (not treated as scalar)."""
+        mask = Matrix(2, 2, [1.0, 0.0, 0.0, 1.0])
+        with pytest.raises(ValueError):
+            Matrix.where(mask, Matrix(1, 1, [5.0]), 0.0)
+
+    def test_bad_operand_type_raises(self):
+        """A non-matrix, non-scalar operand raises TypeError."""
+        mask = Matrix(2, 2, [1.0, 0.0, 0.0, 1.0])
+        with pytest.raises(TypeError):
+            Matrix.where(mask, "x", 0.0)
+
+
+class TestComparisonMaskSelfBroadcast:
+    """Mask methods where self (the left operand) is the broadcast side.
+
+    These pin the swap_right reflections inside Matrix_binary_op: when self is
+    the smaller operand the op is reflected before dispatch, so the result must
+    still read ``ref(self_elem, other_elem)``.
+    """
+
+    @pytest.mark.parametrize("name,ref", COMPARE_OPS, ids=[o[0] for o in COMPARE_OPS])
+    def test_self_one_by_one(self, name, ref):
+        """A 1x1 self broadcasts against a full other."""
+        full = Matrix(2, 3, [1.0, 5.0, 3.0, 4.0, 2.0, 6.0])
+        s = Matrix(1, 1, [3.0])
+        result = getattr(s, name)(full)
+        for i in range(2):
+            for j in range(3):
+                expected = 1.0 if ref(3.0, full[i, j]) else 0.0
+                assert result[i, j] == expected
+
+    @pytest.mark.parametrize("name,ref", COMPARE_OPS, ids=[o[0] for o in COMPARE_OPS])
+    def test_self_row_vector(self, name, ref):
+        """A 1xN self broadcasts down the rows of an MxN other."""
+        full = Matrix(2, 3, [1.0, 5.0, 3.0, 4.0, 2.0, 6.0])
+        s = Matrix(1, 3, [3.0, 3.0, 3.0])
+        result = getattr(s, name)(full)
+        for i in range(2):
+            for j in range(3):
+                expected = 1.0 if ref(s[0, j], full[i, j]) else 0.0
+                assert result[i, j] == expected
+
+    @pytest.mark.parametrize("name,ref", COMPARE_OPS, ids=[o[0] for o in COMPARE_OPS])
+    def test_self_column_vector(self, name, ref):
+        """An Mx1 self broadcasts across the columns of an MxN other."""
+        full = Matrix(2, 3, [1.0, 5.0, 3.0, 4.0, 2.0, 6.0])
+        s = Matrix(2, 1, [3.0, 4.0])
+        result = getattr(s, name)(full)
+        for i in range(2):
+            for j in range(3):
+                expected = 1.0 if ref(s[i, 0], full[i, j]) else 0.0
+                assert result[i, j] == expected
+
+    @pytest.mark.parametrize("name,ref", COMPARE_OPS, ids=[o[0] for o in COMPARE_OPS])
+    def test_self_row_vs_column_outer(self, name, ref):
+        """A 1xN self against an Mx1 other forms the MxN outer-product mask."""
+        s = Matrix(1, 3, [1.0, 3.0, 5.0])
+        other = Matrix(2, 1, [2.0, 4.0])
+        result = getattr(s, name)(other)
+        assert (result.rows, result.columns) == (2, 3)
+        for i in range(2):
+            for j in range(3):
+                expected = 1.0 if ref(s[0, j], other[i, 0]) else 0.0
+                assert result[i, j] == expected
+
+
+class TestComparisonMaskCoercion:
+    """Mask methods accept list/tuple and bool operands."""
+
+    def test_list_operand_row_broadcast(self):
+        """A list operand is taken as a row vector and broadcasts."""
+        a = Matrix(2, 3, [1.0, 5.0, 3.0, 4.0, 2.0, 6.0])
+        result = a.less([3.0, 3.0, 3.0])
+        for i in range(2):
+            for j in range(3):
+                assert result[i, j] == (1.0 if a[i, j] < 3.0 else 0.0)
+
+    def test_tuple_operand_same_shape(self):
+        """A tuple operand matching the flat shape compares element-wise."""
+        a = Matrix(1, 3, [1.0, 3.0, 5.0])
+        result = a.equal((1.0, 0.0, 5.0))
+        assert _flat(result) == [1.0, 0.0, 1.0]
+
+    def test_bool_operand_is_scalar(self):
+        """A bool operand is the scalar 1.0 (True) or 0.0 (False)."""
+        a = Matrix(1, 3, [0.0, 1.0, 2.0])
+        assert _flat(a.less(True)) == [1.0, 0.0, 0.0]
+        assert _flat(a.greater(False)) == [0.0, 1.0, 1.0]
+        assert _flat(a.equal(True)) == [0.0, 1.0, 0.0]
+
+    def test_empty_list_operand_raises(self):
+        """An empty list/tuple cannot be coerced and raises ValueError."""
+        a = Matrix(1, 3, [0.0, 1.0, 2.0])
+        with pytest.raises(ValueError):
+            a.less([])
+        with pytest.raises(ValueError):
+            a.equal(())
+
+    def test_malformed_list_operand_raises(self):
+        """A list holding a non-number raises TypeError."""
+        a = Matrix(1, 3, [0.0, 1.0, 2.0])
+        with pytest.raises(TypeError):
+            a.greater([1.0, "x", 3.0])
+
+
+class TestLexicographicNaN:
+    """NaN handling in the lexicographic comparison operators."""
+
+    def test_all_nan_equals_itself(self):
+        """An all-NaN matrix compares == equal to itself (NaN never decides)."""
+        nan = float("nan")
+        a = Matrix(1, 3, [nan, nan, nan])
+        b = Matrix(1, 3, [nan, nan, nan])
+        assert a == b
+        assert not (a != b)
+        assert not (a < b)
+        assert not (a > b)
+        assert a <= b
+        assert a >= b
+
+    def test_nan_skipped_first_real_difference_decides(self):
+        """A leading NaN is skipped; the first real ordering decides."""
+        nan = float("nan")
+        a = Matrix(1, 3, [nan, 1.0, 9.0])
+        b = Matrix(1, 3, [nan, 2.0, 0.0])
+        assert a < b
+        assert not (a > b)
+
+    def test_nan_scalar_path(self):
+        """The scalar comparison path also skips NaN elements."""
+        nan = float("nan")
+        a = Matrix(1, 3, [nan, nan, nan])
+        assert (a == nan) is True
+        assert (a != nan) is False
+        assert (a < nan) is False
+        assert (a > nan) is False
+
+    def test_equal_mask_vs_eq_operator_nan_divergence(self):
+        """equal() sends NaN->0.0, but the == operator treats all-NaN as equal."""
+        nan = float("nan")
+        a = Matrix(1, 2, [nan, nan])
+        b = Matrix(1, 2, [nan, nan])
+        assert _flat(a.equal(b)) == [0.0, 0.0]
+        assert (a == b) is True
+
+
+class TestReflectedScalarCompare:
+    """Reflected scalar comparisons mirror the matrix-on-left form."""
+
+    @pytest.mark.parametrize("scalar", [0.0, 3.0, 5.0])
+    def test_reflected_equivalence(self, scalar):
+        """``scalar OP a`` equals the reflected ``a OP' scalar`` per operator."""
+        a = Matrix(1, 3, [1.0, 3.0, 5.0])
+        assert (scalar < a) is (a > scalar)
+        assert (scalar <= a) is (a >= scalar)
+        assert (scalar > a) is (a < scalar)
+        assert (scalar >= a) is (a <= scalar)
+        assert (scalar == a) is (a == scalar)
+        assert (scalar != a) is (a != scalar)
+
+
+class TestRichcompareCoercion:
+    """Comparison operators accept list/tuple operands and bool scalars."""
+
+    @pytest.mark.parametrize("name,op", RICHCOMPARE_OPS, ids=[o[0] for o in RICHCOMPARE_OPS])
+    def test_list_operand_matches_matrix(self, name, op):
+        """A same-shape list operand compares like the equivalent matrix."""
+        a = Matrix(1, 3, [1.0, 2.0, 3.0])
+        seq = [1.0, 2.0, 4.0]
+        assert op(a, seq) is op(a, Matrix(1, 3, seq))
+
+    def test_tuple_operand(self):
+        """A tuple operand of matching shape compares lexicographically."""
+        a = Matrix(1, 3, [1.0, 2.0, 3.0])
+        assert (a == (1.0, 2.0, 3.0)) is True
+        assert (a < (1.0, 2.0, 4.0)) is True
+
+    def test_list_shape_mismatch_eq_false(self):
+        """A list whose shape differs makes == False / != True (no raise)."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        assert (a == [1.0, 2.0, 3.0, 4.0]) is False
+        assert (a != [1.0, 2.0, 3.0, 4.0]) is True
+
+    def test_list_shape_mismatch_ordering_raises(self):
+        """An ordering operator against a mismatched list raises ValueError."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        with pytest.raises(ValueError):
+            _ = a < [1.0, 2.0, 3.0, 4.0]
+
+    def test_bool_scalar(self):
+        """A bool operand is the scalar 1.0 (True) or 0.0 (False)."""
+        a = Matrix(1, 2, [1.0, 1.0])
+        assert (a == True) is True  # noqa: E712 — bool-as-scalar is intended
+        assert (a == False) is False  # noqa: E712 — bool-as-scalar is intended
+
+    def test_empty_list_eq_is_total(self):
+        """An empty list cannot be coerced, so == is False / != True (no raise)."""
+        a = Matrix(1, 3, [1.0, 2.0, 3.0])
+        assert (a == []) is False
+        assert (a != []) is True
+        assert (a == ()) is False
+        assert (a != ()) is True
+
+    def test_empty_list_ordering_raises(self):
+        """An ordering operator against an empty list raises ValueError."""
+        a = Matrix(1, 3, [1.0, 2.0, 3.0])
+        with pytest.raises(ValueError):
+            _ = a < []
+
+    def test_malformed_list_eq_is_total(self):
+        """A list holding a non-number makes == False / != True (no raise)."""
+        a = Matrix(1, 3, [1.0, 2.0, 3.0])
+        assert (a == [1.0, "x", 3.0]) is False
+        assert (a != [1.0, "x", 3.0]) is True
+
+    def test_nested_list_eq_is_total(self):
+        """A nested list (non-number elements) makes == False / != True."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        assert (a == [[1.0, 2.0], [3.0, 4.0]]) is False
+        assert (a != [[1.0, 2.0], [3.0, 4.0]]) is True
+
+    def test_malformed_list_ordering_raises(self):
+        """An ordering operator against a malformed list raises TypeError."""
+        a = Matrix(1, 3, [1.0, 2.0, 3.0])
+        with pytest.raises(TypeError):
+            _ = a < [1.0, "x", 3.0]
+
+    def test_nested_list_ordering_raises(self):
+        """An ordering operator against a nested list raises TypeError."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        with pytest.raises(TypeError):
+            _ = a < [[1.0, 2.0], [3.0, 4.0]]
+
+    def test_in_list_with_uncoercible_elements(self):
+        """`matrix in container` stays exception-free past empty/malformed lists."""
+        a = Matrix(1, 3, [1.0, 2.0, 3.0])
+        b = Matrix(1, 3, [1.0, 2.0, 3.0])
+        assert a in [[], [1.0, "x", 3.0], b]
+
+
+class TestWhereExtended:
+    """where() NaN propagation, bool, and sequence operands."""
+
+    def test_nan_value_propagates(self):
+        """Selecting a NaN value propagates it; value NaN is not special-cased."""
+        nan = float("nan")
+        mask = Matrix(1, 2, [0.0, 1.0])
+        b = Matrix(1, 2, [nan, nan])
+        result = Matrix.where(mask, 1.0, b)
+        assert math.isnan(result[0, 0])
+        assert result[0, 1] == 1.0
+
+    def test_list_operand(self):
+        """A list value operand is taken as a row vector matching the mask."""
+        mask = Matrix(1, 3, [1.0, 0.0, 1.0])
+        result = Matrix.where(mask, [10.0, 20.0, 30.0], 0.0)
+        assert _flat(result) == [10.0, 0.0, 30.0]
+
+    def test_tuple_operand(self):
+        """A tuple value operand is coerced the same as a list."""
+        mask = Matrix(1, 3, [0.0, 1.0, 0.0])
+        result = Matrix.where(mask, 9.0, (10.0, 20.0, 30.0))
+        assert _flat(result) == [10.0, 9.0, 30.0]
+
+    def test_list_shape_mismatch_raises(self):
+        """A list whose shape differs from the mask raises ValueError."""
+        mask = Matrix(2, 2, [1.0, 0.0, 0.0, 1.0])
+        with pytest.raises(ValueError):
+            Matrix.where(mask, [1.0, 2.0, 3.0], 0.0)
+
+    def test_bool_operand(self):
+        """Bool value operands are scalars (True -> 1.0, False -> 0.0)."""
+        mask = Matrix(1, 2, [1.0, 0.0])
+        result = Matrix.where(mask, True, False)
+        assert _flat(result) == [1.0, 0.0]
+
+    def test_empty_list_operand_raises(self):
+        """An empty list value operand cannot be coerced and raises ValueError."""
+        mask = Matrix(1, 3, [1.0, 0.0, 1.0])
+        with pytest.raises(ValueError):
+            Matrix.where(mask, [], 0.0)
+
+    def test_empty_list_b_operand_raises(self):
+        """An empty list in the b (second) position also raises ValueError."""
+        mask = Matrix(1, 3, [1.0, 0.0, 1.0])
+        with pytest.raises(ValueError):
+            Matrix.where(mask, 0.0, [])
+
+    def test_malformed_list_operand_raises(self):
+        """A list value operand holding a non-number raises TypeError."""
+        mask = Matrix(1, 3, [1.0, 0.0, 1.0])
+        with pytest.raises(TypeError):
+            Matrix.where(mask, [1.0, "x", 3.0], 0.0)
+
+    def test_malformed_list_b_operand_raises(self):
+        """A non-number element in the b (second) position raises TypeError."""
+        mask = Matrix(1, 3, [1.0, 0.0, 1.0])
+        with pytest.raises(TypeError):
+            Matrix.where(mask, 0.0, [1.0, "x", 3.0])
+
+
+class TestFmaBroadcast:
+    """fma() row- and column-vector broadcasting of b and c."""
+
+    def test_row_vector_b(self):
+        """A 1xN b broadcasts down the rows of self."""
+        a = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        row = Matrix(1, 3, [10.0, 20.0, 30.0])
+        out = a.fma(row, 0.0)
+        for i in range(2):
+            for j in range(3):
+                assert out[i, j] == ref_fma(a[i, j], row[0, j], 0.0)
+
+    def test_column_vector_b(self):
+        """An Mx1 b broadcasts across the columns of self."""
+        a = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        col = Matrix(2, 1, [10.0, 20.0])
+        out = a.fma(col, 0.0)
+        for i in range(2):
+            for j in range(3):
+                assert out[i, j] == ref_fma(a[i, j], col[i, 0], 0.0)
+
+    def test_row_vector_c(self):
+        """A 1xN c broadcasts down the rows of self."""
+        a = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        row = Matrix(1, 3, [10.0, 20.0, 30.0])
+        out = a.fma(1.0, row)
+        for i in range(2):
+            for j in range(3):
+                assert out[i, j] == ref_fma(a[i, j], 1.0, row[0, j])
+
+    def test_column_vector_c(self):
+        """An Mx1 c broadcasts across the columns of self."""
+        a = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        col = Matrix(2, 1, [10.0, 20.0])
+        out = a.fma(1.0, col)
+        for i in range(2):
+            for j in range(3):
+                assert out[i, j] == ref_fma(a[i, j], 1.0, col[i, 0])
+
+    def test_row_b_and_column_c(self):
+        """A row-vector b and a column-vector c broadcast independently."""
+        a = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        row = Matrix(1, 3, [10.0, 20.0, 30.0])
+        col = Matrix(2, 1, [100.0, 200.0])
+        out = a.fma(row, col)
+        for i in range(2):
+            for j in range(3):
+                assert out[i, j] == ref_fma(a[i, j], row[0, j], col[i, 0])
+
+    def test_broadcast_in_place(self):
+        """A broadcast operand still supports in_place=True."""
+        a = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        av = _flat(a)
+        row = Matrix(1, 3, [10.0, 20.0, 30.0])
+        expected = [ref_fma(av[i * 3 + j], row[0, j], 0.0)
+                    for i in range(2) for j in range(3)]
+        out = a.fma(row, 0.0, in_place=True)
+        assert out is a
+        assert _flat(a) == expected
+
+    def test_broadcast_leaves_operand_unmodified(self):
+        """Materialising a broadcast operand does not mutate the source vector."""
+        a = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        row = Matrix(1, 3, [10.0, 20.0, 30.0])
+        before = _flat(row)
+        a.fma(row, 0.0)
+        assert _flat(row) == before
+
+    def test_wrong_length_row_vector_raises(self):
+        """A 1xN b whose width mismatches self's columns raises ValueError."""
+        a = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        bad = Matrix(1, 2, [1.0, 2.0])
+        with pytest.raises(ValueError):
+            a.fma(bad, 0.0)
+
+    def test_wrong_length_column_vector_raises(self):
+        """An Mx1 b whose height mismatches self's rows raises ValueError."""
+        a = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        bad = Matrix(3, 1, [1.0, 2.0, 3.0])
+        with pytest.raises(ValueError):
+            a.fma(bad, 0.0)

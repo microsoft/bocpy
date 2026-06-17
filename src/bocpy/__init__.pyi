@@ -229,6 +229,30 @@ class Matrix:
         :seealso: ``@`` / :func:`numpy.matmul` for matrix multiplication.
         """
 
+    def fma(self, b: Union["Matrix", int, float],
+            c: Union["Matrix", int, float],
+            /, in_place: bool = False) -> "Matrix":
+        """Fused multiply-add: single-rounding ``self * b + c``.
+
+        Uses C99 ``fma`` so the product is rounded once, unlike
+        ``self * b + c`` which rounds twice (the build sets
+        ``-ffp-contract=off`` for bit-reproducibility, so even an explicit
+        ``self * b + c`` never fuses). Results may differ from the
+        two-rounding form by up to half a ULP -- compare with
+        :meth:`allclose`, never ``==``.
+
+        :param b: Multiplier: a same-shape :class:`Matrix`, a ``1x1``
+            matrix, a ``1xN`` row vector or ``Mx1`` column vector that
+            broadcasts against ``self``, or a scalar.
+        :param c: Addend, with the same shape rules as *b*.
+        :param in_place: When ``True``, write into ``self`` and return it.
+        :return: ``self * b + c`` (``self`` itself when ``in_place=True``).
+        :raises ValueError: if *b* / *c* is a matrix whose shape neither
+            matches ``self`` nor broadcasts against it.
+        :raises TypeError: if *b* / *c* is neither a matrix nor a real
+            number.
+        """
+
     def cross(self, other: "Matrix",
               axis: Optional[int] = None) -> Union[float, "Matrix"]:
         """2D or 3D cross product against another vector or batch.
@@ -265,7 +289,7 @@ class Matrix:
             through this method).
         :return: A float for ``1x2`` / ``2x1`` inputs; otherwise a
             :class:`Matrix`.
-        :raises NotImplementedError: on incompatible shapes or
+        :raises ValueError: on incompatible shapes or
             mismatched batch sizes.
         """
 
@@ -302,7 +326,7 @@ class Matrix:
             When ``False`` (the default), return a new :class:`Matrix`
             with the rotated vectors.
         :return: A :class:`Matrix` (``self`` when ``in_place=True``).
-        :raises NotImplementedError: on any shape that is not a 2D vector
+        :raises ValueError: on any shape that is not a 2D vector
             or a ``Nx2`` / ``2xN`` batch.
         """
 
@@ -319,7 +343,7 @@ class Matrix:
             on unambiguous shapes.
         :return: A float for a single 2D vector input, otherwise a
             :class:`Matrix` of per-vector angles.
-        :raises NotImplementedError: on any shape that is not a 2D vector
+        :raises ValueError: on any shape that is not a 2D vector
             or a ``Nx2`` / ``2xN`` batch.
         """
 
@@ -397,15 +421,138 @@ class Matrix:
         :param in_place: When ``True``, mutate ``self`` and return it.
         """
 
-    def clip(self, min_or_maxval: float, maxval: Optional[float] = None) -> "Matrix":
-        """Clip every element to a given range.
+    def sqrt(self, in_place: bool = False) -> "Matrix":
+        """Take the square root of every element.
 
-        :param min_or_maxval: If *maxval* is provided, this is the minimum
-            clipping value.  Otherwise, this is the maximum and the minimum
-            defaults to zero.
-        :param maxval: The maximum clipping value, or ``None`` to treat
-            *min_or_maxval* as the maximum.
+        Negative elements yield ``NaN`` (no exception is raised), matching
+        :func:`numpy.sqrt`.
+
+        :param in_place: When ``True``, mutate ``self`` and return it.
+        """
+
+    def less(self, other: Union["Matrix", int, float,
+                                Sequence[Union[int, float]]]) -> "Matrix":
+        """Element-wise ``self < other`` as a 0/1 mask matrix.
+
+        Distinct from the ``<`` operator, which returns a single
+        :class:`bool` (see :meth:`__lt__`).
+
+        :param other: A same-shape matrix, a scalar (including ``bool``), a
+            ``1x1`` matrix, a row/column vector that broadcasts (same rules
+            as arithmetic), or a list/tuple of numbers.
+        :return: A new :class:`Matrix` of ``1.0``/``0.0``. NaN comparisons
+            yield ``0.0``.
+        :raises ValueError: on a non-broadcastable shape or an empty
+            list/tuple operand.
+        :raises TypeError: if *other* is a list/tuple holding a non-number,
+            or is not a matrix, scalar, or list/tuple.
+        """
+
+    def less_equal(self, other: Union["Matrix", int, float,
+                                      Sequence[Union[int, float]]]) -> "Matrix":
+        """Element-wise ``self <= other`` as a 0/1 mask matrix.
+
+        Distinct from the ``<=`` operator, which returns a single
+        :class:`bool` (see :meth:`__le__`).
+
+        :param other: A same-shape matrix, a scalar (including ``bool``), a
+            ``1x1`` matrix, a row/column vector that broadcasts, or a
+            list/tuple of numbers.
+        :return: A new :class:`Matrix` of ``1.0``/``0.0``. NaN comparisons
+            yield ``0.0``.
+        :raises ValueError: on a non-broadcastable shape or an empty
+            list/tuple operand.
+        :raises TypeError: on a non-number list/tuple element or an
+            unsupported operand type (see :meth:`less`).
+        """
+
+    def greater(self, other: Union["Matrix", int, float,
+                                   Sequence[Union[int, float]]]) -> "Matrix":
+        """Element-wise ``self > other`` as a 0/1 mask matrix.
+
+        Distinct from the ``>`` operator, which returns a single
+        :class:`bool` (see :meth:`__gt__`).
+
+        :param other: A same-shape matrix, a scalar (including ``bool``), a
+            ``1x1`` matrix, a row/column vector that broadcasts, or a
+            list/tuple of numbers.
+        :return: A new :class:`Matrix` of ``1.0``/``0.0``. NaN comparisons
+            yield ``0.0``.
+        :raises ValueError: on a non-broadcastable shape or an empty
+            list/tuple operand.
+        :raises TypeError: on a non-number list/tuple element or an
+            unsupported operand type (see :meth:`less`).
+        """
+
+    def greater_equal(self, other: Union["Matrix", int, float,
+                                         Sequence[Union[int, float]]]) -> "Matrix":
+        """Element-wise ``self >= other`` as a 0/1 mask matrix.
+
+        Distinct from the ``>=`` operator, which returns a single
+        :class:`bool` (see :meth:`__ge__`).
+
+        :param other: A same-shape matrix, a scalar (including ``bool``), a
+            ``1x1`` matrix, a row/column vector that broadcasts, or a
+            list/tuple of numbers.
+        :return: A new :class:`Matrix` of ``1.0``/``0.0``. NaN comparisons
+            yield ``0.0``.
+        :raises ValueError: on a non-broadcastable shape or an empty
+            list/tuple operand.
+        :raises TypeError: on a non-number list/tuple element or an
+            unsupported operand type (see :meth:`less`).
+        """
+
+    def equal(self, other: Union["Matrix", int, float,
+                                 Sequence[Union[int, float]]]) -> "Matrix":
+        """Element-wise ``self == other`` as a 0/1 mask matrix.
+
+        Distinct from the ``==`` operator, which returns a single
+        :class:`bool` (see :meth:`__eq__`).
+
+        :param other: A same-shape matrix, a scalar (including ``bool``), a
+            ``1x1`` matrix, a row/column vector that broadcasts, or a
+            list/tuple of numbers.
+        :return: A new :class:`Matrix` of ``1.0``/``0.0``. NaN comparisons
+            yield ``0.0``.
+        :raises ValueError: on a non-broadcastable shape or an empty
+            list/tuple operand.
+        :raises TypeError: on a non-number list/tuple element or an
+            unsupported operand type (see :meth:`less`).
+        """
+
+    def not_equal(self, other: Union["Matrix", int, float,
+                                     Sequence[Union[int, float]]]) -> "Matrix":
+        """Element-wise ``self != other`` as a 0/1 mask matrix.
+
+        Distinct from the ``!=`` operator, which returns a single
+        :class:`bool` (see :meth:`__ne__`).
+
+        :param other: A same-shape matrix, a scalar (including ``bool``), a
+            ``1x1`` matrix, a row/column vector that broadcasts, or a
+            list/tuple of numbers.
+        :return: A new :class:`Matrix` of ``1.0``/``0.0``. NaN comparisons
+            yield ``1.0``.
+        :raises ValueError: on a non-broadcastable shape or an empty
+            list/tuple operand.
+        :raises TypeError: on a non-number list/tuple element or an
+            unsupported operand type (see :meth:`less`).
+        """
+
+    def clip(self, min: Optional[float] = None,
+             max: Optional[float] = None) -> "Matrix":
+        """Clamp every element to ``[min, max]``.
+
+        The first argument is the lower bound and the second the upper
+        bound. Either may be ``None`` (or omitted) to leave that side
+        unbounded: ``m.clip(min=0.0)`` clamps only below and
+        ``m.clip(max=255.0)`` only above.
+
+        :param min: Lower clipping bound, or ``None`` for no lower bound.
+        :param max: Upper clipping bound, or ``None`` for no upper bound.
         :return: A new clipped :class:`Matrix`.
+        :raises ValueError: if both *min* and *max* are ``None``.
+        :raises AssertionError: if both bounds are given and *max* < *min*.
+        :raises TypeError: if a given bound is not a real number.
         """
 
     def copy(self) -> "Matrix":
@@ -419,11 +566,64 @@ class Matrix:
         object overhead. The current interpreter must own the matrix.
         """
 
-    def select(self, indices: Union[list[int], tuple[int]], axis=0):
+    def take(self, indices: Union[list[int], tuple[int]], axis=0) -> "Matrix":
         """Return a new matrix containing only the selected rows or columns.
 
-        :param indices: The row or column indices to select.
-        :param axis: ``0`` to select rows, ``1`` to select columns.
+        *indices* is a 1-D list or tuple of ints. Negative indices count
+        from the end. Duplicate indices repeat the corresponding row or
+        column. Equivalent to ``m[indices]`` (rows) and ``m[:, indices]``
+        (columns). A ``bool`` element is treated as the integer ``0``/``1``.
+
+        :param indices: The row or column indices to take. Must be a
+            non-empty list or tuple of ints.
+        :param axis: ``0`` to take rows, ``1`` to take columns.
+        :raises IndexError: if an index is out of range, or if *indices*
+            is empty.
+        :raises KeyError: if *axis* is not ``0`` or ``1``.
+        :raises TypeError: if an index is not an int.
+        :raises OverflowError: if an index exceeds the platform word size.
+        """
+
+    def put(self, indices: Union[list[int], tuple[int]],
+            value: Union[int, float, "Matrix"], axis=0,
+            accumulate: bool = False) -> "Matrix":
+        """Assign *value* into the selected rows or columns in place.
+
+        The write-side counterpart of :meth:`take`. *value* may be a
+        scalar (a real number or a ``1x1`` matrix, broadcast over the
+        selection) or a matrix whose shape matches the selection exactly
+        (``len(indices)`` rows by this matrix's column count for a row
+        assignment; this matrix's row count by ``len(indices)`` columns for
+        a column assignment). Equivalent to ``m[indices] = value`` (rows)
+        and ``m[:, indices] = value`` (columns).
+
+        All indices and the *value* shape are validated before any element
+        is written, so a rejected call leaves the matrix unchanged. Negative
+        indices count from the end. A ``bool`` index element is treated as
+        the integer ``0``/``1``.
+
+        With ``accumulate=False`` (the default) duplicate indices follow
+        last-write-wins. With ``accumulate=True`` the values are *added*
+        into the selection, so duplicate indices fold additively
+        (``m.put([0, 0], v, accumulate=True)`` adds twice into row 0). This
+        is the only way to fold duplicates: ``m[indices] += value`` desugars
+        to gather/iadd/scatter and so collapses to last-write-wins.
+
+        :param indices: The row or column indices to assign. Must be a
+            non-empty list or tuple of ints.
+        :param value: The scalar or matrix to assign into the selection.
+        :param axis: ``0`` to assign rows, ``1`` to assign columns.
+        :param accumulate: When ``True``, add into the selection instead of
+            overwriting, so duplicate indices accumulate.
+        :return: ``self`` (to allow chaining).
+        :raises IndexError: if an index is out of range, or if *indices*
+            is empty.
+        :raises KeyError: if *axis* is not ``0`` or ``1``.
+        :raises ValueError: if a matrix *value* shape does not match the
+            selection shape.
+        :raises TypeError: if *value* is neither a real number nor a matrix,
+            or if an index is not an int.
+        :raises OverflowError: if an index exceeds the platform word size.
         """
 
     def __add__(self, other: Union["Matrix", int, float]) -> "Matrix":
@@ -459,15 +659,153 @@ class Matrix:
     def __len__(self) -> int:
         """Return the number of rows."""
 
-    def __getitem__(self, key: Union[int, tuple[int, int]]) -> Union["Matrix", float]:
-        """Retrieve a row, element, or sub-matrix by index or slice."""
+    def __getitem__(self, key: Union[int, slice, tuple, list[int]]) -> Union["Matrix", float]:
+        """Retrieve a row, element, sub-matrix, or fancy-index gather.
 
-    def __setitem__(self, key: Union[int, tuple[int, int]], value: Union[int,
-                    float, "Matrix", Sequence[Union[int, float]]]):
-        """Set a row, element, or sub-matrix by index or slice."""
+        A list key gathers rows or columns: ``m[[r0, r1]]`` and
+        ``m[[r0, r1], :]`` select rows, and ``m[:, [c0, c1]]`` selects
+        columns. A list key always returns a :class:`Matrix` (even a
+        single-element list such as ``m[[0]]``), whereas ``m[0]`` and
+        ``m[0, 0]`` return a Python ``float``. Negative indices count from
+        the end; duplicates repeat the row or column; an out-of-range index
+        raises :class:`IndexError` and an empty list raises
+        :class:`IndexError`.
+
+        Column gather requires the bare ``:`` row selector: ``m[0:R, [c]]``
+        (a full *range* rather than ``:``) raises
+        :class:`IndexError`. Paired lists (``m[[r], [c]]``),
+        list-with-int (``m[[r], 0]``), and a list paired with a non-full
+        slice all raise :class:`IndexError`; use :meth:`take`
+        for those. A ``bool`` element in a list is treated as ``0``/``1``.
+
+        :raises IndexError: if a list index is out of range, the list
+            is empty, or for unsupported list/slice combinations.
+        """
+
+    def __setitem__(self, key: Union[int, slice, tuple, list[int]],
+                    value: Union[int, float, "Matrix",
+                                 Sequence[Union[int, float]]]):
+        """Set a row, element, sub-matrix, or fancy-index scatter.
+
+        A list key scatters into rows or columns, mirroring the
+        :meth:`__getitem__` gather shapes: ``m[[r0, r1]] = v`` and
+        ``m[[r0, r1], :] = v`` assign rows, and ``m[:, [c0, c1]] = v``
+        assigns columns. The right-hand side may be a scalar (a real number
+        or a ``1x1`` matrix, broadcast over the selection) or a matrix whose
+        shape matches the selection exactly (``count`` rows by the receiver's
+        column count for a row scatter; the receiver's row count by ``count``
+        columns for a column scatter).
+
+        All indices and the RHS shape are validated *before* any element is
+        written, so a rejected assignment leaves the matrix unchanged (no
+        partial writes). Duplicate indices follow last-write-wins, **not**
+        accumulation — ``m[[0, 0]] += v`` increments row 0 once, not twice;
+        use :meth:`put` with ``accumulate=True`` to fold duplicates. The
+        augmented forms (``+=``, ``-=``, ``*=``, ``/=``) desugar to a
+        gather, an in-place op, and a scatter.
+
+        Column scatter requires the bare ``:`` row selector: ``m[0:R, [c]]``
+        raises :class:`IndexError`. Paired lists (``m[[r], [c]]``),
+        list-with-int (``m[[r], 0]``), and a list paired with a non-full
+        slice all raise :class:`IndexError`. A ``bool`` element in
+        a list is treated as ``0``/``1``.
+
+        :raises IndexError: if a list index is out of range, the list
+            is empty, or for unsupported list/slice combinations.
+        :raises ValueError: if a matrix RHS shape does not match the
+            selection shape.
+        :raises TypeError: if the RHS is neither a real number nor a matrix.
+        """
 
     def __iter__(self) -> Iterator[Union[float, "Matrix"]]:
         """Iterate over rows of the matrix."""
+
+    def __lt__(self, other: Union["Matrix", int, float,
+                                  Sequence[Union[int, float]]]) -> bool:
+        """Lexicographic ``self < other`` returning a single :class:`bool`.
+
+        Compares element by element in row-major order, like a list or
+        tuple: the first element where a strict ordering holds decides.
+        *other* must be a same-shape matrix, a scalar (a scalar
+        broadcasts to ``self``'s shape), or a list/tuple of numbers (coerced
+        to a ``1xN`` row matrix). A ``1x1`` matrix is **not** treated
+        as a scalar here and only compares against another ``1x1``. A
+        ``NaN`` element never decides the ordering; comparison continues
+        past it, so two all-``NaN`` matrices compare neither ``<`` nor ``>``.
+
+        For an element-wise 0/1 mask instead, use :meth:`less`.
+
+        :raises ValueError: if *other* is a matrix (or coerced sequence) of
+            a different shape, or an empty list/tuple.
+        :raises TypeError: if *other* is a list/tuple holding a non-number.
+        """
+
+    def __le__(self, other: Union["Matrix", int, float,
+                                  Sequence[Union[int, float]]]) -> bool:
+        """Lexicographic ``self <= other`` returning a single :class:`bool`.
+
+        See :meth:`__lt__` for the comparison rules. For an element-wise
+        0/1 mask instead, use :meth:`less_equal`.
+
+        :raises ValueError: if *other* is a matrix (or coerced sequence) of
+            a different shape, or an empty list/tuple.
+        :raises TypeError: if *other* is a list/tuple holding a non-number.
+        """
+
+    def __gt__(self, other: Union["Matrix", int, float,
+                                  Sequence[Union[int, float]]]) -> bool:
+        """Lexicographic ``self > other`` returning a single :class:`bool`.
+
+        See :meth:`__lt__` for the comparison rules. For an element-wise
+        0/1 mask instead, use :meth:`greater`.
+
+        :raises ValueError: if *other* is a matrix (or coerced sequence) of
+            a different shape, or an empty list/tuple.
+        :raises TypeError: if *other* is a list/tuple holding a non-number.
+        """
+
+    def __ge__(self, other: Union["Matrix", int, float,
+                                  Sequence[Union[int, float]]]) -> bool:
+        """Lexicographic ``self >= other`` returning a single :class:`bool`.
+
+        See :meth:`__lt__` for the comparison rules. For an element-wise
+        0/1 mask instead, use :meth:`greater_equal`.
+
+        :raises ValueError: if *other* is a matrix (or coerced sequence) of
+            a different shape, or an empty list/tuple.
+        :raises TypeError: if *other* is a list/tuple holding a non-number.
+        """
+
+    def __eq__(self, other: object) -> bool:
+        """Lexicographic ``self == other`` returning a single :class:`bool`.
+
+        ``True`` only when *other* is a same-shape matrix equal element by
+        element, a list/tuple of numbers (coerced to a ``1xN`` row matrix)
+        equal element by element, or a scalar that every element equals.
+        Total over non-equality: a shape mismatch, a non-matrix / non-scalar
+        / non-list-tuple operand, or a list/tuple that cannot be coerced
+        (empty, or holding a non-number) all return ``False`` rather than
+        raising, so ``matrix in some_list`` still works. A ``NaN`` element
+        never decides the comparison (it is skipped), so an all-``NaN``
+        matrix compares ``==`` equal to itself; this diverges from the
+        :meth:`equal` mask, where ``NaN == x`` is ``0.0``. Defining value
+        equality makes :class:`Matrix` unhashable (so it cannot be a dict
+        key or set member), which is correct for a mutable type. For an
+        element-wise 0/1 mask instead, use :meth:`equal`.
+
+        :raises RuntimeError: if *other* is a matrix owned by a different
+            interpreter.
+        """
+
+    def __ne__(self, other: object) -> bool:
+        """Lexicographic ``self != other`` returning a single :class:`bool`.
+
+        The (total) negation of :meth:`__eq__`. For an element-wise
+        0/1 mask instead, use :meth:`not_equal`.
+
+        :raises RuntimeError: if *other* is a matrix owned by a different
+            interpreter.
+        """
 
     @classmethod
     def allclose(cls, lhs: "Matrix", rhs: "Matrix", rtol: float = 1e-05, atol: float = 1e-08, equal_nan: bool = False):
@@ -481,6 +819,32 @@ class Matrix:
         :param atol: Absolute tolerance.
         :param equal_nan: If ``True``, two ``NaN`` values are considered equal.
         :return: ``True`` if every element pair satisfies the tolerance.
+        """
+
+    @classmethod
+    def where(cls, mask: "Matrix",
+              a: Union["Matrix", int, float, Sequence[Union[int, float]]],
+              b: Union["Matrix", int, float,
+                       Sequence[Union[int, float]]]) -> "Matrix":
+        """Select element-wise from *a* or *b* on a truthy mask.
+
+        Returns a fresh matrix taking *a* where the corresponding *mask*
+        element is non-zero and *b* elsewhere, like :func:`numpy.where`.
+
+        :param mask: A :class:`Matrix` whose non-zero elements select *a*.
+            ``NaN`` mask elements count as non-zero and select *a*.
+        :param a: A scalar (including ``bool``), a list/tuple of numbers
+            (coerced to a ``1xN`` row matrix), or a :class:`Matrix` matching
+            *mask*'s shape.
+        :param b: A scalar (including ``bool``), a list/tuple of numbers, or
+            a :class:`Matrix` matching *mask*'s shape.
+        :return: A new :class:`Matrix` with *mask*'s shape.
+        :raises TypeError: if *a* or *b* is neither a matrix, a scalar, nor
+            a list/tuple of numbers, or is a list/tuple holding a non-number.
+        :raises ValueError: if a matrix (or coerced sequence) operand's
+            shape differs from *mask*'s shape, or is an empty list/tuple. A
+            ``1x1`` matrix is treated as a matrix (not a scalar) and so must
+            match the mask shape.
         """
 
     @classmethod

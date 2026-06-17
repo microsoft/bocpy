@@ -1,3 +1,77 @@
+## 2026-06-17 - Version 0.12.0
+A `Matrix` capability release. The dense matrix type gains NumPy-style fancy
+indexing, comparison masks and lexicographic comparison operators, a
+``where`` selector, a single-rounding ``fma`` with vector broadcasting, and
+``sqrt``. Two older method names move to their NumPy spellings: ``select``
+becomes ``take`` and ``clip`` adopts ``min`` / ``max`` keyword bounds.
+
+**New Features**
+
+- **Fancy indexing** — ``m[[r0, r1]]`` / ``m[[r0, r1], :]`` gather rows and
+  ``m[:, [c0, c1]]`` gathers columns, returning a :class:`Matrix`; the
+  matching assignment forms scatter into rows or columns with last-write-wins
+  duplicates and all-or-nothing validation. New :meth:`Matrix.take` and
+  :meth:`Matrix.put` expose the same gather/scatter as methods, ``put`` with
+  an ``accumulate=True`` mode that folds duplicate indices.
+- **Comparison masks** — :meth:`Matrix.less`, ``less_equal``, ``greater``,
+  ``greater_equal``, ``equal``, and ``not_equal`` return a ``1.0`` / ``0.0``
+  mask matrix, accepting a same-shape matrix, a scalar (including ``bool``), a
+  ``1x1`` matrix, a broadcasting row/column vector, or a list/tuple of
+  numbers. Distinct from the comparison operators, which return a single
+  bool.
+- **Lexicographic comparison operators** — ``<`` ``<=`` ``>`` ``>=`` ``==``
+  ``!=`` compare element by element in row-major order and return a single
+  :class:`bool`. ``==`` / ``!=`` are total: a shape mismatch or an
+  uncoercible list/tuple yields ``False`` / ``True`` rather than raising, so
+  ``matrix in some_list`` works. A ``NaN`` never decides the comparison, so an
+  all-``NaN`` matrix compares ``==`` equal to itself. Defining value equality
+  makes :class:`Matrix` unhashable.
+- **`Matrix.where(mask, a, b)`** — a NumPy-style selector taking *a* where the
+  mask is non-zero (``NaN`` counts as non-zero) and *b* elsewhere; *a* and *b*
+  may each be a scalar, a same-shape matrix, or a list/tuple of numbers.
+- **`Matrix.fma(b, c)`** — fused multiply-add computing single-rounding
+  ``self * b + c``; *b* and *c* may be a same-shape matrix, a ``1x1`` matrix,
+  a scalar, or a row / column vector that broadcasts against ``self``. The
+  contraction kernel is preserved so hardware FMA still applies. Use it as an
+  accuracy primitive — compare results with :meth:`Matrix.allclose`, never
+  ``==``.
+- **`Matrix.sqrt()`** — element-wise square root (negative inputs map to
+  ``NaN``), with an ``in_place=True`` form.
+
+**Breaking Changes**
+
+- **`Matrix.select` renamed to `Matrix.take`.** The gather method is now
+  spelled :meth:`Matrix.take` to match NumPy and pair with the new
+  :meth:`Matrix.put`. Replace ``m.select(indices, axis)`` with
+  ``m.take(indices, axis)``; the signature and semantics are otherwise
+  unchanged.
+- **`Matrix.clip` bounds are now `min` / `max` keywords.** The signature
+  changes from ``clip(min_or_maxval, maxval=None)`` to
+  ``clip(min=None, max=None)``, matching :func:`numpy.clip`. Either bound may
+  be omitted to leave that side unbounded: ``m.clip(min=0.0)`` clamps only
+  below, ``m.clip(max=255.0)`` only above.
+
+**Documentation**
+
+- Expanded the :doc:`api` matrix surface for the new indexing, masking,
+  comparison, ``where``, ``fma``, and ``sqrt`` methods via the
+  ``__init__.pyi`` stub docstrings, including the totality, ``NaN``, and
+  broadcasting rules.
+
+**Tests**
+
+- Extensive `test_matrix.py` additions covering fancy-index gather/scatter,
+  ``take`` / ``put`` (including accumulate and all-or-nothing validation),
+  the comparison masks, lexicographic operators (totality, ``NaN``,
+  reflected-scalar, and list/tuple/bool coercion edge cases), ``where``
+  selection and value propagation, and ``fma`` row/column broadcasting.
+
+**Internal**
+
+- New `bench_fma` and `bench_take` micro-benchmarks in
+  `scripts/bench_matrix.py`. The `examples/boids.py` demo migrates from
+  ``select`` to ``take``.
+
 ## 2026-06-14 - Version 0.11.0
 A behavior-dispatch release. `@when` becomes a **runtime decorator backed by
 a content-addressed marshalled-code registry** instead of a transpile-time
