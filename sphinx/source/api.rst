@@ -125,7 +125,7 @@ Math
 .. autoclass:: Matrix
     :members:
     :undoc-members:
-    :special-members: __init__
+    :special-members: __init__, __eq__, __ne__, __lt__, __le__, __gt__, __ge__, __getitem__, __setitem__
 
 
 Messaging

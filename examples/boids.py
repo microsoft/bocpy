@@ -313,8 +313,8 @@ class Simulation:
 
         assert len(boids) > 0, "Invalid grid cell"
 
-        positions = positions.select(boids)
-        velocities = velocities.select(boids)
+        positions = positions.take(boids)
+        velocities = velocities.take(boids)
         return CellData(Cell(row, column), tuple(boids), Cown(positions), Cown(velocities))
 
     def step(self, width: int, height: int):
