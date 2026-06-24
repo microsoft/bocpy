@@ -201,9 +201,9 @@ enum-tools==0.13.0 \
     --hash=sha256:0d13335e361d300dc0f8fd82c8cf9951417246f9676144f5ee1761eb690228eb \
     --hash=sha256:e0112b16767dd08cb94105844b52770eae67ece6f026916a06db4a3d330d2a95
     # via bocpy (pyproject.toml)
-filelock==3.29.0 \
-    --hash=sha256:69974355e960702e789734cb4871f884ea6fe50bd8404051a3530bc07809cf90 \
-    --hash=sha256:96f5f6344709aa1572bbf631c640e4ebeeb519e08da902c39a001882f30ac258
+filelock==3.29.4 \
+    --hash=sha256:10cdb3656fc44541cdf30652a93fb10ec6b05325620eb316bd26893e4201538a \
+    --hash=sha256:dac1648087d5115554850d113e7dd8c83ab2d38e3435dde2d4f163847e57b767
     # via
     #   cachecontrol
     #   sphinx-toolbox
