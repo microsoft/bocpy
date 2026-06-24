@@ -1271,30 +1271,84 @@ static PyObject *Matrix_transpose(PyObject *op, PyObject *args,
   return wrap_impl_or_free(transpose);
 }
 
+/// @brief Validate a caller-supplied ``out=`` target and alias its buffer.
+/// @details Implements the numpy-style ``out=`` convention for the
+///          allocation-free elementwise paths: the result is written into an
+///          existing matrix the caller owns rather than a fresh allocation.
+///          The target must be a Matrix owned by the current interpreter whose
+///          shape exactly matches the operation's result shape; the shape is
+///          validated here, before any kernel writes, so a rejected target
+///          leaves every buffer untouched (the validate-then-write contract
+///          shared with ``put``). The target may alias the primary
+///          same-shape operand because the kernel reads and writes that
+///          operand at the same index; aliasing a lower-rank broadcast
+///          operand is impossible because the result-shape check rejects any
+///          target whose shape differs from the result.
+/// @param out_target The ``out=`` Matrix object (never NULL / Py_None here).
+/// @param out_op Receives a new reference to ``out_target`` on success.
+/// @param want_rows Required row count of the result.
+/// @param want_cols Required column count of the result.
+/// @return The target's impl (no extra C refcount taken — the live Python
+///         reference owns it), or NULL with an exception set on failure.
+static matrix_impl *use_out_target(PyObject *out_target, PyObject **out_op,
+                                   size_t want_rows, size_t want_cols) {
+  if (Py_TYPE(out_target) != LOCAL_STATE->matrix_type) {
+    PyErr_SetString(PyExc_TypeError, "out must be a Matrix");
+    return NULL;
+  }
+  matrix_impl *impl = ((MatrixObject *)out_target)->impl;
+  if (!impl_check_acquired(impl, true)) {
+    return NULL;
+  }
+  if (impl->rows != want_rows || impl->columns != want_cols) {
+    PyErr_Format(PyExc_ValueError,
+                 "out shape %zux%zu does not match result %zux%zu", impl->rows,
+                 impl->columns, want_rows, want_cols);
+    return NULL;
+  }
+  *out_op = Py_NewRef(out_target);
+  return impl;
+}
+
 /// @brief Sets the output of an arithmetic operation.
-/// @details The output of an arithmetic operation is either a new matrix of the
-/// same dimensions as the left hand side of the equation, or the left-hand side
-/// itself in the case of in-place operations.
-/// @param lhs_op The PyObject of the left-hand side of the operation
+/// @details The output of an arithmetic operation is one of three things: a
+/// caller-supplied ``out=`` target (when ``out_target`` is a non-None Matrix),
+/// the left-hand side itself (in-place operations), or a freshly allocated
+/// matrix of the same dimensions as the left-hand side. ``out_target`` and
+/// ``inplace`` are mutually exclusive (asserted here; callers reject the
+/// combination before reaching this point).
+///
+/// The result shape and wrap type come from the already-unwrapped ``lhs``
+/// impl and the interpreter's canonical Matrix type -- never by casting
+/// ``lhs_op``. ``lhs_op`` may be a sequence that ``unwrap_matrix`` coerced
+/// into ``lhs`` (e.g. ``[1, 2, 3] + matrix``), so it is not guaranteed to be
+/// a Matrix; it is dereferenced only as the in-place return value, a path
+/// reachable solely with a genuine Matrix left operand.
+/// @param lhs The unwrapped impl of the left-hand operand (gives result shape)
+/// @param lhs_op The PyObject of the left-hand operand (in-place return only)
 /// @param out_op A pointer to the output pointer of the equation
+/// @param out_target Optional ``out=`` Matrix (NULL or Py_None when unused)
 /// @param inplace Whether this is an inplace operation
 /// @return The matrix wrapped by out_op, or NULL in the case of an error
-static matrix_impl *set_output(PyObject *lhs_op, PyObject **out_op,
+static matrix_impl *set_output(matrix_impl *lhs, PyObject *lhs_op,
+                               PyObject **out_op, PyObject *out_target,
                                bool inplace) {
-  MatrixObject *lhs_matrix = (MatrixObject *)lhs_op;
   matrix_impl *out;
+  if (out_target != NULL && out_target != Py_None) {
+    assert(!inplace);
+    return use_out_target(out_target, out_op, lhs->rows, lhs->columns);
+  }
   if (inplace) {
     *out_op = Py_NewRef(lhs_op);
-    return lhs_matrix->impl;
+    return lhs;
   }
 
-  matrix_impl *lhs = lhs_matrix->impl;
   out = impl_new(lhs->rows, lhs->columns);
   if (out == NULL) {
     return NULL;
   }
 
-  *out_op = wrap_matrix(Py_TYPE(lhs_op), out);
+  *out_op = wrap_matrix(LOCAL_STATE->matrix_type, out);
   if (*out_op == NULL) {
     impl_free(out);
     return NULL;
@@ -1894,14 +1948,15 @@ done:
   return result;
 }
 
-/// @brief A classified fma operand: either a scalar or a same-shape matrix.
+/// @brief A classified broadcast operand: scalar or same-shape matrix.
 /// @details ``full`` is an INCREF'd matrix with the same shape as the
 ///          receiver, and the caller must IMPL_DECREF it; when ``full`` is
-///          NULL the operand is the scalar in ``scalar``.
+///          NULL the operand is the scalar in ``scalar``. Shared by ``fma``
+///          and ``scaled_add`` to classify a multiplier / scale operand.
 typedef struct {
   double scalar;
   matrix_impl *full;
-} fma_operand;
+} broadcast_operand;
 
 /// @brief Materialise a row- or column-vector broadcast into a full buffer.
 /// @details Expands a ``1xN`` row vector (``is_row``) or an ``Mx1`` column
@@ -1932,7 +1987,7 @@ static matrix_impl *impl_broadcast_vector(const matrix_impl *vec, size_t rows,
   return out;
 }
 
-/// @brief Classify an fma operand as a scalar or a full same-shape matrix.
+/// @brief Classify a broadcast operand as a scalar or a same-shape matrix.
 /// @details A Matrix whose size is 1 is treated as a scalar so a ``1x1``
 ///          broadcasts like a number (the in-house scalar rule used
 ///          elsewhere); a same-shape Matrix is INCREF'd into ``out->full``.
@@ -1941,18 +1996,21 @@ static matrix_impl *impl_broadcast_vector(const matrix_impl *vec, size_t rows,
 ///          same-shape buffer stored in ``out->full`` so the contiguous kernel
 ///          keeps its unit stride; any other matrix shape raises ``ValueError``
 ///          naming both shapes. Any real number is accepted as a scalar.
-/// @param op The operand object (``b`` or ``c``).
+/// @param op_name Method name used as the error-message prefix (e.g. ``fma``).
+/// @param operand The operand object to classify.
 /// @param self_impl The receiver's impl, used for the shape check.
 /// @param what Operand name used in error messages.
 /// @param out Output operand descriptor (zeroed before classification).
 /// @return 0 on success; -1 with an exception set on failure.
-static int classify_fma_operand(PyObject *op, const matrix_impl *self_impl,
-                                const char *what, fma_operand *out) {
+static int classify_broadcast_operand(const char *op_name, PyObject *operand,
+                                      const matrix_impl *self_impl,
+                                      const char *what,
+                                      broadcast_operand *out) {
   out->scalar = 0.0;
   out->full = NULL;
 
-  if (Py_TYPE(op) == LOCAL_STATE->matrix_type) {
-    matrix_impl *impl = ((MatrixObject *)op)->impl;
+  if (Py_TYPE(operand) == LOCAL_STATE->matrix_type) {
+    matrix_impl *impl = ((MatrixObject *)operand)->impl;
     if (!impl_check_acquired(impl, true)) {
       return -1;
     }
@@ -1986,21 +2044,21 @@ static int classify_fma_operand(PyObject *op, const matrix_impl *self_impl,
       return 0;
     }
     PyErr_Format(PyExc_ValueError,
-                 "fma: %s shape %zux%zu incompatible with self %zux%zu", what,
-                 impl->rows, impl->columns, self_impl->rows,
+                 "%s: %s shape %zux%zu incompatible with self %zux%zu", op_name,
+                 what, impl->rows, impl->columns, self_impl->rows,
                  self_impl->columns);
     return -1;
   }
 
-  if (unwrap_double(op, &out->scalar)) {
+  if (unwrap_double(operand, &out->scalar)) {
     return 0;
   }
   if (PyErr_Occurred()) {
     return -1;
   }
 
-  PyErr_Format(PyExc_TypeError, "fma: %s must be a Matrix or a real number",
-               what);
+  PyErr_Format(PyExc_TypeError, "%s: %s must be a Matrix or a real number",
+               op_name, what);
   return -1;
 }
 
@@ -2036,8 +2094,8 @@ static PyObject *Matrix_fma(PyObject *op, PyObject *args, PyObject *kwds) {
   PyObject *c_op = NULL;
   int in_place = 0;
   PyObject *out_op = NULL;
-  fma_operand bop = {0.0, NULL};
-  fma_operand cop = {0.0, NULL};
+  broadcast_operand bop = {0.0, NULL};
+  broadcast_operand cop = {0.0, NULL};
 
   static char *kwlist[] = {"", "", "in_place", NULL};
   if (!PyArg_ParseTupleAndKeywords(args, kwds, "OO|p", kwlist, &b_op, &c_op,
@@ -2049,14 +2107,14 @@ static PyObject *Matrix_fma(PyObject *op, PyObject *args, PyObject *kwds) {
     return NULL;
   }
 
-  if (classify_fma_operand(b_op, self->impl, "b", &bop) < 0) {
+  if (classify_broadcast_operand("fma", b_op, self->impl, "b", &bop) < 0) {
     goto done;
   }
-  if (classify_fma_operand(c_op, self->impl, "c", &cop) < 0) {
+  if (classify_broadcast_operand("fma", c_op, self->impl, "c", &cop) < 0) {
     goto done;
   }
 
-  matrix_impl *out = set_output(op, &out_op, in_place);
+  matrix_impl *out = set_output(self->impl, op, &out_op, NULL, in_place);
   if (out == NULL) {
     out_op = NULL;
     goto done;
@@ -2078,7 +2136,98 @@ done:
   return out_op;
 }
 
-/// @brief Classify a matrix as a 2D/3D cross-product operand or batch.
+/// @brief Two-rounding scaled-add kernel: ``out = y + s * x``.
+/// @details Deliberately NOT fused: the product ``s[i] * x[i]`` is rounded to
+///          double first, then the sum with ``y[i]`` is rounded again, so the
+///          result is bit-for-bit identical to the naive ``y[i] + s * x[i]``
+///          expression in IEEE-754 double (two roundings). This is the
+///          two-rounding complement to ``impl_fma``'s single rounding; the
+///          ``-ffp-contract=off`` build flag guarantees the two statements
+///          are never contracted back into an fma. ``s_step`` is 1 for a full
+///          same-shape scale buffer and 0 to repeat a broadcast scalar (the
+///          pointer then aims at a single local ``double``); ``x`` and ``y``
+///          are the same shape (unit stride). Each output cell reads only its
+///          own index, so the in-place case (``out == y``) and ``x`` / ``s``
+///          aliasing ``y`` are all safe.
+BOC_CANARY_NOINLINE
+static void impl_scaled_add(const double *y, const double *s, size_t s_step,
+                            const double *x, double *out, size_t n) {
+  for (size_t i = 0; i < n; ++i, ++y, s += s_step, ++x, ++out) {
+    const double prod = (*s) * (*x);
+    *out = *y + prod;
+  }
+}
+
+/// @brief Scaled add: ``self + s * x`` with two roundings.
+/// @details The two-rounding sibling of ``fma``: the product ``s * x`` is
+///          rounded to double, then the sum with ``self`` is rounded again, so
+///          the result is bit-for-bit identical to ``self + s * x`` and
+///          distinct from the single-rounded ``fma``. ``s`` is the scale and
+///          may be a scalar, a ``1x1`` matrix, a ``1xN`` row vector or ``Mx1``
+///          column vector that broadcasts against ``self``, or a same-shape
+///          matrix (the same operand rules as ``fma``'s multiplier); ``x`` is
+///          a same-shape matrix. Both operands are validated before any
+///          allocation, so a rejected operand leaves ``self`` untouched (the
+///          validate-then-write contract shared with ``put``). With
+///          ``in_place=True`` the result is written into ``self``'s existing
+///          buffer (allocating nothing) and ``self`` is returned; otherwise a
+///          fresh matrix is returned. ``s`` and ``x`` may alias ``self``.
+static PyObject *Matrix_scaled_add(PyObject *op, PyObject *args,
+                                   PyObject *kwds) {
+  MatrixObject *self = (MatrixObject *)op;
+  PyObject *s_op = NULL;
+  PyObject *x_op = NULL;
+  int in_place = 0;
+  PyObject *out_op = NULL;
+  broadcast_operand sop = {0.0, NULL};
+  matrix_impl *x = NULL;
+
+  static char *kwlist[] = {"", "", "in_place", NULL};
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "OO|p", kwlist, &s_op, &x_op,
+                                   &in_place)) {
+    return NULL;
+  }
+
+  if (!impl_check_acquired(self->impl, true)) {
+    return NULL;
+  }
+
+  if (classify_broadcast_operand("scaled_add", s_op, self->impl, "s", &sop) <
+      0) {
+    return NULL;
+  }
+
+  x = unwrap_matrix(x_op, false);
+  if (x == NULL) {
+    goto done;
+  }
+
+  matrix_impl *y = self->impl;
+  if (x->rows != y->rows || x->columns != y->columns) {
+    PyErr_Format(PyExc_ValueError,
+                 "scaled_add: x shape %zux%zu does not match self %zux%zu",
+                 x->rows, x->columns, y->rows, y->columns);
+    goto done;
+  }
+
+  matrix_impl *out = set_output(y, op, &out_op, NULL, in_place);
+  if (out == NULL) {
+    out_op = NULL;
+    goto done;
+  }
+
+  double s_scalar = sop.scalar;
+  const double *s_ptr = sop.full != NULL ? sop.full->data : &s_scalar;
+  size_t s_step = sop.full != NULL ? 1 : 0;
+
+  impl_scaled_add(y->data, s_ptr, s_step, x->data, out->data, y->size);
+
+done:
+  IMPL_DECREF(sop.full);
+  IMPL_DECREF(x);
+  return out_op;
+}
+
 /// @details ``has_axis`` / ``explicit_axis`` carry an optional caller-
 ///          supplied axis (already normalised to 0 or 1 by
 ///          ``parse_validate_normalise_axis``). For the doubly-valid
@@ -2517,7 +2666,7 @@ static PyObject *Matrix_normalize(PyObject *op, PyObject *args,
     return NULL;
   }
 
-  matrix_impl *out = set_output(op, &out_op, in_place);
+  matrix_impl *out = set_output(self->impl, op, &out_op, NULL, in_place);
   if (out == NULL) {
     return NULL;
   }
@@ -2666,7 +2815,7 @@ static PyObject *Matrix_perpendicular(PyObject *op, PyObject *args,
     return Py_NewRef(op);
   }
 
-  matrix_impl *out = set_output(op, &out_op, false);
+  matrix_impl *out = set_output(self->impl, op, &out_op, NULL, false);
   if (out == NULL) {
     return NULL;
   }
@@ -2745,23 +2894,33 @@ static PyObject *Matrix_angle(PyObject *op, PyObject *args, PyObject *kwds) {
    dispatch. The ``in_place`` kwarg routes the output through
    ``set_output``: when true, the kernel aliases its input and output
    buffers and the method returns ``self`` (refcount-incremented); when
-   false, a fresh matrix is allocated and returned. See the
-   BOC_UNARY_OPS top-of-family block comment for the full template. */
+   false, a fresh matrix is allocated and returned. The keyword-only
+   ``out`` target writes the result into a caller-supplied same-shape
+   matrix (allocation-free, numpy convention) and returns it; ``out`` and
+   ``in_place`` are mutually exclusive. See the BOC_UNARY_OPS top-of-family
+   block comment for the full template. */
 #define MATRIX_UNARY_METHOD(ENUM, STAMP)                                       \
   static PyObject *Matrix_##ENUM##_method(PyObject *op, PyObject *args,        \
                                           PyObject *kwds) {                    \
     MatrixObject *self = (MatrixObject *)op;                                   \
     matrix_impl *impl = self->impl;                                            \
     int in_place = 0;                                                          \
-    static char *kwlist[] = {"in_place", NULL};                                \
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|p", kwlist, &in_place)) {   \
+    PyObject *out_target = NULL;                                               \
+    static char *kwlist[] = {"in_place", "out", NULL};                         \
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|p$O", kwlist, &in_place,    \
+                                     &out_target)) {                           \
       return NULL;                                                             \
     }                                                                          \
     if (!impl_check_acquired(impl, true)) {                                    \
       return NULL;                                                             \
     }                                                                          \
+    if (in_place && out_target != NULL && out_target != Py_None) {             \
+      PyErr_SetString(PyExc_ValueError,                                        \
+                      "out and in_place are mutually exclusive");              \
+      return NULL;                                                             \
+    }                                                                          \
     PyObject *out_op = NULL;                                                   \
-    matrix_impl *out = set_output(op, &out_op, in_place);                      \
+    matrix_impl *out = set_output(impl, op, &out_op, out_target, in_place);    \
     if (out == NULL) {                                                         \
       return NULL;                                                             \
     }                                                                          \
@@ -3590,6 +3749,15 @@ static PyObject *Matrix_GreaterEqual_compare(PyObject *self, PyObject *other);
 static PyObject *Matrix_Equal_compare(PyObject *self, PyObject *other);
 static PyObject *Matrix_NotEqual_compare(PyObject *self, PyObject *other);
 
+static PyObject *Matrix_add_method(PyObject *self, PyObject *args,
+                                   PyObject *kwds);
+static PyObject *Matrix_subtract_method(PyObject *self, PyObject *args,
+                                        PyObject *kwds);
+static PyObject *Matrix_multiply_method(PyObject *self, PyObject *args,
+                                        PyObject *kwds);
+static PyObject *Matrix_divide_method(PyObject *self, PyObject *args,
+                                      PyObject *kwds);
+
 static PyMethodDef Matrix_methods[] = {
     {"transpose", (PyCFunction)Matrix_transpose, METH_VARARGS | METH_KEYWORDS,
      "transpose($self, /, in_place=False)\n--\n\n"
@@ -3618,6 +3786,49 @@ static PyMethodDef Matrix_methods[] = {
      "vector that broadcasts, or a scalar; other shapes raise ValueError. "
      "The single rounding differs from ``self*b + c`` (which rounds twice) by "
      "up to half a ULP, so compare results with allclose(), not ==."},
+    {"scaled_add", (PyCFunction)Matrix_scaled_add, METH_VARARGS | METH_KEYWORDS,
+     "scaled_add($self, s, x, /, in_place=False)\n--\n\n"
+     "Scaled add ``self + s * x`` with two roundings; the two-rounding "
+     "sibling of fma().\n\n"
+     "s is the scale -- a scalar, a 1x1 matrix, a row or column vector that "
+     "broadcasts, or a same-shape matrix (the same operand rules as fma's "
+     "multiplier) -- and x is a same-shape matrix. The arithmetic rounds "
+     "twice (``round(round(s*x) + self)``), so the result is bit-for-bit "
+     "identical to ``self + s * x`` and -- unlike fma() -- never fuses to a "
+     "single rounding. With in_place=True the result is written into self's "
+     "buffer (allocating nothing) and self is returned; otherwise a new "
+     "matrix is returned. s and x may alias self. A shape mismatch raises "
+     "ValueError before any write."},
+    {"add", (PyCFunction)Matrix_add_method, METH_VARARGS | METH_KEYWORDS,
+     "add($self, other, /, *, out=None)\n--\n\n"
+     "Element-wise ``self + other`` with the same broadcasting as ``+`` "
+     "(other may be a scalar). With ``out`` (a same-shape matrix) the result "
+     "is written there and returned instead of allocating a new matrix; out "
+     "may alias an input. Bit-for-bit identical to ``self + other``. A shape "
+     "mismatch between out and the result raises ValueError before any write."},
+    {"subtract", (PyCFunction)Matrix_subtract_method,
+     METH_VARARGS | METH_KEYWORDS,
+     "subtract($self, other, /, *, out=None)\n--\n\n"
+     "Element-wise ``self - other`` with the same broadcasting as ``-`` "
+     "(other may be a scalar). With ``out`` (a same-shape matrix) the result "
+     "is written there and returned instead of allocating a new matrix; out "
+     "may alias an input. Bit-for-bit identical to ``self - other``. A shape "
+     "mismatch between out and the result raises ValueError before any write."},
+    {"multiply", (PyCFunction)Matrix_multiply_method,
+     METH_VARARGS | METH_KEYWORDS,
+     "multiply($self, other, /, *, out=None)\n--\n\n"
+     "Element-wise ``self * other`` with the same broadcasting as ``*`` "
+     "(other may be a scalar). With ``out`` (a same-shape matrix) the result "
+     "is written there and returned instead of allocating a new matrix; out "
+     "may alias an input. Bit-for-bit identical to ``self * other``. A shape "
+     "mismatch between out and the result raises ValueError before any write."},
+    {"divide", (PyCFunction)Matrix_divide_method, METH_VARARGS | METH_KEYWORDS,
+     "divide($self, other, /, *, out=None)\n--\n\n"
+     "Element-wise ``self / other`` with the same broadcasting as ``/`` "
+     "(other may be a scalar). With ``out`` (a same-shape matrix) the result "
+     "is written there and returned instead of allocating a new matrix; out "
+     "may alias an input. Bit-for-bit identical to ``self / other``. A shape "
+     "mismatch between out and the result raises ValueError before any write."},
     {"cross", (PyCFunction)Matrix_cross, METH_VARARGS | METH_KEYWORDS,
      "cross($self, other, /, axis=None)\n--\n\n"
      "2D (scalar z-component) or 3D cross product against another "
@@ -3670,23 +3881,35 @@ static PyMethodDef Matrix_methods[] = {
      "(element 0 along the reduced axis), which pins the result to that\n"
      "position. This differs from NumPy, which propagates NaN."},
     {"ceil", (PyCFunction)Matrix_Ceil_method, METH_VARARGS | METH_KEYWORDS,
-     "ceil($self, /, in_place=False)\n--\n\n"
-     "Element-wise ceiling."},
+     "ceil($self, /, in_place=False, *, out=None)\n--\n\n"
+     "Element-wise ceiling. With ``out`` (a same-shape matrix) the result "
+     "is written there and returned; ``out`` and ``in_place`` are mutually "
+     "exclusive."},
     {"floor", (PyCFunction)Matrix_Floor_method, METH_VARARGS | METH_KEYWORDS,
-     "floor($self, /, in_place=False)\n--\n\n"
-     "Element-wise floor."},
+     "floor($self, /, in_place=False, *, out=None)\n--\n\n"
+     "Element-wise floor. With ``out`` (a same-shape matrix) the result "
+     "is written there and returned; ``out`` and ``in_place`` are mutually "
+     "exclusive."},
     {"round", (PyCFunction)Matrix_Round_method, METH_VARARGS | METH_KEYWORDS,
-     "round($self, /, in_place=False)\n--\n\n"
-     "Element-wise rounding (banker's; IEEE round-half-to-even)."},
+     "round($self, /, in_place=False, *, out=None)\n--\n\n"
+     "Element-wise rounding (banker's; IEEE round-half-to-even). With ``out`` "
+     "(a same-shape matrix) the result is written there and returned; "
+     "``out`` and ``in_place`` are mutually exclusive."},
     {"negate", (PyCFunction)Matrix_Negate_method, METH_VARARGS | METH_KEYWORDS,
-     "negate($self, /, in_place=False)\n--\n\n"
-     "Element-wise negation."},
+     "negate($self, /, in_place=False, *, out=None)\n--\n\n"
+     "Element-wise negation. With ``out`` (a same-shape matrix) the result "
+     "is written there and returned; ``out`` and ``in_place`` are mutually "
+     "exclusive."},
     {"abs", (PyCFunction)Matrix_Abs_method, METH_VARARGS | METH_KEYWORDS,
-     "abs($self, /, in_place=False)\n--\n\n"
-     "Element-wise absolute value."},
+     "abs($self, /, in_place=False, *, out=None)\n--\n\n"
+     "Element-wise absolute value. With ``out`` (a same-shape matrix) the "
+     "result is written there and returned; ``out`` and ``in_place`` are "
+     "mutually exclusive."},
     {"sqrt", (PyCFunction)Matrix_Sqrt_method, METH_VARARGS | METH_KEYWORDS,
-     "sqrt($self, /, in_place=False)\n--\n\n"
-     "Element-wise square root. Negative elements yield NaN."},
+     "sqrt($self, /, in_place=False, *, out=None)\n--\n\n"
+     "Element-wise square root. Negative elements yield NaN. With ``out`` "
+     "(a same-shape matrix) the result is written there and returned; "
+     "``out`` and ``in_place`` are mutually exclusive."},
     {"less", (PyCFunction)Matrix_Less_compare, METH_O,
      "less($self, other, /)\n--\n\n"
      "Element-wise ``self < other`` as a 0/1 mask matrix. ``other`` may be a "
@@ -4040,8 +4263,8 @@ static inline enum BinaryOps swap_right(enum BinaryOps op) {
 }
 
 static int Matrix_binary_op(PyObject *lhs_op, PyObject *rhs_op,
-                            PyObject **out_op, enum BinaryOps op,
-                            bool inplace) {
+                            PyObject **out_op, PyObject *out_target,
+                            enum BinaryOps op, bool inplace) {
   double scalar;
   PyObject *mat_op = NULL;
   int result = 0;
@@ -4060,7 +4283,7 @@ static int Matrix_binary_op(PyObject *lhs_op, PyObject *rhs_op,
       goto error;
     }
 
-    matrix_impl *out = set_output(mat_op, out_op, inplace);
+    matrix_impl *out = set_output(lhs, mat_op, out_op, out_target, inplace);
     if (out == NULL) {
       goto error;
     }
@@ -4083,7 +4306,7 @@ static int Matrix_binary_op(PyObject *lhs_op, PyObject *rhs_op,
   // broadcasts against any shape, exactly like a Python float operand.
   // Check rhs first so 1x1 op= 1x1 stays in-place-safe.
   if (rhs->size == 1) {
-    matrix_impl *out = set_output(lhs_op, out_op, inplace);
+    matrix_impl *out = set_output(lhs, lhs_op, out_op, out_target, inplace);
     if (out == NULL) {
       goto error;
     }
@@ -4096,7 +4319,7 @@ static int Matrix_binary_op(PyObject *lhs_op, PyObject *rhs_op,
                       "in-place scalar broadcast would change operand shape");
       goto error;
     }
-    matrix_impl *out = set_output(rhs_op, out_op, inplace);
+    matrix_impl *out = set_output(rhs, rhs_op, out_op, out_target, inplace);
     if (out == NULL) {
       goto error;
     }
@@ -4128,17 +4351,25 @@ static int Matrix_binary_op(PyObject *lhs_op, PyObject *rhs_op,
         goto error;
       }
 
-      matrix_impl *out = impl_new(colvec->rows, rowvec->columns);
-      if (out == NULL) {
-        goto error;
-      }
-
-      // Wrap as Py_TYPE(lhs_op) for parity with the elementwise and matmul
-      // paths (preserve the lhs subclass).
-      *out_op = wrap_matrix(Py_TYPE(lhs_op), out);
-      if (*out_op == NULL) {
-        impl_free(out);
-        goto error;
+      matrix_impl *out;
+      if (out_target != NULL && out_target != Py_None) {
+        out = use_out_target(out_target, out_op, colvec->rows, rowvec->columns);
+        if (out == NULL) {
+          goto error;
+        }
+      } else {
+        out = impl_new(colvec->rows, rowvec->columns);
+        if (out == NULL) {
+          goto error;
+        }
+        // Wrap as the interpreter's canonical Matrix type. Deriving the type
+        // from lhs_op would be unsafe: in the reflected outer case lhs_op is a
+        // sequence unwrap_matrix coerced into a matrix, not a Matrix object.
+        *out_op = wrap_matrix(LOCAL_STATE->matrix_type, out);
+        if (*out_op == NULL) {
+          impl_free(out);
+          goto error;
+        }
       }
 
       dispatch_bin_outer(colvec, rowvec, out, op);
@@ -4161,7 +4392,7 @@ static int Matrix_binary_op(PyObject *lhs_op, PyObject *rhs_op,
       goto error;
     }
 
-    matrix_impl *out = set_output(mat_op, out_op, inplace);
+    matrix_impl *out = set_output(matrix, mat_op, out_op, out_target, inplace);
     if (out == NULL) {
       goto error;
     }
@@ -4187,7 +4418,7 @@ static int Matrix_binary_op(PyObject *lhs_op, PyObject *rhs_op,
       goto error;
     }
 
-    matrix_impl *out = set_output(mat_op, out_op, inplace);
+    matrix_impl *out = set_output(matrix, mat_op, out_op, out_target, inplace);
     if (out == NULL) {
       goto error;
     }
@@ -4196,7 +4427,7 @@ static int Matrix_binary_op(PyObject *lhs_op, PyObject *rhs_op,
     goto exit;
   }
 
-  matrix_impl *out = set_output(lhs_op, out_op, inplace);
+  matrix_impl *out = set_output(lhs, lhs_op, out_op, out_target, inplace);
   if (out == NULL) {
     goto error;
   }
@@ -4216,7 +4447,7 @@ exit:
 #define MATRIX_BINARY_OP(binary)                                               \
   static PyObject *Matrix_##binary##_op(PyObject *lhs, PyObject *rhs) {        \
     PyObject *out = NULL;                                                      \
-    if (Matrix_binary_op(lhs, rhs, &out, binary, false) < 0) {                 \
+    if (Matrix_binary_op(lhs, rhs, &out, NULL, binary, false) < 0) {           \
       return NULL;                                                             \
     }                                                                          \
     return out;                                                                \
@@ -4226,7 +4457,7 @@ exit:
   static PyObject *Matrix_inplace_##binary##_op(PyObject *lhs,                 \
                                                 PyObject *rhs) {               \
     PyObject *out = NULL;                                                      \
-    if (Matrix_binary_op(lhs, rhs, &out, binary, true) < 0) {                  \
+    if (Matrix_binary_op(lhs, rhs, &out, NULL, binary, true) < 0) {            \
       return NULL;                                                             \
     }                                                                          \
     return out;                                                                \
@@ -4240,7 +4471,34 @@ exit:
 #define MATRIX_COMPARE_METHOD(ENUM)                                            \
   static PyObject *Matrix_##ENUM##_compare(PyObject *self, PyObject *other) {  \
     PyObject *out = NULL;                                                      \
-    if (Matrix_binary_op(self, other, &out, ENUM, false) < 0) {                \
+    if (Matrix_binary_op(self, other, &out, NULL, ENUM, false) < 0) {          \
+      return NULL;                                                             \
+    }                                                                          \
+    return out;                                                                \
+  }
+
+/* MATRIX_NAMED_BINARY_METHOD stamps a named element-wise arithmetic method
+   (add / subtract / multiply / divide) that reuses Matrix_binary_op for the
+   full broadcast routing, exactly like the ``+`` / ``-`` / ``*`` / ``/``
+   operators, but
+   additionally accepts a keyword-only ``out=`` target. With ``out`` the
+   result is written into a caller-supplied matrix (allocation-free, numpy
+   ufunc convention) instead of a fresh allocation, and that matrix is
+   returned; ``out`` may alias an input. Invoked as self.<name>(other), so
+   self is the left operand. The result is bit-for-bit identical to the
+   operator form because the same per-op kernels run either way. */
+#define MATRIX_NAMED_BINARY_METHOD(name, ENUM)                                 \
+  static PyObject *Matrix_##name##_method(PyObject *self, PyObject *args,      \
+                                          PyObject *kwds) {                    \
+    PyObject *other = NULL;                                                    \
+    PyObject *out_target = NULL;                                               \
+    static char *kwlist[] = {"", "out", NULL};                                 \
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|$O", kwlist, &other,       \
+                                     &out_target)) {                           \
+      return NULL;                                                             \
+    }                                                                          \
+    PyObject *out = NULL;                                                      \
+    if (Matrix_binary_op(self, other, &out, out_target, ENUM, false) < 0) {    \
       return NULL;                                                             \
     }                                                                          \
     return out;                                                                \
@@ -4257,7 +4515,7 @@ exit:
       return NULL;                                                             \
     }                                                                          \
     PyObject *out_op = NULL;                                                   \
-    matrix_impl *out = set_output(op, &out_op, false);                         \
+    matrix_impl *out = set_output(impl, op, &out_op, NULL, false);             \
     if (out == NULL) {                                                         \
       return NULL;                                                             \
     }                                                                          \
@@ -4282,6 +4540,11 @@ MATRIX_COMPARE_METHOD(Greater)
 MATRIX_COMPARE_METHOD(GreaterEqual)
 MATRIX_COMPARE_METHOD(Equal)
 MATRIX_COMPARE_METHOD(NotEqual)
+
+MATRIX_NAMED_BINARY_METHOD(add, Add)
+MATRIX_NAMED_BINARY_METHOD(subtract, Subtract)
+MATRIX_NAMED_BINARY_METHOD(multiply, Multiply)
+MATRIX_NAMED_BINARY_METHOD(divide, Divide)
 
 /// @brief Lexicographic three-way compare of two equal-length buffers.
 /// @details Walks both buffers in row-major order and returns at the first
@@ -4465,7 +4728,10 @@ static PyObject *Matrix_matmul(PyObject *lhs_op, PyObject *rhs_op) {
   }
 
   impl_matmul(lhs, rhs, out);
-  out_op = wrap_matrix(Py_TYPE(lhs_op), out);
+  // Wrap as the interpreter's canonical Matrix type, never Py_TYPE(lhs_op):
+  // lhs_op may be a sequence unwrap_matrix coerced into lhs (e.g.
+  // ``[1, 2, 3] @ matrix``), in which case it is not a Matrix object.
+  out_op = wrap_matrix(LOCAL_STATE->matrix_type, out);
   if (out_op == NULL) {
     goto error;
   }

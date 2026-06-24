@@ -253,6 +253,104 @@ class Matrix:
             number.
         """
 
+    def scaled_add(self, s: Union["Matrix", int, float], x: "Matrix",
+                   /, in_place: bool = False) -> "Matrix":
+        """Scaled add ``self + s * x`` -- the two-rounding sibling of :meth:`fma`.
+
+        The product ``s * x`` is rounded to ``double`` and then the sum with
+        ``self`` is rounded again, so the result is bit-for-bit identical to
+        ``self + s * x`` (the build sets ``-ffp-contract=off``, so the two
+        statements never fuse). This is exactly the rounding :meth:`fma`
+        avoids: use :meth:`scaled_add` when you need a result identical to the
+        plain ``self + s * x`` expression, and :meth:`fma` for the
+        single-rounding fused form.
+
+        :param s: Scale: a same-shape :class:`Matrix`, a ``1x1`` matrix, a
+            ``1xN`` row vector or ``Mx1`` column vector that broadcasts against
+            ``self``, or a scalar.
+        :param x: Addend term, a :class:`Matrix` with the same shape as
+            ``self``.
+        :param in_place: When ``True``, write into ``self``'s buffer
+            (allocating nothing) and return it.
+        :return: ``self + s * x`` (``self`` itself when ``in_place=True``).
+        :raises ValueError: if *s* is a matrix whose shape neither matches
+            ``self`` nor broadcasts against it, or if *x*'s shape does not
+            match ``self``.
+        :raises TypeError: if *s* is neither a matrix nor a real number.
+        """
+
+    def add(self, other: Union["Matrix", int, float], /, *,
+            out: Optional["Matrix"] = None) -> "Matrix":
+        """Element-wise ``self + other`` -- the method form of ``+``.
+
+        Uses the same broadcasting as the ``+`` operator (*other* may be a
+        same-shape matrix, a ``1x1`` matrix, a ``1xN``/``Mx1`` vector that
+        broadcasts, or a scalar) and is bit-for-bit identical to it.
+
+        :param other: The right-hand operand.
+        :param out: A :class:`Matrix` matching the result shape to write the
+            result into (allocation-free); returned in place of a fresh
+            matrix. May alias an input operand.
+        :return: ``self + other`` (``out`` itself when ``out`` is given).
+        :raises ValueError: if *other*'s shape does not broadcast against
+            ``self``, or if *out*'s shape does not match the result.
+        :raises TypeError: if *out* is given and is not a :class:`Matrix`.
+        """
+
+    def subtract(self, other: Union["Matrix", int, float], /, *,
+                 out: Optional["Matrix"] = None) -> "Matrix":
+        """Element-wise ``self - other`` -- the method form of ``-``.
+
+        Uses the same broadcasting as the ``-`` operator (*other* may be a
+        same-shape matrix, a ``1x1`` matrix, a ``1xN``/``Mx1`` vector that
+        broadcasts, or a scalar) and is bit-for-bit identical to it.
+
+        :param other: The right-hand operand.
+        :param out: A :class:`Matrix` matching the result shape to write the
+            result into (allocation-free); returned in place of a fresh
+            matrix. May alias an input operand.
+        :return: ``self - other`` (``out`` itself when ``out`` is given).
+        :raises ValueError: if *other*'s shape does not broadcast against
+            ``self``, or if *out*'s shape does not match the result.
+        :raises TypeError: if *out* is given and is not a :class:`Matrix`.
+        """
+
+    def multiply(self, other: Union["Matrix", int, float], /, *,
+                 out: Optional["Matrix"] = None) -> "Matrix":
+        """Element-wise ``self * other`` -- the method form of ``*``.
+
+        Uses the same broadcasting as the ``*`` operator (*other* may be a
+        same-shape matrix, a ``1x1`` matrix, a ``1xN``/``Mx1`` vector that
+        broadcasts, or a scalar) and is bit-for-bit identical to it.
+
+        :param other: The right-hand operand.
+        :param out: A :class:`Matrix` matching the result shape to write the
+            result into (allocation-free); returned in place of a fresh
+            matrix. May alias an input operand.
+        :return: ``self * other`` (``out`` itself when ``out`` is given).
+        :raises ValueError: if *other*'s shape does not broadcast against
+            ``self``, or if *out*'s shape does not match the result.
+        :raises TypeError: if *out* is given and is not a :class:`Matrix`.
+        """
+
+    def divide(self, other: Union["Matrix", int, float], /, *,
+               out: Optional["Matrix"] = None) -> "Matrix":
+        """Element-wise ``self / other`` -- the method form of ``/``.
+
+        Uses the same broadcasting as the ``/`` operator (*other* may be a
+        same-shape matrix, a ``1x1`` matrix, a ``1xN``/``Mx1`` vector that
+        broadcasts, or a scalar) and is bit-for-bit identical to it.
+
+        :param other: The right-hand operand.
+        :param out: A :class:`Matrix` matching the result shape to write the
+            result into (allocation-free); returned in place of a fresh
+            matrix. May alias an input operand.
+        :return: ``self / other`` (``out`` itself when ``out`` is given).
+        :raises ValueError: if *other*'s shape does not broadcast against
+            ``self``, or if *out*'s shape does not match the result.
+        :raises TypeError: if *out* is given and is not a :class:`Matrix`.
+        """
+
     def cross(self, other: "Matrix",
               axis: Optional[int] = None) -> Union[float, "Matrix"]:
         """2D or 3D cross product against another vector or batch.
@@ -391,43 +489,67 @@ class Matrix:
            to that position.  This differs from NumPy, which propagates NaN.
         """
 
-    def ceil(self, in_place: bool = False) -> "Matrix":
+    def ceil(self, in_place: bool = False, *,
+             out: Optional["Matrix"] = None) -> "Matrix":
         """Round each element up to the nearest integer.
 
         :param in_place: When ``True``, mutate ``self`` and return it.
+        :param out: A same-shape :class:`Matrix` to write the result into
+            (allocation-free); returned in place of a fresh matrix. Mutually
+            exclusive with ``in_place``.
         """
 
-    def floor(self, in_place: bool = False) -> "Matrix":
+    def floor(self, in_place: bool = False, *,
+              out: Optional["Matrix"] = None) -> "Matrix":
         """Round each element down to the nearest integer.
 
         :param in_place: When ``True``, mutate ``self`` and return it.
+        :param out: A same-shape :class:`Matrix` to write the result into
+            (allocation-free); returned in place of a fresh matrix. Mutually
+            exclusive with ``in_place``.
         """
 
-    def round(self, in_place: bool = False) -> "Matrix":
+    def round(self, in_place: bool = False, *,
+              out: Optional["Matrix"] = None) -> "Matrix":
         """Round each element to the nearest integer (banker's rounding).
 
         :param in_place: When ``True``, mutate ``self`` and return it.
+        :param out: A same-shape :class:`Matrix` to write the result into
+            (allocation-free); returned in place of a fresh matrix. Mutually
+            exclusive with ``in_place``.
         """
 
-    def negate(self, in_place: bool = False) -> "Matrix":
+    def negate(self, in_place: bool = False, *,
+               out: Optional["Matrix"] = None) -> "Matrix":
         """Negate every element.
 
         :param in_place: When ``True``, mutate ``self`` and return it.
+        :param out: A same-shape :class:`Matrix` to write the result into
+            (allocation-free); returned in place of a fresh matrix. Mutually
+            exclusive with ``in_place``.
         """
 
-    def abs(self, in_place: bool = False) -> "Matrix":
+    def abs(self, in_place: bool = False, *,
+            out: Optional["Matrix"] = None) -> "Matrix":
         """Take the absolute value of every element.
 
         :param in_place: When ``True``, mutate ``self`` and return it.
+        :param out: A same-shape :class:`Matrix` to write the result into
+            (allocation-free); returned in place of a fresh matrix. Mutually
+            exclusive with ``in_place``.
         """
 
-    def sqrt(self, in_place: bool = False) -> "Matrix":
+    def sqrt(self, in_place: bool = False, *,
+             out: Optional["Matrix"] = None) -> "Matrix":
         """Take the square root of every element.
 
         Negative elements yield ``NaN`` (no exception is raised), matching
         :func:`numpy.sqrt`.
 
         :param in_place: When ``True``, mutate ``self`` and return it.
+        :param out: A same-shape :class:`Matrix` to write the result into
+            (allocation-free); returned in place of a fresh matrix. Mutually
+            exclusive with ``in_place``.
         """
 
     def less(self, other: Union["Matrix", int, float,
