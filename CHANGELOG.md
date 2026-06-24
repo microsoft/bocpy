@@ -1,3 +1,58 @@
+## 2026-06-24 - Version 0.13.0
+A `Matrix` ergonomics release. The dense matrix type gains named method forms
+of the arithmetic operators, a numpy-style ``out=`` target on every
+element-wise method, and a two-rounding ``scaled_add`` companion to ``fma``.
+The shared ``out=`` machinery is hardened against Python-sequence operands so
+no method form can be tricked into returning a mistyped object.
+
+**New Features**
+
+- **`Matrix.add` / `subtract` / `multiply` / `divide`** — named method forms
+  of ``+`` ``-`` ``*`` ``/`` (``m.add(other, out=...)``), bit-for-bit
+  identical to the operators and sharing their broadcasting: *other* may be a
+  same-shape matrix, a ``1x1`` matrix, a ``1xN`` / ``Mx1`` vector that
+  broadcasts, or a scalar.
+- **`out=` targets on every element-wise method** — ``add`` / ``subtract`` /
+  ``multiply`` / ``divide`` and the unary ufuncs ``ceil`` / ``floor`` /
+  ``round`` / ``negate`` / ``abs`` / ``sqrt`` accept a keyword-only ``out=``
+  :class:`Matrix` to write into allocation-free, returning that matrix in
+  place of a fresh one. For the unary ufuncs ``out`` is mutually exclusive
+  with ``in_place``; the binary forms may alias an input operand.
+- **`Matrix.scaled_add(s, x)`** — the two-rounding sibling of :meth:`Matrix.fma`,
+  computing ``self + s * x`` bit-for-bit identical to the plain expression
+  (the product and the sum are each rounded). *s* may be a same-shape matrix,
+  a ``1x1`` matrix, a broadcasting row / column vector, or a scalar; *x* is a
+  same-shape matrix. Has an ``in_place=True`` form. Use it when you need the
+  plain ``self + s * x`` rounding and :meth:`Matrix.fma` for the
+  single-rounding fused form.
+
+**Documentation**
+
+- Expanded the :doc:`api` matrix surface with the new ``scaled_add``,
+  ``add`` / ``subtract`` / ``multiply`` / ``divide``, and ``out=`` parameters
+  via the ``__init__.pyi`` stub docstrings, including the aliasing and
+  ``in_place`` mutual-exclusivity rules.
+
+**Tests**
+
+- Added operator-parity, scalar, ``out=`` round-trip, aliasing, shape-mismatch,
+  wrong-type, keyword-only, and unacquired-cown coverage for the named binary
+  methods and the unary ``out=`` targets, plus a sequence-coercion regression
+  suite that exercises the hardened wrap path across the binary operators and
+  ``@``.
+
+**Internal**
+
+- Hardened the shared ``out=`` / sequence-coercion path so a coerced
+  ``list`` / ``tuple`` operand can no longer cause an element-wise method or
+  ``@`` to allocate a mistyped result object; the wrap type is now always the
+  canonical per-interpreter ``Matrix`` type and result shapes are read from the
+  unwrapped buffer.
+- Refreshed the audit and docs dependency constraints
+  (``ci/constraints-audit.txt``, ``ci/constraints-docs.txt``) and bumped the
+  pinned GitHub Actions in the wheel-build, nightly-audit, and PR-gate
+  workflows.
+
 ## 2026-06-17 - Version 0.12.0
 A `Matrix` capability release. The dense matrix type gains NumPy-style fancy
 indexing, comparison masks and lexicographic comparison operators, a

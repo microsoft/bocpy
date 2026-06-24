@@ -3,6 +3,7 @@
 import copy
 from fractions import Fraction
 import math
+import operator
 import pickle
 import random
 import struct
@@ -28,6 +29,11 @@ def ref_fma(a, b, c):
     inside range, so this boundary never bites.)
     """
     return float(Fraction(a) * Fraction(b) + Fraction(c))
+
+
+def _flatten(m):
+    """Row-major list of every element in a Matrix."""
+    return [m[i, j] for i in range(m.rows) for j in range(m.columns)]
 
 
 MATRIX_SIZES = [
@@ -1105,6 +1111,508 @@ class TestFma:
         Cown(b)
         with pytest.raises(RuntimeError):
             a.fma(b, 1.0)
+
+
+class TestScaledAdd:
+    """Tests for `scaled_add(s, x, /, in_place=False)` two-rounding add.
+
+    The reference is plain Python ``y + s * x``: CPython floats are IEEE-754
+    doubles, so ``s * x`` rounds once and ``y + (s * x)`` rounds again -- the
+    exact two-rounding semantics scaled_add guarantees (the build sets
+    ``-ffp-contract=off`` so the C kernel never fuses), hence the cell-by-cell
+    comparisons use ``==``, not allclose.
+    """
+
+    def test_exact_small(self):
+        """A hand-computed 2x2 matches two-rounding self + s*x cell-by-cell."""
+        y = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        x = Matrix(2, 2, [10.0, 20.0, 30.0, 40.0])
+        out = y.scaled_add(2.0, x)
+        for i in range(2):
+            for j in range(2):
+                assert out[i, j] == y[i, j] + 2.0 * x[i, j]
+
+    def test_scalar_fuzz(self, shape, rng):
+        """A scalar s broadcasts; every cell equals y + s*x exactly."""
+        rows, cols = shape
+        n = rows * cols
+        yv = [rng.uniform(-100, 100) for _ in range(n)]
+        xv = [rng.uniform(-100, 100) for _ in range(n)]
+        s = rng.uniform(-10, 10)
+        y = Matrix(rows, cols, yv)
+        x = Matrix(rows, cols, xv)
+        out = y.scaled_add(s, x)
+        for i in range(rows):
+            for j in range(cols):
+                k = i * cols + j
+                assert out[i, j] == yv[k] + s * xv[k]
+
+    def test_1x1_s_is_scalar(self):
+        """A 1x1 matrix scale broadcasts like a number."""
+        y = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        x = Matrix(2, 2, [10.0, 20.0, 30.0, 40.0])
+        out = y.scaled_add(Matrix(1, 1, [2.0]), x)
+        for i in range(2):
+            for j in range(2):
+                assert out[i, j] == y[i, j] + 2.0 * x[i, j]
+
+    def test_same_shape_s_fuzz(self, shape, rng):
+        """A same-shape matrix scale multiplies element-wise."""
+        rows, cols = shape
+        n = rows * cols
+        yv = [rng.uniform(-100, 100) for _ in range(n)]
+        xv = [rng.uniform(-100, 100) for _ in range(n)]
+        sv = [rng.uniform(-10, 10) for _ in range(n)]
+        y = Matrix(rows, cols, yv)
+        x = Matrix(rows, cols, xv)
+        out = y.scaled_add(Matrix(rows, cols, sv), x)
+        for i in range(rows):
+            for j in range(cols):
+                k = i * cols + j
+                assert out[i, j] == yv[k] + sv[k] * xv[k]
+
+    def test_row_vector_s_broadcasts(self):
+        """A 1xN row-vector scale broadcasts down the rows."""
+        yv = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        xv = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+        sv = [2.0, 3.0, 4.0]
+        y = Matrix(2, 3, yv)
+        x = Matrix(2, 3, xv)
+        out = y.scaled_add(Matrix(1, 3, sv), x)
+        for i in range(2):
+            for j in range(3):
+                k = i * 3 + j
+                assert out[i, j] == yv[k] + sv[j] * xv[k]
+
+    def test_col_vector_s_broadcasts(self):
+        """An Mx1 column-vector scale broadcasts across the columns."""
+        yv = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        xv = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0]
+        sv = [2.0, 3.0]
+        y = Matrix(2, 3, yv)
+        x = Matrix(2, 3, xv)
+        out = y.scaled_add(Matrix(2, 1, sv), x)
+        for i in range(2):
+            for j in range(3):
+                k = i * 3 + j
+                assert out[i, j] == yv[k] + sv[i] * xv[k]
+
+    def test_distinct_from_fma(self):
+        """Two roundings differ from fma's single rounding on a crafted input.
+
+        With ``s = x = 1 + 2**-27`` and ``y = -1``, the exact ``s * x`` is
+        ``1 + 2**-26 + 2**-54``; the first rounding drops the ``2**-54`` bit, so
+        ``y + round(s*x) == 2**-26``. The fused ``x*s + y`` rounds once and
+        keeps the bit, landing on ``2**-26 + 2**-54``.
+        """
+        s = 1.0 + 2.0 ** -27
+        xval = 1.0 + 2.0 ** -27
+        yval = -1.0
+        y = Matrix(1, 1, [yval])
+        x = Matrix(1, 1, [xval])
+        two_rounding = y.scaled_add(s, x)
+        one_rounding = x.fma(s, y)  # x*s + y, single rounding
+        assert two_rounding[0, 0] == yval + s * xval
+        assert two_rounding[0, 0] == 2.0 ** -26
+        assert one_rounding[0, 0] == 2.0 ** -26 + 2.0 ** -54
+        assert two_rounding[0, 0] != one_rounding[0, 0]
+
+    def test_in_place_returns_self(self):
+        """in_place=True writes into self and returns it; s/x unchanged."""
+        yv = [1.0, 2.0, 3.0, 4.0]
+        xv = [10.0, 20.0, 30.0, 40.0]
+        s = 2.0
+        y = Matrix(2, 2, yv)
+        x = Matrix(2, 2, xv)
+        x_before = [x[i, j] for i in range(2) for j in range(2)]
+        expected = [yv[i * 2 + j] + s * xv[i * 2 + j]
+                    for i in range(2) for j in range(2)]
+        out = y.scaled_add(s, x, in_place=True)
+        assert out is y
+        assert [y[i, j] for i in range(2) for j in range(2)] == expected
+        assert [x[i, j] for i in range(2) for j in range(2)] == x_before
+
+    def test_in_place_matches_copy(self, shape, rng):
+        """in_place result equals the copy result cell-for-cell."""
+        rows, cols = shape
+        n = rows * cols
+        yv = [rng.uniform(-50, 50) for _ in range(n)]
+        y_copy = Matrix(rows, cols, yv)
+        y_ip = Matrix(rows, cols, yv)
+        x = Matrix(rows, cols, [rng.uniform(-50, 50) for _ in range(n)])
+        s = Matrix(rows, cols, [rng.uniform(-10, 10) for _ in range(n)])
+        copied = y_copy.scaled_add(s, x)
+        y_ip.scaled_add(s, x, in_place=True)
+        for i in range(rows):
+            for j in range(cols):
+                assert y_ip[i, j] == copied[i, j]
+
+    def test_keyword_in_place_false_is_copy(self):
+        """Explicit in_place=False returns a distinct matrix; self unchanged."""
+        y = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        before = [y[i, j] for i in range(2) for j in range(2)]
+        out = y.scaled_add(2.0, Matrix(2, 2, [5.0, 6.0, 7.0, 8.0]),
+                           in_place=False)
+        assert out is not y
+        assert [y[i, j] for i in range(2) for j in range(2)] == before
+
+    def test_operands_alias_self(self, shape, rng):
+        """s or x aliasing self reads every cell only once."""
+        rows, cols = shape
+        n = rows * cols
+        yv = [rng.uniform(-20, 20) for _ in range(n)]
+        xv = [rng.uniform(-20, 20) for _ in range(n)]
+        # s aliases self: out = y + y*x.
+        y1 = Matrix(rows, cols, yv)
+        x1 = Matrix(rows, cols, xv)
+        out = y1.scaled_add(y1, x1)
+        for i in range(rows):
+            for j in range(cols):
+                k = i * cols + j
+                assert out[i, j] == yv[k] + yv[k] * xv[k]
+        # x aliases self: out = y + s*y.
+        y2 = Matrix(rows, cols, yv)
+        out = y2.scaled_add(3.0, y2)
+        for i in range(rows):
+            for j in range(cols):
+                k = i * cols + j
+                assert out[i, j] == yv[k] + 3.0 * yv[k]
+        # all three alias, in place: y = y + y*y.
+        y3 = Matrix(rows, cols, yv)
+        res = y3.scaled_add(y3, y3, in_place=True)
+        assert res is y3
+        for i in range(rows):
+            for j in range(cols):
+                k = i * cols + j
+                assert y3[i, j] == yv[k] + yv[k] * yv[k]
+
+    def test_rejects_x_shape_mismatch(self):
+        """An x of the wrong shape raises ValueError naming both shapes."""
+        y = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        bad = Matrix(3, 3, [float(i) for i in range(9)])
+        with pytest.raises(
+                ValueError,
+                match=r"scaled_add: x shape 3x3 does not match self 2x2"):
+            y.scaled_add(2.0, bad)
+
+    def test_rejects_x_mismatch_leaves_self_unmodified(self):
+        """A rejected x allocates nothing and leaves self untouched."""
+        y = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        before = [y[i, j] for i in range(2) for j in range(2)]
+        bad = Matrix(3, 3, [float(i) for i in range(9)])
+        with pytest.raises(ValueError):
+            y.scaled_add(2.0, bad, in_place=True)
+        assert [y[i, j] for i in range(2) for j in range(2)] == before
+
+    def test_rejects_broadcast_s(self):
+        """An s matrix of incompatible shape raises ValueError."""
+        y = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        x = Matrix(2, 2, [10.0, 20.0, 30.0, 40.0])
+        bad = Matrix(1, 3, [1.0, 2.0, 3.0])
+        with pytest.raises(
+                ValueError,
+                match=r"scaled_add: s shape 1x3 incompatible with self 2x2"):
+            y.scaled_add(bad, x)
+
+    def test_rejects_bad_type_s(self):
+        """A non-numeric, non-matrix s raises TypeError."""
+        y = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        x = Matrix(2, 2, [10.0, 20.0, 30.0, 40.0])
+        with pytest.raises(
+                TypeError,
+                match=r"scaled_add: s must be a Matrix or a real number"):
+            y.scaled_add("x", x)
+
+    def test_boc_roundtrip(self):
+        """scaled_add runs inside a @when behavior over a Cown[Matrix]."""
+        y = Cown(Matrix(2, 2, [1.0, 2.0, 3.0, 4.0]))
+        x = Matrix(2, 2, [10.0, 20.0, 30.0, 40.0])
+
+        @when(y)
+        def result(y, x=x):  # noqa: D401 — short behavior
+            """Compute scaled_add inside a behavior and return the result."""
+            return y.value.scaled_add(2.0, x)
+
+        wait()
+        assert result.exception is False
+        yv = [1.0, 2.0, 3.0, 4.0]
+        xv = [10.0, 20.0, 30.0, 40.0]
+        expected = Matrix(2, 2, [yv[k] + 2.0 * xv[k] for k in range(4)])
+        for i in range(2):
+            for j in range(2):
+                assert result.value[i, j] == expected[i, j]
+
+    def test_not_acquired_raises(self):
+        """scaled_add on a cown-resident (unacquired) matrix raises."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        Cown(m)
+        with pytest.raises(RuntimeError):
+            m.scaled_add(2.0, Matrix(2, 2, [10.0, 20.0, 30.0, 40.0]))
+
+    def test_operand_not_acquired_raises(self):
+        """An unacquired matrix operand raises RuntimeError."""
+        y = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        x = Matrix(2, 2, [10.0, 20.0, 30.0, 40.0])
+        Cown(x)
+        with pytest.raises(RuntimeError):
+            y.scaled_add(2.0, x)
+
+
+# Named binary methods (add/subtract/multiply/divide) and their operators.
+_NAMED_OPS = {
+    "add": operator.add,
+    "subtract": operator.sub,
+    "multiply": operator.mul,
+    "divide": operator.truediv,
+}
+
+# Broadcastable (lhs_shape, rhs_shape) pairs the operators accept, covering
+# every routing branch in Matrix_binary_op.
+_BROADCAST_PAIRS = [
+    ((3, 3), (3, 3)),   # same-shape element-wise
+    ((3, 3), (1, 1)),   # 1x1 rhs scalar-broadcast
+    ((1, 1), (3, 3)),   # 1x1 lhs scalar-broadcast
+    ((3, 3), (1, 3)),   # row-vector broadcast
+    ((3, 3), (3, 1)),   # column-vector broadcast
+    ((3, 1), (1, 3)),   # outer product
+    ((1, 3), (3, 1)),   # outer product (reflected)
+]
+
+
+@pytest.mark.parametrize("name", list(_NAMED_OPS))
+class TestNamedBinaryMethods:
+    """add/subtract/multiply/divide mirror the +/-/*// operators exactly."""
+
+    def _operands(self, lhs_shape, rhs_shape, rng):
+        """Two matrices with nonzero data (so divide never hits 0)."""
+        lhs = Matrix(*lhs_shape,
+                     [rng.uniform(1.0, 10.0)
+                      for _ in range(lhs_shape[0] * lhs_shape[1])])
+        rhs = Matrix(*rhs_shape,
+                     [rng.uniform(1.0, 10.0)
+                      for _ in range(rhs_shape[0] * rhs_shape[1])])
+        return lhs, rhs
+
+    @pytest.mark.parametrize("lhs_shape,rhs_shape", _BROADCAST_PAIRS)
+    def test_parity_with_operator(self, name, lhs_shape, rhs_shape, rng):
+        """a.<name>(b) is bit-for-bit identical to ``a <op> b``."""
+        op = _NAMED_OPS[name]
+        lhs, rhs = self._operands(lhs_shape, rhs_shape, rng)
+        expected = op(lhs, rhs)
+        actual = getattr(lhs, name)(rhs)
+        assert actual is not lhs
+        assert _flatten(actual) == _flatten(expected)
+
+    def test_parity_with_scalar_operand(self, name, rng):
+        """A Python scalar operand matches the operator form."""
+        op = _NAMED_OPS[name]
+        lhs = Matrix(2, 3, [rng.uniform(1.0, 10.0) for _ in range(6)])
+        expected = op(lhs, 2.5)
+        actual = getattr(lhs, name)(2.5)
+        assert _flatten(actual) == _flatten(expected)
+
+    @pytest.mark.parametrize("lhs_shape,rhs_shape", _BROADCAST_PAIRS)
+    def test_out_writes_in_place_and_returns_it(self, name, lhs_shape,
+                                                rhs_shape, rng):
+        """out= writes the result into the target and returns that object."""
+        op = _NAMED_OPS[name]
+        lhs, rhs = self._operands(lhs_shape, rhs_shape, rng)
+        expected = op(lhs, rhs)
+        out = Matrix(expected.rows, expected.columns,
+                     [0.0] * (expected.rows * expected.columns))
+        result = getattr(lhs, name)(rhs, out=out)
+        assert result is out
+        assert _flatten(out) == _flatten(expected)
+
+    def test_out_may_alias_an_input(self, name, rng):
+        """out= aliasing an operand still produces the correct result."""
+        op = _NAMED_OPS[name]
+        a = Matrix(2, 2, [rng.uniform(1.0, 10.0) for _ in range(4)])
+        b = Matrix(2, 2, [rng.uniform(1.0, 10.0) for _ in range(4)])
+        expected = _flatten(op(a, b))
+        result = getattr(a, name)(b, out=a)
+        assert result is a
+        assert _flatten(a) == expected
+
+    def test_out_shape_mismatch_raises_and_leaves_target(self, name, rng):
+        """A wrong-shape out= raises ValueError before any write."""
+        a = Matrix(2, 2, [rng.uniform(1.0, 10.0) for _ in range(4)])
+        b = Matrix(2, 2, [rng.uniform(1.0, 10.0) for _ in range(4)])
+        bad = Matrix(3, 3, [7.0] * 9)
+        before = _flatten(bad)
+        with pytest.raises(ValueError,
+                           match=r"out shape 3x3 does not match result 2x2"):
+            getattr(a, name)(b, out=bad)
+        assert _flatten(bad) == before
+
+    def test_out_wrong_type_raises(self, name):
+        """A non-Matrix out= raises TypeError."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        b = Matrix(2, 2, [5.0, 6.0, 7.0, 8.0])
+        with pytest.raises(TypeError, match=r"out must be a Matrix"):
+            getattr(a, name)(b, out=[0.0, 0.0, 0.0, 0.0])
+
+    def test_out_is_keyword_only(self, name):
+        """out cannot be passed positionally."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        b = Matrix(2, 2, [5.0, 6.0, 7.0, 8.0])
+        out = Matrix(2, 2, [0.0, 0.0, 0.0, 0.0])
+        with pytest.raises(TypeError):
+            getattr(a, name)(b, out)
+
+    def test_out_on_unacquired_cown_raises(self, name):
+        """An out= target resident in a cown raises RuntimeError."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        b = Matrix(2, 2, [5.0, 6.0, 7.0, 8.0])
+        out = Matrix(2, 2, [0.0, 0.0, 0.0, 0.0])
+        Cown(out)
+        with pytest.raises(RuntimeError):
+            getattr(a, name)(b, out=out)
+
+
+class TestSequenceCoercionRegression:
+    """Regression tests: a sequence operand must never be cast to a Matrix.
+
+    A coerced sequence operand is a raw Python object, not a MatrixObject;
+    set_output and the outer-product / matmul wrap paths derive the result
+    type from the canonical Matrix type rather than casting the caller's
+    object. Each case must return a genuine Matrix with correct values.
+    """
+
+    def test_named_add_1x1_with_list(self):
+        """1x1 receiver + list operand via the named method (new surface)."""
+        r = Matrix(1, 1, [5.0]).add([1.0, 2.0, 3.0])
+        assert isinstance(r, Matrix)
+        assert _flatten(r) == [6.0, 7.0, 8.0]
+
+    def test_named_add_1x1_with_list_out(self):
+        """1x1 receiver + list operand with an out= target (new surface)."""
+        out = Matrix(1, 3, [0.0, 0.0, 0.0])
+        r = Matrix(1, 1, [5.0]).add([1.0, 2.0, 3.0], out=out)
+        assert r is out
+        assert _flatten(r) == [6.0, 7.0, 8.0]
+
+    def test_1x1_plus_list_operator(self):
+        """1x1 receiver + list via the + operator (scalar-broadcast branch)."""
+        r = Matrix(1, 1, [5.0]) + [1.0, 2.0, 3.0]
+        assert isinstance(r, Matrix)
+        assert _flatten(r) == [6.0, 7.0, 8.0]
+
+    def test_list_plus_matrix_same_shape(self):
+        """list + 1xN matrix via __radd__ (same-shape ewise branch)."""
+        r = [1.0, 2.0, 3.0] + Matrix(1, 3, [4.0, 5.0, 6.0])
+        assert isinstance(r, Matrix)
+        assert _flatten(r) == [5.0, 7.0, 9.0]
+
+    def test_list_times_column_outer(self):
+        """list * column vector via __rmul__ (reflected outer-product branch)."""
+        r = [1.0, 2.0, 3.0] * Matrix(3, 1, [10.0, 20.0, 30.0])
+        assert isinstance(r, Matrix)
+        assert r.rows == 3 and r.columns == 3
+        expected = [col * row
+                    for col in (10.0, 20.0, 30.0)
+                    for row in (1.0, 2.0, 3.0)]
+        assert _flatten(r) == expected
+
+    def test_list_matmul_column(self):
+        """list @ column vector via __rmatmul__ (matmul wrap path)."""
+        r = [1.0, 2.0, 3.0] @ Matrix(3, 1, [10.0, 20.0, 30.0])
+        assert isinstance(r, Matrix)
+        assert r.rows == 1 and r.columns == 1
+        assert r[0, 0] == 1.0 * 10.0 + 2.0 * 20.0 + 3.0 * 30.0
+
+    def test_tuple_matmul_column(self):
+        """tuple @ column vector must also wrap as Matrix, not tuple."""
+        r = (1.0, 2.0, 3.0) @ Matrix(3, 1, [10.0, 20.0, 30.0])
+        assert isinstance(r, Matrix)
+        assert r[0, 0] == 1.0 * 10.0 + 2.0 * 20.0 + 3.0 * 30.0
+
+    def test_list_minus_matrix_operand_order(self):
+        """[seq] - matrix computes seq - matrix (not matrix - seq).
+
+        Subtraction is non-commutative; the reflected coercion branch must
+        preserve operand order.
+        """
+        r = [10.0, 20.0, 30.0] - Matrix(1, 3, [1.0, 2.0, 3.0])
+        assert isinstance(r, Matrix)
+        assert _flatten(r) == [9.0, 18.0, 27.0]
+
+    def test_list_div_matrix_operand_order(self):
+        """[seq] / matrix computes seq / matrix (not matrix / seq).
+
+        Division is non-commutative; the reflected coercion branch must
+        preserve operand order.
+        """
+        r = [10.0, 20.0, 30.0] / Matrix(1, 3, [2.0, 4.0, 5.0])
+        assert isinstance(r, Matrix)
+        assert _flatten(r) == [5.0, 5.0, 6.0]
+
+
+class TestUnaryOutTarget:
+    """out= on the unary methods (ceil/floor/round/negate/abs/sqrt)."""
+
+    UNARY = {
+        "negate": lambda v: -v,
+        "abs": abs,
+        "ceil": math.ceil,
+        "floor": math.floor,
+        "round": round,
+        "sqrt": math.sqrt,
+    }
+
+    @pytest.mark.parametrize("name", list(UNARY))
+    def test_out_writes_and_returns_target(self, name):
+        """out= writes the result and returns the target object."""
+        ref = self.UNARY[name]
+        vals = [0.25, 1.5, 2.75, 4.0]
+        m = Matrix(2, 2, vals)
+        out = Matrix(2, 2, [0.0, 0.0, 0.0, 0.0])
+        result = getattr(m, name)(out=out)
+        assert result is out
+        assert _flatten(out) == pytest.approx([ref(v) for v in vals])
+        # self is untouched (out is a distinct buffer).
+        assert _flatten(m) == vals
+
+    @pytest.mark.parametrize("name", list(UNARY))
+    def test_out_and_in_place_mutually_exclusive(self, name):
+        """Passing both out= and in_place raises ValueError."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        out = Matrix(2, 2, [0.0, 0.0, 0.0, 0.0])
+        with pytest.raises(ValueError,
+                           match=r"out and in_place are mutually exclusive"):
+            getattr(m, name)(True, out=out)
+
+    @pytest.mark.parametrize("name", list(UNARY))
+    def test_out_is_keyword_only(self, name):
+        """out cannot be passed positionally on the unary methods."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        out = Matrix(2, 2, [0.0, 0.0, 0.0, 0.0])
+        with pytest.raises(TypeError):
+            getattr(m, name)(False, out)
+
+    def test_out_shape_mismatch_raises(self):
+        """A wrong-shape out= raises ValueError before any write."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        bad = Matrix(3, 3, [9.0] * 9)
+        before = _flatten(bad)
+        with pytest.raises(ValueError,
+                           match=r"out shape 3x3 does not match result 2x2"):
+            m.negate(out=bad)
+        assert _flatten(bad) == before
+
+    def test_out_wrong_type_raises(self):
+        """A non-Matrix out= raises TypeError."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        with pytest.raises(TypeError, match=r"out must be a Matrix"):
+            m.negate(out=[0.0, 0.0, 0.0, 0.0])
+
+    def test_out_on_unacquired_cown_raises(self):
+        """An out= target resident in a cown raises RuntimeError."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        out = Matrix(2, 2, [0.0, 0.0, 0.0, 0.0])
+        Cown(out)
+        with pytest.raises(RuntimeError):
+            m.negate(out=out)
 
 
 class TestCross:

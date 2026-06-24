@@ -8,7 +8,7 @@
 # the public C ABI it was authored against; bump it in lock-step with
 # ``[project].version`` in the root ``pyproject.toml`` (see the
 # ``finalize-pr`` skill).
-requires = ["setuptools", "wheel", "bocpy~=0.12"]
+requires = ["setuptools", "wheel", "bocpy~=0.13"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -16,4 +16,4 @@ name = "bocpy-c-abi-consumer"
 version = "0.0.0"
 description = "Smoke test and canonical downstream template for the bocpy public C ABI."
 requires-python = ">=3.10"
-dependencies = ["bocpy~=0.12"]
+dependencies = ["bocpy~=0.13"]
