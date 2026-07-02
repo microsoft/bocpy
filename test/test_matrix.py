@@ -152,6 +152,21 @@ class TestFactories:
         assert m.columns == cols
         assert m.sum() == pytest.approx(rows * cols)
 
+    def test_full(self, shape):
+        """Verify Matrix.full() creates a matrix filled with a constant."""
+        rows, cols = shape
+        m = Matrix.full(shape, 3.5)
+        assert m.rows == rows
+        assert m.columns == cols
+        assert m.sum() == pytest.approx(rows * cols * 3.5)
+        assert all(m[r, c] == 3.5 for r in range(rows) for c in range(cols))
+
+    def test_full_negative(self, shape):
+        """Verify Matrix.full() handles negative fill values."""
+        rows, cols = shape
+        m = Matrix.full(shape, -2.0)
+        assert m.sum() == pytest.approx(rows * cols * -2.0)
+
     def test_normal_shape(self, shape):
         """Verify Matrix.normal() produces a matrix of the given shape."""
         rows, cols = shape
@@ -199,6 +214,47 @@ class TestFactories:
         """seed() with no argument raises TypeError."""
         with pytest.raises(TypeError):
             Matrix.seed()
+
+
+class TestFactoriesOnWorker:
+    """RNG factories driven from inside @when behaviors (worker interpreters).
+
+    The per-interpreter PRNG state must be reachable from worker threads,
+    which never ran the _math module init on their own thread.
+    """
+
+    @classmethod
+    def teardown_class(cls):
+        """Tear the runtime down after all behavior tests."""
+        wait()
+
+    def test_rng_runs_on_worker_interpreter(self):
+        """normal()/uniform() draw from the worker PRNG in a behavior."""
+        c = Cown(0)
+
+        @when(c)
+        def result(c):  # noqa: D401 — short behavior body
+            u = Matrix.uniform(0.0, 1.0, size=(3, 2))
+            n = Matrix.normal(0.0, 1.0, size=(2, 4))
+            return (u.rows, u.columns, n.rows, n.columns)
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert result.unwrap() == (3, 2, 2, 4)
+
+    def test_seed_reproducible_on_worker(self):
+        """Seeding in a behavior reproduces the same draw on that interpreter."""
+        c = Cown(0)
+
+        @when(c)
+        def result(c):  # noqa: D401 — short behavior body
+            Matrix.seed(4242)
+            a = Matrix.uniform(0.0, 1.0, size=(4, 4))
+            Matrix.seed(4242)
+            b = Matrix.uniform(0.0, 1.0, size=(4, 4))
+            return Matrix.allclose(a, b)
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert result.unwrap() is True
 
 
 class TestIndexing:
@@ -1560,6 +1616,11 @@ class TestUnaryOutTarget:
         "sqrt": math.sqrt,
     }
 
+    # Every unary elementwise op with keyword-only in_place/out (the UNARY
+    # dict above omits sign/cos/sin, which lack simple value-reference fns).
+    KEYWORD_ONLY_UNARY = ["negate", "abs", "ceil", "floor", "round", "sqrt",
+                          "sign", "cos", "sin"]
+
     @pytest.mark.parametrize("name", list(UNARY))
     def test_out_writes_and_returns_target(self, name):
         """out= writes the result and returns the target object."""
@@ -1580,15 +1641,22 @@ class TestUnaryOutTarget:
         out = Matrix(2, 2, [0.0, 0.0, 0.0, 0.0])
         with pytest.raises(ValueError,
                            match=r"out and in_place are mutually exclusive"):
-            getattr(m, name)(True, out=out)
+            getattr(m, name)(in_place=True, out=out)
 
-    @pytest.mark.parametrize("name", list(UNARY))
+    @pytest.mark.parametrize("name", KEYWORD_ONLY_UNARY)
+    def test_in_place_is_keyword_only(self, name):
+        """in_place cannot be passed positionally on the unary methods."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        with pytest.raises(TypeError):
+            getattr(m, name)(True)
+
+    @pytest.mark.parametrize("name", KEYWORD_ONLY_UNARY)
     def test_out_is_keyword_only(self, name):
         """out cannot be passed positionally on the unary methods."""
         m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
         out = Matrix(2, 2, [0.0, 0.0, 0.0, 0.0])
         with pytest.raises(TypeError):
-            getattr(m, name)(False, out)
+            getattr(m, name)(out)
 
     def test_out_shape_mismatch_raises(self):
         """A wrong-shape out= raises ValueError before any write."""
@@ -3008,6 +3076,22 @@ class TestAllclose:
         b = Matrix(rows, cols, perturbed)
         assert Matrix.allclose(a, b)
 
+    def test_lhs_not_acquired_raises(self):
+        """allclose on a cown-resident left operand raises RuntimeError."""
+        a = Matrix(2, 2, 1.0)
+        b = Matrix(2, 2, 1.0)
+        Cown(a)
+        with pytest.raises(RuntimeError):
+            Matrix.allclose(a, b)
+
+    def test_rhs_not_acquired_raises(self):
+        """allclose on a cown-resident right operand raises RuntimeError."""
+        a = Matrix(2, 2, 1.0)
+        b = Matrix(2, 2, 1.0)
+        Cown(b)
+        with pytest.raises(RuntimeError):
+            Matrix.allclose(a, b)
+
 
 class TestRepr:
     """Smoke tests for string representations."""
@@ -3275,6 +3359,107 @@ class TestTake:
             m.take([0], -3)
 
 
+class TestTakeOut:
+    """Tests for take(out=) — writing the selection into a pre-allocated matrix."""
+
+    def test_rows_into_out_returns_out(self, mat, shape):
+        """take(out=) writes the selected rows and returns the out matrix."""
+        rows, cols = shape
+        indices = [rows - 1, 0]
+        out = Matrix(len(indices), cols, 0.0)
+        result = mat.take(indices, axis=0, out=out)
+        assert result is out
+        for out_r, src_r in enumerate(indices):
+            for c in range(cols):
+                assert out[out_r, c] == pytest.approx(mat[src_r, c])
+
+    def test_columns_into_out_returns_out(self, mat, shape):
+        """take(out=) writes the selected columns and returns the out matrix."""
+        rows, cols = shape
+        indices = [cols - 1, 0]
+        out = Matrix(rows, len(indices), 0.0)
+        result = mat.take(indices, axis=1, out=out)
+        assert result is out
+        for r in range(rows):
+            for out_c, src_c in enumerate(indices):
+                assert out[r, out_c] == pytest.approx(mat[r, src_c])
+
+    def test_out_matches_fresh_result(self, mat, shape):
+        """The out= result equals the freshly-allocated result."""
+        rows, cols = shape
+        indices = [0, 0, rows - 1]
+        out = Matrix(len(indices), cols, 0.0)
+        mat.take(indices, axis=0, out=out)
+        assert Matrix.allclose(out, mat.take(indices, axis=0))
+
+    def test_out_is_keyword_only(self, mat, shape):
+        """out cannot be passed positionally (it is keyword-only)."""
+        rows, cols = shape
+        with pytest.raises(TypeError):
+            mat.take([0], 0, Matrix(1, cols, 0.0))
+
+    def test_out_wrong_shape_raises(self):
+        """An out of the wrong shape raises ValueError."""
+        m = Matrix(3, 2, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        with pytest.raises(ValueError):
+            m.take([0, 1], axis=0, out=Matrix(3, 2, 0.0))
+        with pytest.raises(ValueError):
+            m.take([0], axis=1, out=Matrix(3, 2, 0.0))
+
+    def test_out_non_matrix_raises(self):
+        """A non-Matrix out raises TypeError."""
+        m = Matrix(2, 2, 1.0)
+        with pytest.raises(TypeError):
+            m.take([0], axis=0, out=[1, 2])
+
+    def test_out_alias_self_raises(self):
+        """out aliasing the source matrix raises ValueError."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(ValueError):
+            m.take([0, 1, 2], axis=0, out=m)
+
+    def test_out_unacquired_raises(self):
+        """A cown-resident out raises RuntimeError."""
+        m = Matrix(2, 2, 1.0)
+        out = Matrix(2, 2, 0.0)
+        Cown(out)
+        with pytest.raises(RuntimeError):
+            m.take([0, 1], axis=0, out=out)
+
+    def test_bad_index_leaves_out_untouched(self):
+        """A bad index is rejected before any write (validate-then-write)."""
+        m = Matrix(3, 2, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        out = Matrix(2, 2, 9.0)
+        with pytest.raises(IndexError):
+            m.take([0, 99], axis=0, out=out)
+        for r in range(2):
+            for c in range(2):
+                assert out[r, c] == pytest.approx(9.0)
+
+    def test_out_none_allocates_fresh(self, mat, shape):
+        """out=None behaves like the default (fresh allocation)."""
+        rows, cols = shape
+        indices = [0]
+        result = mat.take(indices, axis=0, out=None)
+        assert result is not mat
+        assert Matrix.allclose(result, mat.take(indices, axis=0))
+
+    def test_out_boc_roundtrip(self):
+        """take(out=) runs inside a @when behavior over cowns."""
+        a = Cown(Matrix(3, 2, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
+        b = Cown(Matrix(2, 2, 0.0))
+
+        @when(a, b)
+        def result(a, b):  # noqa: D401 — short behavior
+            """Take rows into a pre-allocated cown matrix."""
+            a.value.take([2, 0], axis=0, out=b.value)
+            return list(b.value.values())
+
+        wait()
+        assert result.exception is False
+        assert result.value == pytest.approx([5.0, 6.0, 1.0, 2.0])
+
+
 class TestFancyIndexing:
     """List-key gather through __getitem__ (rows and columns)."""
 
@@ -3420,6 +3605,87 @@ class TestFancyIndexing:
         for out_r, src_r in enumerate(perm):
             for c in range(cols):
                 assert result[out_r, c] == pytest.approx(mat[src_r, c])
+
+
+class TestSliceForcesMatrix:
+    """A slice anywhere in the key keeps a Matrix, even at 1x1."""
+
+    @pytest.fixture
+    def m(self):
+        """A 3x3 matrix filled with 0..8 row-major."""
+        return Matrix(3, 3, [float(i) for i in range(9)])
+
+    def test_int_int_collapses_to_float(self, m):
+        """m[i, j] with two integer selectors returns a Python float."""
+        value = m[1, 2]
+        assert isinstance(value, float)
+        assert value == pytest.approx(5.0)
+
+    def test_slice_slice_stays_matrix(self, m):
+        """m[0:1, 0:1] returns a 1x1 Matrix, not a float."""
+        sub = m[0:1, 0:1]
+        assert isinstance(sub, Matrix)
+        assert sub.rows == 1 and sub.columns == 1
+        assert sub[0, 0] == pytest.approx(0.0)
+
+    def test_int_slice_stays_matrix(self, m):
+        """m[i, c:c+1] keeps the column axis as a length-1 Matrix."""
+        sub = m[1, 0:1]
+        assert isinstance(sub, Matrix)
+        assert sub.rows == 1 and sub.columns == 1
+        assert sub[0, 0] == pytest.approx(3.0)
+
+    def test_slice_int_stays_matrix(self, m):
+        """m[r:r+1, j] keeps the row axis as a length-1 Matrix."""
+        sub = m[0:1, 2]
+        assert isinstance(sub, Matrix)
+        assert sub.rows == 1 and sub.columns == 1
+        assert sub[0, 0] == pytest.approx(2.0)
+
+    def test_1x1_matrix_int_int_is_float(self):
+        """A whole-matrix (int, int) read on a 1x1 still collapses."""
+        assert isinstance(Matrix(1, 1, [5.0])[0, 0], float)
+
+    def test_1x1_matrix_slice_slice_is_matrix(self):
+        """m[0:1, 0:1] on a 1x1 keeps it a Matrix."""
+        sub = Matrix(1, 1, [5.0])[0:1, 0:1]
+        assert isinstance(sub, Matrix)
+        assert sub.rows == 1 and sub.columns == 1
+        assert sub[0, 0] == pytest.approx(5.0)
+
+    def test_column_vector_integer_still_float(self):
+        """A bare integer on a column vector keeps the 1-D float ergonomic."""
+        v = Matrix(4, 1, [10.0, 20.0, 30.0, 40.0])
+        assert isinstance(v[2], float)
+        assert v[2] == pytest.approx(30.0)
+
+    def test_column_vector_slice_stays_matrix(self):
+        """A slice on a column vector keeps a Matrix, even at 1x1."""
+        v = Matrix(4, 1, [10.0, 20.0, 30.0, 40.0])
+        sub = v[2:3, 0:1]
+        assert isinstance(sub, Matrix)
+        assert sub.rows == 1 and sub.columns == 1
+        assert sub[0, 0] == pytest.approx(30.0)
+
+    def test_multi_cell_slice_unchanged(self, m):
+        """A slice selecting more than one cell is unaffected."""
+        sub = m[0:2, 1:3]
+        assert isinstance(sub, Matrix)
+        assert sub.rows == 2 and sub.columns == 2
+
+    def test_boc_roundtrip(self):
+        """The length-1 slice rule holds inside a @when behavior."""
+        a = Cown(Matrix(3, 3, [float(i) for i in range(9)]))
+
+        @when(a)
+        def result(a):  # noqa: D401 — short behavior
+            """Read a length-1 slice and report its type and value."""
+            sub = a.value[1, 0:1]
+            return (isinstance(sub, Matrix), sub.rows, sub.columns, sub[0, 0])
+
+        wait()
+        assert result.exception is False
+        assert result.value == (True, 1, 1, pytest.approx(3.0))
 
 
 def _snapshot(m, rows, cols):
@@ -3963,6 +4229,969 @@ class TestPut:
         assert result.exception is False
         expected = Matrix(3, 2, [5.0, 7.0, 0.0, 8.0, 5.0, 9.0])
         assert Matrix.allclose(result.value, expected)
+
+
+class TestTakeAlongAxis:
+    """take_along_axis() — per-row/per-column gather (np.take_along_axis)."""
+
+    def test_gather_axis1_rows(self):
+        """axis=1 gathers one column index per row into a column vector."""
+        m = Matrix(3, 3, [3.0, 1.0, 2.0, 0.0, 5.0, 4.0, 9.0, 8.0, 1.0])
+        out = m.take_along_axis([1, 0, 2], axis=1)
+        assert out.rows == 3
+        assert out.columns == 1
+        assert Matrix.allclose(out, Matrix(3, 1, [1.0, 0.0, 1.0]))
+
+    def test_gather_axis0_columns(self):
+        """axis=0 gathers one row index per column into a row vector."""
+        m = Matrix(3, 3, [3.0, 1.0, 2.0, 0.0, 5.0, 4.0, 9.0, 8.0, 1.0])
+        out = m.take_along_axis([1, 0, 2], axis=0)
+        assert out.rows == 1
+        assert out.columns == 3
+        # out[c] = m[idx[c]][c]: m[1][0]=0, m[0][1]=1, m[2][2]=1.
+        assert Matrix.allclose(out, Matrix(1, 3, [0.0, 1.0, 1.0]))
+
+    def test_gather_pairs_with_argmin(self, mat, shape):
+        """argmin(axis=k) feeds take_along_axis(axis=k) to read the minima."""
+        rows, cols = shape
+        idx = mat.argmin(axis=1)
+        out = mat.take_along_axis(idx, axis=1)
+        assert out.rows == rows
+        assert out.columns == 1
+        for r in range(rows):
+            assert out[r, 0] == pytest.approx(min(mat[r, c]
+                                                  for c in range(cols)))
+
+    def test_gather_pairs_with_argmin_axis0(self, mat, shape):
+        """argmin(axis=0) feeds take_along_axis(axis=0) for column minima."""
+        rows, cols = shape
+        idx = mat.argmin(axis=0)
+        out = mat.take_along_axis(idx, axis=0)
+        assert out.rows == 1
+        assert out.columns == cols
+        for c in range(cols):
+            assert out[0, c] == pytest.approx(min(mat[r, c]
+                                                  for r in range(rows)))
+
+    def test_gather_accepts_tuple(self):
+        """A tuple of indices is accepted like a list."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        out = m.take_along_axis((1, 0), axis=1)
+        assert Matrix.allclose(out, Matrix(2, 1, [2.0, 3.0]))
+
+    def test_gather_negative_axis(self):
+        """A negative axis maps -1 to columns (axis=1)."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        out = m.take_along_axis([1, 0], axis=-1)
+        assert Matrix.allclose(out, Matrix(2, 1, [2.0, 3.0]))
+
+    def test_gather_negative_index(self):
+        """A negative index counts from the end of the gathered axis."""
+        m = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        out = m.take_along_axis([-1, -2], axis=1)
+        assert Matrix.allclose(out, Matrix(2, 1, [3.0, 5.0]))
+
+    def test_gather_bool_index(self):
+        """A bool index element is taken as the integer 0/1."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        out = m.take_along_axis([True, False], axis=1)
+        assert Matrix.allclose(out, Matrix(2, 1, [2.0, 3.0]))
+
+    def test_gather_wrong_count_raises(self):
+        """An index count that does not match the axis raises ValueError."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(ValueError):
+            m.take_along_axis([0, 1], axis=1)
+        with pytest.raises(ValueError):
+            m.take_along_axis([0, 1], axis=0)
+
+    def test_gather_out_of_range_raises(self):
+        """An out-of-range index raises IndexError."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(IndexError):
+            m.take_along_axis([0, 1, 9], axis=1)
+
+    def test_gather_invalid_axis_raises(self):
+        """axis >= 2 raises KeyError, matching take()."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(KeyError):
+            m.take_along_axis([0, 1, 2], 2)
+
+    def test_gather_bad_type_raises(self):
+        """A non-int index raises TypeError."""
+        m = Matrix(2, 2, 1.0)
+        with pytest.raises(TypeError):
+            m.take_along_axis([0.5, 1.0], axis=1)
+
+    def test_gather_boc_roundtrip(self):
+        """take_along_axis runs inside a @when behavior over a Cown[Matrix]."""
+        a = Cown(Matrix(3, 3, [3.0, 1.0, 2.0, 0.0, 5.0, 4.0, 9.0, 8.0, 1.0]))
+
+        @when(a)
+        def result(a):  # noqa: D401 — short behavior
+            """Gather per-row minima inside a behavior."""
+            return a.value.take_along_axis(
+                a.value.argmin(axis=1), axis=1)
+
+        wait()
+        assert result.exception is False
+        assert Matrix.allclose(result.value, Matrix(3, 1, [1.0, 0.0, 1.0]))
+
+
+class TestTakeAlongAxisOut:
+    """take_along_axis(out=) — gather into a pre-allocated matrix."""
+
+    def test_axis1_into_out_returns_out(self):
+        """axis=1 writes the gathered column vector into out and returns it."""
+        m = Matrix(3, 3, [3.0, 1.0, 2.0, 0.0, 5.0, 4.0, 9.0, 8.0, 1.0])
+        out = Matrix(3, 1, 0.0)
+        result = m.take_along_axis([1, 0, 2], axis=1, out=out)
+        assert result is out
+        assert Matrix.allclose(out, Matrix(3, 1, [1.0, 0.0, 1.0]))
+
+    def test_axis0_into_out_returns_out(self):
+        """axis=0 writes the gathered row vector into out and returns it."""
+        m = Matrix(3, 3, [3.0, 1.0, 2.0, 0.0, 5.0, 4.0, 9.0, 8.0, 1.0])
+        out = Matrix(1, 3, 0.0)
+        result = m.take_along_axis([1, 0, 2], axis=0, out=out)
+        assert result is out
+        assert Matrix.allclose(out, Matrix(1, 3, [0.0, 1.0, 1.0]))
+
+    def test_out_matches_fresh_result(self, mat, shape):
+        """The out= result equals the freshly-allocated result."""
+        rows, cols = shape
+        idx = mat.argmin(axis=1)
+        out = Matrix(rows, 1, 0.0)
+        mat.take_along_axis(idx, axis=1, out=out)
+        assert Matrix.allclose(out, mat.take_along_axis(idx, axis=1))
+
+    def test_out_is_keyword_only(self):
+        """out cannot be passed positionally (it is keyword-only)."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        with pytest.raises(TypeError):
+            m.take_along_axis([1, 0], 1, Matrix(2, 1, 0.0))
+
+    def test_out_wrong_shape_raises(self):
+        """An out of the wrong shape raises ValueError."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(ValueError):
+            m.take_along_axis([0, 1, 2], axis=1, out=Matrix(3, 3, 0.0))
+        with pytest.raises(ValueError):
+            m.take_along_axis([0, 1, 2], axis=0, out=Matrix(3, 1, 0.0))
+
+    def test_out_non_matrix_raises(self):
+        """A non-Matrix out raises TypeError."""
+        m = Matrix(2, 2, 1.0)
+        with pytest.raises(TypeError):
+            m.take_along_axis([0, 1], axis=1, out=[1, 2])
+
+    def test_out_alias_self_raises(self):
+        """out aliasing the source matrix raises ValueError."""
+        m = Matrix(1, 3, [1.0, 2.0, 3.0])
+        with pytest.raises(ValueError):
+            m.take_along_axis([0, 0, 0], axis=0, out=m)
+
+    def test_out_unacquired_raises(self):
+        """A cown-resident out raises RuntimeError."""
+        m = Matrix(2, 2, 1.0)
+        out = Matrix(2, 1, 0.0)
+        Cown(out)
+        with pytest.raises(RuntimeError):
+            m.take_along_axis([0, 1], axis=1, out=out)
+
+    def test_bad_index_leaves_out_untouched(self):
+        """A bad index is rejected before any write (validate-then-write)."""
+        m = Matrix(3, 3, 1.0)
+        out = Matrix(3, 1, 9.0)
+        with pytest.raises(IndexError):
+            m.take_along_axis([0, 1, 9], axis=1, out=out)
+        for r in range(3):
+            assert out[r, 0] == pytest.approx(9.0)
+
+    def test_out_none_allocates_fresh(self):
+        """out=None behaves like the default (fresh allocation)."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        result = m.take_along_axis([1, 0], axis=1, out=None)
+        assert result is not m
+        assert Matrix.allclose(result, Matrix(2, 1, [2.0, 3.0]))
+
+    def test_out_boc_roundtrip(self):
+        """take_along_axis(out=) runs inside a @when behavior over cowns."""
+        a = Cown(Matrix(3, 3, [3.0, 1.0, 2.0, 0.0, 5.0, 4.0, 9.0, 8.0, 1.0]))
+        b = Cown(Matrix(3, 1, 0.0))
+
+        @when(a, b)
+        def result(a, b):  # noqa: D401 — short behavior
+            """Gather per-row minima into a pre-allocated cown matrix."""
+            a.value.take_along_axis(a.value.argmin(axis=1),
+                                    axis=1, out=b.value)
+            return list(b.value.values())
+
+        wait()
+        assert result.exception is False
+        assert result.value == pytest.approx([1.0, 0.0, 1.0])
+
+
+class TestPutAlongAxis:
+    """put_along_axis() — the write-side counterpart of take_along_axis()."""
+
+    def test_put_axis1_scalar(self):
+        """axis=1 writes a scalar to one column per row."""
+        m = Matrix(3, 3, 1.0)
+        m.put_along_axis([0, 1, 2], 9.0, axis=1)
+        assert Matrix.allclose(
+            m, Matrix(3, 3, [9.0, 1.0, 1.0, 1.0, 9.0, 1.0, 1.0, 1.0, 9.0]))
+
+    def test_put_axis1_vector(self):
+        """axis=1 writes a rows x 1 vector, one element per row."""
+        m = Matrix(3, 3, 1.0)
+        m.put_along_axis([0, 1, 2], Matrix(3, 1, [7.0, 8.0, 9.0]), axis=1)
+        assert Matrix.allclose(
+            m, Matrix(3, 3, [7.0, 1.0, 1.0, 1.0, 8.0, 1.0, 1.0, 1.0, 9.0]))
+
+    def test_put_axis0_vector(self):
+        """axis=0 writes a 1 x columns vector, one element per column."""
+        m = Matrix(3, 3, 1.0)
+        m.put_along_axis([0, 1, 2], Matrix(1, 3, [7.0, 8.0, 9.0]), axis=0)
+        assert Matrix.allclose(
+            m, Matrix(3, 3, [7.0, 1.0, 1.0, 1.0, 8.0, 1.0, 1.0, 1.0, 9.0]))
+
+    def test_put_round_trips_take(self, mat, shape):
+        """put_along_axis writes back exactly what take_along_axis gathered."""
+        rows, cols = shape
+        idx = mat.argmin(axis=1)
+        gathered = mat.take_along_axis(idx, axis=1)
+        target = Matrix(rows, cols, 0.0)
+        target.put_along_axis(idx, gathered, axis=1)
+        for r in range(rows):
+            assert target[r, idx[r]] == pytest.approx(gathered[r, 0])
+
+    def test_put_1x1_as_scalar(self):
+        """A 1x1 matrix value broadcasts like a scalar."""
+        m = Matrix(2, 2, 0.0)
+        m.put_along_axis([0, 1], Matrix(1, 1, 8.0), axis=1)
+        assert Matrix.allclose(m, Matrix(2, 2, [8.0, 0.0, 0.0, 8.0]))
+
+    def test_put_returns_self(self):
+        """put_along_axis returns self to allow chaining."""
+        m = Matrix(2, 2, 0.0)
+        assert m.put_along_axis([0, 1], 1.0, axis=1) is m
+
+    def test_put_accumulate(self):
+        """accumulate=True folds duplicate target cells additively."""
+        m = Matrix(3, 3, 1.0)
+        m.put_along_axis([0, 0, 0], 5.0, axis=1, accumulate=True)
+        assert Matrix.allclose(
+            m, Matrix(3, 3, [6.0, 1.0, 1.0, 6.0, 1.0, 1.0, 6.0, 1.0, 1.0]))
+
+    def test_put_negative_index(self):
+        """A negative index counts from the end of the indexed axis."""
+        m = Matrix(2, 3, 0.0)
+        m.put_along_axis([-1, -1], 4.0, axis=1)
+        assert Matrix.allclose(m, Matrix(2, 3, [0.0, 0.0, 4.0, 0.0, 0.0, 4.0]))
+
+    def test_put_wrong_count_raises_nowrite(self):
+        """A bad index count raises ValueError and writes nothing."""
+        m = Matrix(3, 3, 1.0)
+        before = _snapshot(m, 3, 3)
+        with pytest.raises(ValueError):
+            m.put_along_axis([0, 1], 5.0, axis=1)
+        assert _snapshot(m, 3, 3) == before
+
+    def test_put_out_of_range_raises_nowrite(self):
+        """An out-of-range index raises IndexError and writes nothing."""
+        m = Matrix(3, 3, 1.0)
+        before = _snapshot(m, 3, 3)
+        with pytest.raises(IndexError):
+            m.put_along_axis([0, 1, 9], 5.0, axis=1)
+        assert _snapshot(m, 3, 3) == before
+
+    def test_put_shape_mismatch_raises_nowrite(self):
+        """A wrong-shaped value raises ValueError and writes nothing."""
+        m = Matrix(3, 3, 1.0)
+        before = _snapshot(m, 3, 3)
+        with pytest.raises(ValueError):
+            m.put_along_axis([0, 1, 2], Matrix(1, 3, [1.0, 2.0, 3.0]), axis=1)
+        assert _snapshot(m, 3, 3) == before
+
+    def test_put_invalid_axis_raises(self):
+        """axis >= 2 raises KeyError, matching put()."""
+        m = Matrix(3, 3, 1.0)
+        with pytest.raises(KeyError):
+            m.put_along_axis([0, 1, 2], 1.0, 2)
+
+    def test_put_bad_value_type_raises(self):
+        """A non-numeric, non-matrix value raises TypeError."""
+        m = Matrix(2, 2, 1.0)
+        with pytest.raises(TypeError):
+            m.put_along_axis([0, 1], "x", axis=1)
+
+    def test_put_self_alias(self):
+        """A self-aliased RHS reads pre-write values via the snapshot."""
+        # m is 2x1, so a put_along_axis(axis=1) selection (2x1) can alias self.
+        m = Matrix(2, 1, [3.0, 5.0])
+        m.put_along_axis([0, 0], m, axis=1, accumulate=True)
+        # Each row reads its snapshot value then adds it: doubles.
+        assert Matrix.allclose(m, Matrix(2, 1, [6.0, 10.0]))
+
+    def test_put_boc_roundtrip(self):
+        """put_along_axis runs inside a @when behavior over a Cown[Matrix]."""
+        a = Cown(Matrix(3, 3, 1.0))
+
+        @when(a)
+        def result(a):  # noqa: D401 — short behavior
+            """Scatter one element per row inside a behavior."""
+            a.value.put_along_axis([0, 1, 2], Matrix(3, 1, [7.0, 8.0, 9.0]),
+                                   axis=1)
+            return a.value.copy()
+
+        wait()
+        assert result.exception is False
+        assert Matrix.allclose(
+            result.value,
+            Matrix(3, 3, [7.0, 1.0, 1.0, 1.0, 8.0, 1.0, 1.0, 1.0, 9.0]))
+
+
+class TestRepeatInterleave:
+    """repeat_interleave() — interleaved row/column/element repetition."""
+
+    def test_flatten_default(self):
+        """axis=None flattens row-major and repeats each element."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        out = m.repeat_interleave(2)
+        assert out.rows == 1
+        assert out.columns == 8
+        assert Matrix.allclose(
+            out, Matrix(1, 8, [1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0]))
+
+    def test_axis0_repeats_rows(self):
+        """axis=0 repeats whole rows consecutively."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        out = m.repeat_interleave(2, axis=0)
+        assert out.rows == 4
+        assert out.columns == 2
+        assert Matrix.allclose(
+            out, Matrix(4, 2, [1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]))
+
+    def test_axis1_repeats_columns(self):
+        """axis=1 repeats each column consecutively."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        out = m.repeat_interleave(3, axis=1)
+        assert out.rows == 2
+        assert out.columns == 6
+        assert Matrix.allclose(
+            out, Matrix(2, 6, [1.0, 1.0, 1.0, 2.0, 2.0, 2.0,
+                               3.0, 3.0, 3.0, 4.0, 4.0, 4.0]))
+
+    def test_repeat_one_is_copy(self, mat, shape):
+        """repeats=1 returns an equal but independent matrix."""
+        rows, cols = shape
+        out = mat.repeat_interleave(1, axis=0)
+        assert out.rows == rows
+        assert out.columns == cols
+        assert Matrix.allclose(out, mat)
+        assert out is not mat
+
+    def test_negative_axis(self):
+        """axis=-1 maps to columns, axis=-2 to rows."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        assert Matrix.allclose(m.repeat_interleave(2, axis=-1),
+                               m.repeat_interleave(2, axis=1))
+        assert Matrix.allclose(m.repeat_interleave(2, axis=-2),
+                               m.repeat_interleave(2, axis=0))
+
+    def test_shapes_fuzzed(self, mat, shape):
+        """Result dimensions and element multiplicity hold across shapes."""
+        rows, cols = shape
+        r0 = mat.repeat_interleave(3, axis=0)
+        assert (r0.rows, r0.columns) == (rows * 3, cols)
+        for r in range(rows):
+            for t in range(3):
+                for c in range(cols):
+                    assert r0[r * 3 + t, c] == pytest.approx(mat[r, c])
+        r1 = mat.repeat_interleave(3, axis=1)
+        assert (r1.rows, r1.columns) == (rows, cols * 3)
+        for r in range(rows):
+            for c in range(cols):
+                for t in range(3):
+                    assert r1[r, c * 3 + t] == pytest.approx(mat[r, c])
+
+    def test_zero_repeats_raises(self):
+        """repeats < 1 raises ValueError."""
+        m = Matrix(2, 2, 1.0)
+        with pytest.raises(ValueError):
+            m.repeat_interleave(0)
+        with pytest.raises(ValueError):
+            m.repeat_interleave(-1, axis=0)
+
+    def test_invalid_axis_raises(self):
+        """An out-of-range axis raises ValueError."""
+        m = Matrix(2, 2, 1.0)
+        with pytest.raises(ValueError):
+            m.repeat_interleave(2, axis=2)
+
+    @pytest.mark.parametrize("rows, cols, axis", [
+        (3, 1, 1),      # axis=1: columns*repeats fits, but total wraps size_t
+        (1, 3, 0),      # axis=0: rows*repeats fits, but total wraps size_t
+        (3, 1, None),   # flatten: size*repeats wraps size_t
+    ])
+    def test_repeats_overflow_raises(self, rows, cols, axis):
+        """Overflowing the total output element count raises OverflowError.
+
+        The bound is on the whole rows*columns*repeats product, not just the
+        repeated dimension: a large repeats with a small repeated axis but the
+        *other* dimension > 1 would otherwise wrap the product to a tiny size
+        and write past the heap allocation. sys.maxsize is the largest value
+        the ``n`` (Py_ssize_t) argument accepts; for size >= 3 the total
+        product exceeds SIZE_MAX while the single-dimension product stays in
+        range.
+        """
+        m = Matrix(rows, cols, 1.0)
+        with pytest.raises(OverflowError):
+            if axis is None:
+                m.repeat_interleave(sys.maxsize)
+            else:
+                m.repeat_interleave(sys.maxsize, axis=axis)
+
+    def test_not_acquired_raises(self):
+        """repeat_interleave on a cown-resident matrix raises."""
+        m = Matrix(2, 2, 1.0)
+        Cown(m)
+        with pytest.raises(RuntimeError):
+            m.repeat_interleave(2)
+
+    def test_boc_roundtrip(self):
+        """repeat_interleave runs inside a @when behavior over a Cown."""
+        a = Cown(Matrix(2, 2, [1.0, 2.0, 3.0, 4.0]))
+
+        @when(a)
+        def result(a):  # noqa: D401 — short behavior
+            """Repeat rows inside a behavior."""
+            return a.value.repeat_interleave(2, axis=0)
+
+        wait()
+        assert result.exception is False
+        assert Matrix.allclose(
+            result.value,
+            Matrix(4, 2, [1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]))
+
+
+def _topk_group(values, mask, k, largest):
+    """Reference top-k of one group: sorted extremes, NaN last, -1/NaN pad.
+
+    Mirrors the C kernel: only included cells (``mask[i] != 0.0``; NaN counts
+    as included) are considered, the result is sorted (descending for
+    ``largest``, ascending otherwise), ties keep the first occurrence, NaN
+    sorts last, and a group with fewer than *k* included elements pads the
+    trailing slots with ``NaN`` values and ``-1`` indices.
+    """
+    entries = [(v, i) for i, v in enumerate(values)
+               if mask is None or mask[i] != 0.0]
+
+    def key(entry):
+        v, i = entry
+        is_nan = math.isnan(v)
+        sort_value = 0.0 if is_nan else (-v if largest else v)
+        return (is_nan, sort_value, i)
+
+    entries.sort(key=key)
+    out_vals, out_idx = [], []
+    for j in range(k):
+        if j < len(entries):
+            out_vals.append(entries[j][0])
+            out_idx.append(entries[j][1])
+        else:
+            out_vals.append(float("nan"))
+            out_idx.append(-1)
+    return out_vals, out_idx
+
+
+def _assert_values_equal(got, expected):
+    """Compare value lists allowing NaN == NaN."""
+    assert len(got) == len(expected)
+    for g, e in zip(got, expected):
+        if math.isnan(e):
+            assert math.isnan(g)
+        else:
+            assert g == pytest.approx(e)
+
+
+class TestTopK:
+    """topk() — k extreme elements per group, sorted, with optional mask."""
+
+    def test_flat_largest_golden(self):
+        """axis=None returns the k greatest, descending, with flat indices."""
+        m = Matrix(2, 3, [3.0, 1.0, 2.0, 0.0, 9.0, 4.0])
+        values, indices = m.topk(2)
+        assert values.rows == 1
+        assert values.columns == 2
+        assert list(values.values()) == pytest.approx([9.0, 4.0])
+        assert indices == [4, 5]
+
+    def test_flat_smallest_golden(self):
+        """largest=False returns the k smallest, ascending."""
+        m = Matrix(2, 3, [3.0, 1.0, 2.0, 0.0, 9.0, 4.0])
+        values, indices = m.topk(2, largest=False)
+        assert list(values.values()) == pytest.approx([0.0, 1.0])
+        assert indices == [3, 1]
+
+    def test_axis1_rowwise_golden(self):
+        """axis=1 reduces across columns into rows x k values."""
+        m = Matrix(2, 3, [3.0, 1.0, 2.0, 0.0, 9.0, 4.0])
+        values, indices = m.topk(2, axis=1)
+        assert values.rows == 2
+        assert values.columns == 2
+        assert values[0, 0] == pytest.approx(3.0)
+        assert values[0, 1] == pytest.approx(2.0)
+        assert values[1, 0] == pytest.approx(9.0)
+        assert values[1, 1] == pytest.approx(4.0)
+        assert indices == [[0, 2], [1, 2]]
+
+    def test_axis0_columnwise_golden(self):
+        """axis=0 reduces down rows into k x columns values."""
+        m = Matrix(2, 3, [3.0, 1.0, 2.0, 0.0, 9.0, 4.0])
+        values, indices = m.topk(2, axis=0)
+        assert values.rows == 2
+        assert values.columns == 3
+        # Column 0: [3, 0] -> [3, 0]; col 1: [1, 9] -> [9, 1]; col 2: [2, 4]
+        # -> [4, 2].
+        assert values[0, 0] == pytest.approx(3.0)
+        assert values[1, 0] == pytest.approx(0.0)
+        assert values[0, 1] == pytest.approx(9.0)
+        assert values[1, 1] == pytest.approx(1.0)
+        assert indices == [[0, 1], [1, 0], [1, 0]]
+
+    def test_ties_keep_first_occurrence(self):
+        """Equal values resolve to ascending original index."""
+        m = Matrix(1, 4, [5.0, 5.0, 5.0, 5.0])
+        _, indices = m.topk(3)
+        assert indices == [0, 1, 2]
+
+    def test_nan_sorts_last(self):
+        """A NaN is never a top value; it lands after the real elements."""
+        nan = float("nan")
+        m = Matrix(1, 4, [1.0, nan, 3.0, 2.0])
+        values, indices = m.topk(4)
+        _assert_values_equal(list(values.values()), [3.0, 2.0, 1.0, nan])
+        assert indices == [2, 3, 0, 1]
+
+    def test_k_equals_axis_length_full_sort(self):
+        """k == axis length performs a complete sort of the group."""
+        m = Matrix(1, 5, [4.0, 2.0, 5.0, 1.0, 3.0])
+        values, indices = m.topk(5)
+        assert list(values.values()) == pytest.approx([5.0, 4.0, 3.0, 2.0, 1.0])
+        assert indices == [2, 0, 4, 1, 3]
+
+    def test_masked_axis1_pads_short_group(self):
+        """A masked row with fewer than k included cells pads with NaN/-1."""
+        m = Matrix(2, 3, [3.0, 1.0, 2.0, 0.0, 9.0, 4.0])
+        mask = Matrix(2, 3, [1.0, 0.0, 1.0, 0.0, 1.0, 1.0])
+        values, indices = m.topk(3, axis=1, where=mask)
+        _assert_values_equal([values[0, j] for j in range(3)],
+                             [3.0, 2.0, float("nan")])
+        _assert_values_equal([values[1, j] for j in range(3)],
+                             [9.0, 4.0, float("nan")])
+        assert indices == [[0, 2, -1], [1, 2, -1]]
+
+    def test_masked_flat(self):
+        """A flat masked top-k only considers included cells."""
+        m = Matrix(1, 5, [3.0, 0.0, 9.0, 1.0, 4.0])
+        mask = Matrix(1, 5, [1.0, 0.0, 0.0, 1.0, 1.0])
+        values, indices = m.topk(2, where=mask)
+        assert list(values.values()) == pytest.approx([4.0, 3.0])
+        assert indices == [4, 0]
+
+    def test_all_excluded_group_all_pad(self):
+        """A fully-masked group is all NaN values and -1 indices."""
+        m = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        zero = Matrix(2, 3, 0.0)
+        values, indices = m.topk(2, axis=1, where=zero)
+        for r in range(2):
+            _assert_values_equal([values[r, j] for j in range(2)],
+                                 [float("nan"), float("nan")])
+        assert indices == [[-1, -1], [-1, -1]]
+
+    def test_nan_mask_cell_is_included(self):
+        """A NaN mask cell counts as included (truthy)."""
+        m = Matrix(1, 3, [5.0, 2.0, 8.0])
+        mask = Matrix(1, 3, [0.0, float("nan"), 1.0])
+        values, indices = m.topk(2, where=mask)
+        assert list(values.values()) == pytest.approx([8.0, 2.0])
+        assert indices == [2, 1]
+
+    def test_negative_axis(self):
+        """axis=-1 behaves like axis=1 and axis=-2 like axis=0."""
+        m = Matrix(3, 2, [4.0, 1.0, 2.0, 8.0, 7.0, 3.0])
+        v1, i1 = m.topk(2, axis=-1)
+        v2, i2 = m.topk(2, axis=1)
+        assert Matrix.allclose(v1, v2)
+        assert i1 == i2
+
+    def test_k_too_large_raises(self):
+        """k larger than the reduced axis length raises ValueError."""
+        m = Matrix(2, 3, 1.0)
+        with pytest.raises(ValueError):
+            m.topk(7)  # flat size is 6
+        with pytest.raises(ValueError):
+            m.topk(3, axis=0)  # only 2 rows
+        with pytest.raises(ValueError):
+            m.topk(4, axis=1)  # only 3 columns
+
+    def test_k_not_positive_raises(self):
+        """k < 1 raises ValueError."""
+        m = Matrix(2, 3, 1.0)
+        with pytest.raises(ValueError):
+            m.topk(0)
+        with pytest.raises(ValueError):
+            m.topk(-2, axis=1)
+
+    def test_invalid_axis_raises(self):
+        """An out-of-range axis raises ValueError."""
+        m = Matrix(2, 2, 1.0)
+        with pytest.raises(ValueError):
+            m.topk(1, axis=2)
+
+    def test_non_matrix_mask_raises(self):
+        """A non-Matrix where= argument raises TypeError."""
+        m = Matrix(2, 3, 1.0)
+        with pytest.raises(TypeError):
+            m.topk(1, where=[1, 0, 1, 0, 1, 0])
+
+    def test_shape_mismatch_mask_raises(self):
+        """A mask of the wrong shape raises ValueError."""
+        m = Matrix(2, 3, 1.0)
+        with pytest.raises(ValueError):
+            m.topk(1, where=Matrix(3, 2, 1.0))
+
+    def test_not_acquired_raises(self):
+        """topk on a cown-resident matrix raises RuntimeError."""
+        m = Matrix(2, 2, 1.0)
+        Cown(m)
+        with pytest.raises(RuntimeError):
+            m.topk(1)
+
+    def test_unacquired_mask_raises(self):
+        """A cown-resident mask raises RuntimeError."""
+        m = Matrix(2, 2, 1.0)
+        mask = Matrix(2, 2, 1.0)
+        Cown(mask)
+        with pytest.raises(RuntimeError):
+            m.topk(1, where=mask)
+
+    @pytest.mark.parametrize("largest", [True, False])
+    def test_fuzzed_flat(self, mat, shape, random_values, largest):
+        """Flat top-k matches a pure-Python reference across shapes."""
+        rows, cols = shape
+        k = max(1, (rows * cols) // 2)
+        values, indices = mat.topk(k, largest=largest)
+        exp_vals, exp_idx = _topk_group(random_values, None, k, largest)
+        _assert_values_equal(list(values.values()), exp_vals)
+        assert indices == exp_idx
+
+    @pytest.mark.parametrize("largest", [True, False])
+    def test_fuzzed_axis1(self, mat, shape, random_values, largest):
+        """Per-row top-k matches a pure-Python reference across shapes."""
+        rows, cols = shape
+        k = max(1, cols // 2)
+        values, indices = mat.topk(k, axis=1, largest=largest)
+        assert values.rows == rows
+        assert values.columns == k
+        for r in range(rows):
+            row = [random_values[r * cols + c] for c in range(cols)]
+            exp_vals, exp_idx = _topk_group(row, None, k, largest)
+            _assert_values_equal([values[r, j] for j in range(k)], exp_vals)
+            assert indices[r] == exp_idx
+
+    @pytest.mark.parametrize("largest", [True, False])
+    def test_fuzzed_axis0(self, mat, shape, random_values, largest):
+        """Per-column top-k matches a pure-Python reference across shapes."""
+        rows, cols = shape
+        k = max(1, rows // 2)
+        values, indices = mat.topk(k, axis=0, largest=largest)
+        assert values.rows == k
+        assert values.columns == cols
+        for c in range(cols):
+            column = [random_values[r * cols + c] for r in range(rows)]
+            exp_vals, exp_idx = _topk_group(column, None, k, largest)
+            _assert_values_equal([values[j, c] for j in range(k)], exp_vals)
+            assert indices[c] == exp_idx
+
+    @pytest.mark.parametrize("largest", [True, False])
+    def test_fuzzed_masked_axis1(self, mat, shape, random_values, rng,
+                                 largest):
+        """Masked per-row top-k matches a pure-Python reference."""
+        rows, cols = shape
+        k = cols  # full width so masking can leave short groups
+        mask_flat = [1.0 if rng.random() < 0.6 else 0.0
+                     for _ in range(rows * cols)]
+        mask = Matrix(rows, cols, mask_flat)
+        values, indices = mat.topk(k, axis=1, largest=largest, where=mask)
+        for r in range(rows):
+            row = [random_values[r * cols + c] for c in range(cols)]
+            row_mask = [mask_flat[r * cols + c] for c in range(cols)]
+            exp_vals, exp_idx = _topk_group(row, row_mask, k, largest)
+            _assert_values_equal([values[r, j] for j in range(k)], exp_vals)
+            assert indices[r] == exp_idx
+
+    def test_boc_roundtrip(self):
+        """topk runs inside a @when behavior over cowns."""
+        a = Cown(Matrix(2, 3, [3.0, 1.0, 2.0, 0.0, 9.0, 4.0]))
+        b = Cown(Matrix(2, 3, [1.0, 0.0, 1.0, 0.0, 1.0, 1.0]))
+
+        @when(a, b)
+        def result(a, b):  # noqa: D401 — short behavior
+            """Masked top-k inside a behavior."""
+            values, indices = a.value.topk(2, axis=1, where=b.value)
+            return list(values.values()), indices
+
+        wait()
+        assert result.exception is False
+        vals, idx = result.value
+        assert vals == pytest.approx([3.0, 2.0, 9.0, 4.0])
+        assert idx == [[0, 2], [1, 2]]
+
+
+def _matrix_idx_to_lists(indices, axis, k):
+    """Reshape a matrix-form topk index result back to the list form.
+
+    Mirrors the index Matrix layout: axis=None -> a flat list of k ints from
+    the 1 x k row; axis=0 -> per column, k row indices read down the k x cols
+    matrix; axis=1 -> per row, k column indices read across the rows x k
+    matrix. Float cells (including the -1.0 pad) are cast back to ints.
+    """
+    if axis is None:
+        return [int(indices[0, j]) for j in range(k)]
+    if axis == 0:
+        cols = indices.columns
+        return [[int(indices[j, c]) for j in range(k)] for c in range(cols)]
+    rows = indices.rows
+    return [[int(indices[r, j]) for j in range(k)] for r in range(rows)]
+
+
+class TestTopKIndexMatrix:
+    """topk(as_matrix=True) — indices returned as a same-shape index Matrix."""
+
+    def test_default_is_matrix(self):
+        """With as_matrix=True the indices come back as a Matrix, not a list."""
+        m = Matrix(2, 3, [3.0, 1.0, 2.0, 0.0, 9.0, 4.0])
+        _, indices = m.topk(2, as_matrix=True)
+        assert isinstance(indices, Matrix)
+
+    def test_flat_index_matrix_shape_and_values(self):
+        """axis=None indices is a 1 x k matrix of flat indices."""
+        m = Matrix(2, 3, [3.0, 1.0, 2.0, 0.0, 9.0, 4.0])
+        _, indices = m.topk(2, as_matrix=True)
+        assert indices.rows == 1
+        assert indices.columns == 2
+        assert list(indices.values()) == pytest.approx([4.0, 5.0])
+
+    def test_axis1_index_matrix_matches_values_shape(self):
+        """axis=1 indices is a rows x k matrix aligned with the values."""
+        m = Matrix(2, 3, [3.0, 1.0, 2.0, 0.0, 9.0, 4.0])
+        values, indices = m.topk(2, axis=1, as_matrix=True)
+        assert (indices.rows, indices.columns) == (values.rows, values.columns)
+        assert list(indices.values()) == pytest.approx([0.0, 2.0, 1.0, 2.0])
+
+    def test_axis0_index_matrix_matches_values_shape(self):
+        """axis=0 indices is a k x cols matrix aligned with the values."""
+        m = Matrix(2, 3, [3.0, 1.0, 2.0, 0.0, 9.0, 4.0])
+        values, indices = m.topk(2, axis=0, as_matrix=True)
+        assert (indices.rows, indices.columns) == (values.rows, values.columns)
+        assert list(indices.values()) == pytest.approx([0.0, 1.0, 1.0,
+                                                        1.0, 0.0, 0.0])
+
+    def test_pad_is_minus_one_float(self):
+        """A short masked group pads the index matrix with -1.0."""
+        m = Matrix(2, 3, [3.0, 1.0, 2.0, 0.0, 9.0, 4.0])
+        mask = Matrix(2, 3, [1.0, 0.0, 1.0, 0.0, 1.0, 1.0])
+        _, indices = m.topk(3, axis=1, where=mask, as_matrix=True)
+        assert [indices[0, j] for j in range(3)] == pytest.approx([0.0, 2.0,
+                                                                  -1.0])
+        assert [indices[1, j] for j in range(3)] == pytest.approx([1.0, 2.0,
+                                                                  -1.0])
+
+    @pytest.mark.parametrize("axis", [None, 0, 1])
+    @pytest.mark.parametrize("largest", [True, False])
+    def test_matrix_form_matches_list_form(self, mat, shape, axis, largest):
+        """The index matrix carries the same indices as the list form."""
+        rows, cols = shape
+        if axis is None:
+            k = max(1, (rows * cols) // 2)
+        elif axis == 0:
+            k = max(1, rows // 2)
+        else:
+            k = max(1, cols // 2)
+        v_mat, i_mat = mat.topk(k, axis=axis, largest=largest, as_matrix=True)
+        v_list, i_list = mat.topk(k, axis=axis, largest=largest)
+        assert Matrix.allclose(v_mat, v_list)
+        assert _matrix_idx_to_lists(i_mat, axis, k) == i_list
+
+    def test_index_matrix_boc_roundtrip(self):
+        """topk(as_matrix=True) returns a cown-able index Matrix in a behavior."""
+        a = Cown(Matrix(2, 3, [3.0, 1.0, 2.0, 0.0, 9.0, 4.0]))
+
+        @when(a)
+        def result(a):  # noqa: D401 — short behavior
+            """Read the index matrix inside a behavior."""
+            _, indices = a.value.topk(2, axis=1, as_matrix=True)
+            return list(indices.values())
+
+        wait()
+        assert result.exception is False
+        assert result.value == pytest.approx([0.0, 2.0, 1.0, 2.0])
+
+
+class TestAggregateWhere:
+    """where= masking on sum/mean/magnitude/magnitude_squared/min/max."""
+
+    def test_sum_masks_elements(self):
+        """Only mask-selected elements contribute to the sum."""
+        m = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        mask = Matrix(2, 3, [1.0, 0.0, 1.0, 0.0, 1.0, 0.0])
+        assert m.sum(where=mask) == pytest.approx(1.0 + 3.0 + 5.0)
+
+    def test_mean_uses_included_count(self):
+        """The mean divides by the number of included elements only."""
+        m = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        mask = Matrix(2, 3, [1.0, 0.0, 1.0, 0.0, 1.0, 0.0])
+        assert m.mean(where=mask) == pytest.approx((1.0 + 3.0 + 5.0) / 3.0)
+
+    def test_min_max_ignore_excluded(self):
+        """min/max only consider included elements."""
+        m = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        # Exclude the global extremes (1 and 6).
+        mask = Matrix(2, 3, [0.0, 1.0, 1.0, 1.0, 1.0, 0.0])
+        assert m.min(where=mask) == pytest.approx(2.0)
+        assert m.max(where=mask) == pytest.approx(5.0)
+
+    def test_magnitude_masks_elements(self):
+        """magnitude and magnitude_squared respect the mask."""
+        m = Matrix(2, 2, [3.0, 0.0, 0.0, 4.0])
+        mask = Matrix(2, 2, [1.0, 0.0, 0.0, 1.0])
+        assert m.magnitude_squared(where=mask) == pytest.approx(25.0)
+        assert m.magnitude(where=mask) == pytest.approx(5.0)
+
+    def test_nan_mask_cell_is_included(self):
+        """A NaN mask cell counts as included (truthy)."""
+        m = Matrix(1, 3, [1.0, 2.0, 3.0])
+        mask = Matrix(1, 3, [float("nan"), 0.0, 1.0])
+        assert m.sum(where=mask) == pytest.approx(1.0 + 3.0)
+
+    def test_axis1_rowwise(self):
+        """where= masks per-row reductions along axis=1."""
+        m = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        mask = Matrix(2, 3, [1.0, 0.0, 1.0, 0.0, 1.0, 1.0])
+        out = m.sum(axis=1, where=mask)
+        assert out.rows == 2
+        assert out.columns == 1
+        assert list(out.values()) == pytest.approx([1.0 + 3.0, 5.0 + 6.0])
+
+    def test_axis0_columnwise(self):
+        """where= masks per-column reductions along axis=0."""
+        m = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        mask = Matrix(2, 3, [1.0, 0.0, 1.0, 0.0, 1.0, 1.0])
+        out = m.sum(axis=0, where=mask)
+        assert out.rows == 1
+        assert out.columns == 3
+        assert list(out.values()) == pytest.approx([1.0, 5.0, 3.0 + 6.0])
+
+    def test_all_excluded_sum_is_zero(self):
+        """An all-masked additive group collapses to 0; mean yields NaN."""
+        m = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        zero = Matrix(2, 3, 0.0)
+        assert m.sum(where=zero) == pytest.approx(0.0)
+        assert m.magnitude(where=zero) == pytest.approx(0.0)
+        assert m.magnitude_squared(where=zero) == pytest.approx(0.0)
+        # mean of an empty group is NaN (NumPy semantics), distinguishing it
+        # from a genuine zero mean.
+        assert math.isnan(m.mean(where=zero))
+
+    def test_all_excluded_mean_axis_is_nan(self):
+        """A fully-masked group yields NaN for mean along an axis."""
+        m = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        mask = Matrix(2, 3, [1.0, 1.0, 1.0, 0.0, 0.0, 0.0])
+        out = m.mean(axis=1, where=mask)
+        values = list(out.values())
+        assert values[0] == pytest.approx((1.0 + 2.0 + 3.0) / 3.0)
+        assert math.isnan(values[1])
+
+    def test_all_excluded_min_max_is_nan(self):
+        """An all-masked min/max group yields NaN."""
+        m = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        zero = Matrix(2, 3, 0.0)
+        assert math.isnan(m.min(where=zero))
+        assert math.isnan(m.max(where=zero))
+
+    def test_all_excluded_row_is_nan(self):
+        """A fully-masked row yields NaN for min/max along axis=1."""
+        m = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        mask = Matrix(2, 3, [1.0, 1.0, 1.0, 0.0, 0.0, 0.0])
+        out = m.min(axis=1, where=mask)
+        values = list(out.values())
+        assert values[0] == pytest.approx(1.0)
+        assert math.isnan(values[1])
+
+    def test_no_mask_matches_unmasked(self, mat, shape):
+        """where=None (and an all-ones mask) reproduce the unmasked result."""
+        rows, cols = shape
+        ones = Matrix(rows, cols, 1.0)
+        assert mat.sum(where=ones) == pytest.approx(mat.sum())
+        assert mat.mean(where=ones) == pytest.approx(mat.mean())
+        assert mat.min(where=ones) == pytest.approx(mat.min())
+        assert mat.max(where=ones) == pytest.approx(mat.max())
+
+    def test_shape_mismatch_raises(self):
+        """A mask whose shape differs from the matrix raises ValueError."""
+        m = Matrix(2, 3, 1.0)
+        with pytest.raises(ValueError):
+            m.sum(where=Matrix(3, 2, 1.0))
+
+    def test_non_matrix_mask_raises(self):
+        """A non-Matrix where= argument raises TypeError."""
+        m = Matrix(2, 3, 1.0)
+        with pytest.raises(TypeError):
+            m.sum(where=[1, 0, 1, 0, 1, 0])
+
+    def test_unacquired_mask_raises(self):
+        """A cown-resident mask raises RuntimeError."""
+        m = Matrix(2, 2, 1.0)
+        mask = Matrix(2, 2, 1.0)
+        Cown(mask)
+        with pytest.raises(RuntimeError):
+            m.sum(where=mask)
+
+    def test_fuzzed_against_reference(self, mat, shape, rng):
+        """Masked sum/mean/min/max match a pure-Python reference."""
+        rows, cols = shape
+        flat = list(mat.values())
+        mask_flat = [1.0 if rng.random() < 0.6 else 0.0
+                     for _ in range(rows * cols)]
+        mask = Matrix(rows, cols, mask_flat)
+        included = [v for v, k in zip(flat, mask_flat) if k != 0.0]
+        if included:
+            assert mat.sum(where=mask) == pytest.approx(sum(included))
+            assert mat.mean(where=mask) == pytest.approx(
+                sum(included) / len(included))
+            assert mat.min(where=mask) == pytest.approx(min(included))
+            assert mat.max(where=mask) == pytest.approx(max(included))
+        else:
+            assert mat.sum(where=mask) == pytest.approx(0.0)
+            assert math.isnan(mat.min(where=mask))
+            assert math.isnan(mat.max(where=mask))
+
+    def test_boc_roundtrip(self):
+        """A masked aggregate runs inside a @when behavior over cowns."""
+        a = Cown(Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
+        b = Cown(Matrix(2, 3, [1.0, 0.0, 1.0, 0.0, 1.0, 0.0]))
+
+        @when(a, b)
+        def result(a, b):  # noqa: D401 — short behavior
+            """Masked sum inside a behavior."""
+            return a.value.sum(where=b.value)
+
+        wait()
+        assert result.exception is False
+        assert result.value == pytest.approx(1.0 + 3.0 + 5.0)
 
 
 VECTOR_LENGTHS = [1, 3, 5, 10, 32]
@@ -4567,6 +5796,81 @@ class TestClip:
         with pytest.raises(AssertionError):
             m.clip(10.0, 0.0)
 
+    def test_clip_in_place_returns_self(self):
+        """clip(in_place=True) clamps self and returns it."""
+        m = Matrix(2, 2, [-5.0, 0.0, 5.0, 20.0])
+        result = m.clip(0.0, 10.0, in_place=True)
+        assert result is m
+        assert Matrix.allclose(m, Matrix(2, 2, [0.0, 0.0, 5.0, 10.0]))
+
+    def test_clip_in_place_min_only(self):
+        """clip(min=..., in_place=True) clamps only below, in place."""
+        m = Matrix(1, 3, [-2.0, 1.0, 3.0])
+        result = m.clip(min=0.0, in_place=True)
+        assert result is m
+        assert Matrix.allclose(m, Matrix(1, 3, [0.0, 1.0, 3.0]))
+
+    def test_clip_out_writes_and_returns_target(self):
+        """clip(out=...) writes the result and returns the target object."""
+        m = Matrix(2, 2, [-5.0, 0.0, 5.0, 20.0])
+        out = Matrix(2, 2, 0.0)
+        result = m.clip(0.0, 10.0, out=out)
+        assert result is out
+        assert Matrix.allclose(out, Matrix(2, 2, [0.0, 0.0, 5.0, 10.0]))
+        # self is untouched (out is a distinct buffer).
+        assert Matrix.allclose(m, Matrix(2, 2, [-5.0, 0.0, 5.0, 20.0]))
+
+    def test_clip_out_and_in_place_mutually_exclusive(self):
+        """Passing both out= and in_place raises ValueError."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        out = Matrix(2, 2, 0.0)
+        with pytest.raises(ValueError,
+                           match=r"out and in_place are mutually exclusive"):
+            m.clip(0.0, 10.0, in_place=True, out=out)
+
+    def test_clip_in_place_and_out_are_keyword_only(self):
+        """in_place and out cannot be passed positionally after min/max."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        with pytest.raises(TypeError):
+            m.clip(0.0, 10.0, True)
+
+    def test_clip_out_shape_mismatch_raises(self):
+        """A wrong-shape out= raises ValueError before any write."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        bad = Matrix(3, 3, 9.0)
+        with pytest.raises(ValueError,
+                           match=r"out shape 3x3 does not match result 2x2"):
+            m.clip(0.0, 10.0, out=bad)
+        assert Matrix.allclose(bad, Matrix(3, 3, 9.0))
+
+    def test_clip_out_wrong_type_raises(self):
+        """A non-Matrix out= raises TypeError."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        with pytest.raises(TypeError, match=r"out must be a Matrix"):
+            m.clip(0.0, 10.0, out=[0.0, 0.0, 0.0, 0.0])
+
+    def test_clip_out_on_unacquired_cown_raises(self):
+        """An out= target resident in a cown raises RuntimeError."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        out = Matrix(2, 2, 0.0)
+        Cown(out)
+        with pytest.raises(RuntimeError):
+            m.clip(0.0, 10.0, out=out)
+
+    def test_clip_in_place_boc_roundtrip(self):
+        """clip(in_place=True) mutates the matrix held by a cown."""
+        v = Cown(Matrix(2, 2, [-5.0, 0.0, 5.0, 20.0]))
+
+        @when(v)
+        def result(v):  # noqa: D401 — short behavior
+            """Clamp the cown-resident matrix in place."""
+            v.value.clip(0.0, 10.0, in_place=True)
+            return list(v.value.values())
+
+        wait()
+        assert result.exception is False
+        assert result.value == pytest.approx([0.0, 0.0, 5.0, 10.0])
+
 
 class TestCopy:
     """Tests for the copy() method."""
@@ -4979,26 +6283,48 @@ class TestArgExtreme:
         assert m.argmax() == 0
 
     def test_argmin_axis0_golden(self):
-        """argmin(axis=0) returns per-column row indices as a 1xcols matrix."""
+        """argmin(axis=0) returns per-column row indices as a list of ints."""
         m = Matrix(2, 3, [3.0, 1.0, 2.0, 0.0, 9.0, 4.0])
         result = m.argmin(axis=0)
-        assert result.rows == 1
-        assert result.columns == 3
-        assert [result[0, c] for c in range(3)] == [1.0, 0.0, 0.0]
+        assert result == [1, 0, 0]
+        assert all(isinstance(i, int) for i in result)
 
     def test_argmax_axis1_golden(self):
-        """argmax(axis=1) returns per-row column indices as a rowsx1 matrix."""
+        """argmax(axis=1) returns per-row column indices as a list of ints."""
         m = Matrix(2, 3, [3.0, 1.0, 2.0, 0.0, 9.0, 4.0])
         result = m.argmax(axis=1)
-        assert result.rows == 2
-        assert result.columns == 1
-        assert [result[r, 0] for r in range(2)] == [0.0, 1.0]
+        assert result == [0, 1]
+        assert all(isinstance(i, int) for i in result)
 
     def test_argmin_negative_axis(self):
         """axis=-1 behaves like axis=1 and axis=-2 like axis=0."""
         m = Matrix(3, 2, [4.0, 1.0, 2.0, 8.0, 7.0, 3.0])
-        assert Matrix.allclose(m.argmin(axis=-1), m.argmin(axis=1))
-        assert Matrix.allclose(m.argmin(axis=-2), m.argmin(axis=0))
+        assert m.argmin(axis=-1) == m.argmin(axis=1)
+        assert m.argmin(axis=-2) == m.argmin(axis=0)
+
+    def test_argmin_axis0_as_matrix(self):
+        """argmin(axis=0, as_matrix=True) returns a Matrix vector of indices."""
+        m = Matrix(2, 3, [3.0, 1.0, 2.0, 0.0, 9.0, 4.0])
+        result = m.argmin(axis=0, as_matrix=True)
+        assert isinstance(result, Matrix)
+        assert result.rows == 1
+        assert result.columns == 3
+        assert list(result.values()) == pytest.approx([1.0, 0.0, 0.0])
+
+    def test_argmax_axis1_as_matrix(self):
+        """argmax(axis=1, as_matrix=True) returns a Matrix vector of indices."""
+        m = Matrix(2, 3, [3.0, 1.0, 2.0, 0.0, 9.0, 4.0])
+        result = m.argmax(axis=1, as_matrix=True)
+        assert isinstance(result, Matrix)
+        assert result.rows == 2
+        assert result.columns == 1
+        assert list(result.values()) == pytest.approx([0.0, 1.0])
+
+    def test_argmin_axis_none_ignores_as_matrix(self):
+        """axis=None always returns a single int regardless of as_matrix."""
+        m = Matrix(2, 3, [3.0, 1.0, 2.0, 0.0, 9.0, 4.0])
+        assert m.argmin(as_matrix=True) == 3
+        assert isinstance(m.argmin(as_matrix=True), int)
 
     @pytest.mark.parametrize("want_max", [False, True])
     def test_argextreme_no_axis_fuzz(self, mat, shape, random_values, want_max):
@@ -5011,22 +6337,20 @@ class TestArgExtreme:
         """Per-column arg-extreme matches a Python reference."""
         rows, cols = shape
         result = mat.argmax(axis=0) if want_max else mat.argmin(axis=0)
-        assert result.rows == 1
-        assert result.columns == cols
+        assert len(result) == cols
         for c in range(cols):
             column = [random_values[r * cols + c] for r in range(rows)]
-            assert result[0, c] == _flat_argextreme(column, want_max)
+            assert result[c] == _flat_argextreme(column, want_max)
 
     @pytest.mark.parametrize("want_max", [False, True])
     def test_argextreme_axis1_fuzz(self, mat, shape, random_values, want_max):
         """Per-row arg-extreme matches a Python reference."""
         rows, cols = shape
         result = mat.argmax(axis=1) if want_max else mat.argmin(axis=1)
-        assert result.rows == rows
-        assert result.columns == 1
+        assert len(result) == rows
         for r in range(rows):
             row = [random_values[r * cols + c] for c in range(cols)]
-            assert result[r, 0] == _flat_argextreme(row, want_max)
+            assert result[r] == _flat_argextreme(row, want_max)
 
     def test_argmin_invalid_axis_raises(self):
         """An out-of-range axis raises ValueError."""
@@ -5047,6 +6371,175 @@ class TestArgExtreme:
         m = Matrix(1, 3, [nan, 1.0, 2.0])
         assert m.argmin() == 0
         assert m.argmax() == 0
+
+
+def _masked_argextreme(values, mask, want_max):
+    """Reference masked arg-extreme: first strict extreme among included cells.
+
+    Mirrors the C kernel: a mask cell == 0.0 excludes the element (NaN counts
+    as included), the first included element seeds the running extreme, strict
+    comparisons keep the first occurrence on a tie, and an all-excluded group
+    yields the -1 "no argument" sentinel.
+    """
+    best_i = -1
+    best = None
+    for i, (v, k) in enumerate(zip(values, mask)):
+        if k == 0.0:
+            continue
+        if best_i < 0 or ((v > best) if want_max else (v < best)):
+            best = v
+            best_i = i
+    return best_i
+
+
+class TestArgExtremeWhere:
+    """where= masking on Matrix.argmin and Matrix.argmax."""
+
+    def test_argmin_no_axis_masks_elements(self):
+        """Flat argmin only considers mask-included elements."""
+        m = Matrix(1, 5, [3.0, 0.0, 9.0, 1.0, 4.0])
+        mask = Matrix(1, 5, [1.0, 0.0, 1.0, 0.0, 1.0])
+        # The global min (0.0) and the second-smallest (1.0) are excluded.
+        assert m.argmin(where=mask) == 0
+
+    def test_argmax_no_axis_masks_elements(self):
+        """Flat argmax only considers mask-included elements."""
+        m = Matrix(1, 5, [3.0, 0.0, 9.0, 1.0, 4.0])
+        mask = Matrix(1, 5, [1.0, 1.0, 0.0, 1.0, 1.0])
+        # The global max (9.0) is excluded, leaving 4.0 at index 4.
+        assert m.argmax(where=mask) == 4
+
+    def test_ties_first_included_occurrence(self):
+        """A tied extreme resolves to the first included occurrence."""
+        m = Matrix(1, 4, [1.0, 1.0, 1.0, 1.0])
+        mask = Matrix(1, 4, [0.0, 0.0, 1.0, 1.0])
+        assert m.argmin(where=mask) == 2
+        assert m.argmax(where=mask) == 2
+
+    def test_nan_mask_cell_is_included(self):
+        """A NaN mask cell counts as included (truthy)."""
+        m = Matrix(1, 3, [5.0, 2.0, 8.0])
+        mask = Matrix(1, 3, [0.0, float("nan"), 1.0])
+        assert m.argmin(where=mask) == 1
+
+    def test_axis0_columnwise(self):
+        """where= masks per-column arg-reductions along axis=0."""
+        m = Matrix(2, 3, [3.0, 1.0, 2.0, 0.0, 9.0, 4.0])
+        # Exclude row 1 of column 0 (the 0.0) so the column min becomes row 0.
+        mask = Matrix(2, 3, [1.0, 1.0, 1.0, 0.0, 1.0, 1.0])
+        result = m.argmin(axis=0, where=mask)
+        assert result == [0, 0, 0]
+        assert all(isinstance(i, int) for i in result)
+
+    def test_axis1_rowwise(self):
+        """where= masks per-row arg-reductions along axis=1."""
+        m = Matrix(2, 3, [3.0, 1.0, 2.0, 0.0, 9.0, 4.0])
+        # Exclude the row minima (col 1 of row 0, col 0 of row 1).
+        mask = Matrix(2, 3, [1.0, 0.0, 1.0, 0.0, 1.0, 1.0])
+        result = m.argmax(axis=1, where=mask)
+        assert result == [0, 1]
+
+    def test_all_excluded_no_axis_is_minus_one(self):
+        """A fully-masked flat arg-reduction yields the -1 sentinel."""
+        m = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        zero = Matrix(2, 3, 0.0)
+        assert m.argmin(where=zero) == -1
+        assert m.argmax(where=zero) == -1
+
+    def test_all_excluded_group_is_minus_one(self):
+        """A fully-masked row yields -1 for that group along axis=1."""
+        m = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        mask = Matrix(2, 3, [1.0, 1.0, 1.0, 0.0, 0.0, 0.0])
+        result = m.argmin(axis=1, where=mask)
+        assert result[0] == 0
+        assert result[1] == -1
+
+    def test_no_mask_matches_unmasked(self, mat, shape):
+        """where=None (and an all-ones mask) reproduce the unmasked result."""
+        rows, cols = shape
+        ones = Matrix(rows, cols, 1.0)
+        assert mat.argmin(where=ones) == mat.argmin()
+        assert mat.argmax(where=ones) == mat.argmax()
+        assert (mat.argmin(axis=0, where=ones)
+                == mat.argmin(axis=0))
+        assert (mat.argmax(axis=1, where=ones)
+                == mat.argmax(axis=1))
+
+    def test_shape_mismatch_raises(self):
+        """A mask whose shape differs from the matrix raises ValueError."""
+        m = Matrix(2, 3, 1.0)
+        with pytest.raises(ValueError):
+            m.argmin(where=Matrix(3, 2, 1.0))
+
+    def test_non_matrix_mask_raises(self):
+        """A non-Matrix where= argument raises TypeError."""
+        m = Matrix(2, 3, 1.0)
+        with pytest.raises(TypeError):
+            m.argmax(where=[1, 0, 1, 0, 1, 0])
+
+    def test_unacquired_mask_raises(self):
+        """A cown-resident mask raises RuntimeError."""
+        m = Matrix(2, 2, 1.0)
+        mask = Matrix(2, 2, 1.0)
+        Cown(mask)
+        with pytest.raises(RuntimeError):
+            m.argmin(where=mask)
+
+    @pytest.mark.parametrize("want_max", [False, True])
+    def test_fuzzed_no_axis(self, mat, shape, random_values, rng, want_max):
+        """Masked flat arg-extreme matches a pure-Python reference."""
+        rows, cols = shape
+        mask_flat = [1.0 if rng.random() < 0.6 else 0.0
+                     for _ in range(rows * cols)]
+        mask = Matrix(rows, cols, mask_flat)
+        expected = _masked_argextreme(random_values, mask_flat, want_max)
+        result = (mat.argmax(where=mask) if want_max
+                  else mat.argmin(where=mask))
+        assert result == expected
+
+    @pytest.mark.parametrize("want_max", [False, True])
+    def test_fuzzed_axis1(self, mat, shape, random_values, rng, want_max):
+        """Masked per-row arg-extreme matches a pure-Python reference."""
+        rows, cols = shape
+        mask_flat = [1.0 if rng.random() < 0.6 else 0.0
+                     for _ in range(rows * cols)]
+        mask = Matrix(rows, cols, mask_flat)
+        result = (mat.argmax(axis=1, where=mask) if want_max
+                  else mat.argmin(axis=1, where=mask))
+        assert len(result) == rows
+        for r in range(rows):
+            row = [random_values[r * cols + c] for c in range(cols)]
+            row_mask = [mask_flat[r * cols + c] for c in range(cols)]
+            assert result[r] == _masked_argextreme(row, row_mask, want_max)
+
+    @pytest.mark.parametrize("want_max", [False, True])
+    def test_fuzzed_axis0(self, mat, shape, random_values, rng, want_max):
+        """Masked per-column arg-extreme matches a pure-Python reference."""
+        rows, cols = shape
+        mask_flat = [1.0 if rng.random() < 0.6 else 0.0
+                     for _ in range(rows * cols)]
+        mask = Matrix(rows, cols, mask_flat)
+        result = (mat.argmax(axis=0, where=mask) if want_max
+                  else mat.argmin(axis=0, where=mask))
+        assert len(result) == cols
+        for c in range(cols):
+            column = [random_values[r * cols + c] for r in range(rows)]
+            col_mask = [mask_flat[r * cols + c] for r in range(rows)]
+            assert result[c] == _masked_argextreme(column, col_mask, want_max)
+
+    def test_boc_roundtrip(self):
+        """A masked arg-reduction runs inside a @when behavior over cowns."""
+        a = Cown(Matrix(1, 5, [3.0, 0.0, 9.0, 1.0, 4.0]))
+        b = Cown(Matrix(1, 5, [1.0, 0.0, 1.0, 0.0, 1.0]))
+
+        @when(a, b)
+        def result(a, b):  # noqa: D401 — short behavior
+            """Masked argmin inside a behavior."""
+            return a.value.argmin(where=b.value)
+
+        wait()
+        assert result.exception is False
+        assert result.value == 0
 
 
 def _outer_op(op, row_vals, col_vals):
@@ -6376,6 +7869,102 @@ class TestSqrt:
                 assert m[i, j] == pytest.approx(math.sqrt(vals[i * cols + j]))
 
 
+class TestSignCosSin:
+    """Element-wise sign, cosine, and sine."""
+
+    def test_sign_matches(self, shape, rng):
+        """sign() returns -1, 0, or 1 by element sign."""
+        rows, cols = shape
+        vals = [rng.uniform(-5, 5) for _ in range(rows * cols)]
+        m = Matrix(rows, cols, vals)
+        result = m.sign()
+        for i in range(rows):
+            for j in range(cols):
+                v = vals[i * cols + j]
+                assert result[i, j] == ((v > 0) - (v < 0))
+
+    def test_sign_zero_and_nan(self):
+        """sign(0) is 0 and sign(NaN) is 0."""
+        m = Matrix(1, 3, [0.0, float("nan"), -0.0])
+        result = m.sign()
+        assert result[0, 0] == 0.0
+        assert result[0, 1] == 0.0
+        assert result[0, 2] == 0.0
+
+    def test_cos_matches_math(self, shape, rng):
+        """cos() matches math.cos element-wise."""
+        rows, cols = shape
+        vals = [rng.uniform(-math.pi, math.pi) for _ in range(rows * cols)]
+        m = Matrix(rows, cols, vals)
+        result = m.cos()
+        for i in range(rows):
+            for j in range(cols):
+                assert result[i, j] == pytest.approx(math.cos(vals[i * cols + j]))
+
+    def test_sin_matches_math(self, shape, rng):
+        """sin() matches math.sin element-wise."""
+        rows, cols = shape
+        vals = [rng.uniform(-math.pi, math.pi) for _ in range(rows * cols)]
+        m = Matrix(rows, cols, vals)
+        result = m.sin()
+        for i in range(rows):
+            for j in range(cols):
+                assert result[i, j] == pytest.approx(math.sin(vals[i * cols + j]))
+
+    def test_sign_in_place(self, shape, rng):
+        """sign(in_place=True) mutates self and returns it."""
+        rows, cols = shape
+        vals = [rng.uniform(-5, 5) for _ in range(rows * cols)]
+        m = Matrix(rows, cols, vals)
+        result = m.sign(in_place=True)
+        assert result is m
+
+
+class TestValues:
+    """Lazy row-major float stream via Matrix.values()."""
+
+    def test_golden_row_major(self):
+        """values() yields elements in row-major order as floats."""
+        m = Matrix(2, 3, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        assert list(m.values()) == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        assert all(isinstance(v, float) for v in m.values())
+
+    def test_iterator_protocol(self):
+        """values() returns a self-iterable iterator."""
+        m = Matrix(1, 3, [7.0, 8.0, 9.0])
+        it = m.values()
+        assert iter(it) is it
+        assert next(it) == 7.0
+        assert next(it) == 8.0
+        assert next(it) == 9.0
+        with pytest.raises(StopIteration):
+            next(it)
+
+    def test_sum(self):
+        """values() composes with sum()."""
+        m = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        assert sum(m.values()) == 10.0
+
+    def test_lazy_single_advance(self):
+        """Each next() advances by exactly one element."""
+        m = Matrix(1, 4, [1.0, 2.0, 3.0, 4.0])
+        it = m.values()
+        assert next(it) == 1.0
+        assert list(it) == [2.0, 3.0, 4.0]
+
+    def test_matches_matrix_reads(self, mat, shape, random_values):
+        """values() agrees with m[i, j] reads in row-major order."""
+        rows, cols = shape
+        assert list(mat.values()) == pytest.approx(random_values)
+
+    def test_matches_indexed(self, mat, shape):
+        """Element-for-element agreement with subscript access."""
+        rows, cols = shape
+        streamed = list(mat.values())
+        indexed = [mat[i, j] for i in range(rows) for j in range(cols)]
+        assert streamed == indexed
+
+
 COMPARE_OPS = [
     ("less", lambda a, b: a < b),
     ("less_equal", lambda a, b: a <= b),
@@ -6473,6 +8062,24 @@ class TestComparisonMasks:
         for name, _ in COMPARE_OPS:
             for v in _flat(getattr(a, name)(b)):
                 assert v in (0.0, 1.0)
+
+    @pytest.mark.parametrize("name,ref", COMPARE_OPS, ids=[o[0] for o in COMPARE_OPS])
+    def test_out_writes_into_target(self, name, ref, shape, rng):
+        """out= writes the mask into the target and returns it."""
+        rows, cols = shape
+        a = Matrix(rows, cols, [float(rng.randint(0, 5)) for _ in range(rows * cols)])
+        b = Matrix(rows, cols, [float(rng.randint(0, 5)) for _ in range(rows * cols)])
+        out = Matrix.zeros(shape)
+        result = getattr(a, name)(b, out=out)
+        assert result is out
+        assert _flat(out) == _flat(getattr(a, name)(b))
+
+    def test_out_wrong_shape_raises(self):
+        """out= with a mismatched shape raises before any write."""
+        a = Matrix(2, 2, [1.0, 2.0, 3.0, 4.0])
+        out = Matrix.zeros((1, 3))
+        with pytest.raises(ValueError):
+            a.greater(2.0, out=out)
 
 
 RICHCOMPARE_OPS = [
@@ -6621,6 +8228,33 @@ class TestWhere:
         mask = Matrix(2, 2, [1.0, 0.0, 0.0, 1.0])
         result = Matrix.where(mask, 1.0, 0.0)
         assert _flat(result) == [1.0, 0.0, 0.0, 1.0]
+
+    def test_out_writes_into_target(self, shape, rng):
+        """out= writes the result into the target and returns it."""
+        rows, cols = shape
+        mask = Matrix(rows, cols, [float(rng.randint(0, 1)) for _ in range(rows * cols)])
+        a = Matrix.full(shape, 7.0)
+        b = Matrix.full(shape, -7.0)
+        out = Matrix.zeros(shape)
+        result = Matrix.where(mask, a, b, out=out)
+        assert result is out
+        assert _flat(out) == _flat(Matrix.where(mask, a, b))
+
+    def test_out_can_alias_a(self):
+        """out= may alias operand a."""
+        mask = Matrix(1, 4, [1.0, 0.0, 1.0, 0.0])
+        a = Matrix(1, 4, [1.0, 2.0, 3.0, 4.0])
+        b = Matrix(1, 4, [9.0, 9.0, 9.0, 9.0])
+        result = Matrix.where(mask, a, b, out=a)
+        assert result is a
+        assert _flat(a) == [1.0, 9.0, 3.0, 9.0]
+
+    def test_out_wrong_shape_raises(self):
+        """out= with a mismatched shape raises before any write."""
+        mask = Matrix(2, 2, [1.0, 0.0, 0.0, 1.0])
+        out = Matrix.zeros((1, 3))
+        with pytest.raises(ValueError):
+            Matrix.where(mask, 1.0, 0.0, out=out)
 
     def test_mask_from_comparison(self):
         """A mask produced by a comparison method drives the selection."""

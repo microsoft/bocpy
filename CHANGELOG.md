@@ -1,3 +1,131 @@
+## 2026-07-02 - Version 0.14.0
+A `Matrix` gather/reduce release. The dense matrix type gains top-k selection,
+along-axis gather/scatter, interleaved repetition, a lazy element iterator,
+masked reductions, and trigonometric/sign ufuncs, while the random-number
+factories move to an independent per-interpreter generator. A crash in the
+noticeboard mutator thread when reconstructing Matrix-valued entries is fixed,
+and a family of allocation-overflow and cross-interpreter acquisition guards
+harden the C core. One breaking change: the ``in_place`` flag on the unary
+element-wise methods is now keyword-only.
+
+**New Features**
+
+- **`Matrix.topk(k, axis=None, largest=True, where=None, as_matrix=False)`** —
+  the *k* extreme elements per reduction group, in sorted order, returning a
+  ``(values, indices)`` tuple. NumPy tie-break (first occurrence wins, NaN
+  sorts last); a masked group shorter than *k* pads with ``NaN`` values and
+  ``-1`` indices. Indices come back as Python lists by default (a flat
+  ``list[int]`` for ``axis=None``, a list of per-group lists for an axis) so
+  they feed straight into fancy indexing; ``as_matrix=True`` returns a
+  same-shape index :class:`Matrix` instead.
+- **`Matrix.take_along_axis` / `Matrix.put_along_axis`** — the
+  ``np.take_along_axis`` / ``np.put_along_axis`` gather and scatter, one index
+  per row (``axis=1``) or per column (``axis=0``). ``take_along_axis`` accepts
+  a keyword-only ``out=`` target; ``put_along_axis`` has an ``accumulate=True``
+  mode. Pairs directly with :meth:`Matrix.argmin` / :meth:`Matrix.argmax`.
+- **`Matrix.repeat_interleave(repeats, axis=None)`** — the
+  ``np.repeat`` / ``torch.repeat_interleave`` interleaved (not tiled) copy of
+  each element, row, or column.
+- **`Matrix.values()`** — a lazy row-major iterator over every element,
+  holding a strong reference to its source and re-checking cown acquisition on
+  each step.
+- **`Matrix.full(size, value)`** — a constant-filled constructor alongside
+  :meth:`Matrix.zeros` / :meth:`Matrix.ones`.
+- **`Matrix.sign` / `Matrix.cos` / `Matrix.sin`** — element-wise ufuncs
+  (``sign`` maps ±0.0 and NaN to ``0``), each with keyword-only
+  ``in_place=`` / ``out=``.
+- **Masked reductions** — ``sum`` / ``mean`` / ``min`` / ``max`` /
+  ``magnitude`` / ``magnitude_squared`` and ``argmin`` / ``argmax`` accept a
+  ``where=`` same-shape mask matrix; only cells whose mask is non-zero (NaN
+  counts as included) are considered. An all-excluded group publishes an
+  op-specific sentinel: ``0`` for the additive ops, ``NaN`` for ``mean`` /
+  ``min`` / ``max`` (matching NumPy's empty-slice semantics), and ``-1`` for
+  ``argmin`` / ``argmax``.
+- **Axis-wise `argmin` / `argmax`** — ``axis=0`` / ``axis=1`` return the
+  per-column / per-row extreme positions as a Python ``list[int]`` (directly
+  usable in fancy indexing), or a :class:`Matrix` vector with
+  ``as_matrix=True``. ``axis=None`` still returns a single ``int``.
+
+**Improvements**
+
+- **Allocation-free `out=` on gathers** — :meth:`Matrix.take` and
+  :meth:`Matrix.take_along_axis` accept a keyword-only ``out=`` :class:`Matrix`
+  to write into, rejected if it aliases the source (a reordering gather would
+  read cells it had already overwritten).
+- **`Matrix.clip` gains `in_place=` / `out=`** — mutate in place or write into
+  a caller-supplied matrix, mutually exclusive.
+- **Slice subscripts always return a `Matrix`** — a slice anywhere in the key
+  (even a length-1 one, e.g. ``m[0:1, 0:1]``) keeps the result a
+  :class:`Matrix`; only an all-integer key collapses to a ``float`` scalar.
+- **Reproducible, race-free Matrix RNG** — :meth:`Matrix.normal` /
+  :meth:`Matrix.uniform` / :meth:`Matrix.seed` now draw from a per-interpreter
+  splitmix64 generator held in the module state instead of the process-global
+  C ``rand()`` / ``srand()``. Each worker sub-interpreter gets an independent
+  stream, so ``seed()`` is reproducible within an interpreter and concurrent
+  draws are no longer a data race on non-glibc or free-threaded builds.
+
+**Bug Fixes**
+
+- **Noticeboard Matrix-entry segfault** — the noticeboard mutator thread (a
+  second OS thread in the primary interpreter that never ran the ``_math``
+  module init) crashed dereferencing a NULL cached module-state pointer while
+  reconstructing a Matrix-valued noticeboard entry during a ``notice_update``
+  snapshot. The main interpreter's module state is now published at module
+  exec (``MAIN_MATH_STATE``) and resolved on that thread; a regression test
+  exercises both the XIData-reconstruction and pickle paths on the mutator
+  thread.
+- **`repeat_interleave` integer-overflow → out-of-bounds heap write** — the
+  overflow guard bounded only the repeated dimension, so a large ``repeats``
+  with a small repeated axis could wrap the ``rows * columns * repeats``
+  product and under-allocate. The guard now bounds the total element count,
+  and ``impl_new`` re-checks the ``rows * columns`` product as a backstop for
+  every constructor; both raise ``OverflowError`` instead of corrupting the
+  heap.
+- **`Matrix.allclose` missing acquisition guard** — the only data-touching
+  method that dereferenced both operands' buffers without an
+  ``impl_check_acquired`` check now raises ``RuntimeError`` on a released or
+  cross-interpreter operand instead of reading memory it does not own.
+- **NULL-deref under memory pressure** — the ``Matrix`` subscript / item paths
+  now check the ``impl_new`` result before use.
+
+**Breaking Changes**
+
+- **`in_place` is keyword-only on the unary element-wise methods** —
+  ``ceil`` / ``floor`` / ``round`` / ``negate`` / ``abs`` / ``sqrt`` /
+  ``sign`` / ``cos`` / ``sin`` no longer accept ``in_place`` positionally,
+  matching :meth:`Matrix.clip`. Replace ``m.negate(True)`` with
+  ``m.negate(in_place=True)``.
+
+**Documentation**
+
+- Expanded the :doc:`api` matrix surface via the ``__init__.pyi`` stub
+  docstrings for the new methods and parameters, including ``@overload``
+  signatures for the polymorphic ``topk`` / ``argmin`` / ``argmax`` return
+  types. The :class:`Matrix` class docstring now states the output-routing
+  convention (which methods offer ``out=`` vs ``in_place=``) and the
+  masked-reduction empty-group sentinel table in one place.
+
+**Tests**
+
+- Added golden and fuzzed coverage for ``topk`` (list and matrix index forms),
+  ``take_along_axis`` / ``put_along_axis``, ``repeat_interleave`` (including
+  the overflow regression), masked reductions and arg-reductions, the
+  ``values()`` iterator, ``sign`` / ``cos`` / ``sin``, slice-forces-matrix,
+  and the ``allclose`` acquisition guard. Added ``TestFactoriesOnWorker`` to
+  exercise the per-interpreter RNG from inside ``@when`` behaviors, and a
+  ``TestNoticeboardMatrixEntry`` regression class for the mutator-thread fix.
+
+**Internal**
+
+- Reworked the RNG onto a per-interpreter splitmix64 state seeded at module
+  exec, and stopped caching the published main-interpreter state into a
+  cold thread's thread-local so a torn-down module surfaces a clean
+  ``RuntimeError`` rather than a dangling pointer.
+- De-duplicated the three ``topk`` axis branches into a single group loop
+  behind ``topk_gather_group`` / ``topk_write_group`` / ``topk_pack_result``,
+  and extracted the shared gather output-allocation + alias-check block
+  (``gather_output``) used by the whole-axis and along-axis gathers.
+
 ## 2026-06-24 - Version 0.13.0
 A `Matrix` ergonomics release. The dense matrix type gains named method forms
 of the arithmetic operators, a numpy-style ``out=`` target on every

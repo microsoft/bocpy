@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <bocpy/bocpy.h>
 
@@ -131,6 +132,17 @@ static int update_row_ptrs(matrix_impl *matrix) {
 
 static matrix_impl *impl_new(size_t rows, size_t columns) {
   assert(rows > 0 && columns > 0);
+
+  // Guard the rows * columns product itself: a wrapped size_t would
+  // under-allocate `data` below (the calloc byte-product check only sees
+  // the already-truncated size), leaving a matrix that advertises more
+  // cells than its backing store holds -> out-of-bounds access. Every
+  // constructor (zeros/ones/full/normal/uniform, repeat_interleave, ...)
+  // routes through here, so this single check covers them all.
+  if (columns != 0 && rows > SIZE_MAX / columns) {
+    PyErr_SetString(PyExc_OverflowError, "Matrix dimensions are too large");
+    return NULL;
+  }
 
   matrix_impl *matrix = (matrix_impl *)PyMem_RawMalloc(sizeof(matrix_impl));
   if (matrix == NULL) {
@@ -774,6 +786,148 @@ static void dispatch_agg_columnwise(matrix_impl *m, enum AggregateOps op,
 }
 
 /* --------------------------------------------------------------------------
+   Masked aggregate kernels (the ``where=`` path).
+
+   Stamped from BOC_AGG_OPS so a new aggregate automatically gains masked
+   support. An excluded element (mask cell == 0.0; a NaN mask cell counts as
+   included, matching where()'s truthiness) is replaced by the op's INIT,
+   which is the neutral element for that op's STEP and so leaves the
+   accumulator unchanged, and it is not counted toward ``cnt``. When a group
+   has no included element the published value is BOC_AGG_MASKED_EMPTY_<ENUM>:
+   the additive ops (Sum/Magnitude/MagnitudeSquared) collapse to 0 (their
+   additive identity), while Mean and min/max yield NaN -- there is no element
+   to average or choose, and NaN matches NumPy's empty-slice mean.
+
+   These run only when a caller passes ``where=`` (the slow path), so they use
+   a single accumulator rather than the LANES=4 unrolling of the unmasked
+   kernels -- simplicity over SIMD. Rows/columns are addressed through
+   row_ptrs so the mask and matrix stay aligned cell-for-cell.
+   -------------------------------------------------------------------------- */
+#define BOC_AGG_MASKED_EMPTY_Sum 0.0
+#define BOC_AGG_MASKED_EMPTY_Mean NAN
+#define BOC_AGG_MASKED_EMPTY_Magnitude 0.0
+#define BOC_AGG_MASKED_EMPTY_MagnitudeSquared 0.0
+#define BOC_AGG_MASKED_EMPTY_Minimum NAN
+#define BOC_AGG_MASKED_EMPTY_Maximum NAN
+
+#define DEFINE_AGG_MASKED_EWISE(ENUM, STAMP, INIT, STEP, MERGE, FINAL, LANES)  \
+  static double impl_##STAMP##_masked_ewise(const matrix_impl *m,              \
+                                            const matrix_impl *mask) {         \
+    double agg = (INIT);                                                       \
+    size_t cnt = 0;                                                            \
+    const double *sp = m->data;                                                \
+    const double *kp = mask->data;                                             \
+    const size_t n = m->size;                                                  \
+    for (size_t i = 0; i < n; ++i) {                                           \
+      const int inc = (kp[i] != 0.0);                                          \
+      const double value = inc ? sp[i] : (INIT);                               \
+      cnt += (size_t)inc;                                                      \
+      agg = (STEP);                                                            \
+    }                                                                          \
+    return (cnt > 0) ? (FINAL) : (BOC_AGG_MASKED_EMPTY_##ENUM);                \
+  }
+
+#define DEFINE_AGG_MASKED_ROWWISE(ENUM, STAMP, INIT, STEP, MERGE, FINAL,       \
+                                  LANES)                                       \
+  static void impl_##STAMP##_masked_rowwise(                                   \
+      const matrix_impl *m, const matrix_impl *mask, matrix_impl *vec) {       \
+    const size_t M = m->rows;                                                  \
+    const size_t N = m->columns;                                               \
+    assert(vec->rows == M && vec->columns == 1);                               \
+    for (size_t r = 0; r < M; ++r) {                                           \
+      const double *sp = m->row_ptrs[r];                                       \
+      const double *kp = mask->row_ptrs[r];                                    \
+      double agg = (INIT);                                                     \
+      size_t cnt = 0;                                                          \
+      for (size_t c = 0; c < N; ++c) {                                         \
+        const int inc = (kp[c] != 0.0);                                        \
+        const double value = inc ? sp[c] : (INIT);                             \
+        cnt += (size_t)inc;                                                    \
+        agg = (STEP);                                                          \
+      }                                                                        \
+      vec->data[r] = (cnt > 0) ? (FINAL) : (BOC_AGG_MASKED_EMPTY_##ENUM);      \
+    }                                                                          \
+  }
+
+#define DEFINE_AGG_MASKED_COLUMNWISE(ENUM, STAMP, INIT, STEP, MERGE, FINAL,    \
+                                     LANES)                                    \
+  static void impl_##STAMP##_masked_columnwise(                                \
+      const matrix_impl *m, const matrix_impl *mask, matrix_impl *vec) {       \
+    const size_t M = m->rows;                                                  \
+    const size_t N = m->columns;                                               \
+    assert(vec->rows == 1 && vec->columns == N);                               \
+    for (size_t c = 0; c < N; ++c) {                                           \
+      double agg = (INIT);                                                     \
+      size_t cnt = 0;                                                          \
+      for (size_t r = 0; r < M; ++r) {                                         \
+        const int inc = (mask->row_ptrs[r][c] != 0.0);                         \
+        const double value = inc ? m->row_ptrs[r][c] : (INIT);                 \
+        cnt += (size_t)inc;                                                    \
+        agg = (STEP);                                                          \
+      }                                                                        \
+      vec->data[c] = (cnt > 0) ? (FINAL) : (BOC_AGG_MASKED_EMPTY_##ENUM);      \
+    }                                                                          \
+  }
+
+#define X(E, S, I, ST, MG, F, L) DEFINE_AGG_MASKED_EWISE(E, S, I, ST, MG, F, L)
+BOC_AGG_OPS(X)
+#undef X
+
+#define X(E, S, I, ST, MG, F, L)                                               \
+  DEFINE_AGG_MASKED_ROWWISE(E, S, I, ST, MG, F, L)
+BOC_AGG_OPS(X)
+#undef X
+
+#define X(E, S, I, ST, MG, F, L)                                               \
+  DEFINE_AGG_MASKED_COLUMNWISE(E, S, I, ST, MG, F, L)
+BOC_AGG_OPS(X)
+#undef X
+
+static double dispatch_agg_masked_ewise(matrix_impl *m, matrix_impl *mask,
+                                        enum AggregateOps op) {
+  switch (op) {
+#define X(ENUM, STAMP, ...)                                                    \
+  case ENUM:                                                                   \
+    return impl_##STAMP##_masked_ewise(m, mask);
+    BOC_AGG_OPS(X)
+#undef X
+  default:
+    fprintf(stderr, "Unknown aggregate op\n");
+    return nan("");
+  }
+}
+
+static void dispatch_agg_masked_rowwise(matrix_impl *m, matrix_impl *mask,
+                                        enum AggregateOps op,
+                                        matrix_impl *vec) {
+  switch (op) {
+#define X(ENUM, STAMP, ...)                                                    \
+  case ENUM:                                                                   \
+    impl_##STAMP##_masked_rowwise(m, mask, vec);                               \
+    return;
+    BOC_AGG_OPS(X)
+#undef X
+  default:
+    fprintf(stderr, "Unknown aggregate op\n");
+  }
+}
+
+static void dispatch_agg_masked_columnwise(matrix_impl *m, matrix_impl *mask,
+                                           enum AggregateOps op,
+                                           matrix_impl *vec) {
+  switch (op) {
+#define X(ENUM, STAMP, ...)                                                    \
+  case ENUM:                                                                   \
+    impl_##STAMP##_masked_columnwise(m, mask, vec);                            \
+    return;
+    BOC_AGG_OPS(X)
+#undef X
+  default:
+    fprintf(stderr, "Unknown aggregate op\n");
+  }
+}
+
+/* --------------------------------------------------------------------------
    Unary family X-macro template.
 
    BOC_UNARY_OPS is the single source of truth for the unary op set. It is
@@ -819,7 +973,10 @@ static void dispatch_agg_columnwise(matrix_impl *m, enum AggregateOps op,
   X(Round, round, nearbyint(v))                                                \
   X(Negate, negate, -v)                                                        \
   X(Abs, abs, fabs(v))                                                         \
-  X(Sqrt, sqrt, sqrt(v))
+  X(Sqrt, sqrt, sqrt(v))                                                       \
+  X(Sign, sign, (double)((v > 0.0) - (v < 0.0)))                               \
+  X(Cos, cos, cos(v))                                                          \
+  X(Sin, sin, sin(v))
 
 #define DEFINE_UNARY(ENUM, STAMP, EXPR)                                        \
   BOC_CANARY_NOINLINE                                                          \
@@ -891,6 +1048,7 @@ typedef struct range_s {
   Py_ssize_t stop;
   Py_ssize_t step;
   size_t count;
+  bool scalar; ///< True iff the key was a bare integer (collapses to a float).
 } range;
 
 /// @brief This processes the arguments to __get__ to produce the actual
@@ -907,10 +1065,12 @@ int range_read(range *range, PyObject *key, size_t length) {
     }
     stop = start + 1;
     step = 1;
+    range->scalar = true;
   } else if (PySlice_Check(key)) {
     if (PySlice_Unpack(key, &start, &stop, &step) < 0) {
       return -1;
     }
+    range->scalar = false;
   } else {
     PyErr_SetString(PyExc_TypeError, "Key must be a long or a slice");
     return -1;
@@ -1075,7 +1235,9 @@ static bool impl_check_acquired(matrix_impl *matrix, bool set_error) {
 typedef struct {
   int_least64_t interpid;
   PyTypeObject *matrix_type;
+  PyTypeObject *values_iter_type;
   PyObject *matrix_unpickle;
+  uint64_t prng_state; ///< Per-interpreter PRNG state (splitmix64).
 } _math_module_state;
 
 static thread_local _math_module_state *LOCAL_STATE;
@@ -1084,6 +1246,62 @@ static thread_local _math_module_state *LOCAL_STATE;
   do {                                                                         \
     LOCAL_STATE = (_math_module_state *)PyModule_GetState(m);                  \
   } while (0)
+
+/// @brief Resolve this thread's @ref _math_module_state, warming the cache.
+/// @details Fast path returns the thread-local set at module exec. A handful
+///          of paths (Matrix pickle reduce/unpickle and the XIData
+///          reconstructor) can also be reached from a *second* thread in the
+///          same interpreter that never ran module init -- concretely the
+///          primary interpreter's noticeboard mutator thread, which
+///          reconstructs Matrix-valued noticeboard entries during
+///          @c notice_update snapshots. On that cold thread @ref LOCAL_STATE
+///          is NULL, so we resolve *this interpreter's* already-imported
+///          module from @c sys.modules and read its state. Module state is
+///          per-interpreter, so this is correct on any interpreter without a
+///          published global. @c PyImport_GetModule is a plain @c sys.modules
+///          lookup: it returns the module @ref _math_module_exec already
+///          created and never re-runs init, so no duplicate state is built.
+///
+///          The lookup is deliberately *not* cached in @ref LOCAL_STATE: it
+///          runs only on the cold noticeboard path, while the fast path is
+///          reserved for the threads that ran module init.
+///
+///          Invariant relied on by the many hot paths that dereference
+///          @ref LOCAL_STATE *directly* (the number-protocol ops,
+///          @c unwrap_matrix, @c use_out_target, @c unwrap_mask, the values
+///          iterator, ...): those run only on threads that executed module
+///          init, so @ref LOCAL_STATE is warm. The one cold thread that
+///          reaches @c _math (the noticeboard mutator) enters solely through
+///          @ref Matrix_reduce, which routes through this helper and never
+///          chains a @ref LOCAL_STATE -direct call. If a future noticeboard
+///          path executes a Matrix *method* on that thread, re-audit: it must
+///          go through @ref math_local_state, not a bare @ref LOCAL_STATE.
+/// @return the module state, or NULL with a RuntimeError set if the module is
+///         no longer present in @c sys.modules for the current interpreter
+///         (does not happen in bocpy's threading model, where the noticeboard
+///         thread is stopped before module teardown; guarded defensively
+///         rather than crashing).
+static _math_module_state *math_local_state(void) {
+  if (LOCAL_STATE != NULL) {
+    return LOCAL_STATE;
+  }
+  PyObject *name = PyUnicode_FromString("bocpy._math");
+  if (name == NULL) {
+    return NULL;
+  }
+  PyObject *module = PyImport_GetModule(name);
+  Py_DECREF(name);
+  if (module == NULL) {
+    if (!PyErr_Occurred()) {
+      PyErr_SetString(PyExc_RuntimeError,
+                      "bocpy._math module state is unavailable on this thread");
+    }
+    return NULL;
+  }
+  _math_module_state *state = (_math_module_state *)PyModule_GetState(module);
+  Py_DECREF(module);
+  return state;
+}
 
 typedef struct matrix_object {
   PyObject_HEAD matrix_impl *impl;
@@ -1208,7 +1426,12 @@ PyObject *wrap_matrix(PyTypeObject *type, matrix_impl *impl) {
 }
 
 static PyObject *wrap_impl_or_free(matrix_impl *impl) {
-  PyObject *matrix = wrap_matrix(LOCAL_STATE->matrix_type, impl);
+  _math_module_state *state = math_local_state();
+  if (state == NULL) {
+    impl_free(impl);
+    return NULL;
+  }
+  PyObject *matrix = wrap_matrix(state->matrix_type, impl);
   if (matrix == NULL) {
     impl_free(impl);
   }
@@ -1426,8 +1649,36 @@ static int parse_validate_normalise_axis(PyObject *axis_obj, AxisArg *out) {
   return 0;
 }
 
+// Validate and unwrap a where= mask: it must be a Matrix of the same shape
+// as the matrix being aggregated and owned by the current interpreter. A
+// mask cell == 0.0 excludes that element; NaN counts as included (matching
+// where()'s truthiness). Returns a borrowed impl (the caller holds the
+// Python object alive for the synchronous call) or NULL with an exception.
+static matrix_impl *unwrap_mask(PyObject *where_op, matrix_impl *impl) {
+  if (Py_TYPE(where_op) != LOCAL_STATE->matrix_type) {
+    PyErr_SetString(PyExc_TypeError, "where must be a Matrix mask");
+    return NULL;
+  }
+
+  matrix_impl *mask = ((MatrixObject *)where_op)->impl;
+  if (!impl_check_acquired(mask, true)) {
+    return NULL;
+  }
+
+  if (mask->rows != impl->rows || mask->columns != impl->columns) {
+    PyErr_Format(PyExc_ValueError,
+                 "where mask shape %zux%zu does not match matrix shape "
+                 "%zux%zu",
+                 mask->rows, mask->columns, impl->rows, impl->columns);
+    return NULL;
+  }
+
+  return mask;
+}
+
 static int Matrix_aggregate(PyObject *matrix_op, AxisArg axis,
-                            PyObject **out_op, enum AggregateOps agg) {
+                            PyObject *where_op, PyObject **out_op,
+                            enum AggregateOps agg) {
   MatrixObject *matrix = (MatrixObject *)matrix_op;
   matrix_impl *impl = matrix->impl;
 
@@ -1435,8 +1686,18 @@ static int Matrix_aggregate(PyObject *matrix_op, AxisArg axis,
     return -1;
   }
 
+  matrix_impl *mask = NULL;
+  if (where_op != NULL && where_op != Py_None) {
+    mask = unwrap_mask(where_op, impl);
+    if (mask == NULL) {
+      return -1;
+    }
+  }
+
   if (!axis.has_axis) {
-    *out_op = PyFloat_FromDouble(dispatch_agg_ewise(impl, agg));
+    double value = mask ? dispatch_agg_masked_ewise(impl, mask, agg)
+                        : dispatch_agg_ewise(impl, agg);
+    *out_op = PyFloat_FromDouble(value);
     return 0;
   }
 
@@ -1446,7 +1707,11 @@ static int Matrix_aggregate(PyObject *matrix_op, AxisArg axis,
       return -1;
     }
 
-    dispatch_agg_columnwise(impl, agg, vector);
+    if (mask) {
+      dispatch_agg_masked_columnwise(impl, mask, agg, vector);
+    } else {
+      dispatch_agg_columnwise(impl, agg, vector);
+    }
     *out_op = wrap_matrix(Py_TYPE(matrix_op), vector);
     if (*out_op == NULL) {
       impl_free(vector);
@@ -1463,7 +1728,11 @@ static int Matrix_aggregate(PyObject *matrix_op, AxisArg axis,
     return -1;
   }
 
-  dispatch_agg_rowwise(impl, agg, vector);
+  if (mask) {
+    dispatch_agg_masked_rowwise(impl, mask, agg, vector);
+  } else {
+    dispatch_agg_rowwise(impl, agg, vector);
+  }
   *out_op = wrap_matrix(Py_TYPE(matrix_op), vector);
   if (*out_op == NULL) {
     impl_free(vector);
@@ -1478,15 +1747,17 @@ static int Matrix_aggregate(PyObject *matrix_op, AxisArg axis,
                                          PyObject *kwds) {                     \
     PyObject *out = NULL;                                                      \
     PyObject *axis_obj = NULL;                                                 \
-    static char *kwlist[] = {"axis", NULL};                                    \
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|O", kwlist, &axis_obj)) {   \
+    PyObject *where_obj = NULL;                                                \
+    static char *kwlist[] = {"axis", "where", NULL};                           \
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|OO", kwlist, &axis_obj,     \
+                                     &where_obj)) {                            \
       return NULL;                                                             \
     }                                                                          \
     AxisArg axis;                                                              \
     if (parse_validate_normalise_axis(axis_obj, &axis) < 0) {                  \
       return NULL;                                                             \
     }                                                                          \
-    if (Matrix_aggregate(op, axis, &out, agg) < 0) {                           \
+    if (Matrix_aggregate(op, axis, where_obj, &out, agg) < 0) {                \
       return NULL;                                                             \
     }                                                                          \
     return out;                                                                \
@@ -1563,8 +1834,103 @@ static void argextreme_rowwise(matrix_impl *m, bool want_max,
   }
 }
 
+/* Masked arg-reduction kernels: among the included elements (mask cell !=
+   0.0; NaN counts as included, matching where()'s truthiness) find the index
+   of the first strict extreme. The first included element seeds the running
+   extreme (best_i < 0 guard); strict comparisons then keep the first
+   occurrence on a tie and -- exactly like the unmasked kernels -- a NaN never
+   displaces a real running extreme, while a NaN seed pins the result to its
+   position. An all-excluded group has no argument and yields
+   ARGEXTREME_MASKED_EMPTY (-1), the integer analog of the masked aggregate's
+   NaN. Rows/columns are addressed through row_ptrs so mask and matrix stay
+   aligned cell-for-cell. */
+#define ARGEXTREME_MASKED_EMPTY (-1)
+
+static Py_ssize_t argextreme_masked_ewise(matrix_impl *m, matrix_impl *mask,
+                                          bool want_max) {
+  const double *p = m->data;
+  const double *kp = mask->data;
+  double best = 0.0;
+  Py_ssize_t best_i = ARGEXTREME_MASKED_EMPTY;
+  for (size_t i = 0; i < m->size; ++i) {
+    if (kp[i] == 0.0) {
+      continue;
+    }
+    const double v = p[i];
+    if (best_i < 0 || (want_max ? (v > best) : (v < best))) {
+      best = v;
+      best_i = (Py_ssize_t)i;
+    }
+  }
+  return best_i;
+}
+
+static void argextreme_masked_columnwise(matrix_impl *m, matrix_impl *mask,
+                                         bool want_max, matrix_impl *out) {
+  const size_t M = m->rows;
+  const size_t N = m->columns;
+  for (size_t c = 0; c < N; ++c) {
+    double best = 0.0;
+    Py_ssize_t best_r = ARGEXTREME_MASKED_EMPTY;
+    for (size_t r = 0; r < M; ++r) {
+      if (mask->row_ptrs[r][c] == 0.0) {
+        continue;
+      }
+      const double v = m->row_ptrs[r][c];
+      if (best_r < 0 || (want_max ? (v > best) : (v < best))) {
+        best = v;
+        best_r = (Py_ssize_t)r;
+      }
+    }
+    out->data[c] = (double)best_r;
+  }
+}
+
+static void argextreme_masked_rowwise(matrix_impl *m, matrix_impl *mask,
+                                      bool want_max, matrix_impl *out) {
+  const size_t M = m->rows;
+  const size_t N = m->columns;
+  for (size_t r = 0; r < M; ++r) {
+    const double *row = m->row_ptrs[r];
+    const double *krow = mask->row_ptrs[r];
+    double best = 0.0;
+    Py_ssize_t best_c = ARGEXTREME_MASKED_EMPTY;
+    for (size_t c = 0; c < N; ++c) {
+      if (krow[c] == 0.0) {
+        continue;
+      }
+      const double v = row[c];
+      if (best_c < 0 || (want_max ? (v > best) : (v < best))) {
+        best = v;
+        best_c = (Py_ssize_t)c;
+      }
+    }
+    out->data[r] = (double)best_c;
+  }
+}
+
+// Convert an Mx1 or 1xN vector of index positions (stored as doubles by the
+// argextreme kernels) into a flat Python list[int] — directly usable in fancy
+// indexing without a float-matrix conversion.
+static PyObject *argextreme_indices_to_list(const matrix_impl *vector) {
+  PyObject *list = PyList_New((Py_ssize_t)vector->size);
+  if (list == NULL) {
+    return NULL;
+  }
+  for (size_t i = 0; i < vector->size; ++i) {
+    PyObject *idx = PyLong_FromSsize_t((Py_ssize_t)vector->data[i]);
+    if (idx == NULL) {
+      Py_DECREF(list);
+      return NULL;
+    }
+    PyList_SET_ITEM(list, (Py_ssize_t)i, idx);
+  }
+  return list;
+}
+
 static int Matrix_argextreme(PyObject *matrix_op, AxisArg axis,
-                             PyObject **out_op, bool want_max) {
+                             PyObject *where_op, PyObject **out_op,
+                             bool want_max, bool as_matrix) {
   MatrixObject *matrix = (MatrixObject *)matrix_op;
   matrix_impl *impl = matrix->impl;
 
@@ -1572,8 +1938,18 @@ static int Matrix_argextreme(PyObject *matrix_op, AxisArg axis,
     return -1;
   }
 
+  matrix_impl *mask = NULL;
+  if (where_op != NULL && where_op != Py_None) {
+    mask = unwrap_mask(where_op, impl);
+    if (mask == NULL) {
+      return -1;
+    }
+  }
+
   // Defensive: the public constructors reject zero-size matrices, but guard
   // each axis so a future empty-capable path can't read p[0] out of bounds.
+  // (The masked kernels never index p[0] unconditionally, so an all-excluded
+  // group is fine -- they return the -1 "no argument" sentinel instead.)
   const char *empty_error = "arg-reduction of an empty matrix is undefined";
 
   if (!axis.has_axis) {
@@ -1581,7 +1957,9 @@ static int Matrix_argextreme(PyObject *matrix_op, AxisArg axis,
       PyErr_SetString(PyExc_ValueError, empty_error);
       return -1;
     }
-    *out_op = PyLong_FromSsize_t(argextreme_ewise(impl, want_max));
+    Py_ssize_t idx = mask ? argextreme_masked_ewise(impl, mask, want_max)
+                          : argextreme_ewise(impl, want_max);
+    *out_op = PyLong_FromSsize_t(idx);
     return *out_op == NULL ? -1 : 0;
   }
 
@@ -1594,13 +1972,18 @@ static int Matrix_argextreme(PyObject *matrix_op, AxisArg axis,
     if (vector == NULL) {
       return -1;
     }
-    argextreme_columnwise(impl, want_max, vector);
-    *out_op = wrap_matrix(Py_TYPE(matrix_op), vector);
-    if (*out_op == NULL) {
-      impl_free(vector);
-      return -1;
+    if (mask) {
+      argextreme_masked_columnwise(impl, mask, want_max, vector);
+    } else {
+      argextreme_columnwise(impl, want_max, vector);
     }
-    return 0;
+    if (as_matrix) {
+      *out_op = (PyObject *)wrap_impl_or_free(vector);
+    } else {
+      *out_op = argextreme_indices_to_list(vector);
+      impl_free(vector);
+    }
+    return *out_op == NULL ? -1 : 0;
   }
 
   if (impl->columns == 0) {
@@ -1611,13 +1994,18 @@ static int Matrix_argextreme(PyObject *matrix_op, AxisArg axis,
   if (vector == NULL) {
     return -1;
   }
-  argextreme_rowwise(impl, want_max, vector);
-  *out_op = wrap_matrix(Py_TYPE(matrix_op), vector);
-  if (*out_op == NULL) {
-    impl_free(vector);
-    return -1;
+  if (mask) {
+    argextreme_masked_rowwise(impl, mask, want_max, vector);
+  } else {
+    argextreme_rowwise(impl, want_max, vector);
   }
-  return 0;
+  if (as_matrix) {
+    *out_op = (PyObject *)wrap_impl_or_free(vector);
+  } else {
+    *out_op = argextreme_indices_to_list(vector);
+    impl_free(vector);
+  }
+  return *out_op == NULL ? -1 : 0;
 }
 
 #define MATRIX_ARGEXTREME(name, want_max_val)                                  \
@@ -1625,15 +2013,19 @@ static int Matrix_argextreme(PyObject *matrix_op, AxisArg axis,
                                           PyObject *kwds) {                    \
     PyObject *out = NULL;                                                      \
     PyObject *axis_obj = NULL;                                                 \
-    static char *kwlist[] = {"axis", NULL};                                    \
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|O", kwlist, &axis_obj)) {   \
+    PyObject *where_obj = NULL;                                                \
+    int as_matrix = 0;                                                         \
+    static char *kwlist[] = {"axis", "where", "as_matrix", NULL};              \
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|OOp", kwlist, &axis_obj,    \
+                                     &where_obj, &as_matrix)) {                \
       return NULL;                                                             \
     }                                                                          \
     AxisArg axis;                                                              \
     if (parse_validate_normalise_axis(axis_obj, &axis) < 0) {                  \
       return NULL;                                                             \
     }                                                                          \
-    if (Matrix_argextreme(op, axis, &out, want_max_val) < 0) {                 \
+    if (Matrix_argextreme(op, axis, where_obj, &out, want_max_val,             \
+                          (bool)as_matrix) < 0) {                              \
       return NULL;                                                             \
     }                                                                          \
     return out;                                                                \
@@ -2907,7 +3299,7 @@ static PyObject *Matrix_angle(PyObject *op, PyObject *args, PyObject *kwds) {
     int in_place = 0;                                                          \
     PyObject *out_target = NULL;                                               \
     static char *kwlist[] = {"in_place", "out", NULL};                         \
-    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|p$O", kwlist, &in_place,    \
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "|$pO", kwlist, &in_place,    \
                                      &out_target)) {                           \
       return NULL;                                                             \
     }                                                                          \
@@ -2938,6 +3330,10 @@ BOC_UNARY_OPS(X)
 ///          ``-INFINITY`` / ``+INFINITY`` so the inner loop stays branch-free;
 ///          NaN elements pass through unchanged. Raises ``ValueError`` if both
 ///          bounds are omitted and ``AssertionError`` if ``max < min``.
+///          Output routing matches the unary elementwise family via
+///          ``set_output``: ``in_place=True`` clamps ``self`` in place and
+///          returns it, the keyword-only ``out`` writes into a caller-supplied
+///          same-shape matrix, and the two are mutually exclusive.
 static PyObject *Matrix_clip(PyObject *op, PyObject *args, PyObject *kwds) {
   MatrixObject *self = (MatrixObject *)op;
   matrix_impl *impl = self->impl;
@@ -2948,10 +3344,18 @@ static PyObject *Matrix_clip(PyObject *op, PyObject *args, PyObject *kwds) {
 
   PyObject *minval_op = Py_None;
   PyObject *maxval_op = Py_None;
-  static char *kwlist[] = {"min", "max", NULL};
+  int in_place = 0;
+  PyObject *out_target = NULL;
+  static char *kwlist[] = {"min", "max", "in_place", "out", NULL};
 
-  if (!PyArg_ParseTupleAndKeywords(args, kwds, "|OO", kwlist, &minval_op,
-                                   &maxval_op)) {
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "|OO$pO", kwlist, &minval_op,
+                                   &maxval_op, &in_place, &out_target)) {
+    return NULL;
+  }
+
+  if (in_place && out_target != NULL && out_target != Py_None) {
+    PyErr_SetString(PyExc_ValueError,
+                    "out and in_place are mutually exclusive");
     return NULL;
   }
 
@@ -2978,22 +3382,14 @@ static PyObject *Matrix_clip(PyObject *op, PyObject *args, PyObject *kwds) {
     return NULL;
   }
 
-  PyTypeObject *type = Py_TYPE(self);
-  MatrixObject *out = (MatrixObject *)type->tp_alloc(type, 0);
+  PyObject *out_op = NULL;
+  matrix_impl *out = set_output(impl, op, &out_op, out_target, in_place);
   if (out == NULL) {
     return NULL;
   }
 
-  out->impl = impl_new(impl->rows, impl->columns);
-  if (out->impl == NULL) {
-    Py_DECREF(out);
-    return NULL;
-  }
-
-  IMPL_INCREF(out->impl);
-
   double *src = impl->data;
-  double *dst = out->impl->data;
+  double *dst = out->data;
   for (size_t i = 0; i < impl->size; ++i, ++src, ++dst) {
     double value = *src;
     if (value < minval) {
@@ -3006,7 +3402,7 @@ static PyObject *Matrix_clip(PyObject *op, PyObject *args, PyObject *kwds) {
     *dst = value;
   }
 
-  return (PyObject *)out;
+  return out_op;
 }
 
 static PyObject *Matrix_copy(PyObject *op, PyObject *Py_UNUSED(dummy)) {
@@ -3063,21 +3459,69 @@ static int resolve_gather_index(PyObject *item, size_t dim,
   return 0;
 }
 
+/// @brief Resolve a gather's output matrix: a caller ``out=`` or a fresh one.
+/// @details Shared by @ref gather_axis and @ref gather_along_axis. When
+///          @p out_target is a real object it is shape-validated via
+///          @ref use_out_target and rejected if it aliases @p impl (a
+///          reordering gather would read cells it has already overwritten);
+///          otherwise a fresh matrix of the requested shape is allocated and
+///          wrapped as @p type (so a subclass is preserved). On success the
+///          impl is returned and @p *result is set to the owning ``PyObject``;
+///          on failure NULL is returned with an exception set (the caller
+///          still owns any index buffer it must free).
+static matrix_impl *gather_output(matrix_impl *impl, PyObject *out_target,
+                                  PyTypeObject *type, size_t want_rows,
+                                  size_t want_cols, PyObject **result) {
+  if (out_target != NULL && out_target != Py_None) {
+    matrix_impl *out = use_out_target(out_target, result, want_rows, want_cols);
+    if (out == NULL) {
+      return NULL;
+    }
+    if (out == impl) {
+      Py_DECREF(*result);
+      PyErr_SetString(PyExc_ValueError,
+                      "out must not alias the matrix being taken from");
+      return NULL;
+    }
+    return out;
+  }
+
+  matrix_impl *out = impl_new(want_rows, want_cols);
+  if (out == NULL) {
+    return NULL;
+  }
+  *result = wrap_matrix(type, out);
+  if (*result == NULL) {
+    impl_free(out);
+    return NULL;
+  }
+  return out;
+}
+
 /// @brief Gather rows (``axis == 0``) or columns (``axis == 1``) named by a
-///        sequence of indices into a fresh matrix.
+///        sequence of indices into a matrix.
 /// @details Shared by ``Matrix.take`` and the subscript gather path so
 ///          both surfaces resolve indices identically (negative-aware and
 ///          bounds-checked via ``resolve_gather_index``) rather than
 ///          keeping two copies in sync. Row gather copies each selected
 ///          row with ``memcpy`` (source and destination rows are both
 ///          contiguous); column gather copies element-wise (inherently
-///          strided). The result is wrapped as ``type`` so a subclass is
-///          preserved. An empty ``indices`` sequence raises ``IndexError``
+///          strided). An empty ``indices`` sequence raises ``IndexError``
 ///          and is rejected *before* any allocation — ``impl_new`` only
 ///          ``assert``s non-zero dimensions, so a ``0``-length axis must
 ///          never reach it.
+///
+///          Every index is resolved up front, before any element is written,
+///          so a bad index can never leave a caller-supplied ``out_target``
+///          partially overwritten (the validate-then-write contract shared
+///          with ``put``). When ``out_target`` is NULL / ``Py_None`` the
+///          result is a fresh matrix wrapped as ``type`` (so a subclass is
+///          preserved); otherwise it is written into that caller-owned
+///          matrix, which must have the result's shape and must not alias the
+///          source (a gather reorders elements, so an in-place permutation
+///          would read rows it had already clobbered).
 static PyObject *gather_axis(matrix_impl *impl, PyObject *indices, int axis,
-                             PyTypeObject *type) {
+                             PyTypeObject *type, PyObject *out_target) {
   const char *err_msg =
       "Indices must be specified as a list or a tuple of ints";
   PyObject *fast = PySequence_Fast(indices, err_msg);
@@ -3092,55 +3536,139 @@ static PyObject *gather_axis(matrix_impl *impl, PyObject *indices, int axis,
     return NULL;
   }
 
-  matrix_impl *out;
-  if (axis == 0) {
-    out = impl_new((size_t)count, impl->columns);
-    if (out == NULL) {
+  const size_t dim = (axis == 0) ? impl->rows : impl->columns;
+  const char *axis_name = (axis == 0) ? "row" : "column";
+
+  // Validate phase: resolve every index before any write.
+  size_t *resolved = PyMem_Malloc((size_t)count * sizeof(size_t));
+  if (resolved == NULL) {
+    Py_DECREF(fast);
+    return PyErr_NoMemory();
+  }
+  for (Py_ssize_t i = 0; i < count; ++i) {
+    PyObject *item = PySequence_Fast_GET_ITEM(fast, i);
+    if (resolve_gather_index(item, dim, axis_name, &resolved[i]) < 0) {
+      PyMem_Free(resolved);
       Py_DECREF(fast);
       return NULL;
     }
+  }
+  Py_DECREF(fast);
 
+  const size_t want_rows = (axis == 0) ? (size_t)count : impl->rows;
+  const size_t want_cols = (axis == 0) ? impl->columns : (size_t)count;
+
+  PyObject *result = NULL;
+  matrix_impl *out =
+      gather_output(impl, out_target, type, want_rows, want_cols, &result);
+  if (out == NULL) {
+    PyMem_Free(resolved);
+    return NULL;
+  }
+
+  // Write phase.
+  if (axis == 0) {
     for (Py_ssize_t i = 0; i < count; ++i) {
-      PyObject *item = PySequence_Fast_GET_ITEM(fast, i);
-      size_t r;
-      if (resolve_gather_index(item, impl->rows, "row", &r) < 0) {
-        Py_DECREF(fast);
-        impl_free(out);
-        return NULL;
-      }
-
-      memcpy(out->row_ptrs[i], impl->row_ptrs[r],
+      memcpy(out->row_ptrs[i], impl->row_ptrs[resolved[i]],
              impl->columns * sizeof(double));
     }
   } else {
-    out = impl_new(impl->rows, (size_t)count);
-    if (out == NULL) {
-      Py_DECREF(fast);
-      return NULL;
-    }
-
     for (Py_ssize_t i = 0; i < count; ++i) {
-      PyObject *item = PySequence_Fast_GET_ITEM(fast, i);
-      size_t c;
-      if (resolve_gather_index(item, impl->columns, "column", &c) < 0) {
-        Py_DECREF(fast);
-        impl_free(out);
-        return NULL;
-      }
-
+      const size_t c = resolved[i];
       for (size_t r = 0; r < impl->rows; ++r) {
         out->row_ptrs[r][i] = impl->row_ptrs[r][c];
       }
     }
   }
 
-  Py_DECREF(fast);
+  PyMem_Free(resolved);
+  return result;
+}
 
-  PyObject *result = wrap_matrix(type, out);
-  if (result == NULL) {
-    impl_free(out);
+/// @brief Gather one element per row (``axis == 1``) or per column
+///        (``axis == 0``) into a fresh matrix, the indices running *along*
+///        the named axis.
+/// @details This is the ``np.take_along_axis`` counterpart to ``gather_axis``
+///          (which selects whole rows/columns). For ``axis == 1`` the
+///          sequence holds one column index per row — its length must equal
+///          ``rows`` — and the result is ``rows x 1`` with
+///          ``out[r] = self[r][indices[r]]``. For ``axis == 0`` it holds one
+///          row index per column — length ``columns`` — and the result is
+///          ``1 x columns`` with ``out[c] = self[indices[c]][c]``. This pairs
+///          with ``argmin``/``argmax`` along the same axis: the index list
+///          they return feeds straight back in to gather the reduced values.
+///          Each index is resolved negative-aware and bounds-checked against
+///          the *gathered* axis via ``resolve_gather_index``.
+///
+///          Every index is resolved up front, before any element is written,
+///          so a bad index can never leave a caller-supplied ``out_target``
+///          partially overwritten (the validate-then-write contract shared
+///          with ``take``). When ``out_target`` is NULL / ``Py_None`` the
+///          result is a fresh matrix wrapped as ``type`` (so a subclass is
+///          preserved); otherwise it is written into that caller-owned
+///          matrix, which must have the result's shape and must not alias the
+///          source.
+static PyObject *gather_along_axis(matrix_impl *impl, PyObject *indices,
+                                   int axis, PyTypeObject *type,
+                                   PyObject *out_target) {
+  const char *err_msg =
+      "Indices must be specified as a list or a tuple of ints";
+  PyObject *fast = PySequence_Fast(indices, err_msg);
+  if (fast == NULL) {
+    return NULL;
   }
 
+  Py_ssize_t count = PySequence_Fast_GET_SIZE(fast);
+  size_t expected = axis == 0 ? impl->columns : impl->rows;
+  size_t bound = axis == 0 ? impl->rows : impl->columns;
+  const char *bound_name = axis == 0 ? "row" : "column";
+  if ((size_t)count != expected) {
+    PyErr_Format(PyExc_ValueError,
+                 "take_along_axis on axis %d expects %zu indices (one per %s), "
+                 "got %zd",
+                 axis, expected, axis == 0 ? "column" : "row", count);
+    Py_DECREF(fast);
+    return NULL;
+  }
+
+  // Validate phase: resolve every index before any write.
+  size_t *resolved = PyMem_Malloc((size_t)count * sizeof(size_t));
+  if (resolved == NULL) {
+    Py_DECREF(fast);
+    return PyErr_NoMemory();
+  }
+  for (Py_ssize_t i = 0; i < count; ++i) {
+    PyObject *item = PySequence_Fast_GET_ITEM(fast, i);
+    if (resolve_gather_index(item, bound, bound_name, &resolved[i]) < 0) {
+      PyMem_Free(resolved);
+      Py_DECREF(fast);
+      return NULL;
+    }
+  }
+  Py_DECREF(fast);
+
+  const size_t want_rows = axis == 0 ? 1 : impl->rows;
+  const size_t want_cols = axis == 0 ? impl->columns : 1;
+
+  PyObject *result = NULL;
+  matrix_impl *out =
+      gather_output(impl, out_target, type, want_rows, want_cols, &result);
+  if (out == NULL) {
+    PyMem_Free(resolved);
+    return NULL;
+  }
+
+  // Write phase.
+  for (Py_ssize_t i = 0; i < count; ++i) {
+    const size_t k = resolved[i];
+    if (axis == 0) {
+      out->row_ptrs[0][i] = impl->row_ptrs[k][i];
+    } else {
+      out->row_ptrs[i][0] = impl->row_ptrs[i][k];
+    }
+  }
+
+  PyMem_Free(resolved);
   return result;
 }
 
@@ -3148,6 +3676,12 @@ static PyObject *gather_axis(matrix_impl *impl, PyObject *indices, int axis,
    to the write path); forward-declared here so Matrix_put can share it. */
 static int scatter_axis(matrix_impl *impl, PyObject *indices, int axis,
                         PyObject *value_op, int accumulate);
+
+/* The along-axis scatter counterpart to scatter_axis, likewise defined next
+   to the write path and forward-declared so Matrix_put_along_axis can use it.
+ */
+static int scatter_along_axis(matrix_impl *impl, PyObject *indices, int axis,
+                              PyObject *value_op, int accumulate);
 
 PyObject *Matrix_take(PyObject *op, PyObject *args, PyObject *kwds) {
   MatrixObject *self = (MatrixObject *)op;
@@ -3159,10 +3693,11 @@ PyObject *Matrix_take(PyObject *op, PyObject *args, PyObject *kwds) {
 
   PyObject *indices = NULL;
   int axis = 0;
-  static char *keywords[] = {"indices", "axis", NULL};
+  PyObject *out = NULL;
+  static char *keywords[] = {"indices", "axis", "out", NULL};
 
-  if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|i", keywords, &indices,
-                                   &axis)) {
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|i$O", keywords, &indices,
+                                   &axis, &out)) {
     return NULL;
   }
 
@@ -3175,7 +3710,7 @@ PyObject *Matrix_take(PyObject *op, PyObject *args, PyObject *kwds) {
     return NULL;
   }
 
-  return gather_axis(impl, indices, axis, Py_TYPE(self));
+  return gather_axis(impl, indices, axis, Py_TYPE(self), out);
 }
 
 PyObject *Matrix_put(PyObject *op, PyObject *args, PyObject *kwds) {
@@ -3214,6 +3749,523 @@ PyObject *Matrix_put(PyObject *op, PyObject *args, PyObject *kwds) {
   return (PyObject *)self;
 }
 
+PyObject *Matrix_take_along_axis(PyObject *op, PyObject *args, PyObject *kwds) {
+  MatrixObject *self = (MatrixObject *)op;
+  matrix_impl *impl = self->impl;
+
+  if (!impl_check_acquired(impl, true)) {
+    return NULL;
+  }
+
+  PyObject *indices = NULL;
+  int axis = 0;
+  PyObject *out = NULL;
+  static char *keywords[] = {"indices", "axis", "out", NULL};
+
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|i$O", keywords, &indices,
+                                   &axis, &out)) {
+    return NULL;
+  }
+
+  if (axis < 0) {
+    axis = 2 + axis;
+  }
+
+  if (axis < 0 || axis >= 2) {
+    PyErr_SetString(PyExc_KeyError, "Invalid axis (must be 0 or 1)");
+    return NULL;
+  }
+
+  return gather_along_axis(impl, indices, axis, Py_TYPE(self), out);
+}
+
+PyObject *Matrix_put_along_axis(PyObject *op, PyObject *args, PyObject *kwds) {
+  MatrixObject *self = (MatrixObject *)op;
+  matrix_impl *impl = self->impl;
+
+  if (!impl_check_acquired(impl, true)) {
+    return NULL;
+  }
+
+  PyObject *indices = NULL;
+  PyObject *value = NULL;
+  int axis = 0;
+  int accumulate = 0;
+  static char *keywords[] = {"indices", "value", "axis", "accumulate", NULL};
+
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "OO|ip", keywords, &indices,
+                                   &value, &axis, &accumulate)) {
+    return NULL;
+  }
+
+  if (axis < 0) {
+    axis = 2 + axis;
+  }
+
+  if (axis < 0 || axis >= 2) {
+    PyErr_SetString(PyExc_KeyError, "Invalid axis (must be 0 or 1)");
+    return NULL;
+  }
+
+  if (scatter_along_axis(impl, indices, axis, value, accumulate) < 0) {
+    return NULL;
+  }
+
+  Py_INCREF(self);
+  return (PyObject *)self;
+}
+
+/// @brief Repeat each element/row/column ``repeats`` times consecutively.
+/// @details The ``np.repeat`` / ``torch.repeat_interleave`` shape: copies run
+///          *interleaved*, not tiled — ``[a, b]`` with ``repeats == 2`` becomes
+///          ``[a, a, b, b]`` (contrast tiling, which gives ``[a, b, a, b]``).
+///          ``axis == 0`` repeats whole rows into a ``(rows*repeats) x
+///          columns`` result (each source row ``memcpy``'d ``repeats`` times);
+///          ``axis == 1`` repeats each column into ``rows x
+///          (columns*repeats)``;
+///          ``flatten`` (the no-axis path) walks the row-major buffer and emits
+///          a ``1 x (size*repeats)`` row vector. The *total* output element
+///          count (``size * repeats``) is validated for ``size_t`` overflow
+///          before allocation — and ``impl_new`` re-checks the final
+///          ``rows * columns`` product — so a huge ``repeats`` can never
+///          under-allocate and write out of bounds.
+static matrix_impl *impl_repeat_interleave(matrix_impl *m, size_t repeats,
+                                           int axis, bool flatten) {
+  // Bound the total element count, not just the repeated dimension: for
+  // axis 0/1 the result is rows*columns*repeats == size*repeats, and a
+  // per-dimension guard (columns*repeats) would let the other dimension
+  // wrap the product. impl_new re-checks rows*columns as a backstop.
+  if (repeats != 0 && m->size > SIZE_MAX / repeats) {
+    PyErr_SetString(PyExc_OverflowError, "repeat_interleave result too large");
+    return NULL;
+  }
+
+  if (flatten) {
+    matrix_impl *out = impl_new(1, m->size * repeats);
+    if (out == NULL) {
+      return NULL;
+    }
+    double *op = out->data;
+    for (size_t i = 0; i < m->size; ++i) {
+      const double v = m->data[i];
+      for (size_t t = 0; t < repeats; ++t, ++op) {
+        *op = v;
+      }
+    }
+    return out;
+  }
+
+  if (axis == 0) {
+    matrix_impl *out = impl_new(m->rows * repeats, m->columns);
+    if (out == NULL) {
+      return NULL;
+    }
+    for (size_t r = 0; r < m->rows; ++r) {
+      const double *src = m->row_ptrs[r];
+      for (size_t t = 0; t < repeats; ++t) {
+        memcpy(out->row_ptrs[r * repeats + t], src,
+               m->columns * sizeof(double));
+      }
+    }
+    return out;
+  }
+
+  matrix_impl *out = impl_new(m->rows, m->columns * repeats);
+  if (out == NULL) {
+    return NULL;
+  }
+  for (size_t r = 0; r < m->rows; ++r) {
+    const double *src = m->row_ptrs[r];
+    double *dst = out->row_ptrs[r];
+    for (size_t c = 0; c < m->columns; ++c) {
+      const double v = src[c];
+      for (size_t t = 0; t < repeats; ++t, ++dst) {
+        *dst = v;
+      }
+    }
+  }
+  return out;
+}
+
+PyObject *Matrix_repeat_interleave(PyObject *op, PyObject *args,
+                                   PyObject *kwds) {
+  MatrixObject *self = (MatrixObject *)op;
+  matrix_impl *impl = self->impl;
+
+  if (!impl_check_acquired(impl, true)) {
+    return NULL;
+  }
+
+  Py_ssize_t repeats = 0;
+  PyObject *axis_obj = NULL;
+  static char *keywords[] = {"repeats", "axis", NULL};
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "n|O", keywords, &repeats,
+                                   &axis_obj)) {
+    return NULL;
+  }
+
+  if (repeats < 1) {
+    PyErr_SetString(PyExc_ValueError, "repeats must be a positive integer");
+    return NULL;
+  }
+
+  AxisArg axis;
+  if (parse_validate_normalise_axis(axis_obj, &axis) < 0) {
+    return NULL;
+  }
+
+  matrix_impl *out = impl_repeat_interleave(
+      impl, (size_t)repeats, axis.has_axis ? axis.axis : 0, !axis.has_axis);
+  if (out == NULL) {
+    return NULL;
+  }
+
+  return wrap_impl_or_free(out);
+}
+
+/* --------------------------------------------------------------------------
+   topk: the k extreme elements per reduction group, in sorted order.
+
+   A group is gathered into a scratch array of (value, original-index) pairs
+   and sorted by qsort with one of two comparators. Both put any NaN last
+   (a NaN is never a "top" value, matching np.sort) and break ties between
+   equal values by the smaller original index, so qsort's lack of stability
+   does not matter: the comparator is a strict total order and the first
+   occurrence of a tied value always wins (NumPy tie-break).
+
+   With a where= mask only the included cells (mask cell != 0.0; NaN counts
+   as included) are gathered. A group with fewer than k included elements
+   fills its leading slots with the available extremes and pads the rest with
+   NaN values and -1 indices -- the same "no element" sentinels used by the
+   masked aggregates (NaN) and masked argmin/argmax (-1).
+
+   The indices come back in one of two shapes. By default (as_matrix=False)
+   they are Python ints -- a flat list for axis=None, or a list of per-group
+   lists for axis=0/1 -- directly usable in fancy indexing. With
+   as_matrix=True they are instead a Matrix of the same shape as the values
+   matrix, each cell the (double-valued) source index aligned with the value
+   beside it; the -1 pad becomes -1.0.
+   -------------------------------------------------------------------------- */
+typedef struct {
+  double value;
+  Py_ssize_t index;
+} topk_entry;
+
+static int topk_cmp_desc(const void *pa, const void *pb) {
+  const topk_entry *a = (const topk_entry *)pa;
+  const topk_entry *b = (const topk_entry *)pb;
+  const int na = isnan(a->value);
+  const int nb = isnan(b->value);
+  if (na || nb) {
+    if (na && nb) {
+      return (a->index < b->index) ? -1 : 1;
+    }
+    return na ? 1 : -1; /* NaN sorts last */
+  }
+  if (a->value > b->value) {
+    return -1;
+  }
+  if (a->value < b->value) {
+    return 1;
+  }
+  return (a->index < b->index) ? -1 : 1; /* first occurrence wins ties */
+}
+
+static int topk_cmp_asc(const void *pa, const void *pb) {
+  const topk_entry *a = (const topk_entry *)pa;
+  const topk_entry *b = (const topk_entry *)pb;
+  const int na = isnan(a->value);
+  const int nb = isnan(b->value);
+  if (na || nb) {
+    if (na && nb) {
+      return (a->index < b->index) ? -1 : 1;
+    }
+    return na ? 1 : -1; /* NaN sorts last */
+  }
+  if (a->value < b->value) {
+    return -1;
+  }
+  if (a->value > b->value) {
+    return 1;
+  }
+  return (a->index < b->index) ? -1 : 1; /* first occurrence wins ties */
+}
+
+// Sort the first `m` gathered entries and emit the top `k`: the j-th slot
+// takes entry j when j < m, else the (NaN, -1) pad. out_vals/out_idx are
+// contiguous length-k scratch buffers the caller scatters into its result.
+static void topk_sort_pad(topk_entry *scratch, size_t m, size_t k, bool largest,
+                          double *out_vals, Py_ssize_t *out_idx) {
+  qsort(scratch, m, sizeof(topk_entry), largest ? topk_cmp_desc : topk_cmp_asc);
+  for (size_t j = 0; j < k; ++j) {
+    if (j < m) {
+      out_vals[j] = scratch[j].value;
+      out_idx[j] = scratch[j].index;
+    } else {
+      out_vals[j] = NAN;
+      out_idx[j] = -1;
+    }
+  }
+}
+
+static PyObject *topk_build_int_list(const Py_ssize_t *idx, size_t k) {
+  PyObject *list = PyList_New((Py_ssize_t)k);
+  if (list == NULL) {
+    return NULL;
+  }
+  for (size_t j = 0; j < k; ++j) {
+    PyObject *o = PyLong_FromSsize_t(idx[j]);
+    if (o == NULL) {
+      Py_DECREF(list);
+      return NULL;
+    }
+    PyList_SET_ITEM(list, (Py_ssize_t)j, o);
+  }
+  return list;
+}
+
+/// @brief Gather the included candidate cells of one topk reduction group.
+/// @details Group @p g is the whole buffer for axis=None, column @p g for
+///          axis=0, or row @p g for axis=1. A masked-out cell (mask == 0.0;
+///          NaN counts as included) is skipped. Each kept cell is written to
+///          @p scratch as (value, original-index-along-the-reduced-axis).
+/// @return the number of included cells (the group's effective length).
+static size_t topk_gather_group(const matrix_impl *impl,
+                                const matrix_impl *mask, AxisArg axis, size_t g,
+                                topk_entry *scratch) {
+  size_t m = 0;
+  if (!axis.has_axis) {
+    for (size_t i = 0; i < impl->size; ++i) {
+      if (mask != NULL && mask->data[i] == 0.0) {
+        continue;
+      }
+      scratch[m].value = impl->data[i];
+      scratch[m].index = (Py_ssize_t)i;
+      ++m;
+    }
+  } else if (axis.axis == 0) {
+    for (size_t r = 0; r < impl->rows; ++r) {
+      if (mask != NULL && mask->row_ptrs[r][g] == 0.0) {
+        continue;
+      }
+      scratch[m].value = impl->row_ptrs[r][g];
+      scratch[m].index = (Py_ssize_t)r;
+      ++m;
+    }
+  } else {
+    for (size_t c = 0; c < impl->columns; ++c) {
+      if (mask != NULL && mask->row_ptrs[g][c] == 0.0) {
+        continue;
+      }
+      scratch[m].value = impl->row_ptrs[g][c];
+      scratch[m].index = (Py_ssize_t)c;
+      ++m;
+    }
+  }
+  return m;
+}
+
+/// @brief Scatter one group's k sorted (value, index) pairs into the outputs.
+/// @details Mirrors @ref topk_gather_group's group layout. The value matrix
+///          always receives the k values; @p idx_impl (the as_matrix index
+///          matrix) receives the k indices as doubles when non-NULL — it is
+///          NULL in the default (list) path, where indices are emitted as
+///          Python lists by the caller instead.
+static void topk_write_group(matrix_impl *values, matrix_impl *idx_impl,
+                             AxisArg axis, size_t g, size_t kk,
+                             const double *tmp_vals,
+                             const Py_ssize_t *tmp_idx) {
+  for (size_t j = 0; j < kk; ++j) {
+    const double iv = (double)tmp_idx[j];
+    if (!axis.has_axis) {
+      values->data[j] = tmp_vals[j];
+      if (idx_impl != NULL) {
+        idx_impl->data[j] = iv;
+      }
+    } else if (axis.axis == 0) {
+      values->row_ptrs[j][g] = tmp_vals[j];
+      if (idx_impl != NULL) {
+        idx_impl->row_ptrs[j][g] = iv;
+      }
+    } else {
+      values->row_ptrs[g][j] = tmp_vals[j];
+      if (idx_impl != NULL) {
+        idx_impl->row_ptrs[g][j] = iv;
+      }
+    }
+  }
+}
+
+/// @brief Pack the (values, indices) result tuple, consuming both operands.
+/// @details Wraps @p values into a Matrix and packs it with the already-built
+///          @p index_obj. Balances references on every path: on any failure
+///          the half-built pieces are released and NULL is returned. @p values
+///          is consumed (wrapped or freed); @p index_obj's reference is stolen
+///          into the tuple (or released on failure).
+static PyObject *topk_pack_result(matrix_impl *values, PyObject *index_obj) {
+  if (index_obj == NULL) {
+    impl_free(values);
+    return NULL;
+  }
+  PyObject *values_obj = wrap_impl_or_free(values);
+  if (values_obj == NULL) {
+    Py_DECREF(index_obj);
+    return NULL;
+  }
+  PyObject *tuple = PyTuple_Pack(2, values_obj, index_obj);
+  Py_DECREF(values_obj);
+  Py_DECREF(index_obj);
+  return tuple;
+}
+
+PyObject *Matrix_topk(PyObject *op, PyObject *args, PyObject *kwds) {
+  MatrixObject *self = (MatrixObject *)op;
+  matrix_impl *impl = self->impl;
+
+  if (!impl_check_acquired(impl, true)) {
+    return NULL;
+  }
+
+  Py_ssize_t k = 0;
+  PyObject *axis_obj = NULL;
+  int largest = 1;
+  PyObject *where_obj = NULL;
+  int as_matrix = 0;
+  static char *keywords[] = {"k",     "axis",      "largest",
+                             "where", "as_matrix", NULL};
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "n|OpOp", keywords, &k,
+                                   &axis_obj, &largest, &where_obj,
+                                   &as_matrix)) {
+    return NULL;
+  }
+
+  if (k < 1) {
+    PyErr_SetString(PyExc_ValueError, "k must be a positive integer");
+    return NULL;
+  }
+
+  AxisArg axis;
+  if (parse_validate_normalise_axis(axis_obj, &axis) < 0) {
+    return NULL;
+  }
+
+  matrix_impl *mask = NULL;
+  if (where_obj != NULL && where_obj != Py_None) {
+    mask = unwrap_mask(where_obj, impl);
+    if (mask == NULL) {
+      return NULL;
+    }
+  }
+
+  const size_t kk = (size_t)k;
+  const size_t rows = impl->rows;
+  const size_t cols = impl->columns;
+
+  // The reduced axis must be at least k long (counting every cell, masked or
+  // not): flattened size for axis=None, rows for axis=0, columns for axis=1.
+  const size_t axis_len =
+      !axis.has_axis ? impl->size : (axis.axis == 0 ? rows : cols);
+  if (kk > axis_len) {
+    PyErr_Format(PyExc_ValueError,
+                 "k (%zu) cannot exceed the length of the reduced axis (%zu)",
+                 kk, axis_len);
+    return NULL;
+  }
+
+  // One scratch (value, index) buffer sized to the largest group, plus two
+  // contiguous length-k staging buffers reused across groups.
+  const size_t group_max =
+      !axis.has_axis ? impl->size : (axis.axis == 0 ? rows : cols);
+  topk_entry *scratch = PyMem_Malloc(group_max * sizeof(topk_entry));
+  double *tmp_vals = PyMem_Malloc(kk * sizeof(double));
+  Py_ssize_t *tmp_idx = PyMem_Malloc(kk * sizeof(Py_ssize_t));
+  if (scratch == NULL || tmp_vals == NULL || tmp_idx == NULL) {
+    PyMem_Free(scratch);
+    PyMem_Free(tmp_vals);
+    PyMem_Free(tmp_idx);
+    return PyErr_NoMemory();
+  }
+
+  PyObject *result = NULL;
+
+  // Unified over all three axis layouts: `groups` reduction groups, each
+  // producing k (value, index) pairs scattered into a values/index matrix of
+  // shape (vrows x vcols). axis=None is the single flat group -> (1 x k);
+  // axis=0 reduces down the rows -> (k x cols); axis=1 across the columns ->
+  // (rows x k).
+  size_t groups, vrows, vcols;
+  if (!axis.has_axis) {
+    groups = 1;
+    vrows = 1;
+    vcols = kk;
+  } else if (axis.axis == 0) {
+    groups = cols;
+    vrows = kk;
+    vcols = cols;
+  } else {
+    groups = rows;
+    vrows = rows;
+    vcols = kk;
+  }
+
+  matrix_impl *values = impl_new(vrows, vcols);
+  if (values == NULL) {
+    goto done;
+  }
+
+  // Default index form is a list (a same-length list[int] for axis=None, or a
+  // list of `groups` per-group int lists for an axis). Pass as_matrix=True for
+  // a same-shape Matrix of float index positions (idx_impl) instead.
+  matrix_impl *idx_impl = NULL;
+  PyObject *index_lists = NULL;
+  if (as_matrix) {
+    idx_impl = impl_new(vrows, vcols);
+    if (idx_impl == NULL) {
+      impl_free(values);
+      goto done;
+    }
+  } else if (axis.has_axis) {
+    index_lists = PyList_New((Py_ssize_t)groups);
+    if (index_lists == NULL) {
+      impl_free(values);
+      goto done;
+    }
+  }
+
+  for (size_t g = 0; g < groups; ++g) {
+    size_t m = topk_gather_group(impl, mask, axis, g, scratch);
+    topk_sort_pad(scratch, m, kk, largest, tmp_vals, tmp_idx);
+    topk_write_group(values, idx_impl, axis, g, kk, tmp_vals, tmp_idx);
+    if (!as_matrix && axis.has_axis) {
+      PyObject *sub = topk_build_int_list(tmp_idx, kk);
+      if (sub == NULL) {
+        Py_DECREF(index_lists);
+        impl_free(values);
+        goto done;
+      }
+      PyList_SET_ITEM(index_lists, (Py_ssize_t)g, sub);
+    }
+  }
+
+  PyObject *index_obj;
+  if (as_matrix) {
+    index_obj = wrap_impl_or_free(idx_impl);
+  } else if (axis.has_axis) {
+    index_obj = index_lists;
+  } else {
+    // Flat list form: groups == 1, so tmp_idx still holds the single group's
+    // sorted indices.
+    index_obj = topk_build_int_list(tmp_idx, kk);
+  }
+  result = topk_pack_result(values, index_obj);
+
+done:
+  PyMem_Free(scratch);
+  PyMem_Free(tmp_vals);
+  PyMem_Free(tmp_idx);
+  return result;
+}
+
 static PyObject *Matrix_allclose(PyObject *cls, PyObject *args,
                                  PyObject *kwargs) {
   PyObject *lhs_op = NULL;
@@ -3232,6 +4284,11 @@ static PyObject *Matrix_allclose(PyObject *cls, PyObject *args,
 
   MatrixObject *lhs = (MatrixObject *)lhs_op;
   MatrixObject *rhs = (MatrixObject *)rhs_op;
+  if (!impl_check_acquired(lhs->impl, true) ||
+      !impl_check_acquired(rhs->impl, true)) {
+    return NULL;
+  }
+
   if (impl_allclose(lhs->impl, rhs->impl, rtol, atol, equal_nan)) {
     Py_RETURN_TRUE;
   }
@@ -3284,12 +4341,15 @@ static int where_resolve_operand(PyObject *op, size_t rows, size_t columns,
 ///          ``ValueError``. A 1x1 matrix is treated as a matrix (not a scalar)
 ///          and so must match the mask shape. NaN mask elements are non-zero
 ///          and select ``a``.
-static PyObject *Matrix_where(PyObject *cls, PyObject *args) {
+static PyObject *Matrix_where(PyObject *cls, PyObject *args, PyObject *kwds) {
   PyObject *mask_op = NULL;
   PyObject *a_op = NULL;
   PyObject *b_op = NULL;
+  PyObject *out_target = NULL;
+  static char *kwlist[] = {"", "", "", "out", NULL};
 
-  if (!PyArg_ParseTuple(args, "O!OO", cls, &mask_op, &a_op, &b_op)) {
+  if (!PyArg_ParseTupleAndKeywords(args, kwds, "O!OO|$O", kwlist, cls, &mask_op,
+                                   &a_op, &b_op, &out_target)) {
     return NULL;
   }
 
@@ -3314,7 +4374,12 @@ static PyObject *Matrix_where(PyObject *cls, PyObject *args) {
     goto done;
   }
 
-  out = impl_new(rows, columns);
+  const bool fresh = (out_target == NULL || out_target == Py_None);
+  if (fresh) {
+    out = impl_new(rows, columns);
+  } else {
+    out = use_out_target(out_target, &result, rows, columns);
+  }
   if (out == NULL) {
     goto done;
   }
@@ -3327,7 +4392,9 @@ static PyObject *Matrix_where(PyObject *cls, PyObject *args) {
     *outp = (*mp != 0.0) ? av : bv;
   }
 
-  result = wrap_impl_or_free(out);
+  if (fresh) {
+    result = wrap_impl_or_free(out);
+  }
 
 done:
   IMPL_DECREF(a_mat);
@@ -3407,19 +4474,65 @@ static PyObject *Matrix_ones(PyObject *cls, PyObject *args) {
   return wrap_impl_or_free(impl);
 }
 
-const double RAND_MAX_D = (double)RAND_MAX;
+static PyObject *Matrix_full(PyObject *cls, PyObject *args) {
+  PyObject *size = NULL;
+  double value;
 
-static double sample_uniform(double min, double max) {
-  double val = (double)rand() / RAND_MAX_D;
+  if (!PyArg_ParseTuple(args, "Od", &size, &value)) {
+    return NULL;
+  }
+
+  size_t rows;
+  size_t columns;
+
+  if (parse_dims(size, &rows, &columns) < 0) {
+    return NULL;
+  }
+
+  matrix_impl *impl = impl_new(rows, columns);
+  if (impl == NULL) {
+    return NULL;
+  }
+
+  double *ptr = impl->data;
+  for (size_t i = 0; i < impl->size; ++i, ++ptr) {
+    *ptr = value;
+  }
+
+  return wrap_impl_or_free(impl);
+}
+
+/// @brief splitmix64: draw the next 64-bit value and advance the state.
+/// @details A single-word PRNG kept per interpreter in the module state, so
+///          parallel worker sub-interpreters draw from independent streams
+///          and never share mutable RNG state (the old ``rand()``/``srand()``
+///          were process-global -- non-reproducible across workers and a data
+///          race off glibc / on free-threaded builds). splitmix64 is chosen
+///          for its tiny footprint and good distribution, and mixes even
+///          low-entropy seeds well so ``seed(1)`` and ``seed(2)`` diverge.
+static inline uint64_t prng_next_u64(uint64_t *state) {
+  uint64_t z = (*state += 0x9E3779B97F4A7C15ULL);
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+  return z ^ (z >> 31);
+}
+
+/// @brief A uniform double in [0, 1) using the top 53 bits (full mantissa).
+static inline double prng_next_unit(uint64_t *state) {
+  return (double)(prng_next_u64(state) >> 11) * (1.0 / 9007199254740992.0);
+}
+
+static double sample_uniform(uint64_t *rng, double min, double max) {
+  double val = prng_next_unit(rng);
   return (val * (max - min)) + min;
 }
 
-static void sample_normal(double *values, size_t n, double mean,
+static void sample_normal(uint64_t *rng, double *values, size_t n, double mean,
                           double stddev) {
   size_t i = 0;
   while (i < n) {
-    double u = sample_uniform(-1, 1);
-    double v = sample_uniform(-1, 1);
+    double u = sample_uniform(rng, -1, 1);
+    double v = sample_uniform(rng, -1, 1);
     double s = (u * u) + (v * v);
     if (s > 0 && s < 1) {
       double factor = sqrt(-2 * log(s) / s);
@@ -3446,9 +4559,14 @@ static PyObject *Matrix_normal(PyObject *cls, PyObject *args,
     return NULL;
   }
 
+  _math_module_state *state = math_local_state();
+  if (state == NULL) {
+    return NULL;
+  }
+
   if (Py_IsNone(size)) {
     double value = 0;
-    sample_normal(&value, 1, mean, stddev);
+    sample_normal(&state->prng_state, &value, 1, mean, stddev);
     return PyFloat_FromDouble(value);
   }
 
@@ -3462,7 +4580,7 @@ static PyObject *Matrix_normal(PyObject *cls, PyObject *args,
     return NULL;
   }
 
-  sample_normal(impl->data, impl->size, mean, stddev);
+  sample_normal(&state->prng_state, impl->data, impl->size, mean, stddev);
 
   return wrap_impl_or_free(impl);
 }
@@ -3480,8 +4598,14 @@ static PyObject *Matrix_uniform(PyObject *cls, PyObject *args,
     return NULL;
   }
 
+  _math_module_state *state = math_local_state();
+  if (state == NULL) {
+    return NULL;
+  }
+
   if (Py_IsNone(size)) {
-    return PyFloat_FromDouble(sample_uniform(minval, maxval));
+    return PyFloat_FromDouble(
+        sample_uniform(&state->prng_state, minval, maxval));
   }
 
   size_t rows, columns;
@@ -3496,7 +4620,7 @@ static PyObject *Matrix_uniform(PyObject *cls, PyObject *args,
 
   double *ptr = impl->data;
   for (size_t i = 0; i < impl->size; ++i, ptr++) {
-    *ptr = sample_uniform(minval, maxval);
+    *ptr = sample_uniform(&state->prng_state, minval, maxval);
   }
 
   return wrap_impl_or_free(impl);
@@ -3509,7 +4633,14 @@ static PyObject *Matrix_seed(PyObject *cls, PyObject *args) {
     return NULL;
   }
 
-  srand((unsigned int)value);
+  _math_module_state *state = math_local_state();
+  if (state == NULL) {
+    return NULL;
+  }
+
+  // Seed this interpreter's stream only. splitmix64 mixes the raw seed
+  // internally, so distinct seeds diverge immediately.
+  state->prng_state = (uint64_t)value;
 
   Py_RETURN_NONE;
 }
@@ -3730,7 +4861,11 @@ static PyObject *Matrix_reduce(PyObject *op, PyObject *Py_UNUSED(dummy)) {
     return NULL;
   }
 
-  PyObject *rebuild = LOCAL_STATE->matrix_unpickle;
+  _math_module_state *state = math_local_state();
+  if (state == NULL) {
+    return NULL;
+  }
+  PyObject *rebuild = state->matrix_unpickle;
 
   PyObject *payload = PyBytes_FromStringAndSize(
       (const char *)impl->data, (Py_ssize_t)(impl->size * sizeof(double)));
@@ -3741,292 +4876,6 @@ static PyObject *Matrix_reduce(PyObject *op, PyObject *Py_UNUSED(dummy)) {
   return Py_BuildValue("(O(nnN))", rebuild, (Py_ssize_t)impl->rows,
                        (Py_ssize_t)impl->columns, payload);
 }
-
-static PyObject *Matrix_Less_compare(PyObject *self, PyObject *other);
-static PyObject *Matrix_LessEqual_compare(PyObject *self, PyObject *other);
-static PyObject *Matrix_Greater_compare(PyObject *self, PyObject *other);
-static PyObject *Matrix_GreaterEqual_compare(PyObject *self, PyObject *other);
-static PyObject *Matrix_Equal_compare(PyObject *self, PyObject *other);
-static PyObject *Matrix_NotEqual_compare(PyObject *self, PyObject *other);
-
-static PyObject *Matrix_add_method(PyObject *self, PyObject *args,
-                                   PyObject *kwds);
-static PyObject *Matrix_subtract_method(PyObject *self, PyObject *args,
-                                        PyObject *kwds);
-static PyObject *Matrix_multiply_method(PyObject *self, PyObject *args,
-                                        PyObject *kwds);
-static PyObject *Matrix_divide_method(PyObject *self, PyObject *args,
-                                      PyObject *kwds);
-
-static PyMethodDef Matrix_methods[] = {
-    {"transpose", (PyCFunction)Matrix_transpose, METH_VARARGS | METH_KEYWORDS,
-     "transpose($self, /, in_place=False)\n--\n\n"
-     "Return a transposed copy, or transpose ``self`` in place when "
-     "``in_place=True`` (in which case ``self`` is returned)."},
-    {"sum", (PyCFunction)Matrix_Sum_method, METH_VARARGS | METH_KEYWORDS,
-     "sum($self, /, axis=None)\n--\n\nSum of elements."},
-    {"mean", (PyCFunction)Matrix_Mean_method, METH_VARARGS | METH_KEYWORDS,
-     "mean($self, /, axis=None)\n--\n\nMean of elements."},
-    {"magnitude", (PyCFunction)Matrix_Magnitude_method,
-     METH_VARARGS | METH_KEYWORDS,
-     "magnitude($self, /, axis=None)\n--\n\nEuclidean magnitude."},
-    {"magnitude_squared", (PyCFunction)Matrix_MagnitudeSquared_method,
-     METH_VARARGS | METH_KEYWORDS,
-     "magnitude_squared($self, /, axis=None)\n--\n\n"
-     "Sum of squared elements (Euclidean magnitude without the sqrt)."},
-    {"vecdot", (PyCFunction)Matrix_vecdot, METH_VARARGS | METH_KEYWORDS,
-     "vecdot($self, other, /, axis=None)\n--\n\n"
-     "Axis-aware inner product: sum of element-wise products. "
-     "Equivalent to numpy.linalg.vecdot for 1-D inputs with axis=None; "
-     "**not** equivalent to numpy.dot."},
-    {"fma", (PyCFunction)Matrix_fma, METH_VARARGS | METH_KEYWORDS,
-     "fma($self, b, c, /, in_place=False)\n--\n\n"
-     "Fused multiply-add: single-rounding ``self*b + c`` (libc fma()). "
-     "b and c may each be a same-shape matrix, a 1x1 matrix, a row or column "
-     "vector that broadcasts, or a scalar; other shapes raise ValueError. "
-     "The single rounding differs from ``self*b + c`` (which rounds twice) by "
-     "up to half a ULP, so compare results with allclose(), not ==."},
-    {"scaled_add", (PyCFunction)Matrix_scaled_add, METH_VARARGS | METH_KEYWORDS,
-     "scaled_add($self, s, x, /, in_place=False)\n--\n\n"
-     "Scaled add ``self + s * x`` with two roundings; the two-rounding "
-     "sibling of fma().\n\n"
-     "s is the scale -- a scalar, a 1x1 matrix, a row or column vector that "
-     "broadcasts, or a same-shape matrix (the same operand rules as fma's "
-     "multiplier) -- and x is a same-shape matrix. The arithmetic rounds "
-     "twice (``round(round(s*x) + self)``), so the result is bit-for-bit "
-     "identical to ``self + s * x`` and -- unlike fma() -- never fuses to a "
-     "single rounding. With in_place=True the result is written into self's "
-     "buffer (allocating nothing) and self is returned; otherwise a new "
-     "matrix is returned. s and x may alias self. A shape mismatch raises "
-     "ValueError before any write."},
-    {"add", (PyCFunction)Matrix_add_method, METH_VARARGS | METH_KEYWORDS,
-     "add($self, other, /, *, out=None)\n--\n\n"
-     "Element-wise ``self + other`` with the same broadcasting as ``+`` "
-     "(other may be a scalar). With ``out`` (a same-shape matrix) the result "
-     "is written there and returned instead of allocating a new matrix; out "
-     "may alias an input. Bit-for-bit identical to ``self + other``. A shape "
-     "mismatch between out and the result raises ValueError before any write."},
-    {"subtract", (PyCFunction)Matrix_subtract_method,
-     METH_VARARGS | METH_KEYWORDS,
-     "subtract($self, other, /, *, out=None)\n--\n\n"
-     "Element-wise ``self - other`` with the same broadcasting as ``-`` "
-     "(other may be a scalar). With ``out`` (a same-shape matrix) the result "
-     "is written there and returned instead of allocating a new matrix; out "
-     "may alias an input. Bit-for-bit identical to ``self - other``. A shape "
-     "mismatch between out and the result raises ValueError before any write."},
-    {"multiply", (PyCFunction)Matrix_multiply_method,
-     METH_VARARGS | METH_KEYWORDS,
-     "multiply($self, other, /, *, out=None)\n--\n\n"
-     "Element-wise ``self * other`` with the same broadcasting as ``*`` "
-     "(other may be a scalar). With ``out`` (a same-shape matrix) the result "
-     "is written there and returned instead of allocating a new matrix; out "
-     "may alias an input. Bit-for-bit identical to ``self * other``. A shape "
-     "mismatch between out and the result raises ValueError before any write."},
-    {"divide", (PyCFunction)Matrix_divide_method, METH_VARARGS | METH_KEYWORDS,
-     "divide($self, other, /, *, out=None)\n--\n\n"
-     "Element-wise ``self / other`` with the same broadcasting as ``/`` "
-     "(other may be a scalar). With ``out`` (a same-shape matrix) the result "
-     "is written there and returned instead of allocating a new matrix; out "
-     "may alias an input. Bit-for-bit identical to ``self / other``. A shape "
-     "mismatch between out and the result raises ValueError before any write."},
-    {"cross", (PyCFunction)Matrix_cross, METH_VARARGS | METH_KEYWORDS,
-     "cross($self, other, /, axis=None)\n--\n\n"
-     "2D (scalar z-component) or 3D cross product against another "
-     "vector or batch. 1x2 / 2x1 inputs return a float; 1x3 / 3x1 return "
-     "a Matrix preserving self's orientation. Nx2 / 2xN row/column "
-     "batches return per-vector scalars (Mx1 / 1xN); Nx3 / 3xN return "
-     "same-shape batches. Batch operands accept either a same-shape "
-     "other or a single 2D/3D vector (1xK / Kx1) broadcast against "
-     "every per-vector slot \u2014 ``self`` must be the batch (cross is "
-     "anticommutative). ``axis`` disambiguates the 2x2 / 3x3 squares "
-     "(default rows, ``axis=0`` for columns)."},
-    {"normalize", (PyCFunction)Matrix_normalize, METH_VARARGS | METH_KEYWORDS,
-     "normalize($self, /, axis=None, in_place=False)\n--\n\n"
-     "Divide elements by their magnitude. ``axis=None`` divides by the "
-     "matrix's total magnitude; ``axis=0`` divides each column by its own "
-     "magnitude; ``axis=1`` divides each row by its own magnitude. Rows or "
-     "columns whose magnitude is zero are left as the all-zero vector. "
-     "Sub-normal magnitudes may overflow during division; threshold with "
-     "magnitude_squared() if safety matters. When ``in_place=True``, mutates "
-     "``self`` and returns it."},
-    {"perpendicular", (PyCFunction)Matrix_perpendicular,
-     METH_VARARGS | METH_KEYWORDS,
-     "perpendicular($self, /, axis=None, in_place=False)\n--\n\n"
-     "Rotate every 2D vector 90 degrees counter-clockwise: ``(x, y) -> "
-     "(-y, x)``. Accepts a single 2D vector (``1x2`` or ``2x1``), a row "
-     "batch (``Nx2``), or a column batch (``2xN``). On the ambiguous "
-     "``2x2`` shape the default is per-row; pass ``axis=0`` to force "
-     "per-column. When ``in_place=True``, mutates ``self`` and returns it."},
-    {"angle", (PyCFunction)Matrix_angle, METH_VARARGS | METH_KEYWORDS,
-     "angle($self, /, axis=None)\n--\n\n"
-     "Polar angle (``atan2(y, x)``) of every 2D vector. Returns a float "
-     "for a single 2D vector, an ``Mx1`` column matrix for an ``Nx2`` row "
-     "batch, or a ``1xN`` row matrix for a ``2xN`` column batch. On the "
-     "ambiguous ``2x2`` shape the default is per-row; pass ``axis=0`` to "
-     "force per-column."},
-    {"min", (PyCFunction)Matrix_Minimum_method, METH_VARARGS | METH_KEYWORDS,
-     "min($self, /, axis=None)\n--\n\nMinimum of elements."},
-    {"max", (PyCFunction)Matrix_Maximum_method, METH_VARARGS | METH_KEYWORDS,
-     "max($self, /, axis=None)\n--\n\nMaximum of elements."},
-    {"argmin", (PyCFunction)Matrix_argmin_method, METH_VARARGS | METH_KEYWORDS,
-     "argmin($self, /, axis=None)\n--\n\n"
-     "Index of the minimum element (first occurrence on ties).\n\n"
-     "NaN elements are skipped unless the running extreme starts at NaN\n"
-     "(element 0 along the reduced axis), which pins the result to that\n"
-     "position. This differs from NumPy, which propagates NaN."},
-    {"argmax", (PyCFunction)Matrix_argmax_method, METH_VARARGS | METH_KEYWORDS,
-     "argmax($self, /, axis=None)\n--\n\n"
-     "Index of the maximum element (first occurrence on ties).\n\n"
-     "NaN elements are skipped unless the running extreme starts at NaN\n"
-     "(element 0 along the reduced axis), which pins the result to that\n"
-     "position. This differs from NumPy, which propagates NaN."},
-    {"ceil", (PyCFunction)Matrix_Ceil_method, METH_VARARGS | METH_KEYWORDS,
-     "ceil($self, /, in_place=False, *, out=None)\n--\n\n"
-     "Element-wise ceiling. With ``out`` (a same-shape matrix) the result "
-     "is written there and returned; ``out`` and ``in_place`` are mutually "
-     "exclusive."},
-    {"floor", (PyCFunction)Matrix_Floor_method, METH_VARARGS | METH_KEYWORDS,
-     "floor($self, /, in_place=False, *, out=None)\n--\n\n"
-     "Element-wise floor. With ``out`` (a same-shape matrix) the result "
-     "is written there and returned; ``out`` and ``in_place`` are mutually "
-     "exclusive."},
-    {"round", (PyCFunction)Matrix_Round_method, METH_VARARGS | METH_KEYWORDS,
-     "round($self, /, in_place=False, *, out=None)\n--\n\n"
-     "Element-wise rounding (banker's; IEEE round-half-to-even). With ``out`` "
-     "(a same-shape matrix) the result is written there and returned; "
-     "``out`` and ``in_place`` are mutually exclusive."},
-    {"negate", (PyCFunction)Matrix_Negate_method, METH_VARARGS | METH_KEYWORDS,
-     "negate($self, /, in_place=False, *, out=None)\n--\n\n"
-     "Element-wise negation. With ``out`` (a same-shape matrix) the result "
-     "is written there and returned; ``out`` and ``in_place`` are mutually "
-     "exclusive."},
-    {"abs", (PyCFunction)Matrix_Abs_method, METH_VARARGS | METH_KEYWORDS,
-     "abs($self, /, in_place=False, *, out=None)\n--\n\n"
-     "Element-wise absolute value. With ``out`` (a same-shape matrix) the "
-     "result is written there and returned; ``out`` and ``in_place`` are "
-     "mutually exclusive."},
-    {"sqrt", (PyCFunction)Matrix_Sqrt_method, METH_VARARGS | METH_KEYWORDS,
-     "sqrt($self, /, in_place=False, *, out=None)\n--\n\n"
-     "Element-wise square root. Negative elements yield NaN. With ``out`` "
-     "(a same-shape matrix) the result is written there and returned; "
-     "``out`` and ``in_place`` are mutually exclusive."},
-    {"less", (PyCFunction)Matrix_Less_compare, METH_O,
-     "less($self, other, /)\n--\n\n"
-     "Element-wise ``self < other`` as a 0/1 mask matrix. ``other`` may be a "
-     "same-shape matrix, a scalar (including bool), a 1x1 matrix, a "
-     "row/column vector that broadcasts, or a list/tuple of numbers. NaN "
-     "comparisons yield 0. Distinct from the ``<`` operator, which returns a "
-     "single bool."},
-    {"less_equal", (PyCFunction)Matrix_LessEqual_compare, METH_O,
-     "less_equal($self, other, /)\n--\n\n"
-     "Element-wise ``self <= other`` as a 0/1 mask matrix. ``other`` may be a "
-     "same-shape matrix, a scalar (including bool), a 1x1 matrix, a "
-     "row/column vector that broadcasts, or a list/tuple of numbers. NaN "
-     "comparisons yield 0. Distinct from the ``<=`` operator, which returns a "
-     "single bool."},
-    {"greater", (PyCFunction)Matrix_Greater_compare, METH_O,
-     "greater($self, other, /)\n--\n\n"
-     "Element-wise ``self > other`` as a 0/1 mask matrix. ``other`` may be a "
-     "same-shape matrix, a scalar (including bool), a 1x1 matrix, a "
-     "row/column vector that broadcasts, or a list/tuple of numbers. NaN "
-     "comparisons yield 0. Distinct from the ``>`` operator, which returns a "
-     "single bool."},
-    {"greater_equal", (PyCFunction)Matrix_GreaterEqual_compare, METH_O,
-     "greater_equal($self, other, /)\n--\n\n"
-     "Element-wise ``self >= other`` as a 0/1 mask matrix. ``other`` may be a "
-     "same-shape matrix, a scalar (including bool), a 1x1 matrix, a "
-     "row/column vector that broadcasts, or a list/tuple of numbers. NaN "
-     "comparisons yield 0. Distinct from the ``>=`` operator, which returns a "
-     "single bool."},
-    {"equal", (PyCFunction)Matrix_Equal_compare, METH_O,
-     "equal($self, other, /)\n--\n\n"
-     "Element-wise ``self == other`` as a 0/1 mask matrix. ``other`` may be a "
-     "same-shape matrix, a scalar (including bool), a 1x1 matrix, a "
-     "row/column vector that broadcasts, or a list/tuple of numbers. NaN "
-     "comparisons yield 0. Distinct from the ``==`` operator, which returns a "
-     "single bool."},
-    {"not_equal", (PyCFunction)Matrix_NotEqual_compare, METH_O,
-     "not_equal($self, other, /)\n--\n\n"
-     "Element-wise ``self != other`` as a 0/1 mask matrix. ``other`` may be a "
-     "same-shape matrix, a scalar (including bool), a 1x1 matrix, a "
-     "row/column vector that broadcasts, or a list/tuple of numbers. NaN "
-     "comparisons yield 1. Distinct from the ``!=`` operator, which returns a "
-     "single bool."},
-    {"clip", (PyCFunction)Matrix_clip, METH_VARARGS | METH_KEYWORDS,
-     "clip($self, min=None, max=None)\n--\n\n"
-     "Clamp elements to [min, max]; either bound may be omitted.\n\n"
-     "The first argument is the lower bound and the second the upper\n"
-     "bound. Pass None (or omit) to leave a side unbounded, so\n"
-     "clip(min=0) clamps only below and clip(max=255) only above. Raises\n"
-     "ValueError if both bounds are omitted."},
-    {"copy", Matrix_copy, METH_NOARGS,
-     "copy($self, /)\n--\n\nReturn a deep copy."},
-    {"__reduce__", Matrix_reduce, METH_NOARGS,
-     "__reduce__($self, /)\n--\n\n"
-     "Pickle helper: serialize the matrix to its raw double buffer."},
-    {"take", (PyCFunction)Matrix_take, METH_VARARGS | METH_KEYWORDS,
-     "take($self, indices, axis=0)\n--\n\n"
-     "Take rows or columns by index into a new matrix.\n\n"
-     "indices is a 1-D list or tuple of ints selecting whole rows\n"
-     "(axis=0) or columns (axis=1). Negative indices count from the\n"
-     "end; duplicates repeat the row or column; an out-of-range index\n"
-     "raises IndexError, and an empty index sequence raises IndexError."},
-    {"put", (PyCFunction)Matrix_put, METH_VARARGS | METH_KEYWORDS,
-     "put($self, indices, value, axis=0, accumulate=False)\n--\n\n"
-     "Assign value into the selected rows or columns in place.\n\n"
-     "The write-side counterpart of take(): value may be a scalar, a\n"
-     "1x1 matrix, or a matrix matching the selection shape. All indices\n"
-     "and the value shape are validated before any write, so a rejected\n"
-     "call leaves the matrix unchanged. Negative indices count from the\n"
-     "end; an out-of-range or empty index raises IndexError. With\n"
-     "accumulate=False (the default) duplicate indices follow\n"
-     "last-write-wins; with accumulate=True the values are added into the\n"
-     "selection, so duplicate indices fold additively (scatter-add).\n"
-     "Returns self."},
-    {"allclose", (PyCFunction)Matrix_allclose,
-     METH_VARARGS | METH_KEYWORDS | METH_CLASS,
-     "allclose($type, lhs, rhs, /, rtol=1e-05, atol=1e-08, "
-     "equal_nan=False)\n--\n\n"
-     "Check element-wise equality within tolerance."},
-    {"where", (PyCFunction)Matrix_where, METH_VARARGS | METH_CLASS,
-     "where($type, mask, a, b, /)\n--\n\n"
-     "Select element-wise from a or b on a truthy mask.\n\n"
-     "Returns a fresh matrix taking a where the corresponding mask\n"
-     "element is non-zero and b elsewhere. a and b may each be a scalar,\n"
-     "a matrix matching the mask's shape, or a list/tuple of numbers\n"
-     "(taken as a 1xN row vector that must then match the mask shape);\n"
-     "other shapes raise ValueError. A 1x1 matrix is treated as a matrix\n"
-     "(not a scalar) and so must match the mask shape. NaN mask elements\n"
-     "are non-zero and select a."},
-    {"zeros", Matrix_zeros, METH_VARARGS | METH_CLASS,
-     "zeros($type, size, /)\n--\n\nCreate a zero-filled matrix."},
-    {"ones", Matrix_ones, METH_VARARGS | METH_CLASS,
-     "ones($type, size, /)\n--\n\nCreate a matrix of ones."},
-    {"normal", (PyCFunction)Matrix_normal,
-     METH_VARARGS | METH_KEYWORDS | METH_CLASS,
-     "normal($type, mean=0.0, stddev=1.0, /, size=None)\n--\n\n"
-     "Sample from a normal distribution."},
-    {"uniform", (PyCFunction)Matrix_uniform,
-     METH_VARARGS | METH_KEYWORDS | METH_CLASS,
-     "uniform($type, minval=0.0, maxval=1.0, /, size=None)\n--\n\n"
-     "Sample from a uniform distribution."},
-    {"seed", Matrix_seed, METH_VARARGS | METH_CLASS,
-     "seed($type, value, /)\n--\n\n"
-     "Seed the random generator used by normal() and uniform().\n\n"
-     "The generator is the process-global C library PRNG shared by every\n"
-     "sub-interpreter, so a seed only makes subsequent draws reproducible\n"
-     "when random generation stays on a single thread; concurrent draws\n"
-     "interleave on the shared state. The sequence is also not portable\n"
-     "across platforms."},
-    {"vector", Matrix_vector, METH_VARARGS | METH_CLASS,
-     "vector($type, values, /, as_column=False)\n--\n\n"
-     "Create a vector from a sequence."},
-    {"concat", (PyCFunction)Matrix_concat,
-     METH_VARARGS | METH_KEYWORDS | METH_CLASS,
-     "concat($type, values, /, axis=0)\n--\n\n"
-     "Concatenate matrices along an axis."},
-    {NULL} /* Sentinel */
-};
 
 static PyObject *Matrix_get_rows(PyObject *op, void *Py_UNUSED(dummy)) {
   MatrixObject *self = (MatrixObject *)op;
@@ -4467,11 +5316,21 @@ exit:
    reuses Matrix_binary_op for the full broadcast routing (same-shape, scalar,
    1x1, row-vector, column-vector). Always invoked as self.<name>(other), so
    self is the left operand and other the right. Returns a fresh 0/1 mask
-   matrix; the comparison kernels compile branch-free to cmppd + andpd. */
+   matrix; the comparison kernels compile branch-free to cmppd + andpd. A
+   keyword-only ``out=`` target writes the mask into a caller-supplied
+   same-shape matrix (allocation-free) and returns it; out may alias self. */
 #define MATRIX_COMPARE_METHOD(ENUM)                                            \
-  static PyObject *Matrix_##ENUM##_compare(PyObject *self, PyObject *other) {  \
+  static PyObject *Matrix_##ENUM##_compare(PyObject *self, PyObject *args,     \
+                                           PyObject *kwds) {                   \
+    PyObject *other = NULL;                                                    \
+    PyObject *out_target = NULL;                                               \
+    static char *kwlist[] = {"", "out", NULL};                                 \
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O|$O", kwlist, &other,       \
+                                     &out_target)) {                           \
+      return NULL;                                                             \
+    }                                                                          \
     PyObject *out = NULL;                                                      \
-    if (Matrix_binary_op(self, other, &out, NULL, ENUM, false) < 0) {          \
+    if (Matrix_binary_op(self, other, &out, out_target, ENUM, false) < 0) {    \
       return NULL;                                                             \
     }                                                                          \
     return out;                                                                \
@@ -4766,10 +5625,12 @@ static int read_key_ranges(PyObject *key, range *rows, range *columns,
   rows->stop = (Py_ssize_t)impl->rows;
   rows->step = 1;
   rows->count = impl->rows;
+  rows->scalar = true;
   columns->start = 0;
   columns->stop = (Py_ssize_t)impl->columns;
   columns->step = 1;
   columns->count = impl->columns;
+  columns->scalar = true;
   if (PyTuple_Check(key)) {
     if (PyTuple_GET_SIZE(key) != 2) {
       PyErr_SetString(
@@ -4861,9 +5722,9 @@ PyObject *Matrix_subscript(PyObject *op, PyObject *key) {
   PyObject *index_list;
   switch (classify_fancy_key(key, &index_list)) {
   case FANCY_KEY_AXIS0:
-    return gather_axis(impl, index_list, 0, Py_TYPE(op));
+    return gather_axis(impl, index_list, 0, Py_TYPE(op), NULL);
   case FANCY_KEY_AXIS1:
-    return gather_axis(impl, index_list, 1, Py_TYPE(op));
+    return gather_axis(impl, index_list, 1, Py_TYPE(op), NULL);
   case FANCY_KEY_UNSUPPORTED:
     PyErr_SetString(PyExc_IndexError,
                     "fancy indexing supports only m[[rows]], m[[rows], :], or "
@@ -4879,7 +5740,10 @@ PyObject *Matrix_subscript(PyObject *op, PyObject *key) {
     return NULL;
   }
 
-  if (rows.count == 1 && columns.count == 1) {
+  // Collapse to a Python float only for an all-integer key that selects a
+  // single cell. A slice anywhere in the key (even a length-1 one) keeps the
+  // result a Matrix, so m[0:1, 0:1] stays 1x1 while m[i, j] stays a scalar.
+  if (rows.scalar && columns.scalar && rows.count == 1 && columns.count == 1) {
     return PyFloat_FromDouble(impl->row_ptrs[rows.start][columns.start]);
   }
 
@@ -4890,6 +5754,10 @@ PyObject *Matrix_subscript(PyObject *op, PyObject *key) {
   }
 
   out->impl = impl_new(rows.count, columns.count);
+  if (out->impl == NULL) {
+    Py_DECREF(out);
+    return NULL;
+  }
   IMPL_INCREF(out->impl);
   impl_get(impl, &rows, &columns, out->impl);
   return (PyObject *)out;
@@ -4922,12 +5790,82 @@ static PyObject *Matrix_item(PyObject *op, Py_ssize_t index) {
   }
 
   out->impl = impl_new(rows.count, columns.count);
+  if (out->impl == NULL) {
+    Py_DECREF(out);
+    return NULL;
+  }
   IMPL_INCREF(out->impl);
   impl_get(impl, &rows, &columns, out->impl);
   return (PyObject *)out;
 }
 
 static PyObject *Matrix_iter(PyObject *op) { return PySeqIter_New(op); }
+
+// Lazy iterator returned by Matrix.values(): a strong ref to the source matrix
+// plus a row-major cursor. One float is boxed per step; the backing store is
+// already row-major so the cursor is a flat data[0..size) walk.
+typedef struct {
+  PyObject_HEAD MatrixObject *matrix;
+  size_t cursor;
+} MatrixValuesIterObject;
+
+static void MatrixValuesIter_dealloc(PyObject *op) {
+  MatrixValuesIterObject *it = (MatrixValuesIterObject *)op;
+  PyTypeObject *type = Py_TYPE(op);
+  Py_XDECREF(it->matrix);
+  type->tp_free(op);
+  Py_DECREF(type);
+}
+
+static PyObject *MatrixValuesIter_next(PyObject *op) {
+  MatrixValuesIterObject *it = (MatrixValuesIterObject *)op;
+  matrix_impl *impl = it->matrix->impl;
+
+  // Re-check ownership every step: the matrix may be released between yields
+  // (e.g. a values() iterator outliving the @when body that produced it).
+  if (!impl_check_acquired(impl, true)) {
+    return NULL;
+  }
+  if (it->cursor >= impl->size) {
+    return NULL; // StopIteration
+  }
+  return PyFloat_FromDouble(impl->data[it->cursor++]);
+}
+
+static PyObject *MatrixValuesIter_self(PyObject *op) {
+  Py_INCREF(op);
+  return op;
+}
+
+static PyType_Slot MatrixValuesIter_slots[] = {
+    {Py_tp_dealloc, MatrixValuesIter_dealloc},
+    {Py_tp_iter, MatrixValuesIter_self},
+    {Py_tp_iternext, MatrixValuesIter_next},
+    {0, NULL},
+};
+
+static PyType_Spec MatrixValuesIter_Spec = {
+    .name = "bocpy._math.MatrixValuesIter",
+    .basicsize = sizeof(MatrixValuesIterObject),
+    .itemsize = 0,
+    .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_IMMUTABLETYPE,
+    .slots = MatrixValuesIter_slots};
+
+static PyObject *Matrix_values(PyObject *op, PyObject *Py_UNUSED(ignored)) {
+  if (!impl_check_acquired(((MatrixObject *)op)->impl, true)) {
+    return NULL;
+  }
+  PyTypeObject *type = LOCAL_STATE->values_iter_type;
+  MatrixValuesIterObject *it =
+      (MatrixValuesIterObject *)type->tp_alloc(type, 0);
+  if (it == NULL) {
+    return NULL;
+  }
+  Py_INCREF(op);
+  it->matrix = (MatrixObject *)op;
+  it->cursor = 0;
+  return (PyObject *)it;
+}
 
 /// @brief Resolve an entire index list into a validated ``size_t`` array.
 /// @details The scatter (write) counterpart of ``gather_axis``'s per-element
@@ -5198,6 +6136,106 @@ static int scatter_axis(matrix_impl *impl, PyObject *indices, int axis,
   return 0;
 }
 
+/// @brief Three-phase scatter-store for ``put_along_axis``.
+/// @details The write counterpart to ``gather_along_axis``: ``indices`` runs
+///          *along* ``axis``, one per row (``axis == 1``, length ``rows``) or
+///          one per column (``axis == 0``, length ``columns``). Resolve all
+///          indices, classify/shape-check the RHS, then write — so a rejected
+///          scatter leaves the receiver unmodified. The RHS is a scalar, a
+///          ``1x1`` matrix, or a vector matching the selection shape
+///          (``rows x 1`` for ``axis == 1``, ``1 x columns`` for
+///          ``axis == 0``); element ``i`` lands in ``self[i][indices[i]]``
+///          (``axis == 1``) or ``self[indices[i]][i]`` (``axis == 0``). When
+///          ``accumulate`` the RHS is added in (else it overwrites). A
+///          self-aliased matrix RHS is snapshotted before the write.
+/// @pre Callers must ``impl_check_acquired(impl)`` before calling; the RHS is
+///      gated internally by ``classify_scatter_rhs``.
+/// @param impl The receiver matrix impl (written in place).
+/// @param indices The along-axis index sequence.
+/// @param axis 0 to index rows per column, 1 to index columns per row.
+/// @param value_op The assigned scalar or matrix.
+/// @param accumulate When non-zero, add into the selection instead of
+///        overwriting.
+/// @return 0 on success; -1 with an exception set on failure.
+static int scatter_along_axis(matrix_impl *impl, PyObject *indices, int axis,
+                              PyObject *value_op, int accumulate) {
+  size_t stack[64];
+  size_t *idx;
+  size_t count;
+  size_t bound = axis == 0 ? impl->rows : impl->columns;
+  const char *bound_name = axis == 0 ? "row" : "column";
+  if (resolve_index_list(indices, bound, bound_name, stack,
+                         sizeof(stack) / sizeof(stack[0]), &idx, &count) < 0) {
+    return -1;
+  }
+
+  size_t expected = axis == 0 ? impl->columns : impl->rows;
+  if (count != expected) {
+    PyErr_Format(PyExc_ValueError,
+                 "put_along_axis on axis %d expects %zu indices (one per %s), "
+                 "got %zu",
+                 axis, expected, axis == 0 ? "column" : "row", count);
+    if (idx != stack) {
+      PyMem_Free(idx);
+    }
+    return -1;
+  }
+
+  size_t want_rows = axis == 0 ? 1 : impl->rows;
+  size_t want_cols = axis == 0 ? impl->columns : 1;
+  double scalar;
+  matrix_impl *value;
+  if (classify_scatter_rhs(value_op, want_rows, want_cols, &scalar, &value) <
+      0) {
+    if (idx != stack) {
+      PyMem_Free(idx);
+    }
+    return -1;
+  }
+
+  // Snapshot a self-aliased RHS first: each element is read once and written
+  // to a (possibly) different cell, so an in-place write could clobber a cell
+  // still to be read.
+  matrix_impl *src = value;
+  matrix_impl *snapshot = NULL;
+  if (value != NULL && value == impl) {
+    snapshot = impl_new(value->rows, value->columns);
+    if (snapshot == NULL) {
+      IMPL_DECREF(value);
+      if (idx != stack) {
+        PyMem_Free(idx);
+      }
+      return -1;
+    }
+    memcpy(snapshot->data, value->data, value->size * sizeof(double));
+    src = snapshot;
+  }
+
+  for (size_t i = 0; i < count; ++i) {
+    double v = value != NULL
+                   ? (axis == 0 ? src->row_ptrs[0][i] : src->row_ptrs[i][0])
+                   : scalar;
+    double *cell =
+        axis == 0 ? &impl->row_ptrs[idx[i]][i] : &impl->row_ptrs[i][idx[i]];
+    if (accumulate) {
+      *cell += v;
+    } else {
+      *cell = v;
+    }
+  }
+
+  if (snapshot != NULL) {
+    impl_free(snapshot);
+  }
+  if (value != NULL) {
+    IMPL_DECREF(value);
+  }
+  if (idx != stack) {
+    PyMem_Free(idx);
+  }
+  return 0;
+}
+
 int Matrix_ass_subscript(PyObject *op, PyObject *key, PyObject *value_op) {
   MatrixObject *self = (MatrixObject *)op;
   matrix_impl *impl = self->impl;
@@ -5411,6 +6449,419 @@ static PyObject *Matrix_repr(PyObject *op) {
   return str;
 }
 
+static PyMethodDef Matrix_methods[] = {
+    {"transpose", (PyCFunction)Matrix_transpose, METH_VARARGS | METH_KEYWORDS,
+     "transpose($self, /, in_place=False)\n--\n\n"
+     "Return a transposed copy, or transpose ``self`` in place when "
+     "``in_place=True`` (in which case ``self`` is returned)."},
+    {"sum", (PyCFunction)Matrix_Sum_method, METH_VARARGS | METH_KEYWORDS,
+     "sum($self, /, axis=None, where=None)\n--\n\nSum of elements.\n\n"
+     "``where`` is an optional same-shape Matrix mask: an element is included\n"
+     "only where its mask cell is non-zero (NaN counts as included). An\n"
+     "all-excluded group sums to 0."},
+    {"mean", (PyCFunction)Matrix_Mean_method, METH_VARARGS | METH_KEYWORDS,
+     "mean($self, /, axis=None, where=None)\n--\n\nMean of elements.\n\n"
+     "``where`` is an optional same-shape Matrix mask: the mean is taken over\n"
+     "only the elements whose mask cell is non-zero (NaN counts as included).\n"
+     "An all-excluded group yields NaN (matching NumPy's empty-slice mean)."},
+    {"magnitude", (PyCFunction)Matrix_Magnitude_method,
+     METH_VARARGS | METH_KEYWORDS,
+     "magnitude($self, /, axis=None, where=None)\n--\n\nEuclidean "
+     "magnitude.\n\n"
+     "``where`` is an optional same-shape Matrix mask: only elements whose\n"
+     "mask cell is non-zero contribute (NaN counts as included). An\n"
+     "all-excluded group yields 0."},
+    {"magnitude_squared", (PyCFunction)Matrix_MagnitudeSquared_method,
+     METH_VARARGS | METH_KEYWORDS,
+     "magnitude_squared($self, /, axis=None, where=None)\n--\n\n"
+     "Sum of squared elements (Euclidean magnitude without the sqrt).\n\n"
+     "``where`` is an optional same-shape Matrix mask: only elements whose\n"
+     "mask cell is non-zero contribute (NaN counts as included). An\n"
+     "all-excluded group yields 0."},
+    {"vecdot", (PyCFunction)Matrix_vecdot, METH_VARARGS | METH_KEYWORDS,
+     "vecdot($self, other, /, axis=None)\n--\n\n"
+     "Axis-aware inner product: sum of element-wise products. "
+     "Equivalent to numpy.linalg.vecdot for 1-D inputs with axis=None; "
+     "**not** equivalent to numpy.dot."},
+    {"fma", (PyCFunction)Matrix_fma, METH_VARARGS | METH_KEYWORDS,
+     "fma($self, b, c, /, in_place=False)\n--\n\n"
+     "Fused multiply-add: single-rounding ``self*b + c`` (libc fma()). "
+     "b and c may each be a same-shape matrix, a 1x1 matrix, a row or column "
+     "vector that broadcasts, or a scalar; other shapes raise ValueError. "
+     "The single rounding differs from ``self*b + c`` (which rounds twice) by "
+     "up to half a ULP, so compare results with allclose(), not ==."},
+    {"scaled_add", (PyCFunction)Matrix_scaled_add, METH_VARARGS | METH_KEYWORDS,
+     "scaled_add($self, s, x, /, in_place=False)\n--\n\n"
+     "Scaled add ``self + s * x`` with two roundings; the two-rounding "
+     "sibling of fma().\n\n"
+     "s is the scale -- a scalar, a 1x1 matrix, a row or column vector that "
+     "broadcasts, or a same-shape matrix (the same operand rules as fma's "
+     "multiplier) -- and x is a same-shape matrix. The arithmetic rounds "
+     "twice (``round(round(s*x) + self)``), so the result is bit-for-bit "
+     "identical to ``self + s * x`` and -- unlike fma() -- never fuses to a "
+     "single rounding. With in_place=True the result is written into self's "
+     "buffer (allocating nothing) and self is returned; otherwise a new "
+     "matrix is returned. s and x may alias self. A shape mismatch raises "
+     "ValueError before any write."},
+    {"add", (PyCFunction)Matrix_add_method, METH_VARARGS | METH_KEYWORDS,
+     "add($self, other, /, *, out=None)\n--\n\n"
+     "Element-wise ``self + other`` with the same broadcasting as ``+`` "
+     "(other may be a scalar). With ``out`` (a same-shape matrix) the result "
+     "is written there and returned instead of allocating a new matrix; out "
+     "may alias an input. Bit-for-bit identical to ``self + other``. A shape "
+     "mismatch between out and the result raises ValueError before any write."},
+    {"subtract", (PyCFunction)Matrix_subtract_method,
+     METH_VARARGS | METH_KEYWORDS,
+     "subtract($self, other, /, *, out=None)\n--\n\n"
+     "Element-wise ``self - other`` with the same broadcasting as ``-`` "
+     "(other may be a scalar). With ``out`` (a same-shape matrix) the result "
+     "is written there and returned instead of allocating a new matrix; out "
+     "may alias an input. Bit-for-bit identical to ``self - other``. A shape "
+     "mismatch between out and the result raises ValueError before any write."},
+    {"multiply", (PyCFunction)Matrix_multiply_method,
+     METH_VARARGS | METH_KEYWORDS,
+     "multiply($self, other, /, *, out=None)\n--\n\n"
+     "Element-wise ``self * other`` with the same broadcasting as ``*`` "
+     "(other may be a scalar). With ``out`` (a same-shape matrix) the result "
+     "is written there and returned instead of allocating a new matrix; out "
+     "may alias an input. Bit-for-bit identical to ``self * other``. A shape "
+     "mismatch between out and the result raises ValueError before any write."},
+    {"divide", (PyCFunction)Matrix_divide_method, METH_VARARGS | METH_KEYWORDS,
+     "divide($self, other, /, *, out=None)\n--\n\n"
+     "Element-wise ``self / other`` with the same broadcasting as ``/`` "
+     "(other may be a scalar). With ``out`` (a same-shape matrix) the result "
+     "is written there and returned instead of allocating a new matrix; out "
+     "may alias an input. Bit-for-bit identical to ``self / other``. A shape "
+     "mismatch between out and the result raises ValueError before any write."},
+    {"cross", (PyCFunction)Matrix_cross, METH_VARARGS | METH_KEYWORDS,
+     "cross($self, other, /, axis=None)\n--\n\n"
+     "2D (scalar z-component) or 3D cross product against another "
+     "vector or batch. 1x2 / 2x1 inputs return a float; 1x3 / 3x1 return "
+     "a Matrix preserving self's orientation. Nx2 / 2xN row/column "
+     "batches return per-vector scalars (Mx1 / 1xN); Nx3 / 3xN return "
+     "same-shape batches. Batch operands accept either a same-shape "
+     "other or a single 2D/3D vector (1xK / Kx1) broadcast against "
+     "every per-vector slot \u2014 ``self`` must be the batch (cross is "
+     "anticommutative). ``axis`` disambiguates the 2x2 / 3x3 squares "
+     "(default rows, ``axis=0`` for columns)."},
+    {"normalize", (PyCFunction)Matrix_normalize, METH_VARARGS | METH_KEYWORDS,
+     "normalize($self, /, axis=None, in_place=False)\n--\n\n"
+     "Divide elements by their magnitude. ``axis=None`` divides by the "
+     "matrix's total magnitude; ``axis=0`` divides each column by its own "
+     "magnitude; ``axis=1`` divides each row by its own magnitude. Rows or "
+     "columns whose magnitude is zero are left as the all-zero vector. "
+     "Sub-normal magnitudes may overflow during division; threshold with "
+     "magnitude_squared() if safety matters. When ``in_place=True``, mutates "
+     "``self`` and returns it."},
+    {"perpendicular", (PyCFunction)Matrix_perpendicular,
+     METH_VARARGS | METH_KEYWORDS,
+     "perpendicular($self, /, axis=None, in_place=False)\n--\n\n"
+     "Rotate every 2D vector 90 degrees counter-clockwise: ``(x, y) -> "
+     "(-y, x)``. Accepts a single 2D vector (``1x2`` or ``2x1``), a row "
+     "batch (``Nx2``), or a column batch (``2xN``). On the ambiguous "
+     "``2x2`` shape the default is per-row; pass ``axis=0`` to force "
+     "per-column. When ``in_place=True``, mutates ``self`` and returns it."},
+    {"angle", (PyCFunction)Matrix_angle, METH_VARARGS | METH_KEYWORDS,
+     "angle($self, /, axis=None)\n--\n\n"
+     "Polar angle (``atan2(y, x)``) of every 2D vector. Returns a float "
+     "for a single 2D vector, an ``Mx1`` column matrix for an ``Nx2`` row "
+     "batch, or a ``1xN`` row matrix for a ``2xN`` column batch. On the "
+     "ambiguous ``2x2`` shape the default is per-row; pass ``axis=0`` to "
+     "force per-column."},
+    {"min", (PyCFunction)Matrix_Minimum_method, METH_VARARGS | METH_KEYWORDS,
+     "min($self, /, axis=None, where=None)\n--\n\nMinimum of elements.\n\n"
+     "``where`` is an optional same-shape Matrix mask: only elements whose\n"
+     "mask cell is non-zero are considered (NaN counts as included). An\n"
+     "all-excluded group yields NaN."},
+    {"max", (PyCFunction)Matrix_Maximum_method, METH_VARARGS | METH_KEYWORDS,
+     "max($self, /, axis=None, where=None)\n--\n\nMaximum of elements.\n\n"
+     "``where`` is an optional same-shape Matrix mask: only elements whose\n"
+     "mask cell is non-zero are considered (NaN counts as included). An\n"
+     "all-excluded group yields NaN."},
+    {"argmin", (PyCFunction)Matrix_argmin_method, METH_VARARGS | METH_KEYWORDS,
+     "argmin($self, /, axis=None, where=None, as_matrix=False)\n--\n\n"
+     "Index of the minimum element (first occurrence on ties).\n\n"
+     "With axis=None returns a single int. With axis=0/1 returns a list of\n"
+     "ints (directly usable in fancy indexing); pass as_matrix=True to get a\n"
+     "Matrix vector of index positions instead. NaN elements are skipped\n"
+     "unless the first included element along the reduced axis is NaN, which\n"
+     "pins the result to that position. This differs from NumPy, which\n"
+     "propagates NaN.\n\n"
+     "``where`` is an optional same-shape Matrix mask: a cell == 0.0\n"
+     "excludes that element (NaN counts as included). A group with no\n"
+     "included element yields -1, the integer analog of a masked min/max\n"
+     "returning NaN."},
+    {"argmax", (PyCFunction)Matrix_argmax_method, METH_VARARGS | METH_KEYWORDS,
+     "argmax($self, /, axis=None, where=None, as_matrix=False)\n--\n\n"
+     "Index of the maximum element (first occurrence on ties).\n\n"
+     "With axis=None returns a single int. With axis=0/1 returns a list of\n"
+     "ints (directly usable in fancy indexing); pass as_matrix=True to get a\n"
+     "Matrix vector of index positions instead. NaN elements are skipped\n"
+     "unless the first included element along the reduced axis is NaN, which\n"
+     "pins the result to that position. This differs from NumPy, which\n"
+     "propagates NaN.\n\n"
+     "``where`` is an optional same-shape Matrix mask: a cell == 0.0\n"
+     "excludes that element (NaN counts as included). A group with no\n"
+     "included element yields -1, the integer analog of a masked min/max\n"
+     "returning NaN."},
+    {"ceil", (PyCFunction)Matrix_Ceil_method, METH_VARARGS | METH_KEYWORDS,
+     "ceil($self, /, *, in_place=False, out=None)\n--\n\n"
+     "Element-wise ceiling. With ``out`` (a same-shape matrix) the result "
+     "is written there and returned; ``out`` and ``in_place`` are mutually "
+     "exclusive."},
+    {"floor", (PyCFunction)Matrix_Floor_method, METH_VARARGS | METH_KEYWORDS,
+     "floor($self, /, *, in_place=False, out=None)\n--\n\n"
+     "Element-wise floor. With ``out`` (a same-shape matrix) the result "
+     "is written there and returned; ``out`` and ``in_place`` are mutually "
+     "exclusive."},
+    {"round", (PyCFunction)Matrix_Round_method, METH_VARARGS | METH_KEYWORDS,
+     "round($self, /, *, in_place=False, out=None)\n--\n\n"
+     "Element-wise rounding (banker's; IEEE round-half-to-even). With ``out`` "
+     "(a same-shape matrix) the result is written there and returned; "
+     "``out`` and ``in_place`` are mutually exclusive."},
+    {"negate", (PyCFunction)Matrix_Negate_method, METH_VARARGS | METH_KEYWORDS,
+     "negate($self, /, *, in_place=False, out=None)\n--\n\n"
+     "Element-wise negation. With ``out`` (a same-shape matrix) the result "
+     "is written there and returned; ``out`` and ``in_place`` are mutually "
+     "exclusive."},
+    {"abs", (PyCFunction)Matrix_Abs_method, METH_VARARGS | METH_KEYWORDS,
+     "abs($self, /, *, in_place=False, out=None)\n--\n\n"
+     "Element-wise absolute value. With ``out`` (a same-shape matrix) the "
+     "result is written there and returned; ``out`` and ``in_place`` are "
+     "mutually exclusive."},
+    {"sqrt", (PyCFunction)Matrix_Sqrt_method, METH_VARARGS | METH_KEYWORDS,
+     "sqrt($self, /, *, in_place=False, out=None)\n--\n\n"
+     "Element-wise square root. Negative elements yield NaN. With ``out`` "
+     "(a same-shape matrix) the result is written there and returned; "
+     "``out`` and ``in_place`` are mutually exclusive."},
+    {"sign", (PyCFunction)Matrix_Sign_method, METH_VARARGS | METH_KEYWORDS,
+     "sign($self, /, *, in_place=False, out=None)\n--\n\n"
+     "Element-wise sign: -1, 0, or 1 (NaN maps to 0). With ``out`` "
+     "(a same-shape matrix) the result is written there and returned; "
+     "``out`` and ``in_place`` are mutually exclusive."},
+    {"cos", (PyCFunction)Matrix_Cos_method, METH_VARARGS | METH_KEYWORDS,
+     "cos($self, /, *, in_place=False, out=None)\n--\n\n"
+     "Element-wise cosine (radians). With ``out`` (a same-shape matrix) the "
+     "result is written there and returned; ``out`` and ``in_place`` are "
+     "mutually exclusive."},
+    {"sin", (PyCFunction)Matrix_Sin_method, METH_VARARGS | METH_KEYWORDS,
+     "sin($self, /, *, in_place=False, out=None)\n--\n\n"
+     "Element-wise sine (radians). With ``out`` (a same-shape matrix) the "
+     "result is written there and returned; ``out`` and ``in_place`` are "
+     "mutually exclusive."},
+    {"less", (PyCFunction)Matrix_Less_compare, METH_VARARGS | METH_KEYWORDS,
+     "less($self, other, /, *, out=None)\n--\n\n"
+     "Element-wise ``self < other`` as a 0/1 mask matrix. ``other`` may be a "
+     "same-shape matrix, a scalar (including bool), a 1x1 matrix, a "
+     "row/column vector that broadcasts, or a list/tuple of numbers. NaN "
+     "comparisons yield 0. With ``out`` (a same-shape matrix) the mask is "
+     "written there and returned. Distinct from the ``<`` operator, which "
+     "returns a single bool."},
+    {"less_equal", (PyCFunction)Matrix_LessEqual_compare,
+     METH_VARARGS | METH_KEYWORDS,
+     "less_equal($self, other, /, *, out=None)\n--\n\n"
+     "Element-wise ``self <= other`` as a 0/1 mask matrix. ``other`` may be a "
+     "same-shape matrix, a scalar (including bool), a 1x1 matrix, a "
+     "row/column vector that broadcasts, or a list/tuple of numbers. NaN "
+     "comparisons yield 0. With ``out`` (a same-shape matrix) the mask is "
+     "written there and returned. Distinct from the ``<=`` operator, which "
+     "returns a single bool."},
+    {"greater", (PyCFunction)Matrix_Greater_compare,
+     METH_VARARGS | METH_KEYWORDS,
+     "greater($self, other, /, *, out=None)\n--\n\n"
+     "Element-wise ``self > other`` as a 0/1 mask matrix. ``other`` may be a "
+     "same-shape matrix, a scalar (including bool), a 1x1 matrix, a "
+     "row/column vector that broadcasts, or a list/tuple of numbers. NaN "
+     "comparisons yield 0. With ``out`` (a same-shape matrix) the mask is "
+     "written there and returned. Distinct from the ``>`` operator, which "
+     "returns a single bool."},
+    {"greater_equal", (PyCFunction)Matrix_GreaterEqual_compare,
+     METH_VARARGS | METH_KEYWORDS,
+     "greater_equal($self, other, /, *, out=None)\n--\n\n"
+     "Element-wise ``self >= other`` as a 0/1 mask matrix. ``other`` may be a "
+     "same-shape matrix, a scalar (including bool), a 1x1 matrix, a "
+     "row/column vector that broadcasts, or a list/tuple of numbers. NaN "
+     "comparisons yield 0. With ``out`` (a same-shape matrix) the mask is "
+     "written there and returned. Distinct from the ``>=`` operator, which "
+     "returns a single bool."},
+    {"equal", (PyCFunction)Matrix_Equal_compare, METH_VARARGS | METH_KEYWORDS,
+     "equal($self, other, /, *, out=None)\n--\n\n"
+     "Element-wise ``self == other`` as a 0/1 mask matrix. ``other`` may be a "
+     "same-shape matrix, a scalar (including bool), a 1x1 matrix, a "
+     "row/column vector that broadcasts, or a list/tuple of numbers. NaN "
+     "comparisons yield 0. With ``out`` (a same-shape matrix) the mask is "
+     "written there and returned. Distinct from the ``==`` operator, which "
+     "returns a single bool."},
+    {"not_equal", (PyCFunction)Matrix_NotEqual_compare,
+     METH_VARARGS | METH_KEYWORDS,
+     "not_equal($self, other, /, *, out=None)\n--\n\n"
+     "Element-wise ``self != other`` as a 0/1 mask matrix. ``other`` may be a "
+     "same-shape matrix, a scalar (including bool), a 1x1 matrix, a "
+     "row/column vector that broadcasts, or a list/tuple of numbers. NaN "
+     "comparisons yield 1. With ``out`` (a same-shape matrix) the mask is "
+     "written there and returned. Distinct from the ``!=`` operator, which "
+     "returns a single bool."},
+    {"clip", (PyCFunction)Matrix_clip, METH_VARARGS | METH_KEYWORDS,
+     "clip($self, min=None, max=None, *, in_place=False, out=None)\n--\n\n"
+     "Clamp elements to [min, max]; either bound may be omitted.\n\n"
+     "The first argument is the lower bound and the second the upper\n"
+     "bound. Pass None (or omit) to leave a side unbounded, so\n"
+     "clip(min=0) clamps only below and clip(max=255) only above. Raises\n"
+     "ValueError if both bounds are omitted.\n\n"
+     "With in_place=True the matrix is clamped in place and returned; with\n"
+     "out (a pre-allocated same-shape matrix) the result is written there\n"
+     "and returned instead of allocating a new matrix. in_place and out\n"
+     "are mutually exclusive."},
+    {"copy", Matrix_copy, METH_NOARGS,
+     "copy($self, /)\n--\n\nReturn a deep copy."},
+    {"values", Matrix_values, METH_NOARGS,
+     "values($self, /)\n--\n\n"
+     "Yield every element as a float in row-major (row/column) order. "
+     "Lazy: one float is boxed per step, so streaming a large matrix never "
+     "materialises a list."},
+    {"__reduce__", Matrix_reduce, METH_NOARGS,
+     "__reduce__($self, /)\n--\n\n"
+     "Pickle helper: serialize the matrix to its raw double buffer."},
+    {"take", (PyCFunction)Matrix_take, METH_VARARGS | METH_KEYWORDS,
+     "take($self, indices, axis=0, *, out=None)\n--\n\n"
+     "Take rows or columns by index into a new matrix.\n\n"
+     "indices is a 1-D list or tuple of ints selecting whole rows\n"
+     "(axis=0) or columns (axis=1). Negative indices count from the\n"
+     "end; duplicates repeat the row or column; an out-of-range index\n"
+     "raises IndexError, and an empty index sequence raises IndexError.\n"
+     "With out (a pre-allocated matrix of the selection shape -- "
+     "len(indices) x columns for axis=0, rows x len(indices) for axis=1) "
+     "the result is written there and returned instead of allocating a new "
+     "matrix. All indices are validated before any write, so a rejected "
+     "call leaves out untouched; out must not alias self."},
+    {"put", (PyCFunction)Matrix_put, METH_VARARGS | METH_KEYWORDS,
+     "put($self, indices, value, axis=0, accumulate=False)\n--\n\n"
+     "Assign value into the selected rows or columns in place.\n\n"
+     "The write-side counterpart of take(): value may be a scalar, a\n"
+     "1x1 matrix, or a matrix matching the selection shape. All indices\n"
+     "and the value shape are validated before any write, so a rejected\n"
+     "call leaves the matrix unchanged. Negative indices count from the\n"
+     "end; an out-of-range or empty index raises IndexError. With\n"
+     "accumulate=False (the default) duplicate indices follow\n"
+     "last-write-wins; with accumulate=True the values are added into the\n"
+     "selection, so duplicate indices fold additively (scatter-add).\n"
+     "Returns self."},
+    {"take_along_axis", (PyCFunction)Matrix_take_along_axis,
+     METH_VARARGS | METH_KEYWORDS,
+     "take_along_axis($self, indices, axis=0, *, out=None)\n--\n\n"
+     "Gather one element per row or column along an axis.\n\n"
+     "The np.take_along_axis counterpart of take() (which selects whole\n"
+     "rows or columns). With axis=1 the indices give one column index per\n"
+     "row (so len(indices) must equal the row count) and the result is an\n"
+     "rows x 1 column vector with out[r] = self[r][indices[r]]. With\n"
+     "axis=0 they give one row index per column (len(indices) must equal\n"
+     "the column count) and the result is a 1 x columns row vector with\n"
+     "out[c] = self[indices[c]][c]. This pairs directly with argmin/argmax\n"
+     "along the same axis: feed their returned index list straight back in\n"
+     "to gather the reduced values. Negative indices count from the end;\n"
+     "an out-of-range index raises IndexError, and a wrong index count\n"
+     "raises ValueError. With out (a pre-allocated matrix of the result\n"
+     "shape -- 1 x columns for axis=0, rows x 1 for axis=1) the result is\n"
+     "written there and returned instead of allocating a new matrix. All\n"
+     "indices are validated before any write, so a rejected call leaves\n"
+     "out untouched; out must not alias self."},
+    {"put_along_axis", (PyCFunction)Matrix_put_along_axis,
+     METH_VARARGS | METH_KEYWORDS,
+     "put_along_axis($self, indices, value, axis=0, accumulate=False)\n--\n\n"
+     "Assign one element per row or column along an axis in place.\n\n"
+     "The write-side counterpart of take_along_axis(). With axis=1 element\n"
+     "i lands in self[i][indices[i]] (len(indices) equals the row count);\n"
+     "with axis=0 it lands in self[indices[i]][i] (len(indices) equals the\n"
+     "column count). value may be a scalar, a 1x1 matrix, or a vector\n"
+     "matching the selection shape (rows x 1 for axis=1, 1 x columns for\n"
+     "axis=0). All indices and the value shape are validated before any\n"
+     "write, so a rejected call leaves the matrix unchanged. Negative\n"
+     "indices count from the end; an out-of-range index raises IndexError,\n"
+     "and a wrong index count raises ValueError. With accumulate=False (the\n"
+     "default) duplicate indices follow last-write-wins; with\n"
+     "accumulate=True the values are added in (scatter-add). Returns self."},
+    {"repeat_interleave", (PyCFunction)Matrix_repeat_interleave,
+     METH_VARARGS | METH_KEYWORDS,
+     "repeat_interleave($self, repeats, axis=None)\n--\n\n"
+     "Repeat each element, row, or column consecutively into a new matrix.\n\n"
+     "Interleaved (np.repeat / torch.repeat_interleave), not tiled: [a, b]\n"
+     "with repeats=2 gives [a, a, b, b]. With axis=0 each row is repeated\n"
+     "into a (rows*repeats) x columns result; with axis=1 each column is\n"
+     "repeated into rows x (columns*repeats); with axis=None (the default)\n"
+     "the row-major buffer is flattened to a 1 x (size*repeats) row vector.\n"
+     "repeats must be a positive integer. Returns a new matrix."},
+    {"topk", (PyCFunction)Matrix_topk, METH_VARARGS | METH_KEYWORDS,
+     "topk($self, k, axis=None, largest=True, where=None, "
+     "as_matrix=False)\n--\n\n"
+     "The k extreme elements per reduction group, in sorted order.\n\n"
+     "Returns a (values, indices) tuple. ``largest=True`` (the default)\n"
+     "selects the k greatest in descending order; ``largest=False`` selects\n"
+     "the k smallest in ascending order. Ties keep the first occurrence\n"
+     "(NumPy tie-break) and any NaN sorts last.\n\n"
+     "With axis=None the whole row-major buffer is one group and values is\n"
+     "a 1 x k row vector. With axis=0 each column is reduced down the rows\n"
+     "and values is k x cols. With axis=1 each row is reduced across the\n"
+     "columns and values is rows x k.\n\n"
+     "By default (as_matrix=False) indices is Python ints: a flat list[int]\n"
+     "for axis=None, or a list of `cols`/`rows` lists (each k indices) for\n"
+     "axis=0/axis=1. With as_matrix=True indices is instead a Matrix of the\n"
+     "same shape as values, each cell the source index (as a float) of the\n"
+     "value beside it; the -1 pad becomes -1.0.\n\n"
+     "k must be a positive integer no larger than the reduced axis length\n"
+     "(every cell counts, masked or not), else ValueError. ``where`` is an\n"
+     "optional same-shape Matrix mask: a cell == 0.0 excludes that element\n"
+     "(NaN counts as included). A group with fewer than k included elements\n"
+     "fills its leading slots and pads the rest with NaN values and -1\n"
+     "indices."},
+    {"allclose", (PyCFunction)Matrix_allclose,
+     METH_VARARGS | METH_KEYWORDS | METH_CLASS,
+     "allclose($type, lhs, rhs, /, rtol=1e-05, atol=1e-08, "
+     "equal_nan=False)\n--\n\n"
+     "Check element-wise equality within tolerance."},
+    {"where", (PyCFunction)Matrix_where,
+     METH_VARARGS | METH_KEYWORDS | METH_CLASS,
+     "where($type, mask, a, b, /, *, out=None)\n--\n\n"
+     "Select element-wise from a or b on a truthy mask.\n\n"
+     "Returns a fresh matrix taking a where the corresponding mask\n"
+     "element is non-zero and b elsewhere. a and b may each be a scalar,\n"
+     "a matrix matching the mask's shape, or a list/tuple of numbers\n"
+     "(taken as a 1xN row vector that must then match the mask shape);\n"
+     "other shapes raise ValueError. A 1x1 matrix is treated as a matrix\n"
+     "(not a scalar) and so must match the mask shape. NaN mask elements\n"
+     "are non-zero and select a. With out (a same-shape matrix) the result\n"
+     "is written there and returned; out may alias mask, a, or b."},
+    {"zeros", Matrix_zeros, METH_VARARGS | METH_CLASS,
+     "zeros($type, size, /)\n--\n\nCreate a zero-filled matrix."},
+    {"ones", Matrix_ones, METH_VARARGS | METH_CLASS,
+     "ones($type, size, /)\n--\n\nCreate a matrix of ones."},
+    {"full", Matrix_full, METH_VARARGS | METH_CLASS,
+     "full($type, size, value, /)\n--\n\n"
+     "Create a matrix filled with a constant value."},
+    {"normal", (PyCFunction)Matrix_normal,
+     METH_VARARGS | METH_KEYWORDS | METH_CLASS,
+     "normal($type, mean=0.0, stddev=1.0, /, size=None)\n--\n\n"
+     "Sample from a normal distribution."},
+    {"uniform", (PyCFunction)Matrix_uniform,
+     METH_VARARGS | METH_KEYWORDS | METH_CLASS,
+     "uniform($type, minval=0.0, maxval=1.0, /, size=None)\n--\n\n"
+     "Sample from a uniform distribution."},
+    {"seed", Matrix_seed, METH_VARARGS | METH_CLASS,
+     "seed($type, value, /)\n--\n\n"
+     "Seed the random generator used by normal() and uniform().\n\n"
+     "Each interpreter owns an independent splitmix64 stream, so a seed\n"
+     "makes that interpreter's subsequent draws reproducible; parallel\n"
+     "workers seed their own streams independently. The sequence is not\n"
+     "portable across platforms."},
+    {"vector", Matrix_vector, METH_VARARGS | METH_CLASS,
+     "vector($type, values, /, as_column=False)\n--\n\n"
+     "Create a vector from a sequence."},
+    {"concat", (PyCFunction)Matrix_concat,
+     METH_VARARGS | METH_KEYWORDS | METH_CLASS,
+     "concat($type, values, /, axis=0)\n--\n\n"
+     "Concatenate matrices along an axis."},
+    {NULL} /* Sentinel */
+};
+
 static PyType_Slot Matrix_slots[] = {
     {Py_tp_doc, "Matrix(rows, columns, values=None)\n--\n\n"
                 "A dense 2-D matrix of double-precision floats."},
@@ -5458,6 +6909,11 @@ static PyType_Spec Matrix_Spec = {.name = "bocpy._math.Matrix",
 static PyObject *_new_matrix_object(XIDATA_T *xidata) {
   matrix_impl *impl = (matrix_impl *)xidata->data;
 
+  _math_module_state *state = math_local_state();
+  if (state == NULL) {
+    return NULL;
+  }
+
   int_least64_t expected = BOCPY_NO_OWNER;
   int_least64_t desired = bocpy_interpid();
   if (!atomic_compare_exchange_strong(&impl->owner, &expected, desired)) {
@@ -5468,7 +6924,7 @@ static PyObject *_new_matrix_object(XIDATA_T *xidata) {
     return NULL;
   }
 
-  PyTypeObject *type = LOCAL_STATE->matrix_type;
+  PyTypeObject *type = state->matrix_type;
   MatrixObject *matrix = (MatrixObject *)type->tp_alloc(type, 0);
   if (matrix == NULL) {
     int_least64_t rollback_expected = desired;
@@ -5578,6 +7034,12 @@ static int _math_module_exec(PyObject *module) {
     return -1;
   }
 
+  state->values_iter_type = (PyTypeObject *)PyType_FromModuleAndSpec(
+      module, &MatrixValuesIter_Spec, NULL);
+  if (state->values_iter_type == NULL) {
+    return -1;
+  }
+
   if (XIDATA_REGISTERCLASS(state->matrix_type, _matrix_shared)) {
     Py_FatalError(
         "could not register MatrixObject for cross-interpreter sharing");
@@ -5589,6 +7051,14 @@ static int _math_module_exec(PyObject *module) {
     return -1;
   }
 
+  // Seed this interpreter's PRNG with a value distinct per interpreter (and
+  // per run): mixing the interpreter id and the state pointer ensures parallel
+  // workers created within the same clock tick still draw independent streams.
+  // Matrix.seed() overrides this for reproducibility within an interpreter.
+  state->prng_state = ((uint64_t)time(NULL) << 20) ^
+                      ((uint64_t)bocpy_interpid() * 0x9E3779B97F4A7C15ULL) ^
+                      (uint64_t)(uintptr_t)state;
+
   assert(LOCAL_STATE == NULL);
   LOCAL_STATE = state;
 
@@ -5598,6 +7068,7 @@ static int _math_module_exec(PyObject *module) {
 static int _math_module_clear(PyObject *module) {
   _math_module_state *state = (_math_module_state *)PyModule_GetState(module);
   Py_CLEAR(state->matrix_type);
+  Py_CLEAR(state->values_iter_type);
   Py_CLEAR(state->matrix_unpickle);
   return 0;
 }
@@ -5609,6 +7080,7 @@ static void _math_module_free(void *module) {
 static int _math_module_traverse(PyObject *module, visitproc visit, void *arg) {
   _math_module_state *state = (_math_module_state *)PyModule_GetState(module);
   Py_VISIT(state->matrix_type);
+  Py_VISIT(state->values_iter_type);
   Py_VISIT(state->matrix_unpickle);
   return 0;
 }
