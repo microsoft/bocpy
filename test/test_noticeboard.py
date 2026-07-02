@@ -4,7 +4,7 @@ from functools import partial
 
 import pytest
 
-from bocpy import (Cown, notice_delete, notice_read,
+from bocpy import (Cown, Matrix, notice_delete, notice_read,
                    notice_seed, notice_update, notice_write, noticeboard,
                    quiesce, REMOVED, start, wait, when)
 import bocpy._core as _core
@@ -445,6 +445,15 @@ def _conditionally_remove(x):
     return x + 1
 
 
+def _make_matrix_payload(current):
+    """Return a container holding a Matrix.
+
+    Used to force the noticeboard mutator thread to *pickle* a Matrix
+    (``Matrix.__reduce__``) when it commits the update result.
+    """
+    return {"m": Matrix.zeros((4, 3))}
+
+
 class TestNoticeUpdate:
     """Tests for notice_update atomic read-modify-write."""
 
@@ -560,6 +569,62 @@ class TestNoticeUpdate:
 
         snap = quiesce(QUIESCE_TIMEOUT, noticeboard=True)
         assert snap.get("best") == 42
+
+
+class TestNoticeboardMatrixEntry:
+    """Matrix-valued noticeboard entries reconstructed on the mutator thread.
+
+    The mutator thread is a second OS thread in the primary interpreter that
+    never ran the ``_math`` module init, so its cached module-state pointer
+    starts NULL. A ``notice_update`` read-modify-write snapshots every entry
+    (including Matrix-valued ones) on that thread, so Matrix reconstruction
+    must resolve the module state via the main-interpreter fallback rather
+    than dereferencing that NULL pointer.
+    """
+
+    @classmethod
+    def teardown_class(cls):
+        """Ensure runtime is drained after suite."""
+        wait()
+
+    def setup_method(self):
+        """Clear the noticeboard before each test."""
+        _core.noticeboard_clear()
+
+    def test_update_survives_matrix_entry_on_board(self):
+        """Concurrent RMW updates coexist with a pickled Matrix board entry."""
+        # A pickled container of Matrices: each RMW snapshot on the
+        # noticeboard thread reconstructs it via Matrix.__reduce__'s
+        # rebuild (_matrix_unpickle) -- the path that used to segfault.
+        notice_seed("bulky", {i: Matrix.zeros((4, 3)) for i in range(8)})
+
+        n = 8
+        cowns = [Cown(i) for i in range(n)]
+        for i in range(n):
+
+            @when(cowns[i])
+            def bump(c):
+                notice_update("acc", _increment, default=0)
+
+        snap = quiesce(QUIESCE_TIMEOUT, noticeboard=True)
+        assert snap.get("acc") == n
+        bulky = snap.get("bulky")
+        assert len(bulky) == 8
+        assert bulky[0].rows == 4
+        assert bulky[0].columns == 3
+
+    def test_update_returning_matrix_value(self):
+        """An update fn returning a Matrix-bearing value pickles it safely."""
+        x = Cown(0)
+
+        @when(x)
+        def step(x):
+            notice_update("payload", _make_matrix_payload, default=None)
+
+        snap = quiesce(QUIESCE_TIMEOUT, noticeboard=True)
+        payload = snap.get("payload")
+        assert payload["m"].rows == 4
+        assert payload["m"].columns == 3
 
 
 class TestNoticeboardReadOnly:
