@@ -9,6 +9,7 @@
 #include "boc_terminator.h"
 #include <assert.h>
 #include <bocpy/bocpy.h>
+#include <limits.h>
 
 typedef struct boc_queue BOCQueue;
 
@@ -3319,6 +3320,12 @@ typedef struct behavior_s {
   BOCCown *result;
   /// @brief Grouping identifiers, used for reassembling lists of cowns
   int *group_ids;
+  /// @brief Number of top-level @when argument slots (cown parameters).
+  /// @details May exceed the number of distinct groups present in
+  /// @c group_ids: an empty list group contributes no @c args entry, so this
+  /// count -- supplied by @c whencall -- is the only record that the slot
+  /// exists. @ref behavior_execute_impl reconstructs each empty slot as @c [].
+  Py_ssize_t num_arg_slots;
   /// @brief The args buffer
   BOCCown **args;
   /// @brief The number of args
@@ -3394,6 +3401,7 @@ BOCBehavior *behavior_new() {
   behavior->result = NULL;
   behavior->rc = 0;
   behavior->group_ids = NULL;
+  behavior->num_arg_slots = 0;
   behavior->args_size = 0;
   behavior->args = NULL;
   behavior->captures_size = 0;
@@ -3569,10 +3577,16 @@ static int BehaviorCapsule_init(PyObject *op, PyObject *args,
   PyObject *result = NULL;
   PyObject *cowns_list = NULL;
   PyObject *captures = NULL;
+  Py_ssize_t num_arg_slots = 0;
 
-  if (!PyArg_ParseTuple(args, "O!O!OO", &PyUnicode_Type, &thunk,
+  if (!PyArg_ParseTuple(args, "O!O!OOn", &PyUnicode_Type, &thunk,
                         BOC_STATE->cown_capsule_type, &result, &cowns_list,
-                        &captures)) {
+                        &captures, &num_arg_slots)) {
+    return -1;
+  }
+
+  if (num_arg_slots < 0) {
+    PyErr_SetString(PyExc_ValueError, "num_arg_slots must be non-negative");
     return -1;
   }
 
@@ -3595,6 +3609,8 @@ static int BehaviorCapsule_init(PyObject *op, PyObject *args,
            behavior->id);
   self->behavior = behavior;
   BEHAVIOR_INCREF(behavior);
+
+  behavior->num_arg_slots = num_arg_slots;
 
   behavior->thunk = tag_from_PyUnicode(thunk, NULL);
   if (behavior->thunk == NULL) {
@@ -3637,6 +3653,18 @@ static int BehaviorCapsule_init(PyObject *op, PyObject *args,
     PyObject *cown;
     if (!PyArg_ParseTuple(item, "iO!", &group_id, BOC_STATE->cown_capsule_type,
                           &cown)) {
+      Py_DECREF(cowns);
+      Py_DECREF(cowns_list_fast);
+      return -1;
+    }
+
+    // Bound group_id (exec uses abs(group_id)-1): reject 0, INT_MIN, > slots.
+    if (group_id == 0 || group_id == INT_MIN ||
+        (Py_ssize_t)abs(group_id) > num_arg_slots) {
+      PyErr_Format(PyExc_ValueError,
+                   "cown group_id %d out of range for %zd argument slot(s)",
+                   group_id, num_arg_slots);
+      Py_DECREF(cowns);
       Py_DECREF(cowns_list_fast);
       return -1;
     }
@@ -3661,6 +3689,12 @@ static int BehaviorCapsule_init(PyObject *op, PyObject *args,
 
   behavior->captures = add_vars(captures, &behavior->captures_size);
   if (behavior->captures == NULL) {
+    return -1;
+  }
+
+  // Guard the caller-controlled tuple-size sum against Py_ssize_t overflow.
+  if (behavior->num_arg_slots > PY_SSIZE_T_MAX - behavior->captures_size) {
+    PyErr_SetString(PyExc_OverflowError, "too many behavior argument slots");
     return -1;
   }
 
@@ -4102,73 +4136,67 @@ static PyObject *BehaviorCapsule_release(PyObject *op,
 /// failure
 static PyObject *behavior_execute_impl(BOCBehavior *behavior,
                                        PyObject *boc_export) {
-  size_t num_groups = 0;
-  if (behavior->args_size > 0) {
-    num_groups = abs(behavior->group_ids[behavior->args_size - 1]);
-  }
+  // Cown i -> slot abs(group_id)-1; untouched slots become empty groups [].
+  size_t num_arg_slots = (size_t)behavior->num_arg_slots;
+  size_t num_args = num_arg_slots + (size_t)behavior->captures_size;
 
-  num_groups += behavior->captures_size;
-
-  PyObject *thunk_args = PyTuple_New(num_groups);
-
+  PyObject *thunk_args = PyTuple_New((Py_ssize_t)num_args);
   if (thunk_args == NULL) {
     return NULL;
   }
 
-  Py_ssize_t arg_idx = 0;
   BOCCown **ptr = behavior->args;
-
-  PyObject *group_list = NULL;
-  int current_group_id = 0;
   for (Py_ssize_t i = 0; i < behavior->args_size; ++i, ++ptr) {
-    PyObject *capsule = cown_capsule_wrap(*ptr, false);
     int group_id = behavior->group_ids[i];
+    Py_ssize_t slot = (Py_ssize_t)(abs(group_id) - 1);
 
-    if (group_id == current_group_id) {
-      if (PyList_Append(group_list, capsule) < 0) {
-        Py_DECREF(thunk_args);
-        Py_DECREF(group_list);
-        return NULL;
-      }
-
-      Py_DECREF(capsule);
-      continue;
-    }
-
-    if (group_list != NULL) {
-      PyTuple_SET_ITEM(thunk_args, arg_idx, group_list);
-      arg_idx += 1;
-      group_list = NULL;
-      current_group_id = 0;
-    }
-
-    if (group_id > 0) {
-      PyTuple_SET_ITEM(thunk_args, arg_idx, capsule);
-      arg_idx += 1;
-      continue;
-    }
-
-    group_list = PyList_New(1);
-    if (group_list == NULL) {
+    PyObject *capsule = cown_capsule_wrap(*ptr, false);
+    if (capsule == NULL) {
       Py_DECREF(thunk_args);
       return NULL;
     }
 
-    current_group_id = group_id;
-    PyList_SET_ITEM(group_list, 0, capsule);
+    if (group_id > 0) {
+      // Singleton argument: the slot holds the capsule directly.
+      PyTuple_SET_ITEM(thunk_args, slot, capsule);
+      continue;
+    }
+
+    // Group member: append to the slot's list, creating it on first sight.
+    PyObject *group_list = PyTuple_GET_ITEM(thunk_args, slot);
+    if (group_list == NULL) {
+      group_list = PyList_New(0);
+      if (group_list == NULL) {
+        Py_DECREF(capsule);
+        Py_DECREF(thunk_args);
+        return NULL;
+      }
+      PyTuple_SET_ITEM(thunk_args, slot, group_list);
+    }
+    if (PyList_Append(group_list, capsule) < 0) {
+      Py_DECREF(capsule);
+      Py_DECREF(thunk_args);
+      return NULL;
+    }
+    Py_DECREF(capsule);
   }
 
-  if (group_list != NULL) {
-    PyTuple_SET_ITEM(thunk_args, arg_idx, group_list);
-    arg_idx += 1;
-    group_list = NULL;
-    current_group_id = 0;
+  // Any cown slot still unset is an empty list group -> [].
+  for (Py_ssize_t slot = 0; slot < (Py_ssize_t)num_arg_slots; ++slot) {
+    if (PyTuple_GET_ITEM(thunk_args, slot) == NULL) {
+      PyObject *empty = PyList_New(0);
+      if (empty == NULL) {
+        Py_DECREF(thunk_args);
+        return NULL;
+      }
+      PyTuple_SET_ITEM(thunk_args, slot, empty);
+    }
   }
 
   ptr = behavior->captures;
-  for (Py_ssize_t i = 0; i < behavior->captures_size; ++i, ++arg_idx, ++ptr) {
+  for (Py_ssize_t i = 0; i < behavior->captures_size; ++i, ++ptr) {
     PyObject *value = Py_NewRef((*ptr)->value);
-    PyTuple_SET_ITEM(thunk_args, arg_idx, value);
+    PyTuple_SET_ITEM(thunk_args, (Py_ssize_t)num_arg_slots + i, value);
   }
 
   PyObject *thunk = PyObject_GetAttrString(boc_export, behavior->thunk->str);

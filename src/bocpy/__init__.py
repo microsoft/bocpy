@@ -6,7 +6,7 @@ import os
 import sys
 
 from ._core import drain, receive, send, set_tags, TIMEOUT
-from ._math import Matrix
+from ._math import Matrix, MatrixView
 from .behaviors import (Behaviors, Cown, notice_delete, notice_read,
                         notice_seed, notice_update, notice_write, noticeboard,
                         PinnedCown, pump, PumpResult, quiesce,
@@ -67,7 +67,8 @@ def get_sources() -> list[str]:
     return []
 
 
-__all__ = ["Behaviors", "Cown", "Matrix", "PinnedCown", "PumpResult",
+__all__ = ["Behaviors", "Cown", "Matrix", "MatrixView", "PinnedCown",
+           "PumpResult",
            "REMOVED", "TIMEOUT",
            "WORKER_COUNT", "__version__", "drain",
            "get_include", "get_sources",

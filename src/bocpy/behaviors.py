@@ -1870,7 +1870,9 @@ def whencall(func, args: list[Union[Cown, list[Cown]]], captures: list[Any]) -> 
 
         group_id += 1
 
-    behavior = _core.BehaviorCapsule(key, result.impl, cowns, captures)
+    # Empty groups leave no cown entry, so pass the top-level arg count for tuple sizing and [] fill.
+    behavior = _core.BehaviorCapsule(key, result.impl, cowns, captures,
+                                     len(args))
     # Take the terminator hold before scheduling so a concurrent stop()/terminator_close() refuses the schedule
     # rather than racing teardown; the matching dec runs on the worker thread once the body completes.
     if _core.terminator_inc() < 0:

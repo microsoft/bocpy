@@ -92,7 +92,7 @@ def avoid_others(neighbors: Matrix, pos: Matrix,
     bounds = BoundingBox(left, top, right, bottom)
 
     move = Matrix.vector([0, 0])
-    for npos in neighbors:
+    for npos in neighbors.row_views():
         if bounds.is_outside(npos.x, npos.y):
             continue
 
@@ -263,7 +263,7 @@ class Simulation:
 
         self.grid_cells.clear()
 
-        for i, pos in enumerate(positions):
+        for i, pos in enumerate(positions.row_views()):
             r = int_coord(pos.y, self.spacing)
             c = int_coord(pos.x, self.spacing)
             self.grid_cells.add(Cell(r, c))
@@ -303,9 +303,8 @@ class Simulation:
         start = self.cell_start[h]
         end = self.cell_start[h + 1]
         boids = []
-        for i in range(start, end):
-            b = self.cell_entries[i]
-            pos = positions[b]
+        for b in self.cell_entries[start:end]:
+            pos = positions.row_view(b)
             if box.is_outside(pos.x, pos.y):
                 continue
 

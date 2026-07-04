@@ -10,7 +10,7 @@ import traceback
 
 import pytest
 
-from bocpy import (Cown, drain, notice_write,
+from bocpy import (Cown, drain, notice_write, PinnedCown,
                    quiesce, receive, send, start, TIMEOUT, wait, when)
 from bocpy._core import CownCapsule
 from bocpy_test import collide_a, collide_b, dunders
@@ -170,6 +170,137 @@ def cown_grouping():
         return single0.value + sum([c.value for c in group]) + single1.value
 
     return expected, [group, group_single, single_group, group_single_group, single_group_single]
+
+
+class TestEmptyGroups:
+    """An empty cown-list @when argument passes an empty list to its parameter."""
+
+    @classmethod
+    def teardown_class(cls):
+        """Ensure runtime is drained after suite."""
+        wait()
+
+    def test_trailing_empty_group(self):
+        """An empty list as the last @when arg yields [] for that parameter."""
+        a = Cown(1)
+
+        @when(a, [])
+        def result(a, group):
+            return (a.value, list(group))
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert result.unwrap() == (1, [])
+
+    def test_leading_empty_group(self):
+        """An empty list as the first @when arg keeps later slots correct."""
+        b = Cown(2)
+
+        @when([], b)
+        def result(group, b):
+            return (list(group), b.value)
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert result.unwrap() == ([], 2)
+
+    def test_middle_empty_group(self):
+        """An empty list between two singletons yields [] in the middle slot."""
+        a = Cown(1)
+        b = Cown(2)
+
+        @when(a, [], b)
+        def result(a, group, b):
+            return (a.value, list(group), b.value)
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert result.unwrap() == (1, [], 2)
+
+    def test_all_empty_groups_zero_cowns(self):
+        """A behavior whose only args are empty groups still fires."""
+
+        @when([], [])
+        def result(g0, g1):
+            return (list(g0), list(g1))
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert result.unwrap() == ([], [])
+
+    def test_mixed_empty_and_nonempty_groups(self):
+        """Empty and non-empty groups reconstruct at their correct slots."""
+        a = Cown(1)
+        grp = [Cown(2), Cown(3)]
+        c = Cown(4)
+
+        @when(a, [], grp, c)
+        def result(a, empty, group, c):
+            return (a.value, list(empty),
+                    sorted(x.value for x in group), c.value)
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert result.unwrap() == (1, [], [2, 3], 4)
+
+    def test_empty_group_with_capture(self):
+        """An empty group coexists with a trailing capture parameter."""
+        a = Cown(1)
+        factor = 10
+
+        @when(a, [])
+        def result(a, group, factor=factor):
+            return (a.value * factor, list(group))
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert result.unwrap() == (10, [])
+
+    def test_multi_member_group_with_capture(self):
+        """A multi-member group plus an empty group and a trailing capture."""
+        a = Cown(1)
+        grp = [Cown(2), Cown(3)]
+        factor = 10
+
+        @when(a, [], grp)
+        def result(a, empty, group, factor=factor):
+            return (a.value * factor, list(empty),
+                    sorted(x.value for x in group))
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert result.unwrap() == (10, [], [2, 3])
+
+    def test_tuple_form_groups(self):
+        """Groups passed as tuples reconstruct identically to lists."""
+        a = Cown(1)
+        b = Cown(2)
+
+        @when(a, (), (b,))
+        def result(a, empty, group):
+            return (a.value, list(empty), [x.value for x in group])
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert result.unwrap() == (1, [], [2])
+
+    def test_empty_group_result_feeds_chained_behavior(self):
+        """A behavior with an empty group feeds its result downstream."""
+        a = Cown(1)
+
+        @when(a, [])
+        def stage1(a, group):
+            return a.value + len(group)
+
+        @when(stage1)
+        def stage2(s):
+            return s.value * 100
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert stage2.unwrap() == 100
+
+    def test_pinned_empty_group_pump_path(self):
+        """An empty group on a pinned-cown behavior (pump path) yields []."""
+        pc = PinnedCown({"n": 5})
+
+        @when(pc, [])
+        def result(pc, group):
+            return (pc.value["n"], list(group))
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert result.unwrap() == (5, [])
 
 
 class TestBOC:
@@ -1124,6 +1255,7 @@ class TestBehaviorCapsuleArgsSize:
             result.impl,
             [],
             [],
+            0,
         )
         assert capsule is not None
 
@@ -1135,15 +1267,40 @@ class TestBehaviorCapsuleArgsSize:
 
         result = Cown(None)
         cowns = [Cown(i) for i in range(32)]
-        args = [(i, c.impl) for i, c in enumerate(cowns)]
+        # group_ids are 1-based (as whencall emits them), one slot per cown.
+        args = [(i + 1, c.impl) for i, c in enumerate(cowns)]
 
         capsule = BehaviorCapsule(
             "__behavior_large_args__",
             result.impl,
             args,
             [],
+            len(args),
         )
         assert capsule is not None
+
+    def test_group_id_out_of_range_rejected(self):
+        """A group_id outside [1, num_arg_slots] is rejected at construction.
+
+        Guards the raw (public) BehaviorCapsule constructor against an
+        out-of-bounds argument-tuple write at execute time: the reconstruction
+        places each cown at slot abs(group_id) - 1 in a tuple of num_arg_slots.
+        """
+        from bocpy import start as _start_runtime
+        from bocpy._core import BehaviorCapsule
+        _start_runtime()
+
+        result = Cown(None)
+        c = Cown(1)
+        # group_id 5 but only one slot -> would index a 1-tuple at slot 4.
+        with pytest.raises(ValueError):
+            BehaviorCapsule("__oob__", result.impl, [(5, c.impl)], [], 1)
+        # group_id 0 -> slot -1.
+        with pytest.raises(ValueError):
+            BehaviorCapsule("__zero__", result.impl, [(0, c.impl)], [], 1)
+        # A negative num_arg_slots is rejected outright.
+        with pytest.raises(ValueError):
+            BehaviorCapsule("__neg__", result.impl, [(1, c.impl)], [], -1)
 
 
 class TestExceptionFlag:

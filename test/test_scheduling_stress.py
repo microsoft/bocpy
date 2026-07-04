@@ -619,6 +619,7 @@ class TestOrphanDropException:
             result.impl,
             [(1, arg.impl)],
             [],
+            1,
         )
 
         drop = RuntimeError("orphaned during stop()")
@@ -731,6 +732,7 @@ class TestDispatchAfterRuntimeStop:
             result.impl,
             [(1, c.impl)],
             [],
+            1,
         )
 
         prior_count, prior_seeded = _core.terminator_reset()

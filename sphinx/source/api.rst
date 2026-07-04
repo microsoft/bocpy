@@ -128,6 +128,58 @@ Math
     :special-members: __init__, __eq__, __ne__, __lt__, __le__, __gt__, __ge__, __getitem__, __setitem__
 
 
+Matrix views
+^^^^^^^^^^^^
+
+:meth:`Matrix.row_view`, :meth:`Matrix.column_view`, and the ``m.view[...]``
+accessor return a :class:`MatrixView` — a read/write, 1-D window that
+**shares** the matrix's storage instead of copying it. This is the
+borrow-by-view counterpart to plain subscripting (``m[i]`` / ``m[i, j]`` /
+``m[rows, cols]``), which always **copies**::
+
+    m = Matrix(3, 4, [float(i) for i in range(12)])
+
+    row = m.row_view(1)      # borrow: aliases m's storage
+    row[0] = 99.0            # writes THROUGH to m[1, 0]
+    col = m.view[:, 2]       # slice-notation borrow of column 2
+    snap = m[1]              # copy: an independent 1 x 4 Matrix
+
+Key semantics:
+
+* **Aliasing / write-through.** Reading or writing a view element touches the
+  source matrix directly (``view[i] = x``, ``view[:] = scalar``,
+  ``view[:] = sequence``). Sub-views (``view[1:3]``) and the free transpose
+  (``view.T``, an O(1) orientation flip) alias the same storage.
+* **Copy vs borrow.** ``m[...]`` copies; ``m.row_view`` / ``m.column_view`` /
+  ``m.view[...]`` borrow. Use :meth:`MatrixView.copy` (or
+  :meth:`Matrix.from_view`) to materialise an independent owned
+  :class:`Matrix`.
+* **Iterating views.** :meth:`Matrix.row_views` / :meth:`Matrix.column_views`
+  yield a fresh borrow over each row / column in turn — a cleaner spelling of
+  ``for i in range(m.rows): m.row_view(i)``. Each yielded view is a distinct
+  object (never a reused cursor), so ``list(m.row_views())`` behaves like any
+  other iterator. Plain ``for row in m`` still **copies** each row.
+* **Whole-buffer lifetime pin.** A view keeps the *entire* backing matrix
+  alive for as long as the view exists, even a one-element span.
+* **Not shippable.** A view cannot be pickled, sent, or placed in a
+  :class:`Cown`; doing so raises :class:`TypeError` naming the ``.copy()``
+  remedy. ``.copy()`` yields an owned, shippable matrix.
+* **Arithmetic materialises.** ``+``, ``-``, ``*``, ``/``, ``@``, unary ``-``,
+  and ``abs()`` on a view return a fresh owned :class:`Matrix`; augmented
+  ``view += x`` therefore rebinds the name to a new matrix rather than writing
+  through.
+* **Column views are strided.** A column view materialises (for arithmetic or
+  ``.copy()``) by gathering strided elements, so it costs a little more than a
+  contiguous row view.
+* **Ownership.** Every value access requires the current interpreter to own
+  the source matrix; a released base raises :class:`RuntimeError`.
+
+.. autoclass:: MatrixView
+    :members:
+    :undoc-members:
+    :special-members: __len__, __getitem__, __setitem__
+
+
 Messaging
 ---------
 

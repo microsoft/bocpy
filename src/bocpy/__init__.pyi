@@ -88,6 +88,25 @@ class Matrix:
     Supports element-wise arithmetic (``+``, ``-``, ``*``, ``/``), matrix
     multiplication (``@``), in-place variants (``+=``, ``-=``, ``*=``, ``/=``),
     unary ``-`` and ``abs()``, and subscript indexing with integers or slices.
+
+    **Output-routing convention.** Methods that produce a same-shape result
+    (the unary element-wise ops ``ceil``/``floor``/``round``/``negate``/
+    ``abs``/``sqrt``/``reciprocal``/``sign``/``cos``/``sin``, plus ``clip``)
+    accept a keyword-only ``in_place=`` to mutate ``self`` and a keyword-only
+    ``out=`` to write into a caller-supplied matrix; the two are mutually
+    exclusive.
+    Methods with a natural in-place meaning but no fresh-allocation form
+    (``normalize``, ``perpendicular``, ``transpose``) accept only ``in_place=``.
+    Reductions and gathers (``add``/``subtract``/``multiply``/``divide``, the
+    six comparisons, ``take``, ``take_along_axis``, ``where``) accept only
+    ``out=``. Scatter-style writers (``put``, ``put_along_axis``) always mutate
+    and return ``self``.
+
+    **Masked-reduction empty-group sentinels.** When a ``where=`` mask
+    excludes every element of a reduction group, the published value depends on
+    the op: additive ops (``sum``, ``magnitude``, ``magnitude_squared``) yield
+    ``0``; ``mean``, ``min``, and ``max`` yield ``NaN`` (matching NumPy's
+    empty-slice semantics); ``argmin``/``argmax`` yield ``-1``.
     """
 
     def __init__(self, rows: int, columns: int,
@@ -171,6 +190,17 @@ class Matrix:
     def shape(self) -> tuple[int, int]:
         """The ``(rows, columns)`` shape of the matrix."""
 
+    @property
+    def view(self) -> "MatrixViewIndexer":
+        """Slice-notation constructor for read/write row and column views.
+
+        ``m.view[i]`` and ``m.view[i, cols]`` return a row
+        :class:`MatrixView`; ``m.view[rows, j]`` returns a column
+        :class:`MatrixView`. Unlike ``m[...]`` (which copies), the result
+        **aliases** ``m``'s storage. A two-axis key must resolve to a single
+        row or column; a sub-matrix selection raises :class:`TypeError`.
+        """
+
     def transpose(self, in_place: bool = False) -> "Matrix":
         """Return a transposed matrix.
 
@@ -179,36 +209,55 @@ class Matrix:
             return a new transposed :class:`Matrix`.
         """
 
-    def sum(self, axis: Optional[int] = None) -> Union[float, "Matrix"]:
+    def sum(self, axis: Optional[int] = None,
+            where: Optional["Matrix"] = None) -> Union[float, "Matrix"]:
         """Sum of matrix elements.
 
         :param axis: If ``None``, return the total sum as a float.
             If ``0``, return a 1 x *columns* row vector of column sums.
             If ``1``, return a *rows* x 1 column vector of row sums.
+        :param where: Optional same-shape mask matrix. An element is included
+            only where its mask cell is non-zero (NaN counts as included). A
+            group with no included element sums to ``0``.
         """
 
-    def mean(self, axis: Optional[int] = None) -> Union[float, "Matrix"]:
+    def mean(self, axis: Optional[int] = None,
+             where: Optional["Matrix"] = None) -> Union[float, "Matrix"]:
         """Arithmetic mean of matrix elements.
 
         :param axis: If ``None``, return the overall mean as a float.
             If ``0``, return a 1 x *columns* row vector of column means.
             If ``1``, return a *rows* x 1 column vector of row means.
+        :param where: Optional same-shape mask matrix. The mean is taken over
+            only the elements whose mask cell is non-zero (NaN counts as
+            included). A group with no included element yields ``NaN``
+            (matching NumPy's mean of an empty slice), distinguishing it from
+            a genuine zero mean.
         """
 
-    def magnitude(self, axis: Optional[int] = None) -> Union[float, "Matrix"]:
+    def magnitude(self, axis: Optional[int] = None,
+                  where: Optional["Matrix"] = None) -> Union[float, "Matrix"]:
         """Euclidean magnitude (L2 norm) of matrix elements.
 
         :param axis: If ``None``, return the total magnitude as a float.
             If ``0``, return a 1 x *columns* row vector of column magnitudes.
             If ``1``, return a *rows* x 1 column vector of row magnitudes.
+        :param where: Optional same-shape mask matrix. Only elements whose
+            mask cell is non-zero contribute (NaN counts as included). A
+            group with no included element yields ``0``.
         """
 
-    def magnitude_squared(self, axis: Optional[int] = None) -> Union[float, "Matrix"]:
+    def magnitude_squared(self, axis: Optional[int] = None,
+                          where: Optional["Matrix"] = None
+                          ) -> Union[float, "Matrix"]:
         """Sum of squared elements (squared L2 norm), avoiding the square-root step.
 
         :param axis: If ``None``, return the total squared magnitude as a float.
             If ``0``, return a 1 x *columns* row vector of column squared magnitudes.
             If ``1``, return a *rows* x 1 column vector of row squared magnitudes.
+        :param where: Optional same-shape mask matrix. Only elements whose
+            mask cell is non-zero contribute (NaN counts as included). A
+            group with no included element yields ``0``.
         """
 
     def vecdot(self, other: "Matrix",
@@ -445,51 +494,103 @@ class Matrix:
             or a ``Nx2`` / ``2xN`` batch.
         """
 
-    def min(self, axis: Optional[int] = None) -> Union[float, "Matrix"]:
+    def min(self, axis: Optional[int] = None,
+            where: Optional["Matrix"] = None) -> Union[float, "Matrix"]:
         """Minimum of matrix elements.
 
         :param axis: If ``None``, return the overall minimum as a float.
             If ``0``, return a 1 x *columns* row vector of column minima.
             If ``1``, return a *rows* x 1 column vector of row minima.
+        :param where: Optional same-shape mask matrix. Only elements whose
+            mask cell is non-zero are considered (NaN counts as included). A
+            group with no included element yields ``NaN``.
         """
 
-    def max(self, axis: Optional[int] = None) -> Union[float, "Matrix"]:
+    def max(self, axis: Optional[int] = None,
+            where: Optional["Matrix"] = None) -> Union[float, "Matrix"]:
         """Maximum of matrix elements.
 
         :param axis: If ``None``, return the overall maximum as a float.
             If ``0``, return a 1 x *columns* row vector of column maxima.
             If ``1``, return a *rows* x 1 column vector of row maxima.
+        :param where: Optional same-shape mask matrix. Only elements whose
+            mask cell is non-zero are considered (NaN counts as included). A
+            group with no included element yields ``NaN``.
         """
 
-    def argmin(self, axis: Optional[int] = None) -> Union[int, "Matrix"]:
+    @overload
+    def argmin(self, axis: Optional[int] = None,
+               where: Optional["Matrix"] = None,
+               as_matrix: Literal[False] = False) -> Union[int, list[int]]: ...
+
+    @overload
+    def argmin(self, axis: Optional[int] = None,
+               where: Optional["Matrix"] = None, *,
+               as_matrix: Literal[True]) -> Union[int, "Matrix"]: ...
+
+    def argmin(self, axis: Optional[int] = None,
+               where: Optional["Matrix"] = None,
+               as_matrix: bool = False
+               ) -> Union[int, list[int], "Matrix"]:
         """Index of the minimum element (first occurrence on ties).
 
         :param axis: If ``None``, return the flat row-major index of the
-            overall minimum as an ``int``.  If ``0``, return a 1 x *columns*
-            row vector of per-column row indices.  If ``1``, return a
-            *rows* x 1 column vector of per-row column indices.
+            overall minimum as an ``int``.  If ``0``, reduce down the rows;
+            if ``1``, reduce across the columns.
+        :param where: Optional same-shape mask matrix. An element is
+            considered only where its mask cell is non-zero (NaN counts as
+            included). A group with no included element yields ``-1``, the
+            integer analog of a masked minimum returning NaN.
+        :param as_matrix: Controls the axis-wise index form. With ``False``
+            (the default) the per-group indices are returned as a Python
+            ``list[int]``, directly usable in fancy indexing (e.g. fed to
+            :meth:`take_along_axis`). With ``True`` they are instead a
+            :class:`Matrix` vector of ``float`` index positions. Ignored for
+            ``axis=None`` (always a single ``int``).
 
         .. note::
-           NaN elements are skipped unless the running extreme starts at
-           NaN (element 0 along the reduced axis), which pins the result
-           to that position.  This differs from NumPy, which propagates NaN.
+           NaN elements are skipped unless the first *included* element
+           along the reduced axis is NaN, which pins the result to that
+           position.  This differs from NumPy, which propagates NaN.
         """
 
-    def argmax(self, axis: Optional[int] = None) -> Union[int, "Matrix"]:
+    @overload
+    def argmax(self, axis: Optional[int] = None,
+               where: Optional["Matrix"] = None,
+               as_matrix: Literal[False] = False) -> Union[int, list[int]]: ...
+
+    @overload
+    def argmax(self, axis: Optional[int] = None,
+               where: Optional["Matrix"] = None, *,
+               as_matrix: Literal[True]) -> Union[int, "Matrix"]: ...
+
+    def argmax(self, axis: Optional[int] = None,
+               where: Optional["Matrix"] = None,
+               as_matrix: bool = False
+               ) -> Union[int, list[int], "Matrix"]:
         """Index of the maximum element (first occurrence on ties).
 
         :param axis: If ``None``, return the flat row-major index of the
-            overall maximum as an ``int``.  If ``0``, return a 1 x *columns*
-            row vector of per-column row indices.  If ``1``, return a
-            *rows* x 1 column vector of per-row column indices.
+            overall maximum as an ``int``.  If ``0``, reduce down the rows;
+            if ``1``, reduce across the columns.
+        :param where: Optional same-shape mask matrix. An element is
+            considered only where its mask cell is non-zero (NaN counts as
+            included). A group with no included element yields ``-1``, the
+            integer analog of a masked maximum returning NaN.
+        :param as_matrix: Controls the axis-wise index form. With ``False``
+            (the default) the per-group indices are returned as a Python
+            ``list[int]``, directly usable in fancy indexing (e.g. fed to
+            :meth:`take_along_axis`). With ``True`` they are instead a
+            :class:`Matrix` vector of ``float`` index positions. Ignored for
+            ``axis=None`` (always a single ``int``).
 
         .. note::
-           NaN elements are skipped unless the running extreme starts at
-           NaN (element 0 along the reduced axis), which pins the result
-           to that position.  This differs from NumPy, which propagates NaN.
+           NaN elements are skipped unless the first *included* element
+           along the reduced axis is NaN, which pins the result to that
+           position.  This differs from NumPy, which propagates NaN.
         """
 
-    def ceil(self, in_place: bool = False, *,
+    def ceil(self, *, in_place: bool = False,
              out: Optional["Matrix"] = None) -> "Matrix":
         """Round each element up to the nearest integer.
 
@@ -499,7 +600,7 @@ class Matrix:
             exclusive with ``in_place``.
         """
 
-    def floor(self, in_place: bool = False, *,
+    def floor(self, *, in_place: bool = False,
               out: Optional["Matrix"] = None) -> "Matrix":
         """Round each element down to the nearest integer.
 
@@ -509,7 +610,7 @@ class Matrix:
             exclusive with ``in_place``.
         """
 
-    def round(self, in_place: bool = False, *,
+    def round(self, *, in_place: bool = False,
               out: Optional["Matrix"] = None) -> "Matrix":
         """Round each element to the nearest integer (banker's rounding).
 
@@ -519,7 +620,7 @@ class Matrix:
             exclusive with ``in_place``.
         """
 
-    def negate(self, in_place: bool = False, *,
+    def negate(self, *, in_place: bool = False,
                out: Optional["Matrix"] = None) -> "Matrix":
         """Negate every element.
 
@@ -529,7 +630,7 @@ class Matrix:
             exclusive with ``in_place``.
         """
 
-    def abs(self, in_place: bool = False, *,
+    def abs(self, *, in_place: bool = False,
             out: Optional["Matrix"] = None) -> "Matrix":
         """Take the absolute value of every element.
 
@@ -539,7 +640,7 @@ class Matrix:
             exclusive with ``in_place``.
         """
 
-    def sqrt(self, in_place: bool = False, *,
+    def sqrt(self, *, in_place: bool = False,
              out: Optional["Matrix"] = None) -> "Matrix":
         """Take the square root of every element.
 
@@ -552,8 +653,52 @@ class Matrix:
             exclusive with ``in_place``.
         """
 
+    def reciprocal(self, *, in_place: bool = False,
+                   out: Optional["Matrix"] = None) -> "Matrix":
+        """Take the reciprocal (``1 / x``) of every element.
+
+        Zero elements yield +/-``inf`` (no exception is raised), matching
+        :func:`numpy.reciprocal`.
+
+        :param in_place: When ``True``, mutate ``self`` and return it.
+        :param out: A same-shape :class:`Matrix` to write the result into
+            (allocation-free); returned in place of a fresh matrix. Mutually
+            exclusive with ``in_place``.
+        """
+
+    def sign(self, *, in_place: bool = False,
+             out: Optional["Matrix"] = None) -> "Matrix":
+        """Return -1, 0, or 1 for each element by sign (``NaN`` maps to 0).
+
+        :param in_place: When ``True``, mutate ``self`` and return it.
+        :param out: A same-shape :class:`Matrix` to write the result into
+            (allocation-free); returned in place of a fresh matrix. Mutually
+            exclusive with ``in_place``.
+        """
+
+    def cos(self, *, in_place: bool = False,
+            out: Optional["Matrix"] = None) -> "Matrix":
+        """Take the cosine (radians) of every element.
+
+        :param in_place: When ``True``, mutate ``self`` and return it.
+        :param out: A same-shape :class:`Matrix` to write the result into
+            (allocation-free); returned in place of a fresh matrix. Mutually
+            exclusive with ``in_place``.
+        """
+
+    def sin(self, *, in_place: bool = False,
+            out: Optional["Matrix"] = None) -> "Matrix":
+        """Take the sine (radians) of every element.
+
+        :param in_place: When ``True``, mutate ``self`` and return it.
+        :param out: A same-shape :class:`Matrix` to write the result into
+            (allocation-free); returned in place of a fresh matrix. Mutually
+            exclusive with ``in_place``.
+        """
+
     def less(self, other: Union["Matrix", int, float,
-                                Sequence[Union[int, float]]]) -> "Matrix":
+                                Sequence[Union[int, float]]], *,
+             out: Optional["Matrix"] = None) -> "Matrix":
         """Element-wise ``self < other`` as a 0/1 mask matrix.
 
         Distinct from the ``<`` operator, which returns a single
@@ -562,6 +707,8 @@ class Matrix:
         :param other: A same-shape matrix, a scalar (including ``bool``), a
             ``1x1`` matrix, a row/column vector that broadcasts (same rules
             as arithmetic), or a list/tuple of numbers.
+        :param out: A same-shape :class:`Matrix` to write the mask into
+            (allocation-free); returned in place of a fresh matrix.
         :return: A new :class:`Matrix` of ``1.0``/``0.0``. NaN comparisons
             yield ``0.0``.
         :raises ValueError: on a non-broadcastable shape or an empty
@@ -571,7 +718,8 @@ class Matrix:
         """
 
     def less_equal(self, other: Union["Matrix", int, float,
-                                      Sequence[Union[int, float]]]) -> "Matrix":
+                                      Sequence[Union[int, float]]], *,
+                   out: Optional["Matrix"] = None) -> "Matrix":
         """Element-wise ``self <= other`` as a 0/1 mask matrix.
 
         Distinct from the ``<=`` operator, which returns a single
@@ -589,7 +737,8 @@ class Matrix:
         """
 
     def greater(self, other: Union["Matrix", int, float,
-                                   Sequence[Union[int, float]]]) -> "Matrix":
+                                   Sequence[Union[int, float]]], *,
+                out: Optional["Matrix"] = None) -> "Matrix":
         """Element-wise ``self > other`` as a 0/1 mask matrix.
 
         Distinct from the ``>`` operator, which returns a single
@@ -607,7 +756,8 @@ class Matrix:
         """
 
     def greater_equal(self, other: Union["Matrix", int, float,
-                                         Sequence[Union[int, float]]]) -> "Matrix":
+                                         Sequence[Union[int, float]]], *,
+                      out: Optional["Matrix"] = None) -> "Matrix":
         """Element-wise ``self >= other`` as a 0/1 mask matrix.
 
         Distinct from the ``>=`` operator, which returns a single
@@ -625,7 +775,8 @@ class Matrix:
         """
 
     def equal(self, other: Union["Matrix", int, float,
-                                 Sequence[Union[int, float]]]) -> "Matrix":
+                                 Sequence[Union[int, float]]], *,
+              out: Optional["Matrix"] = None) -> "Matrix":
         """Element-wise ``self == other`` as a 0/1 mask matrix.
 
         Distinct from the ``==`` operator, which returns a single
@@ -643,7 +794,8 @@ class Matrix:
         """
 
     def not_equal(self, other: Union["Matrix", int, float,
-                                     Sequence[Union[int, float]]]) -> "Matrix":
+                                     Sequence[Union[int, float]]], *,
+                  out: Optional["Matrix"] = None) -> "Matrix":
         """Element-wise ``self != other`` as a 0/1 mask matrix.
 
         Distinct from the ``!=`` operator, which returns a single
@@ -661,7 +813,8 @@ class Matrix:
         """
 
     def clip(self, min: Optional[float] = None,
-             max: Optional[float] = None) -> "Matrix":
+             max: Optional[float] = None, *, in_place: bool = False,
+             out: Optional["Matrix"] = None) -> "Matrix":
         """Clamp every element to ``[min, max]``.
 
         The first argument is the lower bound and the second the upper
@@ -671,14 +824,164 @@ class Matrix:
 
         :param min: Lower clipping bound, or ``None`` for no lower bound.
         :param max: Upper clipping bound, or ``None`` for no upper bound.
-        :return: A new clipped :class:`Matrix`.
-        :raises ValueError: if both *min* and *max* are ``None``.
+        :param in_place: When ``True``, clamp ``self`` and return it.
+        :param out: A same-shape :class:`Matrix` to write the result into
+            (allocation-free); returned in place of a fresh matrix. Mutually
+            exclusive with ``in_place``.
+        :return: A new clipped :class:`Matrix`, or ``self``/``out`` when
+            ``in_place``/``out`` is used.
+        :raises ValueError: if both *min* and *max* are ``None``, or if
+            ``in_place`` and ``out`` are both given.
         :raises AssertionError: if both bounds are given and *max* < *min*.
-        :raises TypeError: if a given bound is not a real number.
+        :raises TypeError: if a given bound is not a real number, or if
+            *out* is not a :class:`Matrix`.
+        """
+
+    def bin(self, bins: int, *,
+            bounds: Optional[tuple[float, float]] = None,
+            right: bool = False, in_place: bool = False,
+            out: Optional["Matrix"] = None) -> "Matrix":
+        """Map each element to its equal-width bin index over a range.
+
+        The range is split into *bins* equal-width intervals and each element
+        is replaced by the integer index (stored as a ``float``) of the
+        interval it falls in. By default the range is taken from the matrix's
+        own elements (both bounds computed ignoring ``NaN``); pass *bounds* to
+        fix it and skip the min/max scan.
+
+        :param bins: Number of equal-width bins; must be ``>= 1``.
+        :param bounds: An optional ``(min, max)`` tuple fixing the value
+            range. When given, the ``O(size)`` data scan is skipped and a
+            value outside the range clamps into the first or last bin. When
+            ``None`` (the default), the range is the matrix's own
+            ``(min, max)``.
+        :param right: When ``False`` (default), a value on an interior
+            boundary falls into the upper bin; when ``True``, into the lower
+            bin. A value equal to ``max`` always lands in the last bin
+            (index ``bins - 1``).
+        :param in_place: When ``True``, bin ``self`` and return it.
+        :param out: A same-shape :class:`Matrix` to write the result into
+            (allocation-free); returned in place of a fresh matrix. Mutually
+            exclusive with ``in_place``.
+        :return: A new :class:`Matrix` of bin indices, or ``self``/``out``
+            when ``in_place``/``out`` is used.
+        :raises ValueError: if *bins* < 1, if *bounds* is not a length-2
+            ``(min, max)`` pair of finite numbers with ``max >= min``, or if
+            ``in_place`` and ``out`` are both given.
+        :raises TypeError: if a *bounds* value is not a real number, or if
+            *out* is not a :class:`Matrix`.
+
+        .. note::
+           A ``NaN`` element maps to ``-1`` (the invalid-index sentinel). A
+           degenerate range (``max == min``) sends every element to bin 0.
+           Because the equal-width edges are implicit, boundary placement may
+           differ by at most one bin from :meth:`digitize` fed edges derived
+           from the same range.
+        """
+
+    def digitize(self, edges: Union["Matrix", Sequence[float]], *,
+                 right: bool = False, in_place: bool = False,
+                 out: Optional["Matrix"] = None) -> "Matrix":
+        """Map each element to the index of the edge interval it falls in.
+
+        Mirrors :func:`numpy.digitize`. Each element is replaced by the
+        index (stored as a ``float``) of the bin bounded by *edges*.
+
+        :param edges: A strictly increasing vector of interior boundaries,
+            given as a :class:`Matrix` vector (1 x *n* or *n* x 1) or any
+            coercible sequence of numbers.
+        :param right: When ``False`` (default), the index is the count of
+            edges ``<=`` the value (bin ``i`` means
+            ``edges[i-1] <= value < edges[i]``); when ``True``, the count of
+            edges ``<`` the value (``edges[i-1] < value <= edges[i]``).
+            Indices span ``[0, len(edges)]``.
+        :param in_place: When ``True``, digitize ``self`` and return it.
+        :param out: A same-shape :class:`Matrix` to write the result into
+            (allocation-free); returned in place of a fresh matrix. Mutually
+            exclusive with ``in_place``.
+        :return: A new :class:`Matrix` of bin indices, or ``self``/``out``
+            when ``in_place``/``out`` is used.
+        :raises ValueError: if *edges* is not a vector, is empty, is not
+            strictly increasing or contains ``NaN``, or if ``in_place`` and
+            ``out`` are both given.
+        :raises TypeError: if *out* is not a :class:`Matrix`.
+
+        .. note::
+           A ``NaN`` element maps to ``-1`` (the invalid-index sentinel).
         """
 
     def copy(self) -> "Matrix":
         """Return a deep copy of this matrix."""
+
+    def values(self) -> Iterator[float]:
+        """Yield every element as a ``float`` in row-major order.
+
+        Lazy: one ``float`` is boxed per step, so streaming a large
+        matrix never materialises an intermediate list.  The current
+        interpreter must own the matrix for the duration of iteration.
+        """
+
+    def row_view(self, row: int,
+                 columns: Optional[Union[int, slice]] = None, *,
+                 read_only: bool = False) -> "MatrixView":
+        """Return a 1-D view onto a single row (no copy).
+
+        The view **aliases** this matrix's storage: reading or writing an
+        element (``rv[i]``, ``rv[i] = x``, ``rv[:] = ...``) touches the
+        underlying matrix directly. *columns* selects a sub-span of the row —
+        an ``int`` (a single cell), a ``slice`` (including non-unit and
+        negative steps), or ``None`` (the whole row). The view pins the whole
+        backing buffer alive and cannot be pickled or sent across
+        interpreters; call :meth:`MatrixView.copy` to detach an owned
+        :class:`Matrix`.
+
+        :param row: The row index (negative counts from the end).
+        :param columns: A column selector, or ``None`` for the whole row.
+        :param read_only: When ``True``, the view — and any view derived from
+            it via ``.T`` or slicing — rejects writes with ``TypeError``.
+        :return: A :class:`MatrixView` aliasing the selected row.
+        """
+
+    def column_view(self, column: int,
+                    rows: Optional[Union[int, slice]] = None, *,
+                    read_only: bool = False) -> "MatrixView":
+        """Return a 1-D view onto a single column (no copy).
+
+        The column-oriented twin of :meth:`row_view`; see it for the aliasing,
+        whole-buffer-pin, and not-shippable semantics. *rows* selects a
+        sub-span of the column.
+
+        :param column: The column index (negative counts from the end).
+        :param rows: A row selector, or ``None`` for the whole column.
+        :param read_only: When ``True``, the view (and any view derived from
+            it) rejects writes with ``TypeError``.
+        :return: A :class:`MatrixView` aliasing the selected column.
+        """
+
+    def row_views(self, *,
+                  read_only: bool = False) -> Iterator["MatrixView"]:
+        """Yield a :class:`MatrixView` over each row in turn.
+
+        Each yielded view is a distinct object aliasing this matrix's
+        storage (a ``1 x N`` row view per row). A cleaner spelling of
+        ``for i in range(m.rows): m.row_view(i)``. The current interpreter
+        must own the matrix for the duration of iteration.
+
+        :param read_only: When ``True``, every yielded view is immutable
+            (writes raise ``TypeError``) — a convenient way to iterate a
+            matrix's rows without risking accidental mutation.
+        """
+
+    def column_views(self, *,
+                     read_only: bool = False) -> Iterator["MatrixView"]:
+        """Yield a :class:`MatrixView` over each column in turn.
+
+        The column-oriented twin of :meth:`row_views`; each yielded view is a
+        distinct ``M x 1`` column view aliasing this matrix's storage.
+
+        :param read_only: When ``True``, every yielded view is immutable
+            (writes raise ``TypeError``).
+        """
 
     def __reduce__(self) -> tuple:
         """Support pickling and :func:`copy.deepcopy`.
@@ -688,7 +991,8 @@ class Matrix:
         object overhead. The current interpreter must own the matrix.
         """
 
-    def take(self, indices: Union[list[int], tuple[int]], axis=0) -> "Matrix":
+    def take(self, indices: Union[list[int], tuple[int]], axis=0, *,
+             out: Optional["Matrix"] = None) -> "Matrix":
         """Return a new matrix containing only the selected rows or columns.
 
         *indices* is a 1-D list or tuple of ints. Negative indices count
@@ -699,10 +1003,19 @@ class Matrix:
         :param indices: The row or column indices to take. Must be a
             non-empty list or tuple of ints.
         :param axis: ``0`` to take rows, ``1`` to take columns.
+        :param out: A pre-allocated :class:`Matrix` of the selection shape
+            (``len(indices)`` rows by this matrix's columns for ``axis=0``;
+            this matrix's rows by ``len(indices)`` columns for ``axis=1``)
+            to write the result into and return, avoiding a fresh
+            allocation. All indices are validated before any write, so a
+            rejected call leaves *out* untouched. *out* must not alias
+            ``self``.
         :raises IndexError: if an index is out of range, or if *indices*
             is empty.
         :raises KeyError: if *axis* is not ``0`` or ``1``.
-        :raises TypeError: if an index is not an int.
+        :raises TypeError: if an index is not an int, or if *out* is not a
+            :class:`Matrix`.
+        :raises ValueError: if *out* has the wrong shape or aliases ``self``.
         :raises OverflowError: if an index exceeds the platform word size.
         """
 
@@ -746,6 +1059,157 @@ class Matrix:
         :raises TypeError: if *value* is neither a real number nor a matrix,
             or if an index is not an int.
         :raises OverflowError: if an index exceeds the platform word size.
+        """
+
+    def take_along_axis(self, indices: Union[list[int], tuple[int]],
+                        axis=0, *,
+                        out: Optional["Matrix"] = None) -> "Matrix":
+        """Gather one element per row or column along an axis.
+
+        The ``np.take_along_axis`` counterpart of :meth:`take` (which
+        selects whole rows or columns). With ``axis=1`` *indices* gives one
+        column index per row, so ``len(indices)`` must equal the row count,
+        and the result is a ``rows x 1`` column vector with
+        ``out[r] == self[r][indices[r]]``. With ``axis=0`` *indices* gives
+        one row index per column, so ``len(indices)`` must equal the column
+        count, and the result is a ``1 x columns`` row vector with
+        ``out[c] == self[indices[c]][c]``.
+
+        This pairs directly with :meth:`argmin`/:meth:`argmax` along the
+        same axis: the index list they return feeds straight back in to
+        gather the reduced values. Negative indices count from the end. A
+        ``bool`` element is treated as the integer ``0``/``1``.
+
+        :param indices: One index per row (``axis=1``) or per column
+            (``axis=0``). Must be a list or tuple of ints whose length
+            matches that axis.
+        :param axis: ``1`` to gather a column index per row, ``0`` to gather
+            a row index per column.
+        :param out: A pre-allocated :class:`Matrix` of the result shape
+            (``1 x columns`` for ``axis=0``; ``rows x 1`` for ``axis=1``)
+            to write the result into and return, avoiding a fresh
+            allocation. All indices are validated before any write, so a
+            rejected call leaves *out* untouched. *out* must not alias
+            ``self``.
+        :raises IndexError: if an index is out of range.
+        :raises ValueError: if ``len(indices)`` does not match the axis, or
+            if *out* has the wrong shape or aliases ``self``.
+        :raises KeyError: if *axis* is not ``0`` or ``1``.
+        :raises TypeError: if an index is not an int, or if *out* is not a
+            :class:`Matrix`.
+        :raises OverflowError: if an index exceeds the platform word size.
+        """
+
+    def put_along_axis(self, indices: Union[list[int], tuple[int]],
+                       value: Union[int, float, "Matrix"], axis=0,
+                       accumulate: bool = False) -> "Matrix":
+        """Assign one element per row or column along an axis in place.
+
+        The write-side counterpart of :meth:`take_along_axis`. With
+        ``axis=1`` element ``i`` lands in ``self[i][indices[i]]`` and
+        ``len(indices)`` must equal the row count; with ``axis=0`` it lands
+        in ``self[indices[i]][i]`` and ``len(indices)`` must equal the column
+        count. *value* may be a scalar (a real number or a ``1x1`` matrix,
+        broadcast over the selection) or a vector matching the selection
+        shape (``rows x 1`` for ``axis=1``, ``1 x columns`` for ``axis=0``).
+
+        All indices and the *value* shape are validated before any element
+        is written, so a rejected call leaves the matrix unchanged. Negative
+        indices count from the end. A ``bool`` index element is treated as
+        the integer ``0``/``1``.
+
+        With ``accumulate=False`` (the default) duplicate indices follow
+        last-write-wins. With ``accumulate=True`` the values are *added*
+        into the selection, so duplicate indices fold additively
+        (scatter-add).
+
+        :param indices: One index per row (``axis=1``) or per column
+            (``axis=0``). Must be a list or tuple of ints whose length
+            matches that axis.
+        :param value: The scalar or vector to assign into the selection.
+        :param axis: ``1`` to index a column per row, ``0`` to index a row
+            per column.
+        :param accumulate: When ``True``, add into the selection instead of
+            overwriting, so duplicate indices accumulate.
+        :return: ``self`` (to allow chaining).
+        :raises IndexError: if an index is out of range.
+        :raises ValueError: if ``len(indices)`` does not match the axis, or
+            if a matrix *value* shape does not match the selection shape.
+        :raises KeyError: if *axis* is not ``0`` or ``1``.
+        :raises TypeError: if *value* is neither a real number nor a matrix,
+            or if an index is not an int.
+        :raises OverflowError: if an index exceeds the platform word size.
+        """
+
+    def repeat_interleave(self, repeats: int, axis=None) -> "Matrix":
+        """Repeat each element, row, or column consecutively.
+
+        Interleaved like ``np.repeat`` / ``torch.repeat_interleave`` (not
+        tiled): ``[a, b]`` with ``repeats=2`` becomes ``[a, a, b, b]``. With
+        ``axis=0`` each row is repeated into a ``(rows*repeats) x columns``
+        matrix; with ``axis=1`` each column is repeated into
+        ``rows x (columns*repeats)``; with ``axis=None`` (the default) the
+        row-major buffer is flattened to a ``1 x (size*repeats)`` row vector.
+
+        :param repeats: The number of consecutive copies of each element,
+            row, or column. Must be a positive integer.
+        :param axis: ``0`` to repeat rows, ``1`` to repeat columns, or
+            ``None`` to flatten and repeat each element.
+        :return: A new matrix; the receiver is unchanged.
+        :raises ValueError: if *repeats* is not positive, or if *axis* is not
+            ``-2``, ``-1``, ``0``, ``1``, or ``None``.
+        :raises OverflowError: if the result would exceed the platform word
+            size.
+        """
+
+    @overload
+    def topk(self, k: int, axis: Optional[int] = None, largest: bool = True,
+             where: Optional["Matrix"] = None,
+             as_matrix: Literal[False] = False
+             ) -> tuple["Matrix", Union[list[int], list[list[int]]]]: ...
+
+    @overload
+    def topk(self, k: int, axis: Optional[int] = None, largest: bool = True,
+             where: Optional["Matrix"] = None, *,
+             as_matrix: Literal[True]
+             ) -> tuple["Matrix", "Matrix"]: ...
+
+    def topk(self, k: int, axis: Optional[int] = None, largest: bool = True,
+             where: Optional["Matrix"] = None, as_matrix: bool = False
+             ) -> tuple["Matrix", Union[list[int], list[list[int]], "Matrix"]]:
+        """The *k* extreme elements per reduction group, in sorted order.
+
+        Returns a ``(values, indices)`` tuple. ``largest=True`` (the default)
+        selects the *k* greatest in descending order; ``largest=False``
+        selects the *k* smallest in ascending order. Ties keep the first
+        occurrence (NumPy tie-break) and any NaN sorts last.
+
+        :param k: The number of elements to select per group. Must be a
+            positive integer no larger than the reduced axis length (every
+            cell counts, masked or not).
+        :param axis: With ``None`` (the default) the whole row-major buffer
+            is one group and *values* is a ``1 x k`` row vector. With ``0``
+            each column is reduced down the rows and *values* is
+            ``k x columns``. With ``1`` each row is reduced across the
+            columns and *values* is ``rows x k``.
+        :param largest: Select the largest *k* (descending) when ``True``,
+            else the smallest *k* (ascending).
+        :param where: Optional same-shape mask matrix. An element is
+            considered only where its mask cell is non-zero (NaN counts as
+            included). A group with fewer than *k* included elements fills its
+            leading slots and pads the rest with ``NaN`` values and ``-1``
+            indices.
+        :param as_matrix: Controls the *indices* form. With ``False`` (the
+            default) *indices* is Python ints: a flat ``list[int]`` for
+            ``axis=None``, or a list of *columns*/*rows* lists (each *k*
+            indices) for ``axis=0``/``axis=1``. With ``True`` *indices* is
+            instead a :class:`Matrix` of the same shape as *values*, each cell
+            the source index (as a ``float``) of the value beside it, and the
+            ``-1`` pad becomes ``-1.0``.
+        :return: A ``(values, indices)`` tuple as described above.
+        :raises ValueError: if *k* is not positive, exceeds the reduced axis
+            length, or if *axis* is not ``-2``, ``-1``, ``0``, ``1``, or
+            ``None``.
         """
 
     def __add__(self, other: Union["Matrix", int, float]) -> "Matrix":
@@ -792,6 +1256,12 @@ class Matrix:
         the end; duplicates repeat the row or column; an out-of-range index
         raises :class:`IndexError` and an empty list raises
         :class:`IndexError`.
+
+        A result collapses to a Python ``float`` only when every selector is
+        an integer and the selection is a single cell. A slice anywhere in
+        the key keeps the result a :class:`Matrix`, even when it is 1x1: so
+        ``m[0:1, 0:1]``, ``m[i, 0:1]``, and ``m[0:1, j]`` all return a 1x1
+        :class:`Matrix`, while ``m[i, j]`` returns a ``float``.
 
         Column gather requires the bare ``:`` row selector: ``m[0:R, [c]]``
         (a full *range* rather than ``:``) raises
@@ -947,7 +1417,8 @@ class Matrix:
     def where(cls, mask: "Matrix",
               a: Union["Matrix", int, float, Sequence[Union[int, float]]],
               b: Union["Matrix", int, float,
-                       Sequence[Union[int, float]]]) -> "Matrix":
+                       Sequence[Union[int, float]]], *,
+              out: Optional["Matrix"] = None) -> "Matrix":
         """Select element-wise from *a* or *b* on a truthy mask.
 
         Returns a fresh matrix taking *a* where the corresponding *mask*
@@ -960,6 +1431,9 @@ class Matrix:
             *mask*'s shape.
         :param b: A scalar (including ``bool``), a list/tuple of numbers, or
             a :class:`Matrix` matching *mask*'s shape.
+        :param out: A same-shape :class:`Matrix` to write the result into
+            (allocation-free); returned in place of a fresh matrix. May alias
+            *mask*, *a*, or *b*.
         :return: A new :class:`Matrix` with *mask*'s shape.
         :raises TypeError: if *a* or *b* is neither a matrix, a scalar, nor
             a list/tuple of numbers, or is a list/tuple holding a non-number.
@@ -983,6 +1457,15 @@ class Matrix:
 
         :param size: A ``(rows, columns)`` tuple specifying the shape.
         :return: A new :class:`Matrix` with every element set to ``1.0``.
+        """
+
+    @classmethod
+    def full(cls, size: tuple[int, int], value: float) -> "Matrix":
+        """Create a matrix filled with a constant value.
+
+        :param size: A ``(rows, columns)`` tuple specifying the shape.
+        :param value: The value every element is set to.
+        :return: A new :class:`Matrix` with every element set to ``value``.
         """
 
     @classmethod
@@ -1014,11 +1497,10 @@ class Matrix:
         :param value: The seed value.
 
         .. note::
-           The generator is the process-global C library PRNG shared by
-           every sub-interpreter, so a seed only makes subsequent draws
-           reproducible when random generation stays on a single thread;
-           concurrent draws interleave on the shared state.  The sequence
-           is also not portable across platforms.
+           Each interpreter owns an independent splitmix64 stream, so a
+           seed makes that interpreter's subsequent draws reproducible;
+           parallel workers seed their own streams independently.  The
+           sequence is not portable across platforms.
         """
 
     @classmethod
@@ -1041,6 +1523,199 @@ class Matrix:
             ``1`` to concatenate horizontally (stack columns).
         :return: A new :class:`Matrix` containing the concatenated data.
         """
+
+    @classmethod
+    def from_view(cls, view: "MatrixView") -> "Matrix":
+        """Materialise a :class:`MatrixView` into a new owned :class:`Matrix`.
+
+        Equivalent to :meth:`MatrixView.copy`, in the constructor-family
+        spelling next to :meth:`zeros` / :meth:`ones` / :meth:`vector`. The
+        result shares no storage with the view's base.
+
+        :param view: The :class:`MatrixView` to copy.
+        :return: A new :class:`Matrix` holding the view's elements.
+        :raises TypeError: if *view* is not a :class:`MatrixView`.
+        """
+
+
+class MatrixView:
+    """A read/write, 1-D window onto a single row or column of a :class:`Matrix`.
+
+    A view **aliases** its source matrix's storage rather than copying it:
+    reading an element reads the matrix, and writing one (``v[i] = x``,
+    ``v[:] = scalar``, ``v[:] = sequence``) writes straight through to the
+    matrix. A view **pins the whole backing buffer** alive for its lifetime and
+    is **not shippable** — it cannot be pickled or sent across interpreters;
+    call :meth:`copy` to detach an independent, shippable :class:`Matrix`.
+
+    Construct a view via :meth:`Matrix.row_view`, :meth:`Matrix.column_view`,
+    or the ``m.view[...]`` accessor; direct construction raises
+    :class:`TypeError`. Arithmetic (``+``, ``-``, ``*``, ``/``, ``@``, unary
+    ``-``, ``abs()``) materialises the view and returns a fresh owned
+    :class:`Matrix`; augmented ``v += x`` therefore **rebinds** the name to a
+    new :class:`Matrix` and does not write through. Every value access requires
+    the current interpreter to own the source matrix.
+    """
+
+    @property
+    def rows(self) -> int:
+        """The row count (``1`` for a row view, else the element count)."""
+
+    @property
+    def columns(self) -> int:
+        """The column count (``1`` for a column view, else the element count)."""
+
+    @property
+    def size(self) -> int:
+        """The number of elements in the view."""
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        """The ``(rows, columns)`` shape (``1 x N`` row or ``N x 1`` column)."""
+
+    @property
+    def is_row(self) -> bool:
+        """``True`` for a row view, ``False`` for a column view."""
+
+    @property
+    def read_only(self) -> bool:
+        """``True`` if writes through this view raise ``TypeError``.
+
+        Set at construction via the ``read_only=`` flag on
+        :meth:`Matrix.row_view` / :meth:`Matrix.column_view` /
+        :meth:`Matrix.row_views` / :meth:`Matrix.column_views`, and inherited
+        by views derived through ``.T`` or slicing.
+        """
+
+    @property
+    def T(self) -> "MatrixView":
+        """A free (no-copy) transposed view: same storage, flipped orientation."""
+
+    @property
+    def x(self) -> float:
+        """The first view element; writes through to the source matrix."""
+
+    @x.setter
+    def x(self, value):
+        """Set the first view element (writes through)."""
+
+    @property
+    def y(self) -> float:
+        """The second view element; writes through (``IndexError`` if absent)."""
+
+    @y.setter
+    def y(self, value):
+        """Set the second view element (writes through)."""
+
+    @property
+    def z(self) -> float:
+        """The third view element; writes through (``IndexError`` if absent)."""
+
+    @z.setter
+    def z(self, value):
+        """Set the third view element (writes through)."""
+
+    @property
+    def w(self) -> float:
+        """The fourth view element; writes through (``IndexError`` if absent)."""
+
+    @w.setter
+    def w(self, value):
+        """Set the fourth view element (writes through)."""
+
+    def __len__(self) -> int:
+        """Return the number of elements in the view."""
+
+    def __getitem__(self, key: Union[int, slice]
+                    ) -> Union[float, "MatrixView"]:
+        """Read an element (``int`` key) or a sub-view (``slice`` key).
+
+        A sub-view aliases the same storage; slices support non-unit and
+        negative steps. A tuple key raises :class:`TypeError` (a view is 1-D).
+        """
+
+    def __setitem__(self, key: Union[int, slice],
+                    value: Union[int, float, "Matrix", "MatrixView",
+                                 Sequence[Union[int, float]]]):
+        """Write through to the source matrix.
+
+        An ``int`` key assigns a single scalar. A ``slice`` key assigns a
+        scalar (broadcast to every selected element) or a sequence /
+        :class:`Matrix` / :class:`MatrixView` whose element **count** matches
+        the slice length (matching is length-only — a view is 1-D, so RHS
+        orientation is irrelevant).
+
+        :raises IndexError: if an ``int`` key is out of range.
+        :raises ValueError: if a sequence RHS length differs from the slice.
+        :raises TypeError: on a tuple key, on ``del v[i]`` (a view cannot
+            resize), or on a non-numeric scalar RHS.
+        """
+
+    def values(self) -> Iterator[float]:
+        """Yield every element as a ``float`` in view order (lazy, guarded)."""
+
+    def __iter__(self) -> Iterator[float]:
+        """Iterate the view's elements as ``float`` s.
+
+        A view is 1-D, so ``for x in view`` yields scalars (like iterating a
+        1-D array), exactly equivalent to :meth:`values`.
+        """
+
+    def copy(self) -> "Matrix":
+        """Return an independent owned :class:`Matrix` of the view's elements.
+
+        The escape hatch for shipping: the result shares no storage with the
+        source, so it can be pickled, sent, or placed in a :class:`Cown`.
+        """
+
+    def __add__(self, other: Union["Matrix", "MatrixView", int, float,
+                                   Sequence[Union[int, float]]]) -> "Matrix":
+        """Element-wise addition; returns a fresh owned :class:`Matrix`."""
+
+    def __radd__(self, other) -> "Matrix":
+        """Reflected element-wise addition."""
+
+    def __sub__(self, other) -> "Matrix":
+        """Element-wise subtraction; returns a fresh owned :class:`Matrix`."""
+
+    def __rsub__(self, other) -> "Matrix":
+        """Reflected element-wise subtraction."""
+
+    def __mul__(self, other) -> "Matrix":
+        """Element-wise multiplication; returns a fresh owned :class:`Matrix`."""
+
+    def __rmul__(self, other) -> "Matrix":
+        """Reflected element-wise multiplication."""
+
+    def __truediv__(self, other) -> "Matrix":
+        """Element-wise division; returns a fresh owned :class:`Matrix`."""
+
+    def __rtruediv__(self, other) -> "Matrix":
+        """Reflected element-wise division."""
+
+    def __matmul__(self, other) -> "Matrix":
+        """Matrix multiplication; returns a fresh owned :class:`Matrix`."""
+
+    def __rmatmul__(self, other) -> "Matrix":
+        """Reflected matrix multiplication."""
+
+    def __neg__(self) -> "Matrix":
+        """Element-wise negation (``-v``); returns a fresh :class:`Matrix`."""
+
+    def __abs__(self) -> "Matrix":
+        """Element-wise absolute value (``abs(v)``); returns a :class:`Matrix`."""
+
+
+class MatrixViewIndexer:
+    """Private accessor returned by :attr:`Matrix.view` for ``m.view[...]``.
+
+    Not part of the public API — obtained only via :attr:`Matrix.view`. Its
+    ``__getitem__`` builds a :class:`MatrixView` from native subscript grammar
+    (``m.view[i]``, ``m.view[i, cols]``, ``m.view[rows, j]``).
+    """
+
+    def __getitem__(self, key: Union[int, tuple]) -> "MatrixView":
+        """Build a row/column :class:`MatrixView` from ``m.view[...]`` grammar."""
 
 
 T = TypeVar("T")
