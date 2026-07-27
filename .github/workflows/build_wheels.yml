@@ -20,14 +20,14 @@ jobs:
         python: [cp310, cp311, cp312, cp313, cp314]
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Git config for fetching pull requests
         run: |
           git config --global --add remote.origin.fetch +refs/pull/*/merge:refs/remotes/pull/*
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@294735312765b09d24a2fbec22660ce817587d55  # v4.1.0
+        uses: pypa/cibuildwheel@4726cd35bb13f7bde50cf2761f2499ac7b3aa32c  # v4.1.1
         env:
           CIBW_BUILD: ${{ matrix.python }}-win*
           CIBW_TEST_REQUIRES: "pytest setuptools wheel"
@@ -61,9 +61,9 @@ jobs:
         python: [cp310, cp311, cp312, cp313, cp314]
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         id: python
         with:
           python-version: "3.10 - 3.14"
@@ -78,7 +78,7 @@ jobs:
           export PATH=$(python3 -m site --user-base)/bin:$PATH
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@294735312765b09d24a2fbec22660ce817587d55  # v4.1.0
+        uses: pypa/cibuildwheel@4726cd35bb13f7bde50cf2761f2499ac7b3aa32c  # v4.1.1
         env:
           CIBW_BUILD: ${{ matrix.python }}-macosx*
           CIBW_ARCHS_MACOS: arm64
@@ -112,9 +112,9 @@ jobs:
         python: [cp310, cp311, cp312, cp313, cp314]
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         id: python
         with:
           python-version: "3.10 - 3.14"
@@ -129,7 +129,7 @@ jobs:
           export PATH=$(python3 -m site --user-base)/bin:$PATH
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@294735312765b09d24a2fbec22660ce817587d55  # v4.1.0
+        uses: pypa/cibuildwheel@4726cd35bb13f7bde50cf2761f2499ac7b3aa32c  # v4.1.1
         env:
           CIBW_BUILD: ${{ matrix.python }}-macosx*
           CIBW_ARCHS_MACOS: x86_64
@@ -164,14 +164,14 @@ jobs:
         python: [cp310, cp311, cp312, cp313, cp314]
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Git config for fetching pull requests
         run: |
           git config --global --add remote.origin.fetch +refs/pull/*/merge:refs/remotes/pull/*
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@294735312765b09d24a2fbec22660ce817587d55  # v4.1.0
+        uses: pypa/cibuildwheel@4726cd35bb13f7bde50cf2761f2499ac7b3aa32c  # v4.1.1
         env:
           CIBW_BUILD: ${{ matrix.python }}-manylinux*
           CIBW_BEFORE_ALL: yum makecache
@@ -206,14 +206,14 @@ jobs:
         python: [cp310, cp311, cp312, cp313, cp314]
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Git config for fetching pull requests
         run: |
           git config --global --add remote.origin.fetch +refs/pull/*/merge:refs/remotes/pull/*
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@294735312765b09d24a2fbec22660ce817587d55  # v4.1.0
+        uses: pypa/cibuildwheel@4726cd35bb13f7bde50cf2761f2499ac7b3aa32c  # v4.1.1
         env:
           CIBW_BUILD: ${{ matrix.python }}-musllinux*
           CIBW_TEST_REQUIRES: "pytest setuptools wheel"
@@ -265,11 +265,11 @@ jobs:
       # still cannot let a RECORD-mismatched wheel reach the upload
       # artifact.
       - name: Use Python 3.14
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.14"
       - name: Checkout (for scripts/)
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           path: source
       - name: Validate every wheel against PyPI's checks
@@ -336,10 +336,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Use Python 3.14
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.14"
 
