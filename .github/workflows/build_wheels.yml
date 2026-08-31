@@ -27,7 +27,7 @@ jobs:
           git config --global --add remote.origin.fetch +refs/pull/*/merge:refs/remotes/pull/*
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@4726cd35bb13f7bde50cf2761f2499ac7b3aa32c  # v4.1.1
+        uses: pypa/cibuildwheel@1828c10ab37f080699c7b81cea34097c684a7074  # v4.2.0
         env:
           CIBW_BUILD: ${{ matrix.python }}-win*
           CIBW_TEST_REQUIRES: "pytest setuptools wheel"
@@ -78,7 +78,7 @@ jobs:
           export PATH=$(python3 -m site --user-base)/bin:$PATH
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@4726cd35bb13f7bde50cf2761f2499ac7b3aa32c  # v4.1.1
+        uses: pypa/cibuildwheel@1828c10ab37f080699c7b81cea34097c684a7074  # v4.2.0
         env:
           CIBW_BUILD: ${{ matrix.python }}-macosx*
           CIBW_ARCHS_MACOS: arm64
@@ -129,7 +129,7 @@ jobs:
           export PATH=$(python3 -m site --user-base)/bin:$PATH
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@4726cd35bb13f7bde50cf2761f2499ac7b3aa32c  # v4.1.1
+        uses: pypa/cibuildwheel@1828c10ab37f080699c7b81cea34097c684a7074  # v4.2.0
         env:
           CIBW_BUILD: ${{ matrix.python }}-macosx*
           CIBW_ARCHS_MACOS: x86_64
@@ -171,7 +171,7 @@ jobs:
           git config --global --add remote.origin.fetch +refs/pull/*/merge:refs/remotes/pull/*
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@4726cd35bb13f7bde50cf2761f2499ac7b3aa32c  # v4.1.1
+        uses: pypa/cibuildwheel@1828c10ab37f080699c7b81cea34097c684a7074  # v4.2.0
         env:
           CIBW_BUILD: ${{ matrix.python }}-manylinux*
           CIBW_BEFORE_ALL: yum makecache
@@ -213,7 +213,7 @@ jobs:
           git config --global --add remote.origin.fetch +refs/pull/*/merge:refs/remotes/pull/*
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@4726cd35bb13f7bde50cf2761f2499ac7b3aa32c  # v4.1.1
+        uses: pypa/cibuildwheel@1828c10ab37f080699c7b81cea34097c684a7074  # v4.2.0
         env:
           CIBW_BUILD: ${{ matrix.python }}-musllinux*
           CIBW_TEST_REQUIRES: "pytest setuptools wheel"
@@ -366,7 +366,7 @@ jobs:
       # runtime Python deps, so the expected count is 0.
       - name: Download grype
         id: grype
-        uses: anchore/scan-action/download-grype@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2  # v7.4.0
+        uses: anchore/scan-action/download-grype@27805bf3b4e84b4a5c980df22ed233c00390a439  # v7.4.2
 
       - name: Scan every SBOM with grype
         # Route the grype binary path through ``env:`` rather than
