@@ -27,7 +27,7 @@ jobs:
           git config --global --add remote.origin.fetch +refs/pull/*/merge:refs/remotes/pull/*
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@4726cd35bb13f7bde50cf2761f2499ac7b3aa32c  # v4.1.1
+        uses: pypa/cibuildwheel@b3395e271a35f73dad77f21802abe9b986dfe299  # v4.3.1
         env:
           CIBW_BUILD: ${{ matrix.python }}-win*
           CIBW_TEST_REQUIRES: "pytest setuptools wheel"
@@ -49,7 +49,7 @@ jobs:
         with:
           package-dir: ${{github.workspace}}
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: wheels-${{ matrix.python }}-windows
           path: ./wheelhouse/*.whl
@@ -78,7 +78,7 @@ jobs:
           export PATH=$(python3 -m site --user-base)/bin:$PATH
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@4726cd35bb13f7bde50cf2761f2499ac7b3aa32c  # v4.1.1
+        uses: pypa/cibuildwheel@b3395e271a35f73dad77f21802abe9b986dfe299  # v4.3.1
         env:
           CIBW_BUILD: ${{ matrix.python }}-macosx*
           CIBW_ARCHS_MACOS: arm64
@@ -100,7 +100,7 @@ jobs:
         with:
           package-dir: ${{github.workspace}}
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: wheels-${{ matrix.python }}-mac-arm64
           path: ./wheelhouse/*.whl
@@ -129,7 +129,7 @@ jobs:
           export PATH=$(python3 -m site --user-base)/bin:$PATH
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@4726cd35bb13f7bde50cf2761f2499ac7b3aa32c  # v4.1.1
+        uses: pypa/cibuildwheel@b3395e271a35f73dad77f21802abe9b986dfe299  # v4.3.1
         env:
           CIBW_BUILD: ${{ matrix.python }}-macosx*
           CIBW_ARCHS_MACOS: x86_64
@@ -152,7 +152,7 @@ jobs:
         with:
           package-dir: ${{github.workspace}}
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: wheels-${{ matrix.python }}-mac-x86_64
           path: ./wheelhouse/*.whl
@@ -171,7 +171,7 @@ jobs:
           git config --global --add remote.origin.fetch +refs/pull/*/merge:refs/remotes/pull/*
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@4726cd35bb13f7bde50cf2761f2499ac7b3aa32c  # v4.1.1
+        uses: pypa/cibuildwheel@b3395e271a35f73dad77f21802abe9b986dfe299  # v4.3.1
         env:
           CIBW_BUILD: ${{ matrix.python }}-manylinux*
           CIBW_BEFORE_ALL: yum makecache
@@ -193,7 +193,7 @@ jobs:
         with:
           package-dir: ${{github.workspace}}
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: wheels-${{ matrix.python }}-manylinux
           path: ./wheelhouse/*.whl
@@ -213,7 +213,7 @@ jobs:
           git config --global --add remote.origin.fetch +refs/pull/*/merge:refs/remotes/pull/*
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@4726cd35bb13f7bde50cf2761f2499ac7b3aa32c  # v4.1.1
+        uses: pypa/cibuildwheel@b3395e271a35f73dad77f21802abe9b986dfe299  # v4.3.1
         env:
           CIBW_BUILD: ${{ matrix.python }}-musllinux*
           CIBW_TEST_REQUIRES: "pytest setuptools wheel"
@@ -234,7 +234,7 @@ jobs:
         with:
           package-dir: ${{github.workspace}}
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: wheels-${{ matrix.python }}-musllinux
           path: ./wheelhouse/*.whl
@@ -249,7 +249,7 @@ jobs:
       runs-on: ubuntu-latest
       steps:
       - name: Download Wheels
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           path: wheelhouse
           pattern: wheels-*
@@ -275,7 +275,7 @@ jobs:
       - name: Validate every wheel against PyPI's checks
         run: python source/scripts/validate_wheel.py wheelhouse
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: wheels
           path: ./wheelhouse/*
@@ -311,7 +311,7 @@ jobs:
           ls -l sboms
 
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: sboms
           path: ./sboms/*.cdx.json
@@ -344,7 +344,7 @@ jobs:
           python-version: "3.14"
 
       - name: Download SBOMs
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: sboms
           path: sboms
@@ -366,7 +366,7 @@ jobs:
       # runtime Python deps, so the expected count is 0.
       - name: Download grype
         id: grype
-        uses: anchore/scan-action/download-grype@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2  # v7.4.0
+        uses: anchore/scan-action/download-grype@27805bf3b4e84b4a5c980df22ed233c00390a439  # v7.4.2
 
       - name: Scan every SBOM with grype
         # Route the grype binary path through ``env:`` rather than
