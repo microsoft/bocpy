@@ -1657,6 +1657,15 @@ def _canonical_key(code: types.CodeType,
     return digest.hexdigest()[:32]
 
 
+def _behavior_module(func) -> str:
+    """Use the logical module for behaviors created by the main-thread resolver."""
+    if BEHAVIORS is not None and BEHAVIORS.export_module is not None:
+        resolver = BEHAVIORS.export_module
+        if func.__globals__ is resolver._bindings.__dict__:
+            return resolver._modname
+    return func.__module__ if func.__module__ is not None else "__main__"
+
+
 def classify_behavior_origin(func) -> Origin:
     """Classify where ``func`` was defined.
 
@@ -1666,7 +1675,7 @@ def classify_behavior_origin(func) -> Origin:
         :attr:`Origin.MAIN_WITH_SOURCE` for a ``__main__`` behavior with
         a readable source file; :attr:`Origin.INTERACTIVE` otherwise.
     """
-    module = func.__module__
+    module = _behavior_module(func)
     if module is not None and module != "__main__":
         # If the module is already loaded in this interpreter, its
         # globals are available here -- whether that is the real import
@@ -1790,7 +1799,8 @@ def register_behavior(func) -> str:
     yet rendered on the worker).
     """
     orig = func.__code__
-    memo_key = (orig, func.__module__)
+    module_name = _behavior_module(func)
+    memo_key = (orig, module_name)
     key = _CODE_KEY_MEMO.get(memo_key)
     if key is not None:
         return key
@@ -1802,7 +1812,6 @@ def register_behavior(func) -> str:
     # ``registry_register`` (which rejects a non-str module) stay consistent
     # and the worker binds it to the bindings namespace like other
     # source-less behaviors.
-    module_name = func.__module__ if func.__module__ is not None else "__main__"
     # Fold the resolution-target module into the registry key: two
     # byte-identical bodies in different modules resolve their globals
     # against different namespaces, so they must key distinctly or the
