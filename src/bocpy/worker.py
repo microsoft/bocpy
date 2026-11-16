@@ -120,8 +120,7 @@ def cleanup():
             logger.debug("acquiring orphan cowns")
             for cown in orphan_cowns:
                 if cown is not None:
-                    cown.acquire()
-                    cown.disown()
+                    cown._cleanup()
 
         orphan_cowns = None
         _core.recycle()

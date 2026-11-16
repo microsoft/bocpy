@@ -1,9 +1,10 @@
 /// @file boc_terminator.h
-/// @brief Per-instance rundown counters and root lifecycle shared between TUs.
+/// @brief Root and scope rundown counter API shared between TUs.
 ///
 /// The terminator is the C-level barrier that gates `wait()` /
 /// `stop()`. Increment before the schedule call and decrement after
-/// `behavior_release_all` completes.
+/// `behavior_release_all` completes. Each open scope also reserves the
+/// root until its output has been finalized.
 ///
 /// State is NOT per-interpreter: sub-interpreters share each
 /// terminator's counter, mutex, and condvar.
@@ -66,7 +67,7 @@ bool terminator_reset(void);
 bool terminator_activate(void);
 
 /// @brief Read the current counter.
-/// @details Includes all native reservations; absent root returns zero.
+/// @details Includes behavior and scope-lifetime reservations; absent root returns zero.
 int_least64_t terminator_count(void);
 
 /// @brief Broadcast on registered terminator condvars without changing the

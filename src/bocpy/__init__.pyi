@@ -6,6 +6,7 @@ entries in sync with the implementations in :mod:`bocpy.behaviors`,
 :mod:`bocpy._core`, and :mod:`bocpy._math`.
 """
 
+from types import TracebackType
 from typing import (Any, Callable, Generic, Iterator, Literal, Mapping,
                     NamedTuple, Optional, overload, Sequence, TypeVar, Union)
 
@@ -1781,7 +1782,12 @@ class Cown(Generic[T]):
         The cown is acquired for the duration of the read, so call
         :meth:`unwrap` from the caller's thread once the runtime is
         globally quiescent -- after :func:`quiesce` or :func:`wait`, not
-        merely after this cown's own producer.
+        merely after this cown's own producer or a local :class:`Scope`.
+        The global completion count must still be zero and host-access protections
+        must permit the read. A successful :func:`quiesce` alone is not
+        sufficient if a concurrent producer has since scheduled more work.
+        A scope output cown cannot be unwrapped; use ``scope.output_value``
+        after normal scope exit instead.
 
         Calling :meth:`unwrap` while behaviors are still in flight
         raises :class:`RuntimeError`: reading a result before its
@@ -1821,6 +1827,132 @@ class Cown(Generic[T]):
 
     def __repr__(self) -> str:
         """Debug representation."""
+
+
+class _RootScope:
+    """Private type of the root scheduling destination."""
+
+
+class _ScopeHandle(Generic[T]):
+    """Private scheduling-only view of a scope captured by a worker."""
+
+    @property
+    def output_cown(self) -> Cown[T]:
+        """Return the output cown for scheduled access within the scope subtree."""
+
+
+root_scope: _RootScope
+"""Scheduling destination joined globally rather than by a local scope.
+
+Pass as ``scope=root_scope`` to :func:`when` or :func:`whencall`.
+This handle has no context-manager or output interface. Retaining it does
+not prevent global completion or reuse after a runtime restart.
+"""
+
+
+class Scope(_ScopeHandle[T]):
+    """Single-use context manager that joins a local subtree of behaviors.
+
+    Omitted scheduling destinations inherit the active scope. Normal exit
+    joins its work and nested scopes, then transfers the output to
+    :attr:`output_value` without stopping the shared runtime. Work explicitly
+    assigned outside this subtree is not joined.
+
+    Captured behavior exceptions stay on each behavior's own result cown.
+    Output mutations made before a behavior fails are not rolled back.
+    Local joins neither fence noticeboard mutations nor report statistics.
+
+    A captured scope travels to workers as a scheduling-only handle;
+    enter, exit, quiesce, and output-value access belong to the original host
+    thread and interpreter.
+    Entry reserves one unit of the global completion count until output
+    extraction or cleanup and restoration of the previous active scope finish.
+    Global quiescence therefore waits for open scopes, even when locally idle;
+    :meth:`quiesce` observes only this scope's work and permits repeated batches.
+    Blocking nested scopes retain the parent's cowns and require spare
+    workers. Dependencies on those cowns or worker exhaustion can deadlock.
+
+    :param initial: Initial payload of :attr:`output_cown`; defaults to
+        ``None`` when omitted.
+    """
+
+    @overload
+    def __init__(self, initial: T) -> None: ...  # noqa: D107
+
+    @overload
+    def __init__(self: "Scope[None]") -> None: ...  # noqa: D107
+
+    def __enter__(self) -> "Scope[T]":
+        """Activate the scope, starting the shared runtime if necessary.
+
+        :return: This scope.
+        :raises RuntimeError: If the scope has already been entered.
+        """
+
+    def quiesce(self, timeout: Optional[float] = None) -> None:
+        """Observe zero outstanding scoped work without closing the scope.
+
+        Return immediately if the work count is zero; otherwise wait until
+        it next reaches zero. New work may already be active by the time this
+        call returns. The scope remains active, accepts subsequent batches,
+        and does not publish :attr:`output_value` or permit host access to
+        :attr:`output_cown`. No statistics or noticeboard snapshot is taken.
+
+        Only the original entering host may call this method while this
+        scope is its active context. A behavior cannot wait on its own
+        scope or an ancestor that accounts for its work. A host inside a
+        nested scope cannot quiesce an enclosing scope.
+
+        :param timeout: Maximum seconds to wait. ``None`` waits indefinitely;
+            otherwise the value must be finite and nonnegative.
+        :return: ``None`` after observing quiescence.
+        :raises TimeoutError: If no zero is observed before the deadline.
+            The scope remains active and the wait can be retried.
+        :raises ValueError: If ``timeout`` is negative or non-finite.
+        :raises RuntimeError: If called outside the original active host
+            context or when the wait would include the calling behavior.
+        """
+
+    def __exit__(self, exc_type: Optional[type[BaseException]],
+                 exc_value: Optional[BaseException],
+                 traceback: Optional[TracebackType]) -> Literal[False]:
+        """Join scoped work and close the output cown permanently.
+
+        Normal exit transfers the output to :attr:`output_value`, including any
+        partial mutations from behaviors that failed. A host-body exception
+        still joins the work but prevents publication and propagates.
+        Exit or transfer failures propagate with ordinary Python chaining.
+        A pump interruption is deferred until remaining local work drains
+        and the output can close safely; accepted blocking deadlocks can
+        therefore prevent propagation. The previous active scope is
+        restored on exit. This introduces no cancellation or exception
+        grouping and does not alter global wait or pump behavior.
+        """
+
+    @property
+    def output_cown(self) -> Cown[T]:
+        """Return the scope output cown for scheduled exclusive access.
+
+        Only behaviors owned by this scope or its descendants may acquire
+        this cown through :func:`when` or :func:`whencall`. Within those
+        behaviors, use the acquired parameter's ``.value``.
+
+        Direct acquisition, context-manager entry, host-side ``.value``
+        access, and ``unwrap()`` are forbidden. Scheduling before entry
+        or after exit is also forbidden. All raise :class:`RuntimeError`.
+        """
+
+    @property
+    def output_value(self) -> T:
+        """Return the transferred output after normal scope exit.
+
+        This property is read-only; the returned value belongs to the
+        host and may itself be mutable. Unrelated work may still be live.
+
+        :raises RuntimeError: If no output has been published yet.
+        :raises BaseException: The scope's host-body, exit, or transfer
+            failure if the scope failed.
+        """
 
 
 class PinnedCown(Cown[T]):
@@ -2297,19 +2429,34 @@ def wait(timeout: Optional[float] = None, *,
     ``@when`` call (or explicit :func:`start`) will spin up a fresh
     runtime.
 
-    Note that holding on to references to Cown objects such that they
-    are deallocated after wait() is called results in undefined behavior.
+    This is a global join: it includes root-owned work and active local
+    scopes, not just work scheduled outside context managers. Captured
+    behavior exceptions remain on their own result cowns; this function
+    does not aggregate or re-raise them. Retaining a scope handle does not
+    keep the runtime busy.
+
+    Calling from any behavior or an active local scope host body raises
+    :class:`RuntimeError` to prevent self-join.
+
+    If draining outstanding work or open scope lifetime reservations times
+    out, :class:`TimeoutError` propagates and the runtime remains running
+    with admission still open for retry. This also applies to root-only work.
+    ``Behaviors.stop`` follows the same rule, and snapshot flags do not
+    suppress this timeout. Scope exit has no timeout option.
+    Successful shutdown atomically closes admission at global completion
+    count zero. Open scopes retain their reservations through output
+    extraction or cleanup and restoration of the previous active scope.
 
     :param timeout: Maximum number of seconds to wait, or ``None`` to
         wait indefinitely. The timeout bounds only the quiescence and
-        noticeboard-drain phases. A work-drain timeout aborts shutdown;
-        after a successful drain, worker shutdown runs to completion
-        regardless. Other values must be finite and nonnegative.
+        noticeboard-drain phases. Any work-drain timeout aborts shutdown
+        as described above. Once the work drain succeeds, worker shutdown
+        runs to completion regardless. Other values must be finite and nonnegative.
     :type timeout: Optional[float]
     :param stats: If ``True``, capture the per-worker
-        :func:`_core.scheduler_stats` snapshot after observed quiescence,
-        before the per-worker array is freed. Concurrent producers may
-        have admitted newer work by then. This is the only reliable way to read the
+        :func:`_core.scheduler_stats` snapshot at shutdown
+        (after every behavior has run, before the per-worker array
+        is freed). This is the only reliable way to read the
         scheduler counters for the session that just ended --
         calling :func:`_core.scheduler_stats` after :func:`wait`
         returns ``[]`` because the per-worker array has already been
@@ -2339,9 +2486,10 @@ def wait(timeout: Optional[float] = None, *,
         carrying both when both flags are set.
     :rtype: Union[None, list[dict], dict[str, Any], WaitResult]
     :raises ValueError: If ``timeout`` is negative or non-finite.
-    :raises TimeoutError: If outstanding work does not drain before the
-        deadline. Admission and workers remain available for retry.
-    :raises RuntimeError: If called from a behavior, or the noticeboard thread does not exit
+    :raises TimeoutError: If draining work or open scope lifetime reservations
+        times out. The runtime remains running and admission open for retry.
+    :raises RuntimeError: If called from a behavior or an active local
+        scope host body, or if the noticeboard thread does not exit
         before the timeout (or, on a retry call, is still alive).
         The first failure carries the message prefix
         ``"noticeboard thread did not shut down within timeout=..."``;
@@ -2402,29 +2550,34 @@ def quiesce(timeout: Optional[float] = None, *,
             stats: bool = False,
             noticeboard: bool = False
             ) -> Union[None, list[dict], dict[str, Any], "WaitResult"]:
-    """Observe a zero-work transition **without** teardown.
+    """Observe global completion count zero **without** teardown.
 
     Unlike :func:`wait`, this leaves the runtime fully usable:
     workers remain running, the noticeboard thread remains
     registered, and the terminator is **not** closed. Further
     ``@when`` calls work immediately after ``quiesce()`` returns.
 
-    A waiter remembers the completion generation, so a zero transition is
-    observed even if new work arrives before it resumes. An already-zero
-    counter completes immediately. The return does not guarantee that the
-    current work count is still zero; ordinary cown access checks still apply.
-    Calling from a running behavior is rejected to prevent self-join.
+    Return immediately if the global completion count is zero; otherwise wait
+    until it next reaches zero. New work may already be running by the
+    time this call returns. The count includes an ordinary reservation for
+    each open scope until output extraction or cleanup and restoration of
+    its previous active scope finish. Even an idle scope on another host
+    can therefore delay this call or cause a timeout. Use
+    :meth:`Scope.quiesce` inside a scope for a work-only checkpoint.
+    Captured behavior exceptions remain on their own result cowns.
+    Calling from any behavior or an active local scope host body raises
+    :class:`RuntimeError` to prevent self-join.
 
     Typical use is to lift a result out of a long-running parallel
     job at a defined synchronization point — e.g. a parallel search
     that periodically wants to inspect its best-so-far state — and
     then keep working. The flags mirror :func:`wait`:
 
-    - neither flag set: returns ``None`` once quiescence is observed.
+    - neither flag set: returns ``None`` after observing quiescence.
     - ``stats=True`` only: returns the per-worker scheduler-stats
       snapshot as ``list[dict]`` (same shape as :func:`wait`).
     - ``noticeboard=True`` only: returns a plain ``dict[str, Any]``
-      with the noticeboard contents sampled after the quiescence observation.
+      with noticeboard contents sampled after observing quiescence.
     - both flags set: returns :class:`WaitResult`.
 
     The noticeboard snapshot is captured by cycling the dedicated
@@ -2438,17 +2591,23 @@ def quiesce(timeout: Optional[float] = None, *,
 
     Single-caller: like :func:`wait`, ``quiesce`` assumes one
     thread at a time on the primary interpreter. Concurrent
-    ``@when`` calls before the observed zero transition contribute to the
-    wait; calls after it need not finish before return.
-    Concurrent ``notice_write`` calls have undefined
-    ordering with respect to the returned snapshot.
+    ``@when`` calls and open scopes on secondary threads can keep the global count
+    positive, but work admitted after an observed zero need not complete
+    before return. Snapshots are taken afterward, not atomically with
+    that zero; statistics need not be stable under concurrent producers.
+    Concurrent ``notice_write`` calls have undefined ordering with respect
+    to the returned snapshot. This event does not by itself authorize
+    :meth:`Cown.unwrap`, which requires current global completion count zero and the
+    usual host-access protections. Scope output remains unpublished
+    until scope exit.
 
     :param timeout: Maximum seconds to wait. ``None`` means wait
-        forever. The same deadline bounds both the terminator wait
+        forever; otherwise the value must be finite and nonnegative.
+        The same deadline bounds both the terminator wait
         and the noticeboard-cycle join.
     :type timeout: Optional[float]
     :param stats: If ``True``, capture per-worker scheduler stats
-        AFTER quiescence so the counts are stable.
+        after observing quiescence.
     :type stats: bool
     :param noticeboard: If ``True``, capture a noticeboard snapshot
         via the thread-cycle protocol described above.
@@ -2458,25 +2617,28 @@ def quiesce(timeout: Optional[float] = None, *,
         only ``noticeboard=True``; a :class:`WaitResult` when both
         flags are set.
     :rtype: Union[None, list[dict], dict[str, Any], WaitResult]
-    :raises ValueError: If ``timeout`` is negative or non-finite.
     :raises TimeoutError: If quiescence is not reached within
         ``timeout`` (or if the noticeboard-cycle join times out).
-        Unlike :func:`wait`, ``quiesce`` propagates this rather
-        than swallowing it -- callers who need silent best-effort
-        behavior should wrap the call.
-    :raises RuntimeError: If called from a non-primary interpreter
-        while pinned cowns are live (same constraint as :func:`wait`).
+        Work-drain timeouts leave the runtime running and admission open,
+        as with :func:`wait`.
+    :raises ValueError: If ``timeout`` is negative or non-finite.
+    :raises RuntimeError: If called from a behavior or an active local
+        scope host body, or from a non-primary interpreter while pinned
+        cowns are live (same constraints as :func:`wait`).
     """
 
 
-def when(*cowns):
+def when(*cowns: Union[Cown[Any], list[Cown[Any]], tuple[Cown[Any], ...]],
+         scope: Union[_ScopeHandle[Any], _RootScope] = ...
+         ) -> Callable[[Callable[..., T]], Cown[T]]:
     """Decorator to schedule a function as a behavior using given cowns.
 
     This decorator takes a list of zero or more cown objects, which will be
     passed in the order in which they were provided to the decorated function.
     The function is registered at decoration time and run as a behavior once
     all the cowns are available (i.e., not acquired by other behaviors).
-    Behaviors are scheduled such that deadlock will not occur.
+    Cown acquisition is deadlock-free; blocking inside a behavior (including
+    joining a nested scope) can still introduce cyclic waits.
 
     The function itself will be replaced by a :class:`Cown` which will hold
     the result of executing the behavior.  This :class:`Cown` can be used for
@@ -2494,29 +2656,39 @@ def when(*cowns):
     loop on workers to drive coroutines, and a behavior runs to completion as
     a plain function.
 
+    The keyword-only ``scope`` selects the behavior's owner, not an
+    additional behavior parameter. If omitted, it inherits the active
+    scope or defaults to :data:`root_scope`. Descendants inherit the
+    selected owner unless they select another scope or enter a nested one.
+
     :param cowns: Zero or more :class:`Cown` objects or ``list[Cown]`` groups
         to acquire before running the decorated function.  Each argument
         becomes one parameter of the decorated function: a single
         :class:`Cown` is passed directly, while a list is delivered as a
         ``list[Cown]``.
-    :type cowns: Union[Cown, list[Cown]]
-    :return: A :class:`Cown` holding the result of the behavior.
+    :type cowns: Union[Cown, list[Cown], tuple[Cown, ...]]
+    :param scope: An active scope handle or :data:`root_scope`.
+        Omit to inherit; explicit ``None`` is not a destination.
+    :return: A decorator that replaces the function with its result cown.
+    :raises RuntimeError: If the destination cannot accept work or a
+        scope output cown does not belong to its subtree.
     """
 
 
-def start(**kwargs):
+def start(worker_count: Optional[int] = None,
+          module: Optional[tuple[str, str]] = None) -> None:
     """Start the bocpy runtime and worker pool.
 
     Spawns the worker sub-interpreters and the dedicated noticeboard
     thread. Scheduling and release run on the caller and worker
     threads themselves — there is no central scheduler thread.
 
-    Idempotent: if the runtime is already up, returns silently. A
+    Idempotent: if the runtime is already up with matching options, returns silently. A
     follow-up :func:`start` from a sibling code path in the same
     process is a no-op rather than an error, which makes "ensure
     the runtime is live before I :func:`notice_write`" usable as a
-    one-liner without try/except scaffolding. Arguments supplied to
-    a short-circuited call are **ignored**; callers who need a
+    one-liner without try/except scaffolding. Conflicting options raise
+    :class:`RuntimeError`; callers who need a
     different ``worker_count`` or ``module`` must :func:`wait` /
     :func:`stop` the existing runtime first.
 
@@ -2527,11 +2699,15 @@ def start(**kwargs):
         export for worker import.  If ``None``, the caller's module will
         be used.
     :type module: Optional[tuple[str, str]]
-    :raises RuntimeError: If called from a non-primary interpreter.
+    :raises RuntimeError: If called from a non-primary interpreter or with
+        options that conflict with an already running runtime.
     """
 
 
-def whencall(func: Callable[..., Any], args: list[Union[Cown, list[Cown]]], captures: list[Any]) -> Cown:
+def whencall(func: Callable[..., T],
+             args: list[Union[Cown[Any], list[Cown[Any]], tuple[Cown[Any], ...]]],
+             captures: list[Any], *,
+             scope: Union[_ScopeHandle[Any], _RootScope] = ...) -> Cown[T]:
     """Schedule ``func`` as a behavior over ``args`` with ``captures``.
 
     ``whencall`` is the explicit escape hatch for scheduling a
@@ -2547,9 +2723,15 @@ def whencall(func: Callable[..., Any], args: list[Union[Cown, list[Cown]]], capt
     :type args: list[Union[Cown, list[Cown]]]
     :param captures: Closed-over values to pass to the behavior.
     :type captures: list[Any]
+    :param scope: An active scope handle or :data:`root_scope`. Omit to
+        inherit the active scope, falling back to the root. Explicit
+        ``None`` is invalid. Selection and output-cown ownership follow
+        the same rules as :func:`when`.
     :return: A :class:`Cown` that will hold the behavior's return value.
-    :rtype: Cown
+    :rtype: Cown[T]
     :raises TypeError: If ``func`` is a string (removed thunk-name form).
+    :raises RuntimeError: If the destination cannot accept work or an
+        output cown is outside the destination's scope subtree.
     """
 
 

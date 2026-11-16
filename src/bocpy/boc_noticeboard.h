@@ -95,6 +95,13 @@ void noticeboard_cache_clear_for_behavior(void);
 /// @return 0 on success, -1 on failure (PyErr set).
 int nb_pin_cowns(PyObject *cowns, BOCNativeRef **out_array, int *out_count);
 
+/// @brief Report whether serialization borrows entry-owned native references
+bool nb_pickle_borrowing(void);
+
+/// @brief Retain a deduplicated native reference in the active borrowing context
+/// @return Zero on success, -1 with PyErr on allocation failure
+int nb_pickle_retain(BOCNativeRef ref);
+
 /// @brief Write or overwrite a noticeboard entry.
 /// @details On success, the noticeboard takes ownership of @p xidata
 /// and the @p pins array (and the strong refs the caller pre-INCREFed

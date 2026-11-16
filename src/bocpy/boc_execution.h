@@ -6,16 +6,19 @@
 
 #include "boc_compat.h"
 #include "boc_terminator.h"
+#include "boc_scope.h"
 #include <Python.h>
 
 extern thread_local bool IN_PUMP_BODY;
-extern thread_local bool IN_BEHAVIOR;
+extern thread_local uint64_t CURRENT_EXECUTION;
+extern atomic_int_least64_t NEXT_EXECUTION;
 extern atomic_int_least64_t WAIT_PUMP_POLL_MS;
 
 bool wait_arguments(PyObject *args, PyObject *kwargs, double *end,
                     bool *forever, PyObject **boc_export);
 PyObject *terminator_wait_driver(BOCTerminator *term, bool drain, double end, bool forever,
-                                 PyObject *boc_export, bool pumpable);
+                                 PyObject *boc_export, bool pumpable,
+                                 BOCScopeOwner *host);
 
 uint64_t _core_pinned_depth_load(void);
 PyObject *main_pump_bounded_impl(PyObject *deadline_ms, PyObject *max_behaviors,

@@ -43,6 +43,7 @@ except ModuleNotFoundError:
 
 BEHAVIORS = None
 _LIFECYCLE_LOCK = threading.RLock()
+_INHERIT_SCOPE = object()
 
 
 def _default_worker_count() -> int:
@@ -124,9 +125,10 @@ REMOVED = _RemovedType()
 
 def _check_global_join():
     """Reject a join that would include its caller."""
-    if _core.in_behavior():
+    if _core.scope_active():
         raise RuntimeError(
-            "global wait/quiesce/stop cannot run inside a behavior"
+            "global wait/quiesce/stop cannot run inside a Scope or behavior; "
+            "leave the scope instead"
         )
 
 
@@ -230,7 +232,9 @@ class Cown(Generic[T]):
         may store a fresh value into it again. Acquires the cown for the
         read, so call it from the caller's thread once the runtime is
         globally quiescent -- after :func:`quiesce` or :func:`wait`, not
-        merely after this cown's own producer.
+        merely after this cown's own producer. Concurrent producers may admit
+        newer work after a quiescence event, so this method checks the current
+        runtime state rather than relying on the earlier observation.
 
         Delegates to the C-level :meth:`CownCapsule.unwrap` so a
         behavior that returns a :class:`Cown` (which surfaces
@@ -284,6 +288,128 @@ class Cown(Generic[T]):
     def __repr__(self) -> str:
         """Debug representation."""
         return repr(self.impl)
+
+
+class _RootScope:
+    """Scheduling destination for work joined by the global runtime."""
+
+    def __repr__(self):
+        return "root_scope"
+
+    def __reduce__(self):
+        return (_get_root_scope, ())
+
+
+def _get_root_scope():
+    """Reconstruct the interpreter-local root scheduling handle."""
+    return root_scope
+
+
+root_scope = _RootScope()
+
+
+class _ScopeHandle:
+    """Cross-interpreter scheduling handle without context-manager ownership."""
+
+    def __init__(self, impl, output):
+        self._impl = impl
+        self._output = output
+
+    @property
+    def output_cown(self):
+        """Return the scope-owned output cown."""
+        return self._output
+
+    def __reduce__(self):
+        return (_ScopeHandle, (self._impl, self._output))
+
+
+class Scope(_ScopeHandle, Generic[T]):
+    """Join a local group of behaviors and move its output to the caller.
+
+    :param initial: Initial value of the scope-owned output cown.
+
+    Scope exit does not stop the runtime. Captured behavior exceptions stay
+    on their behavior result cowns; partial output mutations are not rolled
+    back. Nested scopes may block workers while retaining their cowns, so the
+    caller must avoid cyclic dependencies and worker exhaustion.
+    """
+
+    def __init__(self, initial: T = None):
+        """Create a single-use scope and its output cown."""
+        output = Cown(initial)
+        super().__init__(_core.ScopeCapsule(output.impl), output)
+        self._output_value = _ABSENT
+        self._failure = None
+
+    @property
+    def output_value(self) -> T:
+        """Return the output after successful scope exit."""
+        if self._failure is not None:
+            raise self._failure
+        if self._output_value is _ABSENT:
+            raise RuntimeError("scope output is unavailable before successful exit")
+        return self._output_value
+
+    def __enter__(self):
+        """Enter the scope, starting the shared runtime if necessary."""
+        if self._impl.state != "created":
+            raise RuntimeError("Scope is single-use")
+        if _core.is_primary() and not _core.scope_active():
+            with _LIFECYCLE_LOCK:
+                if BEHAVIORS is None:
+                    start(module=get_caller_module())
+                self._impl.enter()
+        else:
+            self._impl.enter()
+        return self
+
+    def quiesce(self, timeout: Optional[float] = None) -> None:
+        """Observe completion of scoped work without closing the scope.
+
+        :param timeout: Maximum wait in seconds; ``None`` waits indefinitely.
+        :raises TimeoutError: If no quiescence is observed before the deadline.
+        :raises RuntimeError: If called outside the active scope's host context.
+
+        A zero transition satisfies this wait even if another caller schedules
+        new work before it returns. Output is published only on scope exit.
+        :raises ValueError: If timeout is negative or non-finite.
+        """
+        timeout = _normalize_timeout(timeout)
+        resolver = BEHAVIORS.export_module if BEHAVIORS is not None else None
+        if not self._impl.quiescence(timeout, resolver):
+            raise TimeoutError(f"scope did not reach quiescence within timeout={timeout!r}")
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        """Join scoped work, finalize its output, and restore the enclosing scope."""
+        if self._impl.state != "active":
+            raise RuntimeError("Scope is not active")
+        self._impl.close()
+        try:
+            try:
+                resolver = BEHAVIORS.export_module if BEHAVIORS is not None else None
+                self._impl.wait(None, resolver)
+            except BaseException:
+                self._impl.finish(False)
+                raise
+            self._output_value = self._impl.finish(exc_type is None)
+        except BaseException as error:
+            self._failure = error
+            raise
+        if exc_value is not None:
+            self._failure = exc_value
+        return False
+
+
+def _scope_destination(scope):
+    """Resolve an explicit public scheduling destination to its native handle."""
+    if scope is _INHERIT_SCOPE:
+        return _INHERIT_SCOPE
+    if scope is root_scope:
+        return None
+    if isinstance(scope, _ScopeHandle):
+        return scope._impl
+    raise TypeError("scope must be a Scope or root_scope")
 
 
 class PinnedCown(Cown[T]):
@@ -834,19 +960,22 @@ class Behaviors:
             for name in list(frame.f_globals):
                 val = frame.f_globals[name]
                 if isinstance(val, Cown) or isinstance(val, _core.CownCapsule):
-                    self.logger.debug("acquiring %s", name)
-                    val.acquire()
+                    if not val.impl._scope_owned:
+                        self.logger.debug("acquiring %s", name)
+                        val.acquire()
 
             for name in list(frame.f_locals):
                 val = frame.f_locals[name]
                 if isinstance(val, Cown) or isinstance(val, _core.CownCapsule):
-                    self.logger.debug("acquiring %s", name)
-                    val.acquire()
+                    if not val.impl._scope_owned:
+                        self.logger.debug("acquiring %s", name)
+                        val.acquire()
 
             frame = frame.f_back
 
         for cown in self.final_cowns:
-            cown.acquire()
+            if not cown.impl._scope_owned:
+                cown.acquire()
 
         self.logger.debug("stopping workers")
         _core.scheduler_request_stop_all()
@@ -1286,7 +1415,7 @@ class Behaviors:
         return self
 
     def _wait_for_quiescence(self, timeout: Optional[float]) -> bool:
-        """Drain current root work before shutdown."""
+        """Drain current root work and active scope hosts before shutdown."""
         if not _core.is_primary():
             raise RuntimeError(
                 f"runtime drain must run on the main "
@@ -1310,7 +1439,7 @@ class Behaviors:
             timeout must be finite and nonnegative.
         :type timeout: Optional[float]
         :raises TimeoutError: If the global join times out while any
-            work reservation remains. The runtime remains running
+            work or scope reservation remains. The runtime remains running
             with admission still open for a later retry.
         :raises RuntimeError: If the noticeboard thread does not exit
             before the timeout (or, on a retry call, is still alive).
@@ -1327,7 +1456,7 @@ class Behaviors:
         With no central scheduler thread, ``stop()`` drives
         the C terminator directly. The sequence is:
 
-        1. Wait for current work to finish.
+        1. Wait for current work and active scope hosts to finish.
         2. Fence admission atomically with the zero-work observation.
         3. After admission closes, any later ``whencall`` raises
            ``RuntimeError("runtime is shutting down")`` from the
@@ -1339,7 +1468,7 @@ class Behaviors:
 
         A quiescence event alone is insufficient for teardown: newer work
         may have arrived after the event. Shutdown waits for current
-        work reservations, not just a previously observed zero.
+        work and host lifetimes, not just a previously observed zero.
 
         The retry path is internally gated on ``_workers_stopped`` so
         the worker pool is not torn down twice; a second ``stop()``
@@ -1427,8 +1556,9 @@ class Behaviors:
         frees the per-worker queues. Each orphan has had its cowns
         scheduled (MCS links established) but never acquired by a
         worker. ``release_all`` walks the MCS queues, hands off to any
-        waiting successors, frees the request array, and drops the native
-        reservation taken by ``behavior_schedule``.
+        waiting successors, and frees the request array;
+        the native release path drops the reservation held by the
+        scheduled behavior.
 
         Before ``release_all`` runs, ``set_drop_exception`` marks the
         result Cown with a :class:`RuntimeError` so a caller awaiting
@@ -1813,7 +1943,8 @@ def register_behavior(func) -> str:
     return key
 
 
-def whencall(func, args: list[Union[Cown, list[Cown]]], captures: list[Any]) -> Cown:
+def whencall(func, args: list[Union[Cown, list[Cown]]], captures: list[Any], *,
+             scope=_INHERIT_SCOPE) -> Cown:
     """Schedule ``func`` as a behavior over ``args`` with ``captures``.
 
     ``func`` is the behavior function object; it is registered and
@@ -1829,6 +1960,10 @@ def whencall(func, args: list[Union[Cown, list[Cown]]], captures: list[Any]) -> 
             "the @when-decorated function object directly; the string-thunk "
             "form was removed when @when became a runtime decorator."
         )
+
+    destination = _scope_destination(scope)
+    if BEHAVIORS is None and _core.is_primary():
+        start(module=get_caller_module())
 
     key = register_behavior(func)
     result = Cown(None)
@@ -1855,7 +1990,10 @@ def whencall(func, args: list[Union[Cown, list[Cown]]], captures: list[Any]) -> 
     # Empty groups leave no cown entry, so pass the top-level arg count for tuple sizing and [] fill.
     behavior = _core.BehaviorCapsule(key, result.impl, cowns, captures,
                                      len(args))
-    behavior.schedule()
+    if destination is _INHERIT_SCOPE:
+        behavior.schedule()
+    else:
+        behavior.schedule(scope=destination)
     return result
 
 
@@ -1901,9 +2039,9 @@ def start(worker_count: Optional[int] = None,
     """
     if not _core.is_primary():
         raise RuntimeError("start() can only be called from the main interpreter")
-    if _core.in_behavior():
+    if _core.scope_active():
         if BEHAVIORS is None:
-            raise RuntimeError("cannot restart the runtime from an active behavior")
+            raise RuntimeError("cannot restart the runtime from an active scope or behavior")
         _start_runtime(worker_count, module)
         return
     if module is None and BEHAVIORS is None:
@@ -1947,7 +2085,7 @@ def _start_runtime(worker_count, module):
         raise
 
 
-def when(*cowns):
+def when(*cowns, scope=_INHERIT_SCOPE):
     """Decorator to schedule a function as a behavior using given cowns.
 
     This decorator takes a list of zero or more cown objects, which will be passed in the order
@@ -1995,7 +2133,7 @@ def when(*cowns):
                 f"{n_captures} default(s)."
             )
 
-        result = whencall(func, list(cowns), list(defaults))
+        result = whencall(func, list(cowns), list(defaults), scope=scope)
 
         return result
 
@@ -2007,8 +2145,9 @@ def quiesce(timeout: Optional[float] = None, *,
             stats: bool = False, noticeboard: bool = False):
     """Observe a zero-work transition without tearing down the runtime.
 
-    New work may be admitted before this function returns. Use :func:`wait`
-    for strict draining and shutdown.
+    New work may be admitted before this function returns. Open scopes retain
+    root reservations and delay global quiescence; use :func:`Scope.quiesce`
+    for batches within one scope and :func:`wait` for strict shutdown.
     Optional snapshots are sampled after the observation.
 
     :param timeout: Upper bound (seconds). ``None`` waits forever.
