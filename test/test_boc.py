@@ -720,34 +720,22 @@ class TestUnwrap:
         quiesce(QUIESCE_TIMEOUT)
         assert slow.unwrap() == 1
 
-    def test_unwrap_rejects_last_behavior_in_seed_dropped_window(self):
-        """unwrap() rejects an in-flight behavior even while the seed is dropped.
-
-        During quiesce()/wait() the Pyrona seed is dropped, so a single
-        in-flight behavior leaves ``terminator_count == 1`` -- the same
-        value as a fully quiesced, seed-armed runtime. The guard keys
-        off ``count - seeded`` rather than ``count > 1`` so it still
-        rejects this case. Simulated by poking the terminator into the
-        seed-dropped + one-hold state on the primary interpreter.
-        """
+    def test_unwrap_rejects_last_outstanding_work_reservation(self):
+        """Reject extraction with one work reservation, without a host seed."""
         from bocpy import _core
 
         x = Cown(0)
         result = simple(x)
         quiesce(QUIESCE_TIMEOUT)
 
-        seed_dropped = _core.terminator_seed_dec()
         held = _core.terminator_inc() >= 0
         try:
             assert _core.terminator_count() == 1
-            assert _core.terminator_seeded() == 0
             with pytest.raises(RuntimeError, match="still in flight"):
                 result.unwrap()
         finally:
             if held:
                 _core.terminator_dec()
-            if seed_dropped:
-                _core.terminator_seed_inc()
 
         assert result.unwrap() == 0
 
@@ -1664,48 +1652,6 @@ class TestInMemoryExport:
         b = _behaviors.Behaviors(2)
         with pytest.raises(ValueError, match="dotted Python module path"):
             b.start(module=('a"b', __file__))
-
-
-class TestTimeoutValidation:
-    """Boundary validation for wait timeouts.
-
-    The C-level ``boc_validate_finite_timeout`` helper rejects NaN with
-    ``ValueError``, treats ``+Inf`` as "wait forever", and clamps
-    negatives to 0 (return immediately). Without it NaN would compute a
-    nonsensical ``ms`` argument to the OS timed-wait primitive (UB on
-    Windows, wedge-forever on POSIX).
-    """
-
-    @classmethod
-    def teardown_class(cls):
-        wait()
-
-    def test_terminator_wait_nan_timeout_raises_value_error(self):
-        """NaN timeout to ``_core.terminator_wait`` raises ``ValueError``."""
-        from bocpy import _core
-        with pytest.raises(ValueError, match="NaN"):
-            _core.terminator_wait(float("nan"))
-
-    def test_wait_inf_timeout_blocks_until_done(self):
-        """``+Inf`` timeout treats wait as "wait forever" and returns once done.
-
-        With no live behaviors the terminator count is already 0, so
-        ``terminator_wait(+Inf)`` returns ``True`` immediately rather
-        than blocking. The point is that it does *not* raise.
-        """
-        from bocpy import _core
-        assert _core.terminator_wait(float("inf")) is True
-
-    def test_terminator_wait_negative_timeout_returns_immediately(self):
-        """Negative timeout to ``_core.terminator_wait`` is mapped to wait_forever.
-
-        bocpy treats negatives as "wait forever"; the timeout validator
-        preserves that for negatives and upgrades only NaN to a hard
-        error. With no live runtime the terminator
-        is already at 0, so this returns immediately either way.
-        """
-        from bocpy import _core
-        assert _core.terminator_wait(-1.0) is True
 
 
 class TestBaseExceptionDiscipline:

@@ -2302,16 +2302,14 @@ def wait(timeout: Optional[float] = None, *,
 
     :param timeout: Maximum number of seconds to wait, or ``None`` to
         wait indefinitely. The timeout bounds only the quiescence and
-        noticeboard-drain phases; worker shutdown runs to completion
-        regardless. Values above ``1e9`` seconds (~31.7 years) are
-        clamped to wait-forever to avoid platform ``time_t`` /
-        ``DWORD`` overflow inside the underlying condition-variable
-        wait.
+        noticeboard-drain phases. A work-drain timeout aborts shutdown;
+        after a successful drain, worker shutdown runs to completion
+        regardless. Other values must be finite and nonnegative.
     :type timeout: Optional[float]
     :param stats: If ``True``, capture the per-worker
-        :func:`_core.scheduler_stats` snapshot at shutdown
-        (after every behavior has run, before the per-worker array
-        is freed). This is the only reliable way to read the
+        :func:`_core.scheduler_stats` snapshot after observed quiescence,
+        before the per-worker array is freed. Concurrent producers may
+        have admitted newer work by then. This is the only reliable way to read the
         scheduler counters for the session that just ended --
         calling :func:`_core.scheduler_stats` after :func:`wait`
         returns ``[]`` because the per-worker array has already been
@@ -2340,7 +2338,10 @@ def wait(timeout: Optional[float] = None, *,
         ``noticeboard=True``; and a :class:`WaitResult` ``NamedTuple``
         carrying both when both flags are set.
     :rtype: Union[None, list[dict], dict[str, Any], WaitResult]
-    :raises RuntimeError: If the noticeboard thread does not exit
+    :raises ValueError: If ``timeout`` is negative or non-finite.
+    :raises TimeoutError: If outstanding work does not drain before the
+        deadline. Admission and workers remain available for retry.
+    :raises RuntimeError: If called from a behavior, or the noticeboard thread does not exit
         before the timeout (or, on a retry call, is still alive).
         The first failure carries the message prefix
         ``"noticeboard thread did not shut down within timeout=..."``;
@@ -2401,23 +2402,29 @@ def quiesce(timeout: Optional[float] = None, *,
             stats: bool = False,
             noticeboard: bool = False
             ) -> Union[None, list[dict], dict[str, Any], "WaitResult"]:
-    """Block until in-flight behaviors complete **without** teardown.
+    """Observe a zero-work transition **without** teardown.
 
     Unlike :func:`wait`, this leaves the runtime fully usable:
     workers remain running, the noticeboard thread remains
     registered, and the terminator is **not** closed. Further
     ``@when`` calls work immediately after ``quiesce()`` returns.
 
+    A waiter remembers the completion generation, so a zero transition is
+    observed even if new work arrives before it resumes. An already-zero
+    counter completes immediately. The return does not guarantee that the
+    current work count is still zero; ordinary cown access checks still apply.
+    Calling from a running behavior is rejected to prevent self-join.
+
     Typical use is to lift a result out of a long-running parallel
     job at a defined synchronization point — e.g. a parallel search
     that periodically wants to inspect its best-so-far state — and
     then keep working. The flags mirror :func:`wait`:
 
-    - neither flag set: returns ``None`` once the runtime is quiescent.
+    - neither flag set: returns ``None`` once quiescence is observed.
     - ``stats=True`` only: returns the per-worker scheduler-stats
       snapshot as ``list[dict]`` (same shape as :func:`wait`).
     - ``noticeboard=True`` only: returns a plain ``dict[str, Any]``
-      with the noticeboard contents at the quiescence point.
+      with the noticeboard contents sampled after the quiescence observation.
     - both flags set: returns :class:`WaitResult`.
 
     The noticeboard snapshot is captured by cycling the dedicated
@@ -2431,9 +2438,9 @@ def quiesce(timeout: Optional[float] = None, *,
 
     Single-caller: like :func:`wait`, ``quiesce`` assumes one
     thread at a time on the primary interpreter. Concurrent
-    ``@when`` calls from secondary threads during a ``quiesce`` are
-    waited for (their behaviors are part of the quiescence
-    condition); concurrent ``notice_write`` calls have undefined
+    ``@when`` calls before the observed zero transition contribute to the
+    wait; calls after it need not finish before return.
+    Concurrent ``notice_write`` calls have undefined
     ordering with respect to the returned snapshot.
 
     :param timeout: Maximum seconds to wait. ``None`` means wait
@@ -2451,6 +2458,7 @@ def quiesce(timeout: Optional[float] = None, *,
         only ``noticeboard=True``; a :class:`WaitResult` when both
         flags are set.
     :rtype: Union[None, list[dict], dict[str, Any], WaitResult]
+    :raises ValueError: If ``timeout`` is negative or non-finite.
     :raises TimeoutError: If quiescence is not reached within
         ``timeout`` (or if the noticeboard-cycle join times out).
         Unlike :func:`wait`, ``quiesce`` propagates this rather

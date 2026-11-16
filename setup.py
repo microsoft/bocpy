@@ -131,6 +131,7 @@ if _build_internal_tests:
                 "src/bocpy/_internal_test_atomics.c",
                 "src/bocpy/_internal_test_bq.c",
                 "src/bocpy/_internal_test_wsq.c",
+                "src/bocpy/_internal_test_terminator.c",
                 "src/bocpy/_core.c",
                 "src/bocpy/boc_compat.c",
                 "src/bocpy/boc_noticeboard.c",

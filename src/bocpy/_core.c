@@ -10,6 +10,7 @@
 #include <assert.h>
 #include <bocpy/bocpy.h>
 #include <limits.h>
+#include <math.h>
 
 typedef struct boc_queue BOCQueue;
 
@@ -59,6 +60,8 @@ static atomic_int_least64_t MAIN_PINNED_DEPTH = 0;
 static atomic_int_least64_t MAIN_PINNED_NONEMPTY_SINCE_NS = 0;
 
 static thread_local bool IN_PUMP_BODY = false;
+static atomic_int_least64_t WAIT_PUMP_POLL_MS = 50;
+static thread_local bool IN_BEHAVIOR = false;
 
 static atomic_int_least64_t LAST_PUMP_NS = 0;
 
@@ -836,14 +839,7 @@ static PyObject *_core_registry_lookup(PyObject *Py_UNUSED(self),
 
 /// @brief Try to register a new behavior with the terminator.
 /// @details Returns the post-increment count on success, or -1 if the
-/// terminator is closed (runtime is shutting down). The double-check of
-/// TERMINATOR_CLOSED around the fetch_add closes the close-vs-inc race:
-/// if close() lands between our first check and our fetch_add, the
-/// second check sees it and we undo, signalling on a 0-transition so a
-/// concurrent terminator_wait() does not miss the wakeup. Uses the
-/// portable plain-atomic forms (seq_cst) — see the polyfill block at
-/// the top of this file; the terminator is not on a hot path so the
-/// stronger ordering is free.
+/// terminator is absent or closed (runtime is shutting down).
 /// @param self The module (unused)
 /// @param args Unused
 /// @return Python int — new count on success, -1 if closed.
@@ -853,14 +849,19 @@ static PyObject *_core_terminator_inc(PyObject *self,
   return PyLong_FromLongLong((long long)terminator_inc());
 }
 
-/// @brief Decrement the terminator. Wakes terminator_wait on 0-transition.
+/// @brief Decrement the terminator. Wakes waiters on 0-transition.
 /// @param self The module (unused)
 /// @param args Unused
 /// @return Python int — the new count.
 static PyObject *_core_terminator_dec(PyObject *self,
                                       PyObject *Py_UNUSED(args)) {
   BOC_STATE_SET(self);
-  return PyLong_FromLongLong((long long)terminator_dec());
+  int_least64_t count = terminator_dec();
+  if (count < 0) {
+    PyErr_SetString(PyExc_RuntimeError, "terminator has no work to release");
+    return NULL;
+  }
+  return PyLong_FromLongLong((long long)count);
 }
 
 /// @brief Set the closed bit. Future terminator_inc() calls return -1.
@@ -876,126 +877,21 @@ static PyObject *_core_terminator_close(PyObject *self,
                     "interpreter");
     return NULL;
   }
-  terminator_close();
+  if (!terminator_close()) {
+    PyErr_SetString(PyExc_TimeoutError,
+                    "cannot stop the runtime while outstanding reservations remain");
+    return NULL;
+  }
   Py_RETURN_NONE;
 }
 
-/// @brief Block until TERMINATOR_COUNT reaches 0.
-/// @details A negative or @c None timeout means wait forever.
-/// Releases the GIL across the wait.
-/// @param self The module (unused)
-/// @param args A tuple @c (timeout,) — float-or-None
-/// @return @c True on success, @c False on timeout.
-static PyObject *_core_terminator_wait(PyObject *self, PyObject *args) {
-  BOC_STATE_SET(self);
-  PyObject *timeout_obj;
-  if (!PyArg_ParseTuple(args, "O", &timeout_obj)) {
-    return NULL;
-  }
-
-  bool wait_forever = false;
-  double timeout = 0.0;
-  if (timeout_obj == Py_None) {
-    wait_forever = true;
-  } else {
-    timeout = PyFloat_AsDouble(timeout_obj);
-    if (timeout == -1.0 && PyErr_Occurred()) {
-      return NULL;
-    }
-    if (boc_validate_finite_timeout(timeout, &timeout, &wait_forever) < 0) {
-      return NULL;
-    }
-  }
-
-  bool ok;
-  Py_BEGIN_ALLOW_THREADS ok = terminator_wait(timeout, wait_forever);
-  Py_END_ALLOW_THREADS
-
-      if (ok) {
-    Py_RETURN_TRUE;
-  }
-  Py_RETURN_FALSE;
-}
-
-/// @brief Pumpable variant of @ref _core_terminator_wait.
-/// @details Forwards to @ref terminator_wait_pumpable, supplying the
-/// @ref _core_pinned_depth_load reader. Returns one of the three
-/// integer constants exposed on the module (`TERMINATED`,
-/// `PUMP_READY`, `WAIT_TIMED_OUT`). Releases the GIL across the wait.
-/// @param self The module (unused)
-/// @param timeout_obj A Python float — seconds to wait. Non-positive
-///                    performs a non-blocking poll.
-/// @return Python int — one of the wake-reason sentinels.
 static uint64_t _core_pinned_depth_load(void);
-static PyObject *_core_terminator_wait_pumpable(PyObject *self,
-                                                PyObject *timeout_obj) {
-  BOC_STATE_SET(self);
-  double timeout_s = PyFloat_AsDouble(timeout_obj);
-  if (timeout_s == -1.0 && PyErr_Occurred()) {
-    return NULL;
-  }
 
-  boc_terminator_wake_reason_t reason;
-  Py_BEGIN_ALLOW_THREADS reason =
-      terminator_wait_pumpable(timeout_s, _core_pinned_depth_load);
-  Py_END_ALLOW_THREADS
-
-      return PyLong_FromLong((long)reason);
-}
-
-/// @brief Idempotent one-shot decrement of the Pyrona seed.
-/// @details Called by stop()/wait() to remove the seed that keeps the
-/// terminator count above zero across momentary quiescence. Safe to call
-/// any number of times — only the first call performs the decrement.
+/// @brief Claim a fresh runtime start with admission closed
+/// @details Requires the previous runtime to be closed and drained.
 /// @param self The module (unused)
 /// @param args Unused
-/// @return Python bool — True if this call removed the seed, False if
-/// the seed was already removed.
-static PyObject *_core_terminator_seed_dec(PyObject *self,
-                                           PyObject *Py_UNUSED(args)) {
-  BOC_STATE_SET(self);
-  if (BOC_STATE->index != 0) {
-    PyErr_SetString(PyExc_RuntimeError,
-                    "terminator_seed_dec must be called from the primary "
-                    "interpreter");
-    return NULL;
-  }
-  if (terminator_seed_dec()) {
-    Py_RETURN_TRUE;
-  }
-  Py_RETURN_FALSE;
-}
-
-/// @brief Idempotent one-shot re-arm of the Pyrona seed.
-/// @param self The module (unused)
-/// @param args Unused
-/// @return Python bool — True if this call restored the seed, False if
-/// the seed was already present.
-static PyObject *_core_terminator_seed_inc(PyObject *self,
-                                           PyObject *Py_UNUSED(args)) {
-  BOC_STATE_SET(self);
-  if (BOC_STATE->index != 0) {
-    PyErr_SetString(PyExc_RuntimeError,
-                    "terminator_seed_inc must be called from the primary "
-                    "interpreter");
-    return NULL;
-  }
-  if (terminator_seed_inc()) {
-    Py_RETURN_TRUE;
-  }
-  Py_RETURN_FALSE;
-}
-
-/// @brief Restore terminator state for a fresh runtime start.
-/// @details Sets count=1 (the Pyrona seed), clears the closed bit, and
-/// re-arms the seed one-shot. Called from Behaviors.start(). Returns
-/// the prior @c (count, seeded) tuple so callers can detect drift left
-/// over from a previous run that died without reaching its
-/// reconciliation point (e.g. KeyboardInterrupt or stop() that raised
-/// before the assertion).
-/// @param self The module (unused)
-/// @param args Unused
-/// @return A 2-tuple @c (prior_count, prior_seeded).
+/// @return Py_None on success, NULL on failure (PyErr set).
 static PyObject *_core_terminator_reset(PyObject *self,
                                         PyObject *Py_UNUSED(args)) {
   PRINTDBG("_core_terminator_reset\n");
@@ -1006,26 +902,31 @@ static PyObject *_core_terminator_reset(PyObject *self,
                     "interpreter");
     return NULL;
   }
-  int_least64_t prior_count = 0;
-  int_least64_t prior_seeded = 0;
-  terminator_reset(&prior_count, &prior_seeded);
+  if (!terminator_reset()) {
+    return NULL;
+  }
   atomic_store(&MAIN_PINNED_NONEMPTY_SINCE_NS, 0);
   atomic_store(&WATCHDOG_LAST_WARN_NS, 0);
   atomic_store(&LAST_PUMP_NS, 0);
 #ifdef Py_GIL_DISABLED
   atomic_store_intptr(&MAIN_PUMP_THREAD, (intptr_t)0);
 #endif
-  return Py_BuildValue("(LL)", (long long)prior_count, (long long)prior_seeded);
+  Py_RETURN_NONE;
 }
 
-/// @brief Read the current TERMINATOR_SEEDED flag (for reconciliation).
-/// @param self The module (unused)
-/// @param args Unused
-/// @return Python int — 0 or 1.
-static PyObject *_core_terminator_seeded(PyObject *self,
-                                         PyObject *Py_UNUSED(args)) {
+/// @brief Open admission after the claimed runtime's resources are ready
+static PyObject *_core_terminator_activate(PyObject *self,
+                                           PyObject *Py_UNUSED(args)) {
   BOC_STATE_SET(self);
-  return PyLong_FromLongLong((long long)terminator_seeded());
+  if (BOC_STATE->index != 0) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "terminator_activate must be called from the primary interpreter");
+    return NULL;
+  }
+  if (!terminator_activate()) {
+    return NULL;
+  }
+  Py_RETURN_NONE;
 }
 
 /// @brief Read the current terminator count (for reconciliation tests).
@@ -1036,6 +937,13 @@ static PyObject *_core_terminator_count(PyObject *self,
                                         PyObject *Py_UNUSED(args)) {
   BOC_STATE_SET(self);
   return PyLong_FromLongLong((long long)terminator_count());
+}
+
+static PyObject *_core_terminator_wake(PyObject *self,
+                                      PyObject *Py_UNUSED(args)) {
+  BOC_STATE_SET(self);
+  terminator_wake_all();
+  Py_RETURN_NONE;
 }
 
 /// @details This can be safely referenced and used from multiple processes.
@@ -1876,12 +1784,8 @@ static PyObject *CownCapsule_disown(PyObject *op, PyObject *Py_UNUSED(dummy)) {
 /// @details Mirrors Rust's @c Result::unwrap. Acquires the cown for the read,
 /// so the runtime must be quiescent: any behavior still in flight could be
 /// mutating the cown, so the call fails fast with @c RuntimeError instead of
-/// racing the worker. Quiescence is tested as
-/// @c TERMINATOR_COUNT - TERMINATOR_SEEDED > 0, which counts behavior holds
-/// independently of the Pyrona seed: this is exact even inside a
-/// seed-dropped window (e.g. a pinned behavior running on the main thread
-/// during @c quiesce / @c wait), where the bare @c count > 1 test would miss
-/// the last in-flight behavior. @b unwrap @b consumes the cown: the stored
+/// racing the worker. Quiescence requires zero behavior reservations.
+/// @b unwrap @b consumes the cown: the stored
 /// payload is taken by reference and the cown is reset to hold @c None before
 /// it is released, so the release re-serializes @c None rather than the
 /// payload. This is required for move-type values (e.g. @c Matrix), which
@@ -1903,7 +1807,7 @@ static PyObject *CownCapsule_unwrap(PyObject *op, PyObject *Py_UNUSED(dummy)) {
   CownCapsuleObject *self = (CownCapsuleObject *)op;
   BOCCown *cown = self->cown;
 
-  if (terminator_count() - terminator_seeded() > 0) {
+  if (terminator_count() > 0) {
     PyErr_SetString(
         PyExc_RuntimeError,
         "Cown.unwrap() called while behaviors are still in flight. "
@@ -2198,6 +2102,167 @@ BOCCown *cown_unwrap(PyObject *op) {
   return self->cown;
 }
 
+static PyObject *main_pump_bounded_impl(PyObject *deadline_ms,
+                                       PyObject *max_behaviors,
+                                       bool raise_on_error, PyObject *boc_export,
+                                       bool *started);
+
+/// @brief Validate the live native wait cadence
+static PyObject *_core_set_wait_pump_poll(PyObject *module, PyObject *ms) {
+  BOC_STATE_SET(module);
+  if (!PyLong_Check(ms) || PyBool_Check(ms)) {
+    PyErr_SetString(PyExc_TypeError, "ms must be a positive int");
+    return NULL;
+  }
+  long long value = PyLong_AsLongLong(ms);
+  if (PyErr_Occurred()) {
+    return NULL;
+  }
+  if (value <= 0) {
+    PyErr_SetString(PyExc_TypeError, "ms must be a positive int");
+    return NULL;
+  }
+  atomic_store(&WAIT_PUMP_POLL_MS, value);
+  Py_RETURN_NONE;
+}
+
+/// @brief Normalize arguments before checking host state, since conversion can execute Python
+static bool wait_arguments(PyObject *args, PyObject *kwargs, double *end,
+                            bool *forever, PyObject **boc_export) {
+  static char *names[] = {"timeout", "boc_export", NULL};
+  PyObject *timeout = Py_None;
+  *boc_export = Py_None;
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|OO", names, &timeout,
+                                   boc_export)) {
+    return false;
+  }
+  *forever = timeout == Py_None;
+  double seconds = 0;
+  if (!*forever) {
+    seconds = PyFloat_AsDouble(timeout);
+    if (PyErr_Occurred()) {
+      return false;
+    }
+    if (!isfinite(seconds) || seconds < 0) {
+      PyErr_SetString(PyExc_ValueError, "timeout must be finite and nonnegative");
+      return false;
+    }
+  }
+  *end = *forever ? 0 : boc_now_s() + seconds;
+  return true;
+}
+
+/// @brief Own one completion observation through blocking, bounded pumping and signal checks
+static PyObject *terminator_wait_driver(bool drain,
+                                        double end, bool forever,
+                                        PyObject *boc_export, bool pumpable) {
+  BOCTerminatorWaiter waiter;
+  terminator_waiter_init(&waiter, drain);
+  PyObject *limit = NULL;
+  bool completed = false;
+  for (;;) {
+    double poll = (double)atomic_load(&WAIT_PUMP_POLL_MS) / 1000.0;
+    double slice = fmin(poll, 0.1);
+    if (!forever) {
+      slice = fmin(slice, fmax(0.0, end - boc_now_s()));
+    }
+    boc_terminator_wake_reason_t reason;
+    Py_BEGIN_ALLOW_THREADS
+    reason = terminator_waiter_wait(
+        &waiter, slice, false, pumpable ? _core_pinned_depth_load : NULL);
+    Py_END_ALLOW_THREADS
+    if (PyErr_CheckSignals() < 0) {
+      break;
+    }
+    if (reason == BOC_TERMINATOR_TERMINATED) {
+      completed = true;
+      break;
+    }
+    // Completion wins over expiry, but a perpetually ready pinned queue must not bypass the deadline.
+    if (slice == 0) {
+      break;
+    }
+    if (reason != BOC_TERMINATOR_PUMP_READY) {
+      continue;
+    }
+    if (boc_export == Py_None) {
+      PyErr_SetString(PyExc_RuntimeError, "pinned work requires a behavior resolver");
+      break;
+    }
+    if (limit == NULL) {
+      limit = PyLong_FromLong(64);
+      if (limit == NULL) {
+        break;
+      }
+    }
+    // Re-read after callbacks so a live poll adjustment applies to the next batch.
+    long long ms = atomic_load(&WAIT_PUMP_POLL_MS);
+    if (ms > 100) {
+      ms = 100;
+    }
+    if (!forever) {
+      double remaining_ms = (end - boc_now_s()) * 1000.0;
+      if (remaining_ms <= 0) {
+        continue;
+      }
+      if (remaining_ms < ms) {
+        ms = (long long)ceil(remaining_ms);
+      }
+    }
+    PyObject *deadline = PyLong_FromLongLong(ms);
+    if (deadline == NULL) {
+      break;
+    }
+    PyObject *result = main_pump_bounded_impl(deadline, limit, false,
+                                             boc_export, NULL);
+    Py_DECREF(deadline);
+    if (result == NULL) {
+      break;
+    }
+    Py_DECREF(result);
+  }
+  Py_XDECREF(limit);
+  if (PyErr_Occurred()) {
+    return NULL;
+  }
+  return PyBool_FromLong(completed);
+}
+
+/// @brief Wait for root completion without creating or reserving a runtime
+static PyObject *root_wait(PyObject *module, PyObject *args, PyObject *kwargs,
+                           bool drain) {
+  BOC_STATE_SET(module);
+  double end;
+  bool forever;
+  PyObject *boc_export;
+  if (!wait_arguments(args, kwargs, &end, &forever, &boc_export)) {
+    return NULL;
+  }
+  if (IN_BEHAVIOR) {
+    PyErr_SetString(PyExc_RuntimeError, "a behavior cannot wait for root completion");
+    return NULL;
+  }
+  bool pumpable = bocpy_interpid() == bocpy_main_interpid() && !IN_PUMP_BODY;
+  return terminator_wait_driver(drain, end, forever, boc_export, pumpable);
+}
+
+static PyObject *_core_terminator_quiescence(PyObject *module, PyObject *args,
+                                            PyObject *kwargs) {
+  return root_wait(module, args, kwargs, false);
+}
+
+static PyObject *_core_terminator_drain(PyObject *module, PyObject *args,
+                                       PyObject *kwargs) {
+  return root_wait(module, args, kwargs, true);
+}
+
+/// @brief Report execution that prevents waiting for root completion
+static PyObject *_core_in_behavior(PyObject *module, PyObject *Py_UNUSED(args)) {
+  BOC_STATE_SET(module);
+  return PyBool_FromLong(IN_BEHAVIOR);
+}
+
+
 /// @brief Module-level factory: allocate a pinned CownCapsule.
 /// @details Refuses to run outside the main interpreter; the
 /// pinned-ownership invariant requires owner == main_id
@@ -2309,7 +2374,7 @@ static PyObject *_core_main_pump_queue_depth(PyObject *Py_UNUSED(self),
       (unsigned long long)atomic_load(&MAIN_PINNED_DEPTH));
 }
 
-/// @brief Lock-free reader handed to @ref terminator_wait_pumpable.
+/// @brief Lock-free pinned-depth reader for the terminator wait driver
 /// @details Function-pointer indirection so `boc_terminator.c` does
 /// not need to see the file-scope `MAIN_PINNED_DEPTH` atomic.
 static uint64_t _core_pinned_depth_load(void) {
@@ -3502,6 +3567,7 @@ static void BehaviorCapsule_dealloc(PyObject *op) {
 
 static PyObject *BehaviorCapsule_new(PyTypeObject *type, PyObject *args,
                                      PyObject *kwds) {
+  BOC_STATE = PyType_GetModuleState(type);
   BehaviorCapsuleObject *self;
   self = (BehaviorCapsuleObject *)type->tp_alloc(type, 0);
   if (self == NULL) {
@@ -3724,30 +3790,8 @@ static int BehaviorCapsule_init(PyObject *op, PyObject *args,
 /// **Failure surface.** @ref boc_sched_dispatch can fail when called
 /// from the off-worker arm if the runtime has been torn down. On
 /// failure the queue-owned BEHAVIOR_INCREF taken just before dispatch
-/// is rolled back here, the Python exception set by
-/// @c boc_sched_dispatch is propagated, and the caller is expected
-/// to roll back its terminator hold (the reference path is
-/// @c whencall in @c behaviors.py).
-///
-/// **Cown-side residue on dispatch failure.** When the count==0
-/// transition fires here AND @c boc_sched_dispatch returns -1
-/// (runtime-down sentinel; see @c boc_sched_dispatch in @c boc_sched.c),
-/// the behavior's BOCRequest array has already been linked onto every
-/// target cown's MCS chain by the link/finish 2PL phases. The
-/// rollback below DECREFs only the queue-owned BEHAVIOR_INCREF; it
-/// does NOT walk and unlink the cown chains. Each request still
-/// holds its BEHAVIOR_INCREF, so the BOCBehavior cannot be freed,
-/// and no worker will ever call @c release_all on it. Any cown that
-/// happens to be linked into this stranded chain remains pinned
-/// awaiting a behavior that cannot run, until the next @c bocpy.start
-/// cycle (which frees the BOCCown via the GC of its owning Python
-/// @c Cown). This residue is intentional and only fires on the
-/// dying-runtime path; the upstream-detection alternative (an
-/// explicit @c scheduler_running check inside @c whencall before the
-/// chain link) introduces a TOCTOU window. The dedicated regression
-/// is @c test_schedule_after_runtime_stop_raises in
-/// @c test_scheduling_stress.py, which exercises this path and
-/// itself contributes one stranded chain per test process.
+/// is rolled back here. The scheduling caller releases its requests and
+/// completion reservations before propagating the dispatch exception.
 /// @param behavior the behavior whose count to decrement
 /// @return 0 on success, -1 if dispatch failed (Python exception set)
 static int behavior_resolve_one(BOCBehavior *behavior) {
@@ -4134,7 +4178,7 @@ static PyObject *BehaviorCapsule_release(PyObject *op,
 /// @param boc_export Namespace (module or object) carrying the thunk
 /// @return Borrowed reference to the stored result value, NULL on setup
 /// failure
-static PyObject *behavior_execute_impl(BOCBehavior *behavior,
+static PyObject *behavior_execute_body(BOCBehavior *behavior,
                                        PyObject *boc_export) {
   // Cown i -> slot abs(group_id)-1; untouched slots become empty groups [].
   size_t num_arg_slots = (size_t)behavior->num_arg_slots;
@@ -4242,6 +4286,16 @@ static PyObject *behavior_execute_impl(BOCBehavior *behavior,
   }
   Py_XDECREF(result);
   return Py_XNewRef(behavior->result->value);
+}
+
+/// @brief Install and restore the behavior guard across every execution outcome
+static PyObject *behavior_execute_impl(BOCBehavior *behavior,
+                                       PyObject *boc_export) {
+  bool saved_in_behavior = IN_BEHAVIOR;
+  IN_BEHAVIOR = true;
+  PyObject *result = behavior_execute_body(behavior, boc_export);
+  IN_BEHAVIOR = saved_in_behavior;
+  return result;
 }
 
 /// @brief Executes the thunk on the behavior.
@@ -4424,7 +4478,7 @@ static inline uintptr_t boc_pump_thread_id(void) {
 /// single-pumper CAS, nested-pump) plus the per-behavior layered
 /// try/finally pattern from `worker.run_behavior`. Every popped
 /// behavior runs its per-iteration cleanup (IN_PUMP_BODY clear +
-/// release pair + terminator_dec) regardless of where the body
+/// release pair + completion decrement) regardless of where the body
 /// failed. ``BaseException`` is stashed across cleanup and restored
 /// at the post-iteration check so the pump exits cleanly with the
 /// FT CAS released.
@@ -4450,7 +4504,15 @@ static PyObject *_core_main_pump_bounded(PyObject *Py_UNUSED(self),
     return NULL;
   }
   bool raise_on_error = (bool)raise_on_error_flag;
+  return main_pump_bounded_impl(deadline_ms, max_behaviors, raise_on_error,
+                                boc_export, NULL);
+}
 
+/// @brief Share the bounded native pump between explicit pumping and completion waits
+static PyObject *main_pump_bounded_impl(PyObject *deadline_ms,
+                                       PyObject *max_behaviors,
+                                       bool raise_on_error, PyObject *boc_export,
+                                       bool *started) {
   Py_ssize_t executed = 0;
   Py_ssize_t raised = 0;
   bool deadline_reached = false;
@@ -4489,6 +4551,9 @@ static PyObject *_core_main_pump_bounded(PyObject *Py_UNUSED(self),
     goto pump_exit;
   }
 
+  if (started != NULL) {
+    *started = true;
+  }
   uint64_t deadline_ns = deadline_or_zero(deadline_ms);
   boc_main_pinned_check_warn();
 
@@ -4772,10 +4837,8 @@ static int request_release_inner(BOCRequest *request) {
 /// @details Pure C, no Python allocation. The only failure surface
 /// is propagated by @ref behavior_resolve_one, which forwards a
 /// dispatch failure from @ref boc_sched_dispatch (e.g. the runtime
-/// was torn down between the caller's @c terminator_inc and our
-/// dispatch). On failure a Python exception is set and the link
-/// loop's caller is expected to roll back its terminator hold;
-/// see @c whencall in @c behaviors.py.
+/// was torn down before dispatch). The native scheduling caller owns
+/// rollback of requests and completion reservations.
 /// @param request The request to enqueue
 /// @param behavior The behavior owning the request
 /// @return 0 on success, -1 on error with a Python exception set
@@ -5582,6 +5645,7 @@ static PyMethodDef _core_module_methods[] = {
      METH_NOARGS,
      "scheduler_drain_all_queues($module, /)\n--\n\n"
      "Drain every per-worker queue. Returns list[BehaviorCapsule]."},
+    {"in_behavior", _core_in_behavior, METH_NOARGS, NULL},
     {"_cown_capsule_from_pointer_inheriting",
      _cown_capsule_from_pointer_inheriting, METH_VARARGS, NULL},
     {"_cown_capsule_from_pointer_borrowing",
@@ -5660,34 +5724,27 @@ static PyMethodDef _core_module_methods[] = {
      "\n--\n\nIncrement the terminator. Returns new count or -1 if closed."},
     {"terminator_dec", _core_terminator_dec, METH_NOARGS,
      "terminator_dec($module, /)"
-     "\n--\n\nDecrement the terminator. Wakes terminator_wait on 0."},
+     "\n--\n\nDecrement the terminator. Wakes waiters on 0."},
     {"terminator_close", _core_terminator_close, METH_NOARGS,
      "terminator_close($module, /)"
      "\n--\n\nMark the terminator closed; future terminator_inc returns -1."},
-    {"terminator_wait", _core_terminator_wait, METH_VARARGS,
-     "terminator_wait($module, timeout, /)"
-     "\n--\n\nBlock until the terminator count reaches 0 or timeout."},
-    {"terminator_wait_pumpable", _core_terminator_wait_pumpable, METH_O,
-     "terminator_wait_pumpable($module, timeout_s, /)"
-     "\n--\n\nBlock until the terminator count reaches 0, the "
-     "pinned-queue depth becomes positive, or timeout_s elapses. "
-     "Returns one of TERMINATED, PUMP_READY, or WAIT_TIMED_OUT."},
-    {"terminator_seed_dec", _core_terminator_seed_dec, METH_NOARGS,
-     "terminator_seed_dec($module, /)"
-     "\n--\n\nIdempotent one-shot decrement of the Pyrona seed."},
-    {"terminator_seed_inc", _core_terminator_seed_inc, METH_NOARGS,
-     "terminator_seed_inc($module, /)"
-     "\n--\n\nIdempotent one-shot re-arm of the Pyrona seed."},
     {"terminator_reset", _core_terminator_reset, METH_NOARGS,
      "terminator_reset($module, /)"
-     "\n--\n\nRestore terminator state for a fresh runtime start. "
-     "Returns the prior (count, seeded) for drift detection."},
+     "\n--\n\nClaim startup only when the runtime is closed and drained."},
+    {"terminator_activate", _core_terminator_activate, METH_NOARGS,
+     "terminator_activate($module, /)"
+     "\n--\n\nOpen admission after the claimed runtime's resources are ready."},
     {"terminator_count", _core_terminator_count, METH_NOARGS,
      "terminator_count($module, /)"
      "\n--\n\nRead the current terminator count."},
-    {"terminator_seeded", _core_terminator_seeded, METH_NOARGS,
-     "terminator_seeded($module, /)"
-     "\n--\n\nRead the current terminator SEEDED flag."},
+    {"terminator_quiescence", (PyCFunction)_core_terminator_quiescence,
+     METH_VARARGS | METH_KEYWORDS, "Wait for root quiescence"},
+    {"terminator_drain", (PyCFunction)_core_terminator_drain, METH_VARARGS | METH_KEYWORDS,
+     "Wait for zero root reservations, then close admission"},
+    {"set_wait_pump_poll", _core_set_wait_pump_poll, METH_O,
+     "Set the native wait polling interval in milliseconds"},
+    {"terminator_wake", _core_terminator_wake, METH_NOARGS,
+     "Notify completion waits"},
     {NULL} /* Sentinel */
 };
 
@@ -5852,18 +5909,6 @@ static int _core_module_exec(PyObject *module) {
   BOC_STATE = state;
 
   PyModule_AddStringConstant(module, "TIMEOUT", BOC_TIMEOUT);
-  if (PyModule_AddIntConstant(module, "TERMINATED", BOC_TERMINATOR_TERMINATED) <
-      0) {
-    return -1;
-  }
-  if (PyModule_AddIntConstant(module, "PUMP_READY", BOC_TERMINATOR_PUMP_READY) <
-      0) {
-    return -1;
-  }
-  if (PyModule_AddIntConstant(module, "WAIT_TIMED_OUT",
-                              BOC_TERMINATOR_WAIT_TIMED_OUT) < 0) {
-    return -1;
-  }
   return 0;
 }
 

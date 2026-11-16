@@ -14,12 +14,14 @@ to block on a mutex.
 import builtins
 import dis
 import enum
+import functools
 import hashlib
 import importlib
 import inspect
 import linecache
 import logging
 import marshal
+import math
 import os
 import struct
 import sys
@@ -40,6 +42,7 @@ except ModuleNotFoundError:
 
 
 BEHAVIORS = None
+_LIFECYCLE_LOCK = threading.RLock()
 
 
 def _default_worker_count() -> int:
@@ -117,6 +120,34 @@ class _RemovedType:
 
 
 REMOVED = _RemovedType()
+
+
+def _check_global_join():
+    """Reject a join that would include its caller."""
+    if _core.in_behavior():
+        raise RuntimeError(
+            "global wait/quiesce/stop cannot run inside a behavior"
+        )
+
+
+def _global_join(func):
+    """Serialize runtime joins and reject a join that would include its caller."""
+    @functools.wraps(func)
+    def guarded(*args, **kwargs):
+        _check_global_join()
+        with _LIFECYCLE_LOCK:
+            return func(*args, **kwargs)
+    return guarded
+
+
+def _normalize_timeout(timeout):
+    """Accept None or finite nonnegative seconds before deadline arithmetic."""
+    if timeout is None:
+        return None
+    seconds = timeout if type(timeout) is float else float(timeout)
+    if not math.isfinite(seconds) or seconds < 0:
+        raise ValueError("timeout must be finite and nonnegative")
+    return seconds
 
 
 class WaitResult(NamedTuple):
@@ -585,12 +616,7 @@ def set_wait_pump_poll(ms: int = 50) -> None:
     """
     if not isinstance(ms, int) or isinstance(ms, bool) or ms <= 0:
         raise TypeError(f"ms must be a positive int, got {ms!r}")
-    global _WAIT_PUMP_POLL_MS
-    _WAIT_PUMP_POLL_MS = ms
-
-
-# Re-read each wait() auto-pump iteration so a mid-wait set_wait_pump_poll change takes effect without restarting.
-_WAIT_PUMP_POLL_MS = 50
+    _core.set_wait_pump_poll(ms)
 
 
 WORKER_MAIN_END = "# END boc_export"
@@ -986,6 +1012,18 @@ class Behaviors:
             in a script.
         :type module: Optional[tuple[str, str]]
         """
+        _core.terminator_reset()
+        try:
+            self._start(module)
+        except BaseException:
+            try:
+                _core.terminator_close()
+            finally:
+                self._restore_main_aliases()
+            raise
+
+    def _start(self, module: Optional[tuple[str, str]]):
+        """Prepare workers under a native startup claim, then open admission."""
         path = os.path.join(os.path.dirname(__file__), "worker.py")
 
         with open(path, encoding="utf-8") as file:
@@ -1116,20 +1154,12 @@ class Behaviors:
                 self._abort_workers()
                 raise
 
-            # reset() returns the prior (count, seeded); a non-zero pair means drift from a crashed run, so refuse.
-            prior_count, prior_seeded = _core.terminator_reset()
-            if prior_count != 0 or prior_seeded != 0:
-                _core.terminator_close()
-                _core.terminator_seed_dec()
+            try:
+                _core.terminator_activate()
+            except BaseException:
                 self._abort_noticeboard()
                 self._abort_workers()
-                raise RuntimeError(
-                    "terminator drift carried over from a previous run "
-                    f"(prior_count={prior_count}, prior_seeded={prior_seeded}). "
-                    "This indicates a leaked whencall, a stop() that raised "
-                    "before reconciliation, or an interrupted teardown. "
-                    "Resolve the earlier failure before starting again."
-                )
+                raise
         except BaseException:
             # Defence in depth: free WORKERS in case an abort path missed it (scheduler_runtime_stop is idempotent).
             try:
@@ -1231,97 +1261,56 @@ class Behaviors:
             self.start_noticeboard()
         return snap
 
+    @_global_join
     def quiesce(self, timeout: Optional[float] = None) -> bool:
-        """Wait for terminator quiescence without tearing down workers; re-arms the Pyrona seed on exit.
+        """Wait for terminator quiescence without tearing down workers.
 
         :param timeout: Upper bound on the wait. ``None`` waits forever.
         :type timeout: Optional[float]
         :returns: ``True`` on quiescence, ``False`` on timeout.
+        :raises ValueError: If timeout is negative or non-finite.
         """
+        timeout = _normalize_timeout(timeout)
+        _check_global_join()
         if not _core.is_primary():
             raise RuntimeError(
                 "Behaviors.quiesce() must be called from the primary "
                 "interpreter."
             )
-        # Only re-arm the seed on exit if seed_dec actually dropped it, so we never over-increment.
-        seed_dropped = _core.terminator_seed_dec()
-        try:
-            return self._wait_for_quiescence(timeout)
-        finally:
-            if seed_dropped:
-                _core.terminator_seed_inc()
+        return _core.terminator_quiescence(timeout, self.export_module)
 
     def __enter__(self):
         """Enter context by starting the runtime."""
         self.start()
         return self
 
-    def _auto_pump_loop(self, timeout: Optional[float]) -> bool:
-        """Pump the pinned queue while waiting for terminator quiescence.
-
-        Used by :meth:`stop` whenever live ``PinnedCown`` handles
-        exist. On each iteration: block on
-        ``terminator_wait_pumpable`` for the current
-        ``_WAIT_PUMP_POLL_MS`` budget (re-read every iteration so a
-        mid-wait ``set_wait_pump_poll`` change is honoured);
-        if it wakes with ``PUMP_READY``, drain up to 64 behaviors via
-        ``main_pump_bounded`` with ``raise_on_error=False`` so body
-        exceptions surface on result cowns instead of aborting the
-        wait. Returns ``True`` on terminator quiescence, ``False`` on
-        deadline expiry — matching ``_core.terminator_wait``'s bool
-        contract.
-        """
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while _core.terminator_count() > 0:
-            poll_s = _WAIT_PUMP_POLL_MS / 1000.0
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    return False
-                poll_s = min(poll_s, remaining)
-            outcome = _core.terminator_wait_pumpable(poll_s)
-            if outcome == _core.TERMINATED:
-                return True
-            if outcome == _core.PUMP_READY:
-                _core.main_pump_bounded(
-                    None, 64, False, self.export_module,
-                )
-            # WAIT_TIMED_OUT falls through to the next iteration's deadline check.
-        return True
-
     def _wait_for_quiescence(self, timeout: Optional[float]) -> bool:
-        """Wait for terminator quiescence, auto-pumping if pinned.
-
-        Picks between the byte-equivalent fast path
-        (``_core.terminator_wait``) and the auto-pump loop based on
-        the live pinned-cown count. Refuses to run from a non-primary
-        interpreter when pinned cowns exist — the pinned queue is
-        single-consumer by design.
-        """
-        if _core.pinned_cown_count() == 0:
-            return _core.terminator_wait(timeout)
+        """Drain current root work before shutdown."""
         if not _core.is_primary():
             raise RuntimeError(
-                f"wait() with pinned cowns must run on the main "
+                f"runtime drain must run on the main "
                 f"interpreter (called from a non-main interpreter; "
                 f"{_core.pinned_cown_count()} pinned cown(s) live). "
                 f"Call wait() from the original main thread."
             )
-        return self._auto_pump_loop(timeout)
+        return _core.terminator_drain(timeout, self.export_module)
 
+    @_global_join
     def stop(self, timeout: Optional[float] = None):
         """Quiesce all behaviors and tear the runtime down.
 
         :param timeout: Upper bound on the **quiescence** and
             **noticeboard-drain** phases (steps 1, 2, and 4 below).
-            The worker shutdown handshake (step 5) and orphan-behavior
-            drain that follow run to completion regardless;
+            A work-drain timeout leaves the runtime running for retry.
+            After a successful drain, the worker shutdown handshake
+            (step 5) and orphan-behavior drain run to completion regardless;
             ``timeout`` does not bound total ``stop()`` runtime.
-            ``None`` means wait forever for quiescence. Values above
-            ``1e9`` seconds (~31.7 years) are clamped to wait-forever
-            to avoid platform ``time_t`` / ``DWORD`` overflow inside
-            the underlying condition-variable wait.
+            ``None`` means wait forever for quiescence; otherwise the
+            timeout must be finite and nonnegative.
         :type timeout: Optional[float]
+        :raises TimeoutError: If the global join times out while any
+            work reservation remains. The runtime remains running
+            with admission still open for a later retry.
         :raises RuntimeError: If the noticeboard thread does not exit
             before the timeout (or, on a retry call, is still alive).
             The first failure carries the message prefix
@@ -1337,11 +1326,9 @@ class Behaviors:
         With no central scheduler thread, ``stop()`` drives
         the C terminator directly. The sequence is:
 
-        1. Drop the seed (idempotent) so quiescence is reachable.
-        2. Block on ``terminator_wait`` until every in-flight
-           behavior has decremented (worker side) and no caller is
-           racing to schedule more.
-        3. Close the terminator. Any later ``whencall`` raises
+        1. Wait for current work to finish.
+        2. Fence admission atomically with the zero-work observation.
+        3. After admission closes, any later ``whencall`` raises
            ``RuntimeError("runtime is shutting down")`` from the
            ``terminator_inc()`` check rather than racing teardown.
         4. Tear down the noticeboard thread (it must have drained any
@@ -1349,16 +1336,18 @@ class Behaviors:
            single-writer slot is released).
         5. Stop workers and release the C-level noticeboard slot.
 
-        After ``terminator_wait`` returns we assert ``terminator_count
-        == 0 and terminator_seeded == 0``; any non-zero value indicates
-        a bookkeeping bug (a missed decrement, or a scheduling-after-
-        wait that slipped past ``terminator_close``).
+        A quiescence event alone is insufficient for teardown: newer work
+        may have arrived after the event. Shutdown waits for current
+        work reservations, not just a previously observed zero.
 
         The retry path is internally gated on ``_workers_stopped`` so
         the worker pool is not torn down twice; a second ``stop()``
         after a noticeboard-timeout abort retries only the
         noticeboard drain.
+        :raises ValueError: If timeout is negative or non-finite.
         """
+        timeout = _normalize_timeout(timeout)
+        _check_global_join()
         # One deadline up front so each stage gets the remaining budget, not a fresh timeout (else the bound is 3*T).
         if timeout is None:
             deadline = None
@@ -1371,19 +1360,10 @@ class Behaviors:
             return max(0.0, deadline - time.monotonic())
 
         if not self._workers_stopped:
-            _core.terminator_seed_dec()
-            self._wait_for_quiescence(_remaining())
-
-            c_count = _core.terminator_count()
-            c_seeded = _core.terminator_seeded()
-            quiesced = (c_count == 0 and c_seeded == 0)
-            _core.terminator_close()
-            if not quiesced:
-                self.logger.warning(
-                    "stop(): terminator did not reach quiescence "
-                    f"(count={c_count}, seeded={c_seeded}). "
-                    "This typically means stop() was invoked with a timeout "
-                    "that elapsed while behaviors were still in flight."
+            if not self._wait_for_quiescence(_remaining()):
+                raise TimeoutError(
+                    "stop(): outstanding reservations did not drain "
+                    f"within timeout={timeout!r}; the runtime remains running"
                 )
 
             _core.send("boc_noticeboard", "shutdown")
@@ -1934,11 +1914,22 @@ def start(worker_count: Optional[int] = None,
         or if the runtime is already up under a different
         ``worker_count`` / ``module`` than the one supplied.
     """
-    global BEHAVIORS
-
     if not _core.is_primary():
         raise RuntimeError("start() can only be called from the main interpreter")
+    if _core.in_behavior():
+        if BEHAVIORS is None:
+            raise RuntimeError("cannot restart the runtime from an active behavior")
+        _start_runtime(worker_count, module)
+        return
+    if module is None and BEHAVIORS is None:
+        module = get_caller_module()
+    with _LIFECYCLE_LOCK:
+        _start_runtime(worker_count, module)
 
+
+def _start_runtime(worker_count, module):
+    """Start under the lifecycle lock, or validate a runtime held by active work."""
+    global BEHAVIORS
     if BEHAVIORS is not None:
         if worker_count is not None and worker_count != BEHAVIORS.num_workers:
             raise RuntimeError(
@@ -1961,8 +1952,6 @@ def start(worker_count: Optional[int] = None,
     if worker_count is None:
         worker_count = WORKER_COUNT
 
-    if module is None:
-        module = get_caller_module()
     BEHAVIORS = Behaviors(worker_count)
     BEHAVIORS._started_module = module
     try:
@@ -2028,9 +2017,14 @@ def when(*cowns):
     return when_factory
 
 
+@_global_join
 def quiesce(timeout: Optional[float] = None, *,
             stats: bool = False, noticeboard: bool = False):
-    """Block until in-flight behaviors complete without tearing down the runtime.
+    """Observe a zero-work transition without tearing down the runtime.
+
+    New work may be admitted before this function returns. Use :func:`wait`
+    for strict draining and shutdown.
+    Optional snapshots are sampled after the observation.
 
     :param timeout: Upper bound (seconds). ``None`` waits forever.
     :type timeout: Optional[float]
@@ -2040,7 +2034,10 @@ def quiesce(timeout: Optional[float] = None, *,
     :type noticeboard: bool
     :raises TimeoutError: If quiescence is not reached within ``timeout``.
     :raises RuntimeError: If called from a non-primary interpreter while pinned cowns are live.
+    :raises ValueError: If timeout is negative or non-finite.
     """
+    timeout = _normalize_timeout(timeout)
+
     def _format(stats_snap, nb_snap):
         if stats and noticeboard:
             return WaitResult(stats=stats_snap, noticeboard=nb_snap)
@@ -2068,12 +2065,13 @@ def quiesce(timeout: Optional[float] = None, *,
             f"quiesce(): runtime did not reach quiescence within "
             f"timeout={timeout!r}"
         )
-    # Sample stats after quiescence so the per-worker counts are stable.
+    # Concurrent producers may already be active again when these snapshots are sampled.
     stats_snap = list(_core.scheduler_stats()) if stats else None
     nb_snap = BEHAVIORS.cycle_noticeboard(_remaining()) if noticeboard else None
     return _format(stats_snap, nb_snap)
 
 
+@_global_join
 def wait(timeout: Optional[float] = None, *,
          stats: bool = False, noticeboard: bool = False):
     """Block until all behaviors complete, with optional timeout.
@@ -2081,9 +2079,8 @@ def wait(timeout: Optional[float] = None, *,
     When ``stats=True``, captures the per-worker
     ``_core.scheduler_stats`` snapshot. When
     ``noticeboard=True``, captures the noticeboard contents as a
-    plain ``dict`` at the quiescence point (NOT after teardown — the
-    two are equivalent in single-caller programs but the quiescence
-    snapshot is the documented one). See the stub in
+    plain ``dict`` after observing quiescence, before teardown. Concurrent
+    producers may already have admitted newer work at snapshot time. See the stub in
     ``__init__.pyi`` for the full contract.
 
     Return value:
@@ -2096,8 +2093,11 @@ def wait(timeout: Optional[float] = None, *,
     Internally a thin wrapper around :func:`quiesce` +
     ``Behaviors.stop``; quiescence timeout warns rather than
     raising.
+    :raises ValueError: If timeout is negative or non-finite.
     """
     global BEHAVIORS
+
+    timeout = _normalize_timeout(timeout)
 
     def _format(stats_snap, nb_snap):
         if stats and noticeboard:

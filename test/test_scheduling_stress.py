@@ -504,6 +504,109 @@ class TestNoticeboardStartupHandshake:
         assert _core.terminator_count() == 0
 
 
+class TestNativeStartupAuthority:
+    """Native startup validation owns admission and preserves rejected runtimes."""
+
+    @classmethod
+    def teardown_class(cls):
+        wait()
+
+    def test_start_does_not_read_counter_in_python(self, monkeypatch):
+        wait()
+
+        def unexpected_count():
+            pytest.fail("startup queried the counter instead of claiming native state")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(_core, "terminator_count", unexpected_count)
+            bocpy.start(worker_count=2, module=(__name__, __file__))
+        assert _core.terminator_count() == 0
+        wait()
+
+    @pytest.mark.parametrize("busy", [False, True])
+    def test_duplicate_start_rejected_before_runtime_setup(self, monkeypatch, busy):
+        wait()
+        bocpy.start(worker_count=2, module=(__name__, __file__))
+        runtime = _behaviors.BEHAVIORS
+        if busy:
+            assert _core.terminator_inc() == 1
+
+        def unexpected_setup(module):
+            pytest.fail("rejected startup reached runtime setup")
+
+        try:
+            for _ in range(2):
+                other = _behaviors.Behaviors(2)
+                monkeypatch.setattr(other, "_start", unexpected_setup)
+                with pytest.raises(RuntimeError):
+                    other.start(module=(__name__, __file__))
+                assert _core.terminator_count() == int(busy)
+                assert _behaviors.BEHAVIORS is runtime
+                assert all(thread.is_alive() for thread in runtime.worker_threads)
+        finally:
+            if busy:
+                _core.terminator_dec()
+            wait()
+
+    def test_admission_stays_closed_until_activation(self, monkeypatch):
+        wait()
+        activate = _core.terminator_activate
+        calls = []
+
+        def check_activation():
+            assert _core.terminator_inc() == -1
+            with pytest.raises(RuntimeError):
+                _core.terminator_reset()
+            runtime = _behaviors.BEHAVIORS
+            assert all(thread.is_alive() for thread in runtime.worker_threads)
+            assert runtime.noticeboard.is_alive()
+            activate()
+            calls.append("activated")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(_core, "terminator_activate", check_activation)
+            bocpy.start(worker_count=2, module=(__name__, __file__))
+        assert calls == ["activated"]
+        assert _core.terminator_inc() == 1
+        _core.terminator_dec()
+        with pytest.raises(RuntimeError):
+            activate()
+        wait()
+
+    @pytest.mark.parametrize("phase", ["prepare", "scheduler", "workers", "activate"])
+    def test_failed_start_releases_native_claim(self, monkeypatch, phase):
+        wait()
+        sentinel = RuntimeError(f"failed startup at {phase}")
+
+        def fail(*args, **kwargs):
+            raise sentinel
+
+        target, attribute = {
+            "prepare": (_behaviors, "bind_file"),
+            "scheduler": (_core, "scheduler_runtime_start"),
+            "workers": (_behaviors.Behaviors, "start_workers"),
+            "activate": (_core, "terminator_activate"),
+        }[phase]
+        with monkeypatch.context() as patch:
+            patch.setattr(target, attribute, fail)
+            with pytest.raises(RuntimeError) as caught:
+                bocpy.start(worker_count=2, module=(__name__, __file__))
+        assert caught.value is sentinel
+        assert _behaviors.BEHAVIORS is None
+        assert _core.terminator_count() == 0
+        assert _core.terminator_inc() == -1
+
+        bocpy.start(worker_count=2, module=(__name__, __file__))
+
+        @when()
+        def probe():
+            return "restarted"
+
+        quiesce(QUIESCE_TIMEOUT)
+        assert probe.unwrap() == "restarted"
+        wait()
+
+
 class TestChainRingPerWorkerCount:
     """Long ring of overlapping pair-locks under varied worker counts.
 
@@ -718,10 +821,8 @@ class TestDispatchAfterRuntimeStop:
         )
 
         before_count = _core.terminator_count()
-        before_seeded = _core.terminator_seeded()
-        assert before_count == 0 and before_seeded == 0, (
-            f"runtime should be quiesced; got count={before_count}, "
-            f"seeded={before_seeded}"
+        assert before_count == 0, (
+            f"runtime should be quiesced; got count={before_count}"
         )
 
         c = Cown(Counter())
@@ -735,7 +836,8 @@ class TestDispatchAfterRuntimeStop:
             1,
         )
 
-        prior_count, prior_seeded = _core.terminator_reset()
+        _core.terminator_reset()
+        _core.terminator_activate()
         rc = _core.terminator_inc()
         assert rc >= 0, f"terminator_inc unexpectedly refused: {rc}"
 
@@ -744,7 +846,6 @@ class TestDispatchAfterRuntimeStop:
                 capsule.schedule()
             _core.terminator_dec()
         finally:
-            _core.terminator_seed_dec()
             _core.terminator_close()
 
         assert _core.terminator_count() == 0, (

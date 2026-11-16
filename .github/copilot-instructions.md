@@ -75,8 +75,8 @@ User code (@when)
 5. Releasing a cown may resolve the next waiting behavior, which is
    dispatched directly to a worker without touching any central queue.
    The result is stored in the `Cown` returned by `@when`.
-6. `wait()` blocks on `terminator_wait` until the C-level count reaches
-   zero; `stop()` then drains the workers and the noticeboard thread.
+6. `wait()` uses the native wait driver to observe quiescence;
+   `stop()` then drains the workers and the noticeboard thread.
 
 ## Public API
 
