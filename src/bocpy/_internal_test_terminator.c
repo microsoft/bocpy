@@ -19,7 +19,7 @@ static boc_terminator_wake_reason_t poll_waiter(
     BOCTerminatorWaiter *waiter, uint64_t (*depth)(void)) {
   boc_terminator_wake_reason_t reason;
   Py_BEGIN_ALLOW_THREADS
-  reason = terminator_waiter_wait(waiter, 0, false, depth);
+  reason = boc_terminator_waiter_wait(waiter, 0, false, depth);
   Py_END_ALLOW_THREADS
   return reason;
 }
@@ -32,7 +32,7 @@ static boc_terminator_wake_reason_t poll_waiter(
     }                                                                          \
   } while (0)
 
-/// @brief Exercise a native observation without exposing a Python waiter
+/// @brief Exercise a retained native observation without exposing a Python waiter
 static PyObject *terminator_scenario(PyObject *Py_UNUSED(self), PyObject *arg) {
   const char *scenario = PyUnicode_AsUTF8(arg);
   if (scenario == NULL) {
@@ -46,6 +46,7 @@ static PyObject *terminator_scenario(PyObject *Py_UNUSED(self), PyObject *arg) {
     terminator_init();
     initialized = true;
   }
+  BOCTerminator *term = NULL;
   BOCTerminatorWaiter waiters[4] = {0};
   BOCTerminatorWaiter fresh = {0};
   BOCTerminatorWaiter initial = {0};
@@ -55,18 +56,20 @@ static PyObject *terminator_scenario(PyObject *Py_UNUSED(self), PyObject *arg) {
   }
   CHECK(terminator_inc() == -1);
   CHECK(terminator_activate());
-  terminator_waiter_init(&initial, false);
+  term = terminator_root_acquire();
+  CHECK(term != NULL);
+  boc_terminator_waiter_init(&initial, term, false);
   CHECK(initial.completed);
-  CHECK(terminator_inc() == 1);
-  uint64_t generation = terminator_zero_count();
+  CHECK(boc_terminator_inc(term) == 1);
+  uint64_t generation = boc_terminator_zero_count(term);
   for (int i = 0; i < 4; ++i) {
-    terminator_waiter_init(&waiters[i], false);
+    boc_terminator_waiter_init(&waiters[i], term, false);
     CHECK(waiters[i].generation == generation);
     CHECK(!waiters[i].completed);
   }
   if (strcmp(scenario, "initial-zero") == 0) {
     CHECK(poll_waiter(&initial, NULL) == BOC_TERMINATOR_TERMINATED);
-    CHECK(terminator_count() == 1);
+    CHECK(boc_terminator_count(term) == 1);
     CHECK(poll_waiter(&waiters[0], NULL) == BOC_TERMINATOR_WAIT_TIMED_OUT);
   } else if (strcmp(scenario, "generation") == 0 ||
              strcmp(scenario, "multiple") == 0 ||
@@ -80,46 +83,50 @@ static PyObject *terminator_scenario(PyObject *Py_UNUSED(self), PyObject *arg) {
         }
         terminator_wake_all();
         CHECK(poll_waiter(&waiters[i], pinned_empty) == BOC_TERMINATOR_WAIT_TIMED_OUT);
-        CHECK(terminator_zero_count() == generation);
-        CHECK(terminator_count() == 1);
+        CHECK(boc_terminator_zero_count(term) == generation);
+        CHECK(boc_terminator_count(term) == 1);
       }
     }
-    CHECK(terminator_dec() == 0);
-    CHECK(terminator_inc() == 1);
-    CHECK(terminator_zero_count() == generation + 1);
+    CHECK(boc_terminator_dec(term) == 0);
+    CHECK(boc_terminator_inc(term) == 1);
+    CHECK(boc_terminator_zero_count(term) == generation + 1);
     for (int i = 0; i < 4; ++i) {
       CHECK(poll_waiter(&waiters[i], pinned_ready) == BOC_TERMINATOR_TERMINATED);
       CHECK(poll_waiter(&waiters[i], NULL) == BOC_TERMINATOR_TERMINATED);
       CHECK(waiters[i].completed);
     }
-    CHECK(terminator_count() == 1);
-    terminator_waiter_init(&fresh, false);
+    CHECK(boc_terminator_count(term) == 1);
+    boc_terminator_waiter_init(&fresh, term, false);
     CHECK(poll_waiter(&fresh, NULL) == BOC_TERMINATOR_WAIT_TIMED_OUT);
-  } else if (strcmp(scenario, "restart") == 0) {
-    CHECK(terminator_dec() == 0);
+  } else if (strcmp(scenario, "retirement") == 0) {
+    CHECK(boc_terminator_dec(term) == 0);
     CHECK(terminator_close());
+    CHECK(terminator_retire());
+    boc_terminator_decref(term);
+    term = NULL;
     CHECK(terminator_reset());
     CHECK(terminator_inc() == -1);
     CHECK(terminator_activate());
-    CHECK(terminator_zero_count() == generation + 1);
-    CHECK(terminator_inc() == 1);
+    term = terminator_root_acquire();
+    CHECK(boc_terminator_inc(term) == 1);
+    CHECK(term != waiters[0].term);
     for (int i = 0; i < 4; ++i) {
       CHECK(poll_waiter(&waiters[i], NULL) == BOC_TERMINATOR_TERMINATED);
-      CHECK(terminator_count() == 1);
-      CHECK(terminator_zero_count() == generation + 1);
+      CHECK(boc_terminator_count(waiters[i].term) == 0);
+      CHECK(boc_terminator_zero_count(waiters[i].term) == generation + 1);
     }
-    terminator_waiter_init(&fresh, false);
+    boc_terminator_waiter_init(&fresh, term, false);
     CHECK(poll_waiter(&fresh, NULL) == BOC_TERMINATOR_WAIT_TIMED_OUT);
   } else if (strcmp(scenario, "drain") == 0) {
-    terminator_waiter_init(&fresh, true);
+    boc_terminator_waiter_init(&fresh, term, true);
     CHECK(poll_waiter(&fresh, NULL) == BOC_TERMINATOR_WAIT_TIMED_OUT);
-    CHECK(terminator_dec() == 0);
-    CHECK(terminator_inc() == 1);
+    CHECK(boc_terminator_dec(term) == 0);
+    CHECK(boc_terminator_inc(term) == 1);
     CHECK(poll_waiter(&waiters[0], NULL) == BOC_TERMINATOR_TERMINATED);
     CHECK(poll_waiter(&fresh, NULL) == BOC_TERMINATOR_WAIT_TIMED_OUT);
-    CHECK(terminator_dec() == 0);
+    CHECK(boc_terminator_dec(term) == 0);
     CHECK(poll_waiter(&fresh, NULL) == BOC_TERMINATOR_TERMINATED);
-    CHECK(terminator_inc() == -1);
+    CHECK(boc_terminator_inc(term) == -1);
   } else {
     PyErr_SetString(PyExc_ValueError, "unknown terminator scenario");
     goto cleanup;
@@ -127,10 +134,19 @@ static PyObject *terminator_scenario(PyObject *Py_UNUSED(self), PyObject *arg) {
   result = Py_NewRef(Py_None);
 
 cleanup:
-  while (terminator_count() > 0) {
-    terminator_dec();
+  if (term != NULL) {
+    while (boc_terminator_count(term) > 0) {
+      boc_terminator_dec(term);
+    }
   }
   terminator_close();
+  terminator_retire();
+  boc_terminator_waiter_clear(&initial);
+  boc_terminator_waiter_clear(&fresh);
+  for (int i = 0; i < 4; ++i) {
+    boc_terminator_waiter_clear(&waiters[i]);
+  }
+  boc_terminator_decref(term);
   boc_atomic_store_bool_explicit(&scenario_running, false, BOC_MO_RELEASE);
   return result;
 }

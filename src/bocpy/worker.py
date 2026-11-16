@@ -33,40 +33,35 @@ def run_behavior(behavior):
     Only ``Exception`` (user-code errors, transient C failures) is
     explicitly handled and logged.
     """
+    acquired = False
     try:
-        acquired = False
         try:
+            _core.noticeboard_cache_clear()
+            behavior.acquire()
+            acquired = True
+        except Exception as ex:
+            logger.exception(ex)
             try:
-                _core.noticeboard_cache_clear()
-                behavior.acquire()
-                acquired = True
-            except Exception as ex:
-                logger.exception(ex)
-                try:
-                    behavior.set_exception(ex)
-                except Exception as inner:
-                    logger.exception(inner)
+                behavior.set_exception(ex)
+            except Exception as inner:
+                logger.exception(inner)
 
-            if acquired:
-                try:
-                    behavior.execute(boc_export)
-                except Exception as ex:
-                    logger.exception(ex)
-                    behavior.set_exception(ex)
-        finally:
+        if acquired:
             try:
-                behavior.release()
+                behavior.execute(boc_export)
             except Exception as ex:
                 logger.exception(ex)
+                behavior.set_exception(ex)
+    finally:
+        try:
+            behavior.release()
+        except Exception as ex:
+            logger.exception(ex)
+        finally:
             try:
                 behavior.release_all()
             except Exception as ex:
                 logger.exception(ex)
-    finally:
-        try:
-            _core.terminator_dec()
-        except Exception as ex:
-            logger.exception(ex)
 
 
 def do_work():

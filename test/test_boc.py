@@ -1760,15 +1760,10 @@ class TestBaseExceptionDiscipline:
 
         import bocpy._core as _core_mod
 
-        def _fake_terminator_dec(*args, **kwargs):
-            return 0
-
         with patch_attr(FakeCapsule, "set_drop_exception",
                         patched_set_drop), \
              patch_attr(_core_mod, "scheduler_drain_all_queues",
-                        fake_drain), \
-             patch_attr(_core_mod, "terminator_dec",
-                        _fake_terminator_dec):
+                        fake_drain):
             with pytest.raises(KeyboardInterrupt, match="orphan-drain KI"):
                 b._drain_orphan_behaviors()
 

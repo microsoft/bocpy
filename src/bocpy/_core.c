@@ -942,6 +942,22 @@ static PyObject *_core_terminator_wake(PyObject *self,
   Py_RETURN_NONE;
 }
 
+/// @brief Retire the root only after admission and all execution have stopped
+static PyObject *_core_terminator_retire(PyObject *self,
+                                        PyObject *Py_UNUSED(args)) {
+  BOC_STATE_SET(self);
+  if (BOC_STATE->index != 0) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "terminator_retire must be called from the primary interpreter");
+    return NULL;
+  }
+  if (!terminator_retire()) {
+    PyErr_SetString(PyExc_RuntimeError, "cannot retire an open or busy runtime");
+    return NULL;
+  }
+  Py_RETURN_NONE;
+}
+
 /// @details This can be safely referenced and used from multiple processes.
 typedef struct boc_cown {
   int_least64_t id;
@@ -2133,7 +2149,10 @@ static PyObject *root_wait(PyObject *module, PyObject *args, PyObject *kwargs,
     return NULL;
   }
   bool pumpable = bocpy_interpid() == bocpy_main_interpid() && !IN_PUMP_BODY;
-  return terminator_wait_driver(drain, end, forever, boc_export, pumpable);
+  BOCTerminator *root = terminator_root_acquire();
+  PyObject *result = terminator_wait_driver(root, drain, end, forever, boc_export, pumpable);
+  boc_terminator_decref(root);
+  return result;
 }
 
 static PyObject *_core_terminator_quiescence(PyObject *module, PyObject *args,
@@ -3296,6 +3315,9 @@ typedef struct behavior_s {
   struct boc_request **requests;
   /// @brief Number of entries in @c requests (post-dedup, ≤ args_size + 1).
   Py_ssize_t requests_size;
+  BOCTerminator *root_owner;
+  bool root_reserved;
+  bool submitted;
   /// @brief Fairness-token discriminator.
   /// @details 0 for ordinary behaviours; 1 for the per-worker
   /// @c token_work sentinel allocated by
@@ -3363,6 +3385,9 @@ BOCBehavior *behavior_new() {
   behavior->captures = NULL;
   behavior->requests = NULL;
   behavior->requests_size = 0;
+  behavior->root_owner = NULL;
+  behavior->root_reserved = false;
+  behavior->submitted = false;
   behavior->is_token = 0;
   behavior->owner_worker_index = -1;
   BOC_REF_TRACKING_ADD_BEHAVIOR();
@@ -3418,6 +3443,7 @@ void behavior_free(BOCBehavior *behavior) {
     BOCTag_free(behavior->thunk);
   }
 
+  boc_terminator_decref(behavior->root_owner);
   PyMem_RawFree(BOC_BEHAVIOR_PREHDR(behavior));
   BOC_REF_TRACKING_REMOVE_BEHAVIOR();
 }
@@ -3814,11 +3840,21 @@ static PyObject *BehaviorCapsule_create_requests(PyObject *op,
   return list;
 }
 
+/// @brief Drop the actual execution reservation exactly once after cleanup
+static void behavior_root_complete(BOCBehavior *behavior) {
+  if (behavior->root_reserved) {
+    behavior->root_reserved = false;
+    boc_terminator_dec(behavior->root_owner);
+  }
+}
+
 static int behavior_release_all_impl(BOCBehavior *behavior) {
   if (behavior->requests == NULL) {
+    behavior_root_complete(behavior);
     return 0;
   }
 
+  PyObject *error = NULL;
   BOCRequest **requests = behavior->requests;
   Py_ssize_t requests_size = behavior->requests_size;
   behavior->requests = NULL;
@@ -3826,16 +3862,21 @@ static int behavior_release_all_impl(BOCBehavior *behavior) {
 
   for (Py_ssize_t i = 0; i < requests_size; ++i) {
     if (request_release_inner(requests[i]) < 0) {
-      for (Py_ssize_t k = i; k < requests_size; ++k) {
-        request_decref(requests[k]);
+      if (error == NULL) {
+        error = PyErr_GetRaisedException();
+      } else {
+        PyErr_Clear();
       }
-      PyMem_RawFree(requests);
-      return -1;
     }
     request_decref(requests[i]);
   }
 
   PyMem_RawFree(requests);
+  behavior_root_complete(behavior);
+  if (error != NULL) {
+    PyErr_SetRaisedException(error);
+    return -1;
+  }
   return 0;
 }
 
@@ -3871,6 +3912,10 @@ static PyObject *BehaviorCapsule_schedule(PyObject *op,
                                           PyObject *Py_UNUSED(dummy)) {
   BehaviorCapsuleObject *capsule = (BehaviorCapsuleObject *)op;
   BOCBehavior *behavior = capsule->behavior;
+  if (behavior->submitted) {
+    PyErr_SetString(PyExc_RuntimeError, "behavior has already been scheduled");
+    return NULL;
+  }
 
   BOCRecycleQueue_empty(BOC_STATE->recycle_queue, false);
 
@@ -3881,6 +3926,15 @@ static PyObject *BehaviorCapsule_schedule(PyObject *op,
     }
     Py_DECREF(list);
   }
+
+  BOCTerminator *root = terminator_reserve();
+  if (root == NULL) {
+    PyErr_SetString(PyExc_RuntimeError, "runtime is shutting down");
+    return NULL;
+  }
+  behavior->root_owner = root;
+  behavior->root_reserved = true;
+  behavior->submitted = true;
 
   BOCRequest **requests = behavior->requests;
   Py_ssize_t n = behavior->requests_size;
@@ -3900,6 +3954,7 @@ static PyObject *BehaviorCapsule_schedule(PyObject *op,
   Py_END_ALLOW_THREADS
 
       if (!ok) {
+    behavior_release_all_impl(behavior);
     if (!PyErr_Occurred()) {
       PyErr_SetString(PyExc_RuntimeError,
                       "behavior_schedule: link phase failed");
@@ -3908,6 +3963,7 @@ static PyObject *BehaviorCapsule_schedule(PyObject *op,
   }
 
   if (behavior_resolve_one(behavior) < 0) {
+    behavior_release_all_impl(behavior);
     return NULL;
   }
 
@@ -4499,7 +4555,6 @@ PyObject *main_pump_bounded_impl(PyObject *deadline_ms,
     if (behavior_release_all_impl(b) < 0) {
       _core_log_release_error();
     }
-    terminator_dec();
     BEHAVIOR_DECREF(b);
 
     IN_PUMP_BODY = false;
@@ -4595,7 +4650,6 @@ static PyObject *_core_main_pump_drain_all(PyObject *Py_UNUSED(self),
     if (behavior_release_all_impl(b) < 0) {
       PyErr_WriteUnraisable(NULL);
     }
-    terminator_dec();
     BEHAVIOR_DECREF(b);
     drained++;
   }
@@ -5633,6 +5687,8 @@ static PyMethodDef _core_module_methods[] = {
      "Wait for zero root reservations, then close admission"},
     {"set_wait_pump_poll", _core_set_wait_pump_poll, METH_O,
      "Set the native wait polling interval in milliseconds"},
+    {"terminator_retire", _core_terminator_retire, METH_NOARGS,
+     "Retire a closed, drained runtime"},
     {"terminator_wake", _core_terminator_wake, METH_NOARGS,
      "Notify completion waits"},
     {NULL} /* Sentinel */

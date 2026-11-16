@@ -1018,6 +1018,7 @@ class Behaviors:
         except BaseException:
             try:
                 _core.terminator_close()
+                _core.terminator_retire()
             finally:
                 self._restore_main_aliases()
             raise
@@ -1408,6 +1409,7 @@ class Behaviors:
                 )
                 self._final_noticeboard = None
             _core.noticeboard_clear()
+            _core.terminator_retire()
             self._teardown_complete = True
         self._restore_main_aliases()
         if drain_errors:
@@ -1425,9 +1427,8 @@ class Behaviors:
         frees the per-worker queues. Each orphan has had its cowns
         scheduled (MCS links established) but never acquired by a
         worker. ``release_all`` walks the MCS queues, hands off to any
-        waiting successors, and frees the request array;
-        ``terminator_dec`` drops the hold the ``whencall`` caller took
-        before ``behavior_schedule``.
+        waiting successors, frees the request array, and drops the native
+        reservation taken by ``behavior_schedule``.
 
         Before ``release_all`` runs, ``set_drop_exception`` marks the
         result Cown with a :class:`RuntimeError` so a caller awaiting
@@ -1512,14 +1513,6 @@ class Behaviors:
                 except (KeyboardInterrupt, SystemExit) as ex:
                     self.logger.exception(ex)
                     errors.append(ex)
-                    if deferred_base_exc is None:
-                        deferred_base_exc = ex
-                try:
-                    _core.terminator_dec()
-                except Exception as ex:
-                    self.logger.exception(ex)
-                except (KeyboardInterrupt, SystemExit) as ex:
-                    self.logger.exception(ex)
                     if deferred_base_exc is None:
                         deferred_base_exc = ex
 
@@ -1862,15 +1855,7 @@ def whencall(func, args: list[Union[Cown, list[Cown]]], captures: list[Any]) -> 
     # Empty groups leave no cown entry, so pass the top-level arg count for tuple sizing and [] fill.
     behavior = _core.BehaviorCapsule(key, result.impl, cowns, captures,
                                      len(args))
-    # Take the terminator hold before scheduling so a concurrent stop()/terminator_close() refuses the schedule
-    # rather than racing teardown; the matching dec runs on the worker thread once the body completes.
-    if _core.terminator_inc() < 0:
-        raise RuntimeError("runtime is shutting down")
-    try:
-        behavior.schedule()
-    except BaseException:
-        _core.terminator_dec()
-        raise
+    behavior.schedule()
     return result
 
 

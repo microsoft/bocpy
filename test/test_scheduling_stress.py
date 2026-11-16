@@ -247,12 +247,8 @@ class TestSchedulingDrainRecycleFlush:
 class TestWhencallRollback:
     """Verify that a failed ``behavior_schedule`` releases its terminator hold.
 
-    The ``whencall`` helper takes a terminator hold via ``terminator_inc``
-    before it dispatches to ``behavior_schedule``. If the schedule call
-    raises (which is normally the unreachable post-prepare branch, but is
-    reachable defensively if a future C-level invariant is violated), the
-    Python ``try/except`` MUST drop the hold via ``terminator_dec`` so
-    ``wait()`` can complete.
+    The native scheduling path owns reservation and rollback. A rejected
+    schedule must not leave outstanding work that prevents global draining.
     """
 
     @classmethod
@@ -334,15 +330,7 @@ class TestStopVsScheduleRace:
         assert _core.terminator_count() == 0
 
     def test_whencall_raises_after_close(self):
-        """``@when`` directly after a refused inc must surface RuntimeError.
-
-        We monkey-patch ``terminator_inc`` to return -1 (the refusal
-        sentinel), since once a real ``terminator_close`` has fenced the
-        runtime the entire @when path is shut and there is no test hook
-        to reopen it without going through ``start()``. The patch
-        targets the same underlying C function via the Python module
-        binding the whencall helper actually consults.
-        """
+        """Reject scheduling after native root admission has been closed."""
         c0 = Cown(Counter())
 
         @when(c0)
@@ -352,21 +340,15 @@ class TestStopVsScheduleRace:
         quiesce(QUIESCE_TIMEOUT)
         assert probe.unwrap() is True
 
-        from mockreplacement import patch_attr
-
-        def _refuse_inc(*args, **kwargs):
-            return -1
-
-        with patch_attr(
-            _behaviors._core, "terminator_inc", _refuse_inc,
-        ):
+        _core.terminator_close()
+        try:
             c = Cown(Counter())
             with pytest.raises(RuntimeError, match="shutting down"):
                 @when(c)
                 def _(c):
                     c.value.count += 1
-
-        wait()
+        finally:
+            wait()
         assert _core.terminator_count() == 0
 
 
@@ -756,13 +738,8 @@ class TestOrphanDropException:
         def _fake_drain():
             return drain_results.pop(0)
 
-        def _fake_terminator_dec(*args, **kwargs):
-            return 0
-
         with patch_attr(
             _behaviors._core, "scheduler_drain_all_queues", _fake_drain,
-        ), patch_attr(
-            _behaviors._core, "terminator_dec", _fake_terminator_dec,
         ):
             behaviors = bocpy.behaviors.BEHAVIORS
             assert behaviors is not None, (
@@ -838,18 +815,16 @@ class TestDispatchAfterRuntimeStop:
 
         _core.terminator_reset()
         _core.terminator_activate()
-        rc = _core.terminator_inc()
-        assert rc >= 0, f"terminator_inc unexpectedly refused: {rc}"
 
         try:
             with pytest.raises(RuntimeError, match="bocpy runtime is not running"):
                 capsule.schedule()
-            _core.terminator_dec()
         finally:
             _core.terminator_close()
+            _core.terminator_retire()
 
         assert _core.terminator_count() == 0, (
-            "schedule failure must roll back the synthetic terminator hold"
+            "schedule failure must roll back its terminator hold"
         )
 
     def test_scheduler_runtime_stop_is_idempotent(self):

@@ -36,11 +36,11 @@ bool wait_arguments(PyObject *args, PyObject *kwargs, double *end,
 }
 
 /// @brief Own one completion observation through blocking, bounded pumping and signal checks
-PyObject *terminator_wait_driver(bool drain,
+PyObject *terminator_wait_driver(BOCTerminator *term, bool drain,
                                  double end, bool forever,
                                  PyObject *boc_export, bool pumpable) {
   BOCTerminatorWaiter waiter;
-  terminator_waiter_init(&waiter, drain);
+  boc_terminator_waiter_init(&waiter, term, drain);
   PyObject *limit = NULL;
   bool completed = false;
   for (;;) {
@@ -51,7 +51,7 @@ PyObject *terminator_wait_driver(bool drain,
     }
     boc_terminator_wake_reason_t reason;
     Py_BEGIN_ALLOW_THREADS
-    reason = terminator_waiter_wait(
+    reason = boc_terminator_waiter_wait(
         &waiter, slice, false, pumpable ? _core_pinned_depth_load : NULL);
     Py_END_ALLOW_THREADS
     if (PyErr_CheckSignals() < 0) {
@@ -105,6 +105,7 @@ PyObject *terminator_wait_driver(bool drain,
     Py_DECREF(result);
   }
   Py_XDECREF(limit);
+  boc_terminator_waiter_clear(&waiter);
   if (PyErr_Occurred()) {
     return NULL;
   }

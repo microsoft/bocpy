@@ -122,7 +122,7 @@ def test_quiescence_has_no_python_waiter_type():
 
 
 @pytest.mark.parametrize(
-    "scenario", ["initial-zero", "generation", "multiple", "pinned", "spurious", "restart", "drain"],
+    "scenario", ["initial-zero", "generation", "multiple", "pinned", "spurious", "retirement", "drain"],
 )
 def test_native_waiter_observation(scenario):
     internal = pytest.importorskip("bocpy._internal_test")
