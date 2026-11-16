@@ -56,6 +56,7 @@ _headers = [
     "src/bocpy/boc_compat.h",
     "src/bocpy/boc_cown.h",
     "src/bocpy/boc_execution.h",
+    "src/bocpy/boc_native_ref.h",
     "src/bocpy/boc_noticeboard.h",
     "src/bocpy/boc_registry.h",
     "src/bocpy/boc_sched.h",

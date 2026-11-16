@@ -14,6 +14,11 @@
 
 #include <string.h>
 
+static void nb_cown_retain(void *pointer) { COWN_INCREF((BOCCown *)pointer); }
+static void nb_cown_release(void *pointer) { COWN_DECREF((BOCCown *)pointer); }
+
+const BOCNativeRefOps BOC_COWN_REF_OPS = {nb_cown_retain, nb_cown_release};
+
 /// @brief A single noticeboard entry.
 typedef struct nb_entry {
   /// @brief The key for this entry (null-terminated UTF-8).
@@ -22,9 +27,9 @@ typedef struct nb_entry {
   XIDATA_T *value;
   /// @brief Whether the value was pickled during serialization.
   bool pickled;
-  /// @brief BOCCowns referenced by @ref value, pinned by this entry.
-  BOCCown **pinned_cowns;
-  /// @brief Number of entries in @ref pinned_cowns.
+  /// @brief Native allocations referenced by @ref value, owned by this entry.
+  BOCNativeRef *pinned_refs;
+  /// @brief Number of entries in @ref pinned_refs.
   int pinned_count;
 } NoticeboardEntry;
 
@@ -71,7 +76,7 @@ void noticeboard_destroy(void) {
 
   XIDATA_T *to_free[NB_MAX_ENTRIES];
   int to_free_count = 0;
-  BOCCown **to_unpin[NB_MAX_ENTRIES];
+  BOCNativeRef *to_unpin[NB_MAX_ENTRIES];
   int to_unpin_count[NB_MAX_ENTRIES];
   int to_unpin_entries = 0;
 
@@ -81,11 +86,11 @@ void noticeboard_destroy(void) {
       to_free[to_free_count++] = NB.entries[i].value;
       NB.entries[i].value = NULL;
     }
-    if (NB.entries[i].pinned_cowns != NULL) {
-      to_unpin[to_unpin_entries] = NB.entries[i].pinned_cowns;
+    if (NB.entries[i].pinned_refs != NULL) {
+      to_unpin[to_unpin_entries] = NB.entries[i].pinned_refs;
       to_unpin_count[to_unpin_entries] = NB.entries[i].pinned_count;
       to_unpin_entries++;
-      NB.entries[i].pinned_cowns = NULL;
+      NB.entries[i].pinned_refs = NULL;
       NB.entries[i].pinned_count = 0;
     }
   }
@@ -98,7 +103,7 @@ void noticeboard_destroy(void) {
   }
   for (int i = 0; i < to_unpin_entries; i++) {
     for (int j = 0; j < to_unpin_count[i]; j++) {
-      COWN_DECREF(to_unpin[i][j]);
+      native_ref_release(to_unpin[i][j]);
     }
     PyMem_RawFree(to_unpin[i]);
   }
@@ -146,7 +151,7 @@ void noticeboard_drop_local_cache(void) {
 
 void noticeboard_cache_clear_for_behavior(void) { NB_VERSION_CHECKED = false; }
 
-int nb_pin_cowns(PyObject *cowns, BOCCown ***out_array, int *out_count) {
+int nb_pin_cowns(PyObject *cowns, BOCNativeRef **out_array, int *out_count) {
   *out_array = NULL;
   *out_count = 0;
 
@@ -166,7 +171,7 @@ int nb_pin_cowns(PyObject *cowns, BOCCown ***out_array, int *out_count) {
     return 0;
   }
 
-  BOCCown **pins = (BOCCown **)PyMem_RawMalloc(sizeof(BOCCown *) * n);
+  BOCNativeRef *pins = PyMem_RawMalloc(sizeof(BOCNativeRef) * n);
   if (pins == NULL) {
     Py_DECREF(seq);
     PyErr_NoMemory();
@@ -189,7 +194,7 @@ int nb_pin_cowns(PyObject *cowns, BOCCown ***out_array, int *out_count) {
       }
       goto fail;
     }
-    pins[taken++] = cown;
+    pins[taken++] = (BOCNativeRef){cown, &BOC_COWN_REF_OPS};
   }
 
   Py_DECREF(seq);
@@ -199,7 +204,7 @@ int nb_pin_cowns(PyObject *cowns, BOCCown ***out_array, int *out_count) {
 
 fail:
   for (int i = 0; i < taken; i++) {
-    COWN_DECREF(pins[i]);
+    native_ref_release(pins[i]);
   }
   for (Py_ssize_t i = (Py_ssize_t)taken + 1; i < n; i++) {
     PyObject *item = PySequence_Fast_GET_ITEM(seq, i);
@@ -216,7 +221,7 @@ fail:
 }
 
 int noticeboard_write(const char *key, Py_ssize_t key_len, XIDATA_T *xidata,
-                      bool pickled, BOCCown **pins, int pin_count) {
+                      bool pickled, BOCNativeRef *pins, int pin_count) {
   if (key_len >= NB_KEY_SIZE) {
     PyErr_SetString(PyExc_ValueError,
                     "noticeboard key too long (max 63 UTF-8 bytes)");
@@ -248,17 +253,17 @@ int noticeboard_write(const char *key, Py_ssize_t key_len, XIDATA_T *xidata,
     strncpy(target->key, key, NB_KEY_SIZE - 1);
     target->key[NB_KEY_SIZE - 1] = '\0';
     target->value = NULL;
-    target->pinned_cowns = NULL;
+    target->pinned_refs = NULL;
     target->pinned_count = 0;
   }
 
   XIDATA_T *old_value = target->value;
-  BOCCown **old_pins = target->pinned_cowns;
+  BOCNativeRef *old_pins = target->pinned_refs;
   int old_pin_count = target->pinned_count;
 
   target->value = xidata;
   target->pickled = pickled;
-  target->pinned_cowns = pins;
+  target->pinned_refs = pins;
   target->pinned_count = pin_count;
 
   atomic_fetch_add(&NB_VERSION, 1);
@@ -270,7 +275,7 @@ int noticeboard_write(const char *key, Py_ssize_t key_len, XIDATA_T *xidata,
   }
   if (old_pins != NULL) {
     for (int i = 0; i < old_pin_count; i++) {
-      COWN_DECREF(old_pins[i]);
+      native_ref_release(old_pins[i]);
     }
     PyMem_RawFree(old_pins);
   }
@@ -282,7 +287,7 @@ fail:
   }
   if (pins != NULL) {
     for (int i = 0; i < pin_count; i++) {
-      COWN_DECREF(pins[i]);
+      native_ref_release(pins[i]);
     }
     PyMem_RawFree(pins);
   }
@@ -302,7 +307,7 @@ int noticeboard_delete(const char *key, Py_ssize_t key_len) {
   }
 
   XIDATA_T *deleted_value = NULL;
-  BOCCown **deleted_pins = NULL;
+  BOCNativeRef *deleted_pins = NULL;
   int deleted_pin_count = 0;
 
   mtx_lock(&NB.mutex);
@@ -316,7 +321,7 @@ int noticeboard_delete(const char *key, Py_ssize_t key_len) {
 
   if (found >= 0) {
     deleted_value = NB.entries[found].value;
-    deleted_pins = NB.entries[found].pinned_cowns;
+    deleted_pins = NB.entries[found].pinned_refs;
     deleted_pin_count = NB.entries[found].pinned_count;
 
     for (int i = found; i < NB.count - 1; i++) {
@@ -334,7 +339,7 @@ int noticeboard_delete(const char *key, Py_ssize_t key_len) {
   }
   if (deleted_pins != NULL) {
     for (int i = 0; i < deleted_pin_count; i++) {
-      COWN_DECREF(deleted_pins[i]);
+      native_ref_release(deleted_pins[i]);
     }
     PyMem_RawFree(deleted_pins);
   }
@@ -344,7 +349,7 @@ int noticeboard_delete(const char *key, Py_ssize_t key_len) {
 void noticeboard_clear(void) {
   XIDATA_T *to_free[NB_MAX_ENTRIES];
   int to_free_count = 0;
-  BOCCown **to_unpin[NB_MAX_ENTRIES];
+  BOCNativeRef *to_unpin[NB_MAX_ENTRIES];
   int to_unpin_count[NB_MAX_ENTRIES];
   int to_unpin_entries = 0;
 
@@ -354,11 +359,11 @@ void noticeboard_clear(void) {
       to_free[to_free_count++] = NB.entries[i].value;
       NB.entries[i].value = NULL;
     }
-    if (NB.entries[i].pinned_cowns != NULL) {
-      to_unpin[to_unpin_entries] = NB.entries[i].pinned_cowns;
+    if (NB.entries[i].pinned_refs != NULL) {
+      to_unpin[to_unpin_entries] = NB.entries[i].pinned_refs;
       to_unpin_count[to_unpin_entries] = NB.entries[i].pinned_count;
       to_unpin_entries++;
-      NB.entries[i].pinned_cowns = NULL;
+      NB.entries[i].pinned_refs = NULL;
       NB.entries[i].pinned_count = 0;
     }
   }
@@ -372,7 +377,7 @@ void noticeboard_clear(void) {
   }
   for (int i = 0; i < to_unpin_entries; i++) {
     for (int j = 0; j < to_unpin_count[i]; j++) {
-      COWN_DECREF(to_unpin[i][j]);
+      native_ref_release(to_unpin[i][j]);
     }
     PyMem_RawFree(to_unpin[i]);
   }
@@ -404,7 +409,7 @@ PyObject *noticeboard_snapshot(PyObject *loads) {
   PyObject *deferred_bytes[NB_MAX_ENTRIES];
   int deferred_count = 0;
 
-  BOCCown **keepalive_pins[NB_MAX_ENTRIES];
+  BOCNativeRef *keepalive_pins[NB_MAX_ENTRIES];
   int keepalive_counts[NB_MAX_ENTRIES];
   for (int i = 0; i < NB_MAX_ENTRIES; i++) {
     keepalive_pins[i] = NULL;
@@ -445,7 +450,7 @@ PyObject *noticeboard_snapshot(PyObject *loads) {
       Py_DECREF(raw);
     } else {
       if (entry->pinned_count > 0) {
-        BOCCown **pins = (BOCCown **)PyMem_RawMalloc(sizeof(BOCCown *) *
+        BOCNativeRef *pins = PyMem_RawMalloc(sizeof(BOCNativeRef) *
                                                      entry->pinned_count);
         if (pins == NULL) {
           Py_DECREF(key);
@@ -455,8 +460,8 @@ PyObject *noticeboard_snapshot(PyObject *loads) {
           goto fail_deferred;
         }
         for (int j = 0; j < entry->pinned_count; j++) {
-          pins[j] = entry->pinned_cowns[j];
-          COWN_INCREF(pins[j]);
+          pins[j] = entry->pinned_refs[j];
+          native_ref_retain(pins[j]);
         }
         keepalive_pins[deferred_count] = pins;
         keepalive_counts[deferred_count] = entry->pinned_count;
@@ -484,7 +489,7 @@ PyObject *noticeboard_snapshot(PyObject *loads) {
       for (int j = 0; j < deferred_count; j++) {
         if (keepalive_pins[j] != NULL) {
           for (int k = 0; k < keepalive_counts[j]; k++) {
-            COWN_DECREF(keepalive_pins[j][k]);
+            native_ref_release(keepalive_pins[j][k]);
           }
           PyMem_RawFree(keepalive_pins[j]);
           keepalive_pins[j] = NULL;
@@ -504,7 +509,7 @@ PyObject *noticeboard_snapshot(PyObject *loads) {
       for (int j = 0; j < deferred_count; j++) {
         if (keepalive_pins[j] != NULL) {
           for (int k = 0; k < keepalive_counts[j]; k++) {
-            COWN_DECREF(keepalive_pins[j][k]);
+            native_ref_release(keepalive_pins[j][k]);
           }
           PyMem_RawFree(keepalive_pins[j]);
           keepalive_pins[j] = NULL;
@@ -519,7 +524,7 @@ PyObject *noticeboard_snapshot(PyObject *loads) {
 
     if (keepalive_pins[i] != NULL) {
       for (int k = 0; k < keepalive_counts[i]; k++) {
-        COWN_DECREF(keepalive_pins[i][k]);
+        native_ref_release(keepalive_pins[i][k]);
       }
       PyMem_RawFree(keepalive_pins[i]);
       keepalive_pins[i] = NULL;
@@ -545,7 +550,7 @@ fail_deferred:
     Py_DECREF(deferred_bytes[i]);
     if (keepalive_pins[i] != NULL) {
       for (int k = 0; k < keepalive_counts[i]; k++) {
-        COWN_DECREF(keepalive_pins[i][k]);
+        native_ref_release(keepalive_pins[i][k]);
       }
       PyMem_RawFree(keepalive_pins[i]);
       keepalive_pins[i] = NULL;

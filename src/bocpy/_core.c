@@ -235,13 +235,13 @@ static thread_local _core_module_state *BOC_STATE;
 /// that. If that ever changes, migration to a module-state cell is
 /// mechanical.
 typedef struct noticeboard_pickle_ctx {
-  /// @brief Caller-owned, exactly-sized array of pre-pinned @c BOCCown*.
+  /// @brief Caller-owned, exactly-sized array of owned native references.
   /// @details Borrowed (not owned) for the duration of one
   /// @c object_to_xidata call. The caller
   /// (@ref _core_noticeboard_write_direct) freed any prior pin array
   /// before installing this one and is responsible for releasing this
   /// one too.
-  BOCCown **pins;
+  BOCNativeRef *pins;
   /// @brief Number of valid entries in @ref pins.
   int pin_count;
   /// @brief Number of @c CownCapsule reductions seen during pickling
@@ -492,7 +492,7 @@ static PyObject *object_to_xidata(PyObject *value, XIDATA_T **xidata_ptr) {
 /// @return Py_None on success, NULL on error (PyErr set).
 static PyObject *nb_serialize_and_commit(const char *key, Py_ssize_t key_len,
                                          PyObject *value, PyObject *cowns) {
-  BOCCown **new_pins = NULL;
+  BOCNativeRef *new_pins = NULL;
   int new_pin_count = 0;
   if (nb_pin_cowns(cowns, &new_pins, &new_pin_count) < 0) {
     return NULL;
@@ -518,7 +518,7 @@ static PyObject *nb_serialize_and_commit(const char *key, Py_ssize_t key_len,
       XIDATA_FREE(xidata);
     }
     for (int i = 0; i < new_pin_count; i++) {
-      COWN_DECREF(new_pins[i]);
+      native_ref_release(new_pins[i]);
     }
     PyMem_RawFree(new_pins);
     return NULL;
@@ -531,7 +531,7 @@ static PyObject *nb_serialize_and_commit(const char *key, Py_ssize_t key_len,
     int unpinned = nb_ctx.unpinned_count;
     XIDATA_FREE(xidata);
     for (int i = 0; i < new_pin_count; i++) {
-      COWN_DECREF(new_pins[i]);
+      native_ref_release(new_pins[i]);
     }
     PyMem_RawFree(new_pins);
     PyErr_Format(PyExc_RuntimeError,
@@ -1911,7 +1911,8 @@ static PyObject *CownCapsule_reduce(PyObject *op, PyObject *Py_UNUSED(dummy)) {
   if (borrowing) {
     bool found = false;
     for (int i = 0; i < nb_ctx->pin_count; i++) {
-      if (nb_ctx->pins[i] == cown) {
+      if (nb_ctx->pins[i].pointer == cown &&
+          nb_ctx->pins[i].ops == &BOC_COWN_REF_OPS) {
         found = true;
         break;
       }
