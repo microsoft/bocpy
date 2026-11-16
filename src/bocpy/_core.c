@@ -2,6 +2,7 @@
 
 #include "boc_compat.h"
 #include "boc_cown.h"
+#include "boc_execution.h"
 #include "boc_noticeboard.h"
 #include "boc_registry.h"
 #include "boc_sched.h"
@@ -58,10 +59,6 @@ static boc_bq_t MAIN_PINNED_QUEUE;
 static atomic_int_least64_t MAIN_PINNED_DEPTH = 0;
 
 static atomic_int_least64_t MAIN_PINNED_NONEMPTY_SINCE_NS = 0;
-
-static thread_local bool IN_PUMP_BODY = false;
-static atomic_int_least64_t WAIT_PUMP_POLL_MS = 50;
-static thread_local bool IN_BEHAVIOR = false;
 
 static atomic_int_least64_t LAST_PUMP_NS = 0;
 
@@ -885,7 +882,6 @@ static PyObject *_core_terminator_close(PyObject *self,
   Py_RETURN_NONE;
 }
 
-static uint64_t _core_pinned_depth_load(void);
 
 /// @brief Claim a fresh runtime start with admission closed
 /// @details Requires the previous runtime to be closed and drained.
@@ -2102,11 +2098,6 @@ BOCCown *cown_unwrap(PyObject *op) {
   return self->cown;
 }
 
-static PyObject *main_pump_bounded_impl(PyObject *deadline_ms,
-                                       PyObject *max_behaviors,
-                                       bool raise_on_error, PyObject *boc_export,
-                                       bool *started);
-
 /// @brief Validate the live native wait cadence
 static PyObject *_core_set_wait_pump_poll(PyObject *module, PyObject *ms) {
   BOC_STATE_SET(module);
@@ -2124,108 +2115,6 @@ static PyObject *_core_set_wait_pump_poll(PyObject *module, PyObject *ms) {
   }
   atomic_store(&WAIT_PUMP_POLL_MS, value);
   Py_RETURN_NONE;
-}
-
-/// @brief Normalize arguments before checking host state, since conversion can execute Python
-static bool wait_arguments(PyObject *args, PyObject *kwargs, double *end,
-                            bool *forever, PyObject **boc_export) {
-  static char *names[] = {"timeout", "boc_export", NULL};
-  PyObject *timeout = Py_None;
-  *boc_export = Py_None;
-  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|OO", names, &timeout,
-                                   boc_export)) {
-    return false;
-  }
-  *forever = timeout == Py_None;
-  double seconds = 0;
-  if (!*forever) {
-    seconds = PyFloat_AsDouble(timeout);
-    if (PyErr_Occurred()) {
-      return false;
-    }
-    if (!isfinite(seconds) || seconds < 0) {
-      PyErr_SetString(PyExc_ValueError, "timeout must be finite and nonnegative");
-      return false;
-    }
-  }
-  *end = *forever ? 0 : boc_now_s() + seconds;
-  return true;
-}
-
-/// @brief Own one completion observation through blocking, bounded pumping and signal checks
-static PyObject *terminator_wait_driver(bool drain,
-                                        double end, bool forever,
-                                        PyObject *boc_export, bool pumpable) {
-  BOCTerminatorWaiter waiter;
-  terminator_waiter_init(&waiter, drain);
-  PyObject *limit = NULL;
-  bool completed = false;
-  for (;;) {
-    double poll = (double)atomic_load(&WAIT_PUMP_POLL_MS) / 1000.0;
-    double slice = fmin(poll, 0.1);
-    if (!forever) {
-      slice = fmin(slice, fmax(0.0, end - boc_now_s()));
-    }
-    boc_terminator_wake_reason_t reason;
-    Py_BEGIN_ALLOW_THREADS
-    reason = terminator_waiter_wait(
-        &waiter, slice, false, pumpable ? _core_pinned_depth_load : NULL);
-    Py_END_ALLOW_THREADS
-    if (PyErr_CheckSignals() < 0) {
-      break;
-    }
-    if (reason == BOC_TERMINATOR_TERMINATED) {
-      completed = true;
-      break;
-    }
-    // Completion wins over expiry, but a perpetually ready pinned queue must not bypass the deadline.
-    if (slice == 0) {
-      break;
-    }
-    if (reason != BOC_TERMINATOR_PUMP_READY) {
-      continue;
-    }
-    if (boc_export == Py_None) {
-      PyErr_SetString(PyExc_RuntimeError, "pinned work requires a behavior resolver");
-      break;
-    }
-    if (limit == NULL) {
-      limit = PyLong_FromLong(64);
-      if (limit == NULL) {
-        break;
-      }
-    }
-    // Re-read after callbacks so a live poll adjustment applies to the next batch.
-    long long ms = atomic_load(&WAIT_PUMP_POLL_MS);
-    if (ms > 100) {
-      ms = 100;
-    }
-    if (!forever) {
-      double remaining_ms = (end - boc_now_s()) * 1000.0;
-      if (remaining_ms <= 0) {
-        continue;
-      }
-      if (remaining_ms < ms) {
-        ms = (long long)ceil(remaining_ms);
-      }
-    }
-    PyObject *deadline = PyLong_FromLongLong(ms);
-    if (deadline == NULL) {
-      break;
-    }
-    PyObject *result = main_pump_bounded_impl(deadline, limit, false,
-                                             boc_export, NULL);
-    Py_DECREF(deadline);
-    if (result == NULL) {
-      break;
-    }
-    Py_DECREF(result);
-  }
-  Py_XDECREF(limit);
-  if (PyErr_Occurred()) {
-    return NULL;
-  }
-  return PyBool_FromLong(completed);
 }
 
 /// @brief Wait for root completion without creating or reserving a runtime
@@ -2377,7 +2266,7 @@ static PyObject *_core_main_pump_queue_depth(PyObject *Py_UNUSED(self),
 /// @brief Lock-free pinned-depth reader for the terminator wait driver
 /// @details Function-pointer indirection so `boc_terminator.c` does
 /// not need to see the file-scope `MAIN_PINNED_DEPTH` atomic.
-static uint64_t _core_pinned_depth_load(void) {
+uint64_t _core_pinned_depth_load(void) {
   return (uint64_t)atomic_load(&MAIN_PINNED_DEPTH);
 }
 
@@ -4509,7 +4398,7 @@ static PyObject *_core_main_pump_bounded(PyObject *Py_UNUSED(self),
 }
 
 /// @brief Share the bounded native pump between explicit pumping and completion waits
-static PyObject *main_pump_bounded_impl(PyObject *deadline_ms,
+PyObject *main_pump_bounded_impl(PyObject *deadline_ms,
                                        PyObject *max_behaviors,
                                        bool raise_on_error, PyObject *boc_export,
                                        bool *started) {
