@@ -158,8 +158,8 @@ Edge cases:
   noticeboard snapshot is the empty dict ``{}`` rather than ``None``.
 - If a key your code expects might not have been written before
   quiescence, use ``snap.get(key)`` (or check ``key in snap``) rather
-  than indexing — :func:`wait` quiesces as soon as every behavior
-  completes, with no guarantee any particular write happened.
+  than indexing — :func:`wait` drains behaviors and open scope lifetime
+  reservations, with no guarantee any particular write happened.
 - The returned dict is a plain mutable ``dict``; mutating it locally
   does not affect the (now-freed) noticeboard.
 
@@ -177,7 +177,7 @@ working — use :func:`quiesce` with ``noticeboard=True``::
     print("best so far:", snap.get("best"))
     # ... next batch of @when calls runs immediately ...
 
-:func:`quiesce` blocks until every in-flight behavior completes,
+:func:`quiesce` observes global completion count zero (immediately if already zero),
 captures the snapshot the same way :func:`wait` does (by cycling
 the dedicated mutator thread, which guarantees every prior
 ``notice_write`` / ``notice_update`` / ``notice_delete`` has been
@@ -185,6 +185,12 @@ committed before the read), and then leaves the workers and the
 noticeboard thread running. The combined ``stats=True,
 noticeboard=True`` form returns a :class:`WaitResult` just like
 :func:`wait`.
+The snapshot is sampled after that observation, not atomically with it.
+Concurrent producers may have added newer work before the call returns.
+Open scopes hold lifetime reservations in the global count until output
+extraction or cleanup and restoration of the previous active scope finish.
+Even an idle scope on another host can delay this checkpoint or cause a
+timeout, just as it can delay global :func:`wait`.
 
 Reading the Noticeboard
 -----------------------

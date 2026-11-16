@@ -63,6 +63,13 @@ Script-mode programs need not call :func:`pump` explicitly —
 :func:`wait` pumps internally when any :class:`PinnedCown` exists
 in the process.
 
+Main-thread :class:`Scope` exit also pumps while waiting, unless it is
+already executing a pinned behavior. Pumping is not reentrant: a nested
+scope inside a pinned behavior can join worker-only work, but pinned
+descendants can deadlock while the main-thread pumper waits in their parent.
+Worker-side scope joins require the main thread to pump concurrently for
+pinned descendants. See :ref:`scoped-concurrency` for these blocking hazards.
+
 .. _pinned-coarse-grained:
 
 The Coarse-Grained Dispatch Pattern
