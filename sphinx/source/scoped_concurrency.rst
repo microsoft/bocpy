@@ -158,6 +158,11 @@ has neither a local output nor a context-manager interface. Retaining
 ``root_scope`` or a completed scope does not keep global joins waiting.
 The same root handle remains usable after runtime restart.
 
+Scope handles may cross bocpy-managed message, capture, and noticeboard
+boundaries. Standalone Python ``pickle.dumps`` is rejected:
+ordinary pickle bytes have no durable receiving transfer object that can own
+the native reference for exactly the correct lifetime.
+
 Output Ownership and Errors
 ---------------------------
 
@@ -275,6 +280,9 @@ stack throughout the operation, preserving its completion observation across
 pinned batches and signal checks. Blocking releases the GIL; pinned Python
 behaviors run with it held. Python handles argument validation and public
 lifecycle behavior, not a second polling loop or a Python waiter object.
+One native exit operation owns draining, output finalization, and restoration
+of the host context and reservations. The shared native pump takes numeric
+limits directly; only explicit Python ``pump()`` calls construct pump statistics.
 Full runtime shutdown retires the root terminator only after all reservations
 have drained; the next startup creates
 a fresh one. Retained ``root_scope`` handles do not pin a retired root, while
@@ -299,6 +307,9 @@ For :ref:`pinned-cowns`, scope exit and ``scope.quiesce()`` on the main thread
 pump ready pinned behaviors when it is not already inside a pinned behavior. A worker-side join
 cannot pump the main-thread queue and needs the main thread to pump concurrently
 if its descendants use pinned cowns.
+On free-threaded builds, automatic joins wait when another host thread owns
+the pump, then retry if work remains. Explicit concurrent ``pump()`` calls
+still raise ``RuntimeError``.
 
 Nested main-thread pumping remains prohibited. A scope inside a pinned
 behavior may join worker-only work without recursively pumping. Pinned

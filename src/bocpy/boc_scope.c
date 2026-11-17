@@ -224,14 +224,7 @@ static PyObject *ScopeCapsule_wait(PyObject *op, PyObject *args,
 }
 
 /// @brief Consume the locally quiescent output and always restore host ownership
-static PyObject *ScopeCapsule_finish(PyObject *op, PyObject *args,
-                                     PyObject *kwargs) {
-  scope_capsule_type(PyType_GetModule(Py_TYPE(op)));
-  static char *names[] = {"publish", NULL};
-  int publish;
-  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "p:finish", names, &publish)) {
-    return NULL;
-  }
+static PyObject *scope_finish(PyObject *op, bool publish) {
   ScopeCapsuleObject *self = (ScopeCapsuleObject *)op;
   if (!scope_check_host(self)) {
     return NULL;
@@ -259,6 +252,59 @@ static PyObject *ScopeCapsule_finish(PyObject *op, PyObject *args,
   return result;
 }
 
+static PyObject *ScopeCapsule_finish(PyObject *op, PyObject *args,
+                                     PyObject *kwargs) {
+  scope_capsule_type(PyType_GetModule(Py_TYPE(op)));
+  static char *names[] = {"publish", NULL};
+  int publish;
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "p:finish", names, &publish)) {
+    return NULL;
+  }
+  return scope_finish(op, publish);
+}
+
+/// @brief Own draining and finalization until output users and host reservations are released
+static PyObject *ScopeCapsule_exit(PyObject *op, PyObject *args) {
+  scope_capsule_type(PyType_GetModule(Py_TYPE(op)));
+  int publish;
+  PyObject *boc_export;
+  if (!PyArg_ParseTuple(args, "pO:exit", &publish, &boc_export)) {
+    return NULL;
+  }
+  ScopeCapsuleObject *self = (ScopeCapsuleObject *)op;
+  if (!scope_check_host(self)) {
+    return NULL;
+  }
+  bool pumpable = bocpy_interpid() == bocpy_main_interpid() && !IN_PUMP_BODY;
+  if (pumpable && boc_export == Py_None) {
+    PyErr_SetString(PyExc_RuntimeError, "scope exit requires a behavior resolver");
+    return NULL;
+  }
+  atomic_store(&self->owner->state, BOC_SCOPE_DRAINING);
+  self->waiting = true;
+  PyObject *drained = terminator_wait_driver(self->owner->term, true, 0, true,
+                                            boc_export, pumpable, self->owner);
+  self->waiting = false;
+  Py_XDECREF(drained);
+  PyObject *interrupted = PyErr_GetRaisedException();
+  PyObject *result = scope_finish(op, publish && interrupted == NULL);
+  if (interrupted != NULL) {
+    if (result == NULL) {
+      PyObject *error = PyErr_GetRaisedException();
+      if (error != interrupted) {
+        PyException_SetContext(error, interrupted);
+      } else {
+        Py_DECREF(interrupted);
+      }
+      PyErr_SetRaisedException(error);
+    } else {
+      Py_CLEAR(result);
+      PyErr_SetRaisedException(interrupted);
+    }
+  }
+  return result;
+}
+
 /// @brief Expose the authoritative lifecycle to the owning Python facade
 static PyObject *ScopeCapsule_state(PyObject *op, void *Py_UNUSED(args)) {
   ScopeCapsuleObject *self = (ScopeCapsuleObject *)op;
@@ -268,8 +314,22 @@ static PyObject *ScopeCapsule_state(PyObject *op, void *Py_UNUSED(args)) {
   return PyUnicode_FromString(names[atomic_load(&self->owner->state)]);
 }
 
-/// @brief Reconstruct only the shared scheduling identity, never host state
-static PyObject *scope_capsule_wrap(BOCScopeOwner *owner) {
+typedef struct {
+  BOCScopeOwner *owner;
+  BOCCown *output;
+} BOCScopeTransfer;
+
+/// @brief Release a scope transfer after all receiving wrappers are independent
+static void scope_transfer_free(void *data) {
+  BOCScopeTransfer *transfer = data;
+  COWN_DECREF(transfer->output);
+  scope_owner_decref(transfer->owner);
+  PyMem_RawFree(transfer);
+}
+
+/// @brief Reconstruct shared scheduling identity and its output dependency
+static PyObject *scope_capsule_wrap_output(BOCScopeOwner *owner,
+                                           BOCCown *output) {
   PyTypeObject *type = scope_capsule_type(NULL);
   ScopeCapsuleObject *self = (ScopeCapsuleObject *)type->tp_alloc(type, 0);
   if (self == NULL) {
@@ -277,97 +337,84 @@ static PyObject *scope_capsule_wrap(BOCScopeOwner *owner) {
   }
   self->owner = owner;
   scope_owner_incref(owner);
+  if (output != NULL) {
+    self->output = output;
+    COWN_INCREF(output);
+  }
   return (PyObject *)self;
 }
 
 static PyObject *_new_scope_object(XIDATA_T *xidata) {
-  return scope_capsule_wrap((BOCScopeOwner *)xidata->data);
+  BOCScopeTransfer *transfer = xidata->data;
+  return scope_capsule_wrap_output(transfer->owner, transfer->output);
 }
 
 XIDATA_GETDATA_FUNC(_scope_shared) {
   ScopeCapsuleObject *self = (ScopeCapsuleObject *)obj;
-  XIDATA_INIT(xidata, tstate->interp, self->owner, obj, _new_scope_object);
+  if (self->output == NULL) {
+    PyErr_SetString(PyExc_TypeError,
+                    "scheduling-only scope capsule has no output dependency");
+    return -1;
+  }
+  BOCScopeTransfer *transfer = PyMem_RawMalloc(sizeof(*transfer));
+  if (transfer == NULL) {
+    return PyErr_NoMemory(), -1;
+  }
+  transfer->owner = self->owner;
+  transfer->output = self->output;
+  scope_owner_incref(transfer->owner);
+  COWN_INCREF(transfer->output);
+  XIDATA_INIT(xidata, tstate->interp, transfer, obj, _new_scope_object);
+  XIDATA_SET_FREE(xidata, scope_transfer_free);
   return 0;
 }
 
-static void scope_ref_retain(void *pointer) { scope_owner_incref(pointer); }
-static void scope_ref_release(void *pointer) { scope_owner_decref(pointer); }
-static const BOCNativeRefOps SCOPE_REF_OPS = {scope_ref_retain, scope_ref_release};
-
-/// @brief Retain the native scheduling identity through the internal pickle path
+/// @brief Transfer scope identity through its retained output cown
 static PyObject *ScopeCapsule_reduce(PyObject *op, PyObject *Py_UNUSED(args)) {
+  PyErr_SetString(PyExc_TypeError,
+                  "scope capsules cannot be pickled outside bocpy-managed transfers");
+  return NULL;
+}
+
+/// @brief Reconstruct a scheduling-only handle from its retained output cown
+static PyObject *_scope_from_output(PyObject *module, PyObject *args) {
+  scope_capsule_type(module);
+  PyObject *output;
+  if (!PyArg_ParseTuple(args, "O", &output)) {
+    return NULL;
+  }
+  BOCCown *cown = cown_unwrap(output);
+  if (cown == NULL) {
+    return NULL;
+  }
+  BOCScopeOwner *owner = cown_scope_owner(cown);
+  if (owner == NULL) {
+    PyErr_SetString(PyExc_TypeError, "scope output cown has no scope owner");
+    return NULL;
+  }
+  return scope_capsule_wrap_output(owner, cown);
+}
+
+/// @brief Expose a retained output cown to bocpy's managed pickler
+static PyObject *_scope_capsule_output(PyObject *module, PyObject *op) {
+  PyTypeObject *type = scope_capsule_type(module);
+  if (!Py_IS_TYPE(op, type)) {
+    PyErr_SetString(PyExc_TypeError, "expected ScopeCapsule");
+    return NULL;
+  }
   ScopeCapsuleObject *self = (ScopeCapsuleObject *)op;
-  PyObject *module = PyType_GetModule(Py_TYPE(op));
-  if (module == NULL) {
+  if (self->output == NULL) {
+    PyErr_SetString(PyExc_TypeError,
+                    "scheduling-only scope capsules must be transferred with their output cown");
     return NULL;
   }
-  bool borrowing = nb_pickle_borrowing();
-  PyObject *rebuild = PyObject_GetAttrString(
-      module, borrowing ? "_scope_from_pointer_borrowing" : "_scope_from_pointer");
-  if (rebuild == NULL) {
-    return NULL;
-  }
-#ifdef _WIN32
-  long pid = (long)_getpid();
-#else
-  long pid = (long)getpid();
-#endif
-  PyObject *pointer = PyLong_FromVoidPtr(self->owner);
-  PyObject *result = pointer == NULL ? NULL :
-      Py_BuildValue("(O(Ol))", rebuild, pointer, pid);
-  Py_XDECREF(pointer);
-  Py_DECREF(rebuild);
-  if (result != NULL && borrowing) {
-    BOCNativeRef ref = {self->owner, &SCOPE_REF_OPS};
+  if (nb_pickle_borrowing()) {
+    BOCNativeRef ref = {self->output, &BOC_COWN_REF_OPS};
     if (nb_pickle_retain(ref) < 0) {
-      Py_DECREF(result);
       return NULL;
     }
-  } else if (result != NULL) {
-    scope_owner_incref(self->owner);
   }
-  return result;
-}
-
-/// @brief Reconstruct a same-process handle, borrowing noticeboard pins or consuming a one-shot pickle pin
-static PyObject *scope_from_pointer(PyObject *module, PyObject *args,
-                                    bool borrowing) {
-  scope_capsule_type(module);
-  PyObject *pointer;
-  long pid;
-  if (!PyArg_ParseTuple(args, "Ol", &pointer, &pid)) {
-    return NULL;
-  }
-#ifdef _WIN32
-  long current_pid = (long)_getpid();
-#else
-  long current_pid = (long)getpid();
-#endif
-  if (pid != current_pid) {
-    PyErr_SetString(PyExc_RuntimeError,
-                    "scope handles cannot cross process boundaries");
-    return NULL;
-  }
-  BOCScopeOwner *owner = PyLong_AsVoidPtr(pointer);
-  if (owner == NULL) {
-    if (!PyErr_Occurred()) {
-      PyErr_SetString(PyExc_ValueError, "invalid scope pointer");
-    }
-    return NULL;
-  }
-  PyObject *result = scope_capsule_wrap(owner);
-  if (!borrowing) {
-    scope_owner_decref(owner);
-  }
-  return result;
-}
-
-static PyObject *_scope_from_pointer(PyObject *module, PyObject *args) {
-  return scope_from_pointer(module, args, false);
-}
-
-static PyObject *_scope_from_pointer_borrowing(PyObject *module, PyObject *args) {
-  return scope_from_pointer(module, args, true);
+  return cown_scope_capsule_ref(self->output);
 }
 
 static PyMethodDef ScopeCapsule_methods[] = {
@@ -377,6 +424,7 @@ static PyMethodDef ScopeCapsule_methods[] = {
     {"close", ScopeCapsule_close, METH_NOARGS, NULL},
     {"wait", (PyCFunction)ScopeCapsule_wait, METH_VARARGS | METH_KEYWORDS, NULL},
     {"finish", (PyCFunction)ScopeCapsule_finish, METH_VARARGS | METH_KEYWORDS, NULL},
+    {"exit", ScopeCapsule_exit, METH_VARARGS, NULL},
     {"__reduce__", ScopeCapsule_reduce, METH_NOARGS, NULL},
     {NULL} /* Sentinel */
 };
@@ -402,8 +450,8 @@ static PyType_Spec ScopeCapsule_Spec = {
 };
 
 static PyMethodDef scope_module_methods[] = {
-    {"_scope_from_pointer", _scope_from_pointer, METH_VARARGS, NULL},
-    {"_scope_from_pointer_borrowing", _scope_from_pointer_borrowing, METH_VARARGS, NULL},
+    {"_scope_from_output", _scope_from_output, METH_VARARGS, NULL},
+    {"_scope_capsule_output", _scope_capsule_output, METH_O, NULL},
     {NULL} /* Sentinel */
 };
 

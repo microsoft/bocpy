@@ -87,7 +87,7 @@ PyObject *terminator_wait_driver(BOCTerminator *term, bool drain,
     scope_publish_pending();
   }
   PyObject *interrupted = NULL;
-  PyObject *limit = NULL;
+  bool pump_busy = false;
   bool completed = false;
   for (;;) {
     double poll = (double)atomic_load(&WAIT_PUMP_POLL_MS) / 1000.0;
@@ -98,8 +98,10 @@ PyObject *terminator_wait_driver(BOCTerminator *term, bool drain,
     boc_terminator_wake_reason_t reason;
     Py_BEGIN_ALLOW_THREADS
     reason = boc_terminator_waiter_wait(
-        &waiter, slice, false, pumpable ? _core_pinned_depth_load : NULL);
+        &waiter, slice, false,
+        pumpable && !pump_busy ? _core_pinned_depth_load : NULL);
     Py_END_ALLOW_THREADS
+    pump_busy = false;
     if (PyErr_CheckSignals() < 0) {
       if (!defer) {
         break;
@@ -126,12 +128,6 @@ PyObject *terminator_wait_driver(BOCTerminator *term, bool drain,
       PyErr_SetString(PyExc_RuntimeError, "pinned work requires a behavior resolver");
       break;
     }
-    if (limit == NULL) {
-      limit = PyLong_FromLong(64);
-      if (limit == NULL) {
-        break;
-      }
-    }
     // Re-read after callbacks so a live poll adjustment applies to the next batch.
     long long ms = atomic_load(&WAIT_PUMP_POLL_MS);
     if (ms > 100) {
@@ -146,26 +142,21 @@ PyObject *terminator_wait_driver(BOCTerminator *term, bool drain,
         ms = (long long)ceil(remaining_ms);
       }
     }
-    PyObject *deadline = PyLong_FromLongLong(ms);
-    if (deadline == NULL) {
-      break;
-    }
-    bool started = false;
-    PyObject *result = main_pump_bounded_impl(deadline, limit, false,
-                                             boc_export, &started);
-    Py_DECREF(deadline);
-    if (result == NULL) {
-      // Gate failures cannot make progress on retry; only execution interruptions are deferred.
-      if (!defer || !started) {
+    BOCPumpResult result;
+    BOCPumpStatus status = main_pump_bounded_impl(
+        boc_now_ns() + (uint64_t)ms * 1000000ULL, 64, false,
+        boc_export, &result);
+    if (status == BOC_PUMP_BUSY) {
+      // Another pumper owns progress; block on completion before trying the ready queue again.
+      pump_busy = true;
+    } else if (status == BOC_PUMP_ERROR) {
+      if (!defer) {
         break;
       }
       wait_defer_exception(&interrupted);
       forever = true;
-    } else {
-      Py_DECREF(result);
     }
   }
-  Py_XDECREF(limit);
   if (interrupted != NULL) {
     if (PyErr_Occurred()) {
       wait_defer_exception(&interrupted);

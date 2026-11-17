@@ -4,6 +4,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import sysconfig
 import textwrap
 import threading
 import uuid
@@ -858,6 +859,80 @@ def test_repeated_pinned_baseexception_restores_scope_host():
     assert "pinned failures drained and host restored" in output
 
 
+@pytest.mark.skipif(not sysconfig.get_config_var("Py_GIL_DISABLED"), reason="requires a free-threaded build")
+def test_scope_exit_waits_for_concurrent_pumper_and_restores_host():
+    output = _run_program("""
+        from threading import Event, Thread
+
+        from bocpy import _core, PinnedCown, pump, root_scope, Scope, start, wait, when
+
+        def pump_once(failures):
+            try:
+                pump(max_behaviors=1)
+            except BaseException as error:
+                failures.append(error)
+
+        def host(ready, finished, outcomes, failures):
+            try:
+                with Scope([]) as scope:
+                    pinned = PinnedCown(None)
+                    @when(pinned, scope.output_cown)
+                    def child(value, output):
+                        output.value.append(42)
+                    ready.set()
+                assert not _core.scope_active()
+                outcomes.append(scope.output_value)
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                finished.set()
+
+        if __name__ == "__main__":
+            start(worker_count=2)
+            entered = Event()
+            release = Event()
+            ready = Event()
+            finished = Event()
+            failures = []
+            outcomes = []
+            blocker = PinnedCown((entered, release))
+
+            @when(blocker, scope=root_scope)
+            def hold_pump(value):
+                entered, release = value.value
+                entered.set()
+                assert release.wait(10)
+
+            pumper = Thread(target=pump_once, args=(failures,))
+            joining_host = Thread(target=host, args=(ready, finished, outcomes, failures))
+            pumper.start()
+            try:
+                assert entered.wait(5)
+                try:
+                    pump()
+                except RuntimeError as error:
+                    assert "in use by another thread" in str(error)
+                else:
+                    raise AssertionError("explicit concurrent pump was accepted")
+                joining_host.start()
+                assert ready.wait(5)
+                assert not finished.wait(0.2), failures
+            finally:
+                release.set()
+                pumper.join(5)
+                if joining_host.ident is not None:
+                    joining_host.join(5)
+            assert not pumper.is_alive()
+            assert not joining_host.is_alive()
+            assert failures == [], failures
+            assert outcomes == [[42]]
+            assert _core.terminator_count() == 0
+            wait(10)
+            print("concurrent pump drained and scope host restored")
+    """)
+    assert "concurrent pump drained and scope host restored" in output
+
+
 def test_retained_scope_output_does_not_break_shutdown_cleanup():
     output = _run_program("""
         from bocpy import Scope, start, wait, when
@@ -973,6 +1048,76 @@ def test_noticeboard_scope_handle_survives_repeated_pinned_snapshots():
             print("scope destination survived 50 snapshots")
     """)
     assert "scope destination survived 50 snapshots" in output
+
+
+def test_scope_handle_rejects_standalone_pickle_without_corrupting_process():
+    output = _run_program("""
+        import gc
+        import pickle
+
+        from bocpy import Cown, Scope
+
+        if __name__ == "__main__":
+            scope = Scope()
+            class ReentrantSerializer:
+                def __reduce__(self):
+                    pickle.dumps(scope)
+                    return (str, ("not reached",))
+
+            for value in (scope, scope._impl):
+                try:
+                    pickle.dumps(value)
+                except TypeError as error:
+                    assert "bocpy-managed transfers" in str(error)
+                else:
+                    raise AssertionError("standalone scope pickle was accepted")
+            try:
+                Cown(ReentrantSerializer())
+            except TypeError as error:
+                assert "bocpy-managed transfers" in str(error)
+            else:
+                raise AssertionError("reentrant standalone scope pickle was accepted")
+            del scope
+            gc.collect()
+            print("standalone scope pickle rejected")
+    """)
+    assert "standalone scope pickle rejected" in output
+
+
+def test_scope_handle_round_trips_through_managed_message_transfer():
+    with Scope(0) as scope:
+        send("scope-transfer", scope)
+        tag, transferred = receive("scope-transfer", WAIT_TIMEOUT)
+        assert tag == "scope-transfer"
+
+        @when(transferred.output_cown, scope=transferred)
+        def update(output):
+            output.value = 42
+
+    assert scope.output_value == 42
+    quiesce(WAIT_TIMEOUT)
+    assert update.unwrap() is None
+
+
+def test_private_scope_capsule_survives_nested_managed_transfer():
+    with Scope() as scope:
+        send("scope-capsule-direct", scope._impl)
+        tag, capsule = receive("scope-capsule-direct", WAIT_TIMEOUT)
+        assert tag == "scope-capsule-direct"
+
+        send("scope-capsule-nested", [capsule])
+        tag, nested = receive("scope-capsule-nested", WAIT_TIMEOUT)
+        assert tag == "scope-capsule-nested"
+        assert nested[0].state == "active"
+
+
+def test_failed_managed_scope_transfer_rolls_back_output_cown_ref():
+    with Scope() as scope:
+        before = _core.cown_refcount(scope.output_cown)
+        for _ in range(3):
+            with pytest.raises(ValueError, match="scope serialization failure"):
+                Cown([scope, _UnpicklableAfterScope()])
+        assert _core.cown_refcount(scope.output_cown) == before
 
 
 @pytest.mark.parametrize("release", ["replace", "delete", "clear"])

@@ -1864,7 +1864,9 @@ class Scope(_ScopeHandle[T]):
 
     A captured scope travels to workers as a scheduling-only handle;
     enter, exit, quiesce, and output-value access belong to the original host
-    thread and interpreter.
+    thread and interpreter. The handle may cross bocpy-managed transfer
+    boundaries, but standalone :func:`pickle.dumps` of a scope is rejected
+    because arbitrary pickle bytes have no durable ownership receiver.
     Entry reserves one unit of the global completion count until output
     extraction or cleanup and restoration of the previous active scope finish.
     Global quiescence therefore waits for open scopes, even when locally idle;
@@ -1925,7 +1927,9 @@ class Scope(_ScopeHandle[T]):
         A pump interruption is deferred until remaining local work drains
         and the output can close safely; accepted blocking deadlocks can
         therefore prevent propagation. The previous active scope is
-        restored on exit. This introduces no cancellation or exception
+        restored on exit. On free-threaded builds, exit waits if another
+        host thread is pumping pinned work, rather than abandoning cleanup.
+        This introduces no cancellation or exception
         grouping and does not alter global wait or pump behavior.
         """
 

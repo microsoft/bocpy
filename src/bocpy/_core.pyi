@@ -8,6 +8,10 @@ internal tooling.
 from typing import Any
 
 
+def cown_refcount(cown: Any) -> int:
+    """Return the native strong-reference count of a cown or capsule."""
+
+
 def scheduler_stats() -> list[dict[str, Any]]:
     """Snapshot the per-worker scheduler counters.
 

@@ -47,5 +47,7 @@ int cown_scope_bind(BOCCown *cown, BOCScopeOwner *owner);
 /// @brief Move or discard output after its scope has fenced admission
 PyObject *cown_scope_finish(BOCCown *output, bool publish);
 BOCCown *cown_unwrap(PyObject *op);
+BOCScopeOwner *cown_scope_owner(BOCCown *output);
+PyObject *cown_scope_capsule_ref(BOCCown *output);
 
 #endif // BOCPY_SCOPE_H

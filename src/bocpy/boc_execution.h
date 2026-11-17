@@ -21,8 +21,21 @@ PyObject *terminator_wait_driver(BOCTerminator *term, bool drain, double end, bo
                                  BOCScopeOwner *host);
 
 uint64_t _core_pinned_depth_load(void);
-PyObject *main_pump_bounded_impl(PyObject *deadline_ms, PyObject *max_behaviors,
-                                bool raise_on_error, PyObject *boc_export,
-                                bool *started);
+
+typedef enum {
+  BOC_PUMP_ERROR = -1,
+  BOC_PUMP_OK,
+  BOC_PUMP_BUSY,
+} BOCPumpStatus;
+
+typedef struct {
+  Py_ssize_t executed;
+  Py_ssize_t raised;
+  bool deadline_reached;
+} BOCPumpResult;
+
+BOCPumpStatus main_pump_bounded_impl(uint64_t deadline_ns, long long max_behaviors,
+                                    bool raise_on_error, PyObject *boc_export,
+                                    BOCPumpResult *result);
 
 #endif // BOCPY_EXECUTION_H

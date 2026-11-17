@@ -416,14 +416,71 @@ static BOCRecycleQueue *BOCRecycleQueue_new(int_least64_t index) {
   return old_head;
 }
 
+typedef struct managed_pickle_context {
+  BOCCown **cowns;
+  Py_ssize_t count;
+  Py_ssize_t capacity;
+  struct managed_pickle_context *previous;
+} ManagedPickleContext;
+
+static thread_local ManagedPickleContext *BOC_MANAGED_PICKLE_CTX = NULL;
+
+/// @brief Begin tracking inheriting native references for one XIData pickle
+static bool managed_pickle_begin(void) {
+  ManagedPickleContext *ctx = PyMem_RawCalloc(1, sizeof(*ctx));
+  if (ctx == NULL) {
+    PyErr_NoMemory();
+    return false;
+  }
+  ctx->previous = BOC_MANAGED_PICKLE_CTX;
+  BOC_MANAGED_PICKLE_CTX = ctx;
+  return true;
+}
+
+/// @brief Track one successfully reduced cown until the XIData transfer owns it
+static int managed_pickle_retain(BOCCown *cown) {
+  ManagedPickleContext *ctx = BOC_MANAGED_PICKLE_CTX;
+  if (ctx == NULL) {
+    return 0;
+  }
+  if (ctx->count == ctx->capacity) {
+    Py_ssize_t capacity = ctx->capacity == 0 ? 8 : ctx->capacity * 2;
+    BOCCown **cowns = PyMem_RawRealloc(
+        ctx->cowns, (size_t)capacity * sizeof(*cowns));
+    if (cowns == NULL) {
+      PyErr_NoMemory();
+      return -1;
+    }
+    ctx->cowns = cowns;
+    ctx->capacity = capacity;
+  }
+  ctx->cowns[ctx->count++] = cown;
+  return 0;
+}
+
+/// @brief Finish an XIData pickle, rolling back references only on failure
+static void managed_pickle_end(bool commit) {
+  ManagedPickleContext *ctx = BOC_MANAGED_PICKLE_CTX;
+  assert(ctx != NULL);
+  if (!commit) {
+    for (Py_ssize_t i = 0; i < ctx->count; ++i) {
+      COWN_DECREF(ctx->cowns[i]);
+    }
+  }
+  BOC_MANAGED_PICKLE_CTX = ctx->previous;
+  PyMem_RawFree(ctx->cowns);
+  PyMem_RawFree(ctx);
+}
+
 static PyObject *_PyPickle_Dumps(PyObject *obj) {
-  PyObject *bytes = PyObject_CallOneArg(BOC_STATE->dumps, obj);
-  return bytes;
+  if (!managed_pickle_begin()) {
+    return NULL;
+  }
+  return PyObject_CallOneArg(BOC_STATE->dumps, obj);
 }
 
 static PyObject *_PyPickle_Loads(PyObject *bytes) {
-  PyObject *obj = PyObject_CallOneArg(BOC_STATE->loads, bytes);
-  return obj;
+  return PyObject_CallOneArg(BOC_STATE->loads, bytes);
 }
 
 /// @brief Deserializes a value from cross-interpereter data.
@@ -484,14 +541,17 @@ static PyObject *object_to_xidata(PyObject *value, XIDATA_T **xidata_ptr) {
 
   PyObject *bytes = _PyPickle_Dumps(value);
   if (bytes == NULL) {
+    managed_pickle_end(false);
     return NULL;
   }
 
   if (XIDATA_GETXIDATA(bytes, xidata) == 0) {
+    managed_pickle_end(true);
     Py_DECREF(bytes);
     Py_RETURN_TRUE;
   }
 
+  managed_pickle_end(false);
   Py_DECREF(bytes);
 
   PyErr_SetString(PyExc_RuntimeError,
@@ -2061,6 +2121,12 @@ static PyObject *CownCapsule_reduce(PyObject *op, PyObject *Py_UNUSED(dummy)) {
   Py_DECREF(args);
   if (result == NULL && !borrowing) {
     COWN_DECREF(cown);
+  } else if (result != NULL && !borrowing) {
+    if (managed_pickle_retain(cown) < 0) {
+      Py_DECREF(result);
+      COWN_DECREF(cown);
+      return NULL;
+    }
   }
   return result;
 }
@@ -2242,6 +2308,15 @@ bool cown_scope_available(BOCCown *cown) {
     return false;
   }
   return true;
+}
+
+/// @brief Retain a cown capsule for transfer of a scope-owned output
+PyObject *cown_scope_capsule_ref(BOCCown *output) {
+  return cown_capsule_wrap(output, false);
+}
+
+BOCScopeOwner *cown_scope_owner(BOCCown *output) {
+  return output->scope_owner;
 }
 
 int cown_scope_bind(BOCCown *cown, BOCScopeOwner *owner) {
@@ -4549,18 +4624,6 @@ static uint64_t deadline_or_zero(PyObject *deadline_ms) {
   return boc_now_ns() + (uint64_t)ms * 1000000ULL;
 }
 
-static bool max_behaviors_or_inf(PyObject *max_behaviors, Py_ssize_t executed) {
-  if (max_behaviors == NULL || max_behaviors == Py_None) {
-    return true;
-  }
-  long long lim = PyLong_AsLongLong(max_behaviors);
-  if (lim <= 0) {
-    PyErr_Clear();
-    return true;
-  }
-  return (long long)executed < lim;
-}
-
 static inline void _core_log_release_error(void) {
   PyErr_WriteUnraisable(NULL);
 }
@@ -4684,8 +4747,9 @@ static inline uintptr_t boc_pump_thread_id(void) {
 ///              (installed for ``__main__``).
 /// @return ``(executed, deadline_reached, raised)`` 3-tuple on
 ///         success, NULL on gate rejection or raise_on_error trigger.
-static PyObject *_core_main_pump_bounded(PyObject *Py_UNUSED(self),
+static PyObject *_core_main_pump_bounded(PyObject *self,
                                          PyObject *args, PyObject *kwds) {
+  BOC_STATE_SET(self);
   static char *kwlist[] = {"deadline_ms", "max_behaviors", "raise_on_error",
                            "boc_export", NULL};
   PyObject *deadline_ms = Py_None;
@@ -4699,15 +4763,37 @@ static PyObject *_core_main_pump_bounded(PyObject *Py_UNUSED(self),
     return NULL;
   }
   bool raise_on_error = (bool)raise_on_error_flag;
-  return main_pump_bounded_impl(deadline_ms, max_behaviors, raise_on_error,
-                                boc_export, NULL);
+  uint64_t deadline_ns = deadline_or_zero(deadline_ms);
+  long long limit = 0;
+  if (max_behaviors != Py_None) {
+    limit = PyLong_AsLongLong(max_behaviors);
+    if (limit <= 0) {
+      PyErr_Clear();
+      limit = 0;
+    }
+  }
+  BOCPumpResult result;
+  BOCPumpStatus status = main_pump_bounded_impl(
+      deadline_ns, limit, raise_on_error, boc_export, &result);
+  if (status == BOC_PUMP_BUSY) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "pump() is in use by another thread on this "
+                    "free-threaded build");
+    return NULL;
+  }
+  if (status == BOC_PUMP_ERROR) {
+    return NULL;
+  }
+  return Py_BuildValue("(nOn)", result.executed,
+                       result.deadline_reached ? Py_True : Py_False,
+                       result.raised);
 }
 
 /// @brief Share the bounded native pump between explicit pumping and completion waits
-PyObject *main_pump_bounded_impl(PyObject *deadline_ms,
-                                       PyObject *max_behaviors,
-                                       bool raise_on_error, PyObject *boc_export,
-                                       bool *started) {
+BOCPumpStatus main_pump_bounded_impl(uint64_t deadline_ns, long long max_behaviors,
+                                    bool raise_on_error, PyObject *boc_export,
+                                    BOCPumpResult *result) {
+  *result = (BOCPumpResult){0};
   Py_ssize_t executed = 0;
   Py_ssize_t raised = 0;
   bool deadline_reached = false;
@@ -4731,10 +4817,7 @@ PyObject *main_pump_bounded_impl(PyObject *deadline_ms,
                                               self_id)) {
       pump_cas_owner = true;
     } else if (expected != self_id) {
-      PyErr_SetString(PyExc_RuntimeError,
-                      "pump() is in use by another thread on this "
-                      "free-threaded build");
-      goto pump_exit;
+      return BOC_PUMP_BUSY;
     }
   }
 #endif
@@ -4746,13 +4829,9 @@ PyObject *main_pump_bounded_impl(PyObject *deadline_ms,
     goto pump_exit;
   }
 
-  if (started != NULL) {
-    *started = true;
-  }
-  uint64_t deadline_ns = deadline_or_zero(deadline_ms);
   boc_main_pinned_check_warn();
 
-  while (max_behaviors_or_inf(max_behaviors, executed)) {
+  while (max_behaviors <= 0 || executed < max_behaviors) {
     assert(!PyErr_Occurred());
 
     boc_bq_node_t *n = boc_bq_dequeue(&MAIN_PINNED_QUEUE);
@@ -4834,13 +4913,14 @@ pump_exit:
   if (first_err) {
     PyErr_SetRaisedException(first_err);
     first_err = NULL;
-    return NULL;
   }
   if (PyErr_Occurred()) {
-    return NULL;
+    return BOC_PUMP_ERROR;
   }
-  return Py_BuildValue("(nOn)", executed, deadline_reached ? Py_True : Py_False,
-                       raised);
+  result->executed = executed;
+  result->raised = raised;
+  result->deadline_reached = deadline_reached;
+  return BOC_PUMP_OK;
 }
 
 /// @brief Shutdown-drain the main-pinned queue without executing bodies.
@@ -5790,7 +5870,31 @@ static PyObject *_core_scheduler_drain_all_queues(PyObject *Py_UNUSED(module),
   return out;
 }
 
+/// @brief Install the Python pickler used only for internal XIData transfers
+static PyObject *_core_set_pickle_dumps(PyObject *module, PyObject *dumps) {
+  BOC_STATE_SET(module);
+  if (!PyCallable_Check(dumps)) {
+    PyErr_SetString(PyExc_TypeError, "dumps must be callable");
+    return NULL;
+  }
+  Py_XSETREF(BOC_STATE->dumps, Py_NewRef(dumps));
+  Py_RETURN_NONE;
+}
+
+/// @brief Read the native strong reference count for a cown capsule
+static PyObject *_core_cown_refcount(PyObject *module, PyObject *op) {
+  BOC_STATE_SET(module);
+  BOCCown *cown = cown_unwrap(op);
+  if (cown == NULL) {
+    return NULL;
+  }
+  return PyLong_FromLongLong(
+      (long long)atomic_load_explicit(&cown->rc, memory_order_relaxed));
+}
+
 static PyMethodDef _core_module_methods[] = {
+    {"_set_pickle_dumps", _core_set_pickle_dumps, METH_O, NULL},
+    {"cown_refcount", _core_cown_refcount, METH_O, NULL},
     {"send", _core_send, METH_VARARGS,
      "send($module, tag, contents, /)\n--\n\nSends a message."},
     {"receive", (PyCFunction)(void (*)(void))_core_receive,

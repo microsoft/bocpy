@@ -18,11 +18,13 @@ import functools
 import hashlib
 import importlib
 import inspect
+import io
 import linecache
 import logging
 import marshal
 import math
 import os
+import pickle
 import struct
 import sys
 from textwrap import dedent
@@ -308,6 +310,11 @@ def _get_root_scope():
 root_scope = _RootScope()
 
 
+def _restore_scope_handle(output):
+    """Reconstruct a scheduling-only scope handle from its output cown."""
+    return _ScopeHandle(_core._scope_from_output(output), output)
+
+
 class _ScopeHandle:
     """Cross-interpreter scheduling handle without context-manager ownership."""
 
@@ -321,7 +328,7 @@ class _ScopeHandle:
         return self._output
 
     def __reduce__(self):
-        return (_ScopeHandle, (self._impl, self._output))
+        raise TypeError("scope handles can only cross bocpy-managed transfers")
 
 
 class Scope(_ScopeHandle, Generic[T]):
@@ -382,23 +389,40 @@ class Scope(_ScopeHandle, Generic[T]):
 
     def __exit__(self, exc_type, exc_value, traceback):
         """Join scoped work, finalize its output, and restore the enclosing scope."""
-        if self._impl.state != "active":
+        if self._impl.state not in ("active", "draining"):
             raise RuntimeError("Scope is not active")
-        self._impl.close()
+        resolver = BEHAVIORS.export_module if BEHAVIORS is not None else None
         try:
-            try:
-                resolver = BEHAVIORS.export_module if BEHAVIORS is not None else None
-                self._impl.wait(None, resolver)
-            except BaseException:
-                self._impl.finish(False)
-                raise
-            self._output_value = self._impl.finish(exc_type is None)
+            self._output_value = self._impl.exit(exc_type is None, resolver)
         except BaseException as error:
-            self._failure = error
+            if self._impl.state == "closed":
+                self._failure = error
             raise
         if exc_value is not None:
             self._failure = exc_value
         return False
+
+
+class _ManagedPickler(pickle.Pickler):
+    """Serialize scope handles only inside bocpy's XIData transfer."""
+
+    def reducer_override(self, obj):
+        if isinstance(obj, _ScopeHandle):
+            return (_restore_scope_handle, (obj._output,))
+        if isinstance(obj, _core.ScopeCapsule):
+            output = _core._scope_capsule_output(obj)
+            return (_core._scope_from_output, (output,))
+        return NotImplemented
+
+
+def _managed_pickle_dumps(value):
+    """Serialize a value for one bocpy-owned XIData transfer."""
+    buffer = io.BytesIO()
+    _ManagedPickler(buffer).dump(value)
+    return buffer.getvalue()
+
+
+_core._set_pickle_dumps(_managed_pickle_dumps)
 
 
 def _scope_destination(scope):
