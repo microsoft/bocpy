@@ -6,7 +6,7 @@ import time
 import pytest
 
 from bocpy import (
-    _core, Cown, PinnedCown, quiesce, receive, root_scope, Scope,
+    _core, Cown, PinnedCown, pump, quiesce, receive, root_scope, Scope,
     send, start, wait, when,
 )
 from bocpy import behaviors as _behaviors
@@ -285,7 +285,7 @@ def test_pinned_behavior_cannot_wait_on_self_or_ancestor_scope(ancestor):
         retained = PinnedCown(outer)
 
         def schedule_check():
-            @when(retained)
+            @when(retained, scope=root_scope)
             def check(value):
                 scope = value.value
                 for operation in (scope.quiesce, scope._impl.quiescence):
@@ -305,6 +305,7 @@ def test_pinned_behavior_cannot_wait_on_self_or_ancestor_scope(ancestor):
         else:
             result = schedule_check()
         outer.quiesce(WAIT_TIMEOUT)
+    quiesce(WAIT_TIMEOUT)
     assert result.unwrap() == "rejected"
 
 
@@ -328,14 +329,14 @@ def test_pinned_self_exit_rejection_leaves_scope_active_and_usable():
     with Scope([]) as scope:
         retained = PinnedCown(scope)
 
-        @when(retained)
+        @when(retained, scope=root_scope)
         def attempted_exit(value):
             with pytest.raises(RuntimeError):
                 value.value.__exit__(None, None, None)
             assert value.value._impl.state == "active"
             return "rejected"
 
-        scope.quiesce(WAIT_TIMEOUT)
+        pump()
         assert scope._impl.state == "active"
 
         @when(scope.output_cown)
@@ -345,7 +346,6 @@ def test_pinned_self_exit_rejection_leaves_scope_active_and_usable():
         scope.quiesce(WAIT_TIMEOUT)
         with pytest.raises(RuntimeError, match="scope output is unavailable"):
             _ = scope.output_value
-    quiesce(WAIT_TIMEOUT)
     assert attempted_exit.unwrap() == "rejected"
     assert scope.output_value == ["still active"]
 
@@ -381,9 +381,13 @@ def test_scope_quiescence_pumps_pinned_child_of_waiting_worker():
         @when(outer.output_cown)
         def parent(output, main_value=pinned):
             with Scope() as inner:
-                @when(main_value, inner.output_cown)
-                def child(value, result):
-                    result.value = value.value * 2
+                @when(main_value, scope=root_scope)
+                def child(value):
+                    return value.value * 2
+
+                @when(child, inner.output_cown)
+                def store_result(result, output):
+                    output.value = result.value
 
                 assert inner.quiesce(WAIT_TIMEOUT) is None
                 assert inner._impl.state == "active"

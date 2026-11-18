@@ -2475,7 +2475,7 @@ static PyObject *_core_pinned_cown_count(PyObject *Py_UNUSED(self),
 /// the node to this function, which owns the actual queue. On the
 /// `0 -> 1` depth transition we stamp
 /// @ref MAIN_PINNED_NONEMPTY_SINCE_NS and broadcast on the terminator
-/// condvar so a `wait()`-blocked main thread wakes to drive the pump.
+/// condvar so a pump-capable waiter in the main interpreter wakes to drive it.
 ///
 /// There is intentionally no `queue_max`-style cap: by construction
 /// `MAIN_PINNED_DEPTH` cannot exceed the live pinned-cown count
@@ -4199,6 +4199,12 @@ static PyObject *BehaviorCapsule_schedule(PyObject *op, PyObject *args,
       return NULL;
     }
     owner = scope_capsule_owner(scope);
+  }
+  if (BOC_BEHAVIOR_PREHDR(behavior)->pinned && owner != NULL) {
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "pinned behaviors must be scheduled with root_scope");
+    return NULL;
   }
   if (owner != NULL && !scope_owner_accepts_work(owner)) {
     PyErr_SetString(PyExc_RuntimeError, "scope is not active or draining");

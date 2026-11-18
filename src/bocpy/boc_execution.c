@@ -87,11 +87,49 @@ PyObject *terminator_wait_driver(BOCTerminator *term, bool drain,
     scope_publish_pending();
   }
   PyObject *interrupted = NULL;
-  bool pump_busy = false;
   bool completed = false;
   for (;;) {
     double poll = (double)atomic_load(&WAIT_PUMP_POLL_MS) / 1000.0;
     double slice = fmin(poll, 0.1);
+    if (!forever) {
+      slice = fmin(slice, fmax(0.0, end - boc_now_s()));
+    }
+    bool pump_busy = false;
+    if (pumpable && (forever || slice > 0) &&
+        _core_pinned_depth_load() > 0) {
+      if (boc_export == Py_None) {
+        PyErr_SetString(PyExc_RuntimeError,
+                        "pinned work requires a behavior resolver");
+        break;
+      }
+      long long ms = atomic_load(&WAIT_PUMP_POLL_MS);
+      if (ms > 100) {
+        ms = 100;
+      }
+      if (!forever) {
+        double remaining_ms = (end - boc_now_s()) * 1000.0;
+        if (remaining_ms <= 0) {
+          continue;
+        }
+        if (remaining_ms < ms) {
+          ms = (long long)ceil(remaining_ms);
+        }
+      }
+      BOCPumpResult result;
+      BOCPumpStatus status = main_pump_bounded_impl(
+          boc_now_ns() + (uint64_t)ms * 1000000ULL, 64, false,
+          boc_export, &result);
+      if (status == BOC_PUMP_BUSY) {
+        pump_busy = true;
+      } else if (status == BOC_PUMP_ERROR) {
+        if (!defer) {
+          break;
+        }
+        wait_defer_exception(&interrupted);
+        forever = true;
+        continue;
+      }
+    }
     if (!forever) {
       slice = fmin(slice, fmax(0.0, end - boc_now_s()));
     }
@@ -101,7 +139,6 @@ PyObject *terminator_wait_driver(BOCTerminator *term, bool drain,
         &waiter, slice, false,
         pumpable && !pump_busy ? _core_pinned_depth_load : NULL);
     Py_END_ALLOW_THREADS
-    pump_busy = false;
     if (PyErr_CheckSignals() < 0) {
       if (!defer) {
         break;
@@ -120,41 +157,6 @@ PyObject *terminator_wait_driver(BOCTerminator *term, bool drain,
     // Completion wins over expiry, but a perpetually ready pinned queue must not bypass the deadline.
     if (!forever && slice == 0) {
       break;
-    }
-    if (reason != BOC_TERMINATOR_PUMP_READY) {
-      continue;
-    }
-    if (boc_export == Py_None) {
-      PyErr_SetString(PyExc_RuntimeError, "pinned work requires a behavior resolver");
-      break;
-    }
-    // Re-read after callbacks so a live poll adjustment applies to the next batch.
-    long long ms = atomic_load(&WAIT_PUMP_POLL_MS);
-    if (ms > 100) {
-      ms = 100;
-    }
-    if (!forever) {
-      double remaining_ms = (end - boc_now_s()) * 1000.0;
-      if (remaining_ms <= 0) {
-        continue;
-      }
-      if (remaining_ms < ms) {
-        ms = (long long)ceil(remaining_ms);
-      }
-    }
-    BOCPumpResult result;
-    BOCPumpStatus status = main_pump_bounded_impl(
-        boc_now_ns() + (uint64_t)ms * 1000000ULL, 64, false,
-        boc_export, &result);
-    if (status == BOC_PUMP_BUSY) {
-      // Another pumper owns progress; block on completion before trying the ready queue again.
-      pump_busy = true;
-    } else if (status == BOC_PUMP_ERROR) {
-      if (!defer) {
-        break;
-      }
-      wait_defer_exception(&interrupted);
-      forever = true;
     }
   }
   if (interrupted != NULL) {

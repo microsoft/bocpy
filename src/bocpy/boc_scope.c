@@ -19,6 +19,17 @@ typedef struct scope_capsule_object {
   bool waiting;
 } ScopeCapsuleObject;
 
+/// @brief Reject blocking scope operations from the non-reentrant pinned executor
+static bool scope_check_not_pinned(void) {
+  if (IN_PUMP_BODY) {
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "pinned behaviors cannot enter or synchronously join a scope");
+    return false;
+  }
+  return true;
+}
+
 /// @brief Allow scheduled output access until draining work has released its reservations
 bool scope_owner_accepts_work(BOCScopeOwner *owner) {
   int_least64_t state = atomic_load(&owner->state);
@@ -108,6 +119,9 @@ static void ScopeCapsule_dealloc(PyObject *op) {
 /// @brief Install a local owner and reserve the enclosing runtime execution
 static PyObject *ScopeCapsule_enter(PyObject *op, PyObject *Py_UNUSED(args)) {
   scope_capsule_type(PyType_GetModule(Py_TYPE(op)));
+  if (!scope_check_not_pinned()) {
+    return NULL;
+  }
   ScopeCapsuleObject *self = (ScopeCapsuleObject *)op;
   int_least64_t expected = BOC_SCOPE_CREATED;
   if (self->output == NULL ||
@@ -137,6 +151,9 @@ static PyObject *ScopeCapsule_enter(PyObject *op, PyObject *Py_UNUSED(args)) {
 
 /// @brief Require structured same-thread exit by the original host wrapper
 static bool scope_check_host(ScopeCapsuleObject *self) {
+  if (!scope_check_not_pinned()) {
+    return false;
+  }
   if (self->waiting || !scope_owner_accepts_work(self->owner) || self->output == NULL ||
       boc_atomic_load_u64_explicit(&self->host_thread, BOC_MO_RELAXED) !=
           (uint64_t)PyThread_get_thread_ident() ||
@@ -179,6 +196,9 @@ static bool scope_check_quiescence(ScopeCapsuleObject *host) {
 static PyObject *ScopeCapsule_quiescence(PyObject *op, PyObject *args,
                                         PyObject *kwargs) {
   scope_capsule_type(PyType_GetModule(Py_TYPE(op)));
+  if (!scope_check_not_pinned()) {
+    return NULL;
+  }
   double end;
   bool forever;
   PyObject *boc_export;
@@ -201,6 +221,9 @@ static PyObject *ScopeCapsule_quiescence(PyObject *op, PyObject *args,
 static PyObject *ScopeCapsule_wait(PyObject *op, PyObject *args,
                                    PyObject *kwargs) {
   scope_capsule_type(PyType_GetModule(Py_TYPE(op)));
+  if (!scope_check_not_pinned()) {
+    return NULL;
+  }
   double end;
   bool forever;
   PyObject *boc_export;
@@ -255,6 +278,9 @@ static PyObject *scope_finish(PyObject *op, bool publish) {
 static PyObject *ScopeCapsule_finish(PyObject *op, PyObject *args,
                                      PyObject *kwargs) {
   scope_capsule_type(PyType_GetModule(Py_TYPE(op)));
+  if (!scope_check_not_pinned()) {
+    return NULL;
+  }
   static char *names[] = {"publish", NULL};
   int publish;
   if (!PyArg_ParseTupleAndKeywords(args, kwargs, "p:finish", names, &publish)) {
@@ -266,6 +292,9 @@ static PyObject *ScopeCapsule_finish(PyObject *op, PyObject *args,
 /// @brief Own draining and finalization until output users and host reservations are released
 static PyObject *ScopeCapsule_exit(PyObject *op, PyObject *args) {
   scope_capsule_type(PyType_GetModule(Py_TYPE(op)));
+  if (!scope_check_not_pinned()) {
+    return NULL;
+  }
   int publish;
   PyObject *boc_export;
   if (!PyArg_ParseTuple(args, "pO:exit", &publish, &boc_export)) {

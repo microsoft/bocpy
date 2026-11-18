@@ -12,7 +12,7 @@ import uuid
 import pytest
 
 from bocpy import (
-    _core, Cown, Matrix, notice_delete, PinnedCown, quiesce, receive,
+    _core, Cown, Matrix, notice_delete, PinnedCown, pump, quiesce, receive,
     root_scope, Scope, send, start, wait, when, whencall,
 )
 from bocpy import behaviors as _behaviors
@@ -390,21 +390,151 @@ def test_global_lifecycle_rejected_inside_worker_behavior(operation):
         check.unwrap()
 
 
-def test_pinned_behavior_inherits_scope_and_schedules_descendants():
+def test_pinned_behavior_uses_root_and_can_schedule_scoped_descendants():
     pinned = PinnedCown([])
+    root_value = Cown(0)
     with Scope([]) as scope:
-        @when(pinned, scope.output_cown)
-        def on_main(value, output):
+        @when(pinned, scope=root_scope)
+        def on_main(value, scope=scope, root_value=root_value):
             value.value.append("main")
-            output.value.append("main")
 
-            @when(output)
-            def on_worker(result):
-                result.value.append("worker")
+            @when(root_value)
+            def inherited(value):
+                value.value += 1
 
-    assert scope.output_value == ["main", "worker"]
+            @when(scope.output_cown, scope=scope)
+            def explicit(output):
+                output.value.append("local descendant")
+
+            @when(root_value, scope=root_scope)
+            def root_owned(value):
+                value.value += 41
+                return value.value
+
+            return inherited, explicit, root_owned
+
+        @when(on_main, scope.output_cown, scope=scope)
+        def observe_pinned(output_cowns, output):
+            output.value.append("pinned completed")
+
+    assert scope.output_value == ["pinned completed", "local descendant"]
     quiesce(WAIT_TIMEOUT)
     assert pinned.unwrap() == ["main"]
+    inherited, explicit, root_owned = on_main.unwrap()
+    assert inherited.unwrap() is None
+    assert explicit.unwrap() is None
+    assert root_owned.unwrap() == 42
+
+
+def test_pinned_behavior_rejects_inherited_and_explicit_local_scope():
+    pinned = PinnedCown(None)
+    with Scope() as scope:
+        count = _core.terminator_count()
+        with pytest.raises(RuntimeError, match="must be scheduled with root_scope"):
+            @when(pinned)
+            def inherited(_value):
+                raise AssertionError("inherited local pinned work ran")
+
+        with pytest.raises(RuntimeError, match="must be scheduled with root_scope"):
+            @when(pinned, scope=scope)
+            def explicit(_value):
+                raise AssertionError("explicit local pinned work ran")
+
+        assert _core.terminator_count() == count
+
+        @when(pinned, scope=root_scope)
+        def allowed(_value):
+            return "root"
+
+    quiesce(WAIT_TIMEOUT)
+    assert allowed.unwrap() == "root"
+
+
+def test_pinned_behavior_cannot_enter_fresh_scope_when_outer_wait_pumps():
+    scope = Scope([])
+    pinned = PinnedCown(None)
+    count = _core.terminator_count()
+
+    @when(pinned, scope=root_scope)
+    def attempt_entry(_value, destination=scope):
+        before = _core.terminator_count()
+        local = Scope([])
+        body_ran = False
+        messages = []
+        try:
+            destination._impl.enter()
+        except RuntimeError as error:
+            messages.append(str(error))
+        else:
+            raise AssertionError("captured native scope entry was accepted")
+        try:
+            with local:
+                body_ran = True
+        except RuntimeError as error:
+            messages.append(str(error))
+        else:
+            raise AssertionError("pinned behavior scope body ran")
+        return (
+            destination._impl.state, local._impl.state, _core.terminator_count() == before,
+            body_ran, messages,
+        )
+
+    quiesce(WAIT_TIMEOUT)
+    assert scope._impl.state == "created"
+    assert _core.terminator_count() == count
+    destination_state, local_state, reservation_unchanged, body_ran, messages = attempt_entry.unwrap()
+    assert destination_state == local_state == "created"
+    assert reservation_unchanged
+    assert not body_ran
+    assert len(messages) == 2
+    assert all("pinned behaviors cannot enter" in message for message in messages)
+
+    with scope:
+        @when(scope.output_cown)
+        def finish(output):
+            output.value.append("legitimate host")
+
+    assert scope.output_value == ["legitimate host"]
+
+
+def test_direct_native_scope_entry_and_joins_reject_pinned_execution():
+    fresh = Scope()
+    with Scope([]) as active:
+        handles = PinnedCown((fresh, active))
+
+        @when(handles, scope=root_scope)
+        def attempt_native_operations(value):
+            fresh, active = value.value
+            state = active._impl.state
+            count = _core.terminator_count()
+            operations = (
+                (fresh._impl.enter, ()),
+                (active._impl.quiescence, (0,)),
+                (active._impl.close, ()),
+                (active._impl.wait, (0,)),
+                (active._impl.finish, (True,)),
+                (active._impl.exit, (True, None)),
+            )
+            for operation, args in operations:
+                try:
+                    operation(*args)
+                except RuntimeError as error:
+                    if "pinned behaviors cannot enter or synchronously join" not in str(error):
+                        raise AssertionError(str(error))
+                else:
+                    raise AssertionError(f"{operation} bypassed pinned execution guard")
+            if (fresh._impl.state != "created" or
+                    active._impl.state != state or state != "active" or
+                    _core.terminator_count() != count):
+                raise AssertionError("rejected operation changed scope state or accounting")
+            return "rejected"
+
+        pump()
+
+    assert attempt_native_operations.unwrap() == "rejected"
+    with fresh:
+        pass
+    assert fresh.output_value is None
 
 
 def test_worker_nested_scope_progresses_when_main_pumps():
@@ -413,9 +543,13 @@ def test_worker_nested_scope_progresses_when_main_pumps():
         @when(outer.output_cown)
         def on_worker(output, main_value=pinned):
             with Scope() as inner:
-                @when(main_value, inner.output_cown)
-                def on_main(value, result):
-                    result.value = value.value * 2
+                @when(main_value, scope=root_scope)
+                def on_main(value):
+                    return value.value * 2
+
+                @when(on_main, inner.output_cown)
+                def store_result(result, output):
+                    output.value = result.value
             output.value = inner.output_value
 
     assert outer.output_value == 10
@@ -830,25 +964,24 @@ def test_nested_host_scope_can_enter_during_global_wait(idempotent_start):
 
 def test_repeated_pinned_baseexception_restores_scope_host():
     output = _run_program("""
-        from bocpy import _core, Scope, PinnedCown, start, wait, when
+        from bocpy import _core, Scope, PinnedCown, pump, root_scope, start, wait, when
 
         if __name__ == "__main__":
             start(worker_count=2)
             pinned = PinnedCown([])
-            try:
-                with Scope():
-                    for label in ("first", "second"):
-                        @when(pinned)
-                        def fail(value, label=label):
-                            value.value.append(label)
-                            raise BaseException(label)
-            except BaseException as error:
-                assert type(error) is BaseException
-                assert error.args == ("second",)
-                assert type(error.__context__) is BaseException
-                assert error.__context__.args == ("first",)
-            else:
-                raise AssertionError("pinned BaseException was not propagated")
+            errors = []
+            with Scope():
+                for label in ("first", "second"):
+                    @when(pinned, scope=root_scope)
+                    def fail(value, label=label):
+                        value.value.append(label)
+                        raise BaseException(label)
+                for _ in range(2):
+                    try:
+                        pump(max_behaviors=1)
+                    except BaseException as error:
+                        errors.append(error)
+            assert [error.args for error in errors] == [("first",), ("second",)]
             assert not _core.scope_active()
             assert _core.terminator_count() == 0
             assert pinned.unwrap() == ["first", "second"]
@@ -876,9 +1009,13 @@ def test_scope_exit_waits_for_concurrent_pumper_and_restores_host():
             try:
                 with Scope([]) as scope:
                     pinned = PinnedCown(None)
-                    @when(pinned, scope.output_cown)
-                    def child(value, output):
-                        output.value.append(42)
+                    @when(pinned, scope=root_scope)
+                    def child(value):
+                        return 42
+
+                    @when(child, scope.output_cown)
+                    def store_child(value, output):
+                        output.value.append(value.value)
                     ready.set()
                 assert not _core.scope_active()
                 outcomes.append(scope.output_value)
@@ -1025,7 +1162,7 @@ def test_timed_shutdown_preserves_active_host_output_and_runtime(shutdown):
 def test_noticeboard_scope_handle_survives_repeated_pinned_snapshots():
     output = _run_program("""
         import gc
-        from bocpy import Scope, PinnedCown, notice_read, notice_seed, pump, start, wait, when
+        from bocpy import Scope, PinnedCown, notice_read, notice_seed, pump, root_scope, start, wait, when
 
         if __name__ == "__main__":
             start(worker_count=2)
@@ -1034,7 +1171,7 @@ def test_noticeboard_scope_handle_survives_repeated_pinned_snapshots():
                 notice_seed("destination", scope)
                 for index in range(50):
                     notice_seed("unrelated", index)
-                    @when(pinned)
+                    @when(pinned, scope=root_scope)
                     def read(value):
                         destination = notice_read("destination")
                         @when(destination.output_cown, scope=destination)

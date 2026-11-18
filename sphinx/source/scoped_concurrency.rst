@@ -82,8 +82,9 @@ It does not close the scope, transfer its output, or permit host access to
 Only the original entering host may call ``quiesce`` while the scope is
 ``ACTIVE`` and is that host's current scope. A behavior cannot wait on its own
 scope or an ancestor that accounts for it. A host inside a nested scope cannot
-quiesce its enclosing scope. A worker may quiesce a new nested scope it entered,
-subject to the same blocking hazards as nested scope exit.
+quiesce its enclosing scope. A pinned behavior cannot enter, quiesce, or join
+any scope, even if its pending work is worker-only. A worker may quiesce a new
+nested scope it entered, subject to the same blocking hazards as nested scope exit.
 
 A finite nonnegative timeout raises ``TimeoutError`` if no zero is observed
 before the deadline; the scope remains active for retry. Only ``None`` waits
@@ -105,7 +106,9 @@ this order:
 Omit it to inherit; passing ``None`` is not an alternative spelling.
 A behavior runs with its selected scope active, so work it schedules inherits
 that same owner. It can instead enter a nested scope or choose another
-destination explicitly.
+destination explicitly. A behavior whose request set contains a pinned cown
+must select :data:`root_scope`; it cannot be owned by a local scope. Its
+non-pinned descendants may explicitly select a local scope.
 
 Root-owned work can outlive a library call:
 
@@ -271,7 +274,8 @@ the host restores the enclosing context and publishes ``CLOSED``, then releases
 its root lifetime reservation and root reference. Output
 values and exit exceptions are stored separately from this lifecycle state.
 
-Pinned enqueue wakes registered main-thread waiters as a separate wake reason.
+Pinned enqueue wakes registered waiters in the main interpreter as a separate
+wake reason.
 It does not increment ``zero_count`` or broadcast completion to unrelated
 counters. Waiters retain their original generation while pumping.
 
@@ -303,19 +307,21 @@ scope can introduce dependencies that the scheduler cannot resolve:
   leave spare workers; merely using two workers does not make arbitrary
   nesting safe.
 
-For :ref:`pinned-cowns`, scope exit and ``scope.quiesce()`` on the main thread
-pump ready pinned behaviors when it is not already inside a pinned behavior. A worker-side join
-cannot pump the main-thread queue and needs the main thread to pump concurrently
-if its descendants use pinned cowns.
+For :ref:`pinned-cowns`, scope exit and ``scope.quiesce()`` from a thread in
+the main interpreter pump ready pinned behaviors when it is not already inside
+a pinned behavior. A worker-side join cannot pump the main-interpreter queue
+and needs a thread in the main interpreter to pump concurrently if its
+descendants use pinned cowns.
 On free-threaded builds, automatic joins wait when another host thread owns
 the pump, then retry if work remains. Explicit concurrent ``pump()`` calls
 still raise ``RuntimeError``.
 
-Nested main-thread pumping remains prohibited. A scope inside a pinned
-behavior may join worker-only work without recursively pumping. Pinned
-descendants still need a main-thread pumper; if that pumper is blocked in the
-parent pinned behavior, the join can deadlock. Scopes do not release parent
-cowns or add worker-helping or reentrant pumping to avoid these hazards.
+Nested pumping in the main interpreter remains prohibited. Scope entry, quiescence, and
+exit/join are rejected while a pinned behavior is executing, before scope
+state or completion reservations change. Pinned behaviors may still schedule
+work into inherited, explicit, or :data:`root_scope` destinations. Scopes do
+not release parent cowns or add worker-helping or reentrant pumping to avoid
+these hazards.
 
 For a complete runnable example of local output and root-owned background
 work, see

@@ -338,8 +338,10 @@ class Scope(_ScopeHandle, Generic[T]):
 
     Scope exit does not stop the runtime. Captured behavior exceptions stay
     on their behavior result cowns; partial output mutations are not rolled
-    back. Nested scopes may block workers while retaining their cowns, so the
-    caller must avoid cyclic dependencies and worker exhaustion.
+    back. Pinned behaviors may schedule work for a scope but cannot enter,
+    quiesce, or synchronously join one. Nested scopes on workers may block
+    while retaining their cowns, so callers must avoid cyclic dependencies
+    and worker exhaustion.
     """
 
     def __init__(self, initial: T = None):
@@ -359,7 +361,10 @@ class Scope(_ScopeHandle, Generic[T]):
         return self._output_value
 
     def __enter__(self):
-        """Enter the scope, starting the shared runtime if necessary."""
+        """Enter the scope, starting the shared runtime if necessary.
+
+        :raises RuntimeError: If entered by a pinned behavior.
+        """
         if self._impl.state != "created":
             raise RuntimeError("Scope is single-use")
         if _core.is_primary() and not _core.scope_active():
@@ -376,7 +381,8 @@ class Scope(_ScopeHandle, Generic[T]):
 
         :param timeout: Maximum wait in seconds; ``None`` waits indefinitely.
         :raises TimeoutError: If no quiescence is observed before the deadline.
-        :raises RuntimeError: If called outside the active scope's host context.
+        :raises RuntimeError: If called outside the active scope's host context,
+            or from a pinned behavior.
 
         A zero transition satisfies this wait even if another caller schedules
         new work before it returns. Output is published only on scope exit.
@@ -388,7 +394,10 @@ class Scope(_ScopeHandle, Generic[T]):
             raise TimeoutError(f"scope did not reach quiescence within timeout={timeout!r}")
 
     def __exit__(self, exc_type, exc_value, traceback):
-        """Join scoped work, finalize its output, and restore the enclosing scope."""
+        """Join scoped work, finalize its output, and restore the enclosing scope.
+
+        :raises RuntimeError: If joined from a pinned behavior.
+        """
         if self._impl.state not in ("active", "draining"):
             raise RuntimeError("Scope is not active")
         resolver = BEHAVIORS.export_module if BEHAVIORS is not None else None
@@ -462,14 +471,15 @@ class PinnedCown(Cown[T]):
     :c:type:`PyObject` reference in the main interpreter. The value
     never goes through ``XIData``; the same Python object is
     observed on every acquire. The trade-off: every behavior whose
-    request set contains a pinned cown runs **on the main thread**,
+    request set contains a pinned cown runs **in the main interpreter**,
     drained by :func:`pump` (called from your event loop) or
     implicitly by :func:`wait`.
 
     Pattern: coarse-grained pinned dispatch
-        The pinned arm is single-consumer (the main thread). If you
+        The pinned queue is single-consumer: only one thread in the main
+        interpreter pumps behaviors at a time. If you
         schedule a pinned behavior per item, those behaviors
-        serialise on the main thread and you lose worker
+        serialise in the main interpreter and you lose worker
         parallelism. Schedule pinned behaviors coarsely -- one per
         logical frame or batch, not per item. Do per-item
         computation on workers against per-item :class:`Cown`
@@ -494,7 +504,9 @@ class PinnedCown(Cown[T]):
         A behavior may freely combine pinned and unpinned cowns;
         the 2PL acquisition order is unchanged. As soon as the
         request set contains any pinned cown, the body runs on the
-        main thread. Unpinned cowns in the set still travel through
+        main interpreter and its scheduling owner must be :data:`root_scope`.
+        It may schedule non-pinned descendants into a local scope.
+        Unpinned cowns in the set still travel through
         XIData into the main interpreter for the body's duration.
 
     Exception model
@@ -531,10 +543,10 @@ class PinnedCown(Cown[T]):
     Restrictions
         - Constructible only on the main interpreter (see
           *Thread affinity* above).
-        - The pinning interpreter is the main interpreter, by
-          design. There is one pinned queue per process and one
-          consumer of that queue (the main pumper); pinned cowns do
-          not split across interpreters.
+        - The pinning interpreter is the main interpreter, by design.
+          There is one pinned queue per process and at most one active
+          consumer thread in that interpreter; pinned cowns do not split
+          across interpreters.
     """
 
     def __init__(self, value: T):
@@ -617,7 +629,7 @@ def pump(deadline_ms: Optional[int] = None,
          raise_on_error: bool = False) -> PumpResult:
     """Run pinned behaviors that are ready, then return.
 
-    Drains the main-thread queue of behaviors whose request sets
+    Drains the main-interpreter queue of behaviors whose request sets
     contain at least one :class:`PinnedCown`. Each behavior runs to
     completion before the next starts. The pump is non-preemptive:
     ``deadline_ms`` gates *starting* the next behavior, not
@@ -2128,6 +2140,8 @@ def when(*cowns, scope=_INHERIT_SCOPE):
     variable raises an error at decoration time. ``@when`` is an ordinary
     runtime decorator, so aliasing the import (``from bocpy import when as
     boc_when``) works like any other name.
+    Behaviors containing a :class:`PinnedCown` must use :data:`root_scope`;
+    local-scope ownership is rejected at native scheduling.
     """
 
     def when_factory(func):

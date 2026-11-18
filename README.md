@@ -255,11 +255,11 @@ construction.
 Some values can't survive an XIData round-trip — pyglet shapes, Tk widgets,
 open file handles, ctypes pointers into a library loaded by `__main__`, a
 GPU context. Wrap those in a `PinnedCown`. Behaviors whose request set
-contains any pinned cown run on the main thread, drained by `pump()` from
+contains any pinned cown run in the main interpreter, drained by `pump()` from
 your event loop (or implicitly by `wait()`).
 
 Keep dispatch coarse — one pinned `@when` per frame, not per item — so the
-single-consumer main thread doesn't serialise your worker parallelism. The
+single-consumer queue in the main interpreter doesn't serialise your worker parallelism. The
 `pump()` call drains whatever pinned behaviors are queued and returns
 immediately when the queue is empty (it never blocks), so it is safe to
 call from a tight render-loop tick. Hosts that want a starvation warning
@@ -360,7 +360,7 @@ example uses it to coordinate early termination across worker behaviors.
 For values that can't survive an XIData round-trip — UI handles, GPU
 contexts, file descriptors — the library provides `PinnedCown`, a cown whose
 value lives permanently in the main interpreter. Behaviors against a pinned
-cown run on the main thread, drained by `pump()` from your event loop or
+cown run in the main interpreter, drained by `pump()` from your event loop or
 implicitly by `wait()`. The full surface is `PinnedCown`, `pump`,
 `PumpResult`, `set_pump_watchdog`, and `set_wait_pump_poll`; the
 [`bocpy-boids`](https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/boids.py)
@@ -497,8 +497,12 @@ exception grouping and leaves global `wait` / `pump` behavior unchanged.
 
 **Nested scopes can deadlock.** A waiting behavior retains its cowns and
 occupies a worker: descendants must not need those cowns or exhaust the
-remaining workers. Pinned descendants also need the main-thread pumper;
-nested pumping is not supported. See the
+remaining workers. A pinned behavior cannot enter, quiesce, or synchronously
+join a scope; it may still schedule work into an inherited or explicit scope,
+including `root_scope`. Ordinary code in the main interpreter can enter and join scopes,
+and scope waits pump pinned work. Behaviors containing a pinned cown must
+themselves be owned by `root_scope`; a local scope may observe their completion
+through a subsequent non-pinned behavior. See the
 [Scoped Concurrency guide](https://microsoft.github.io/bocpy/scoped_concurrency.html)
 for ownership rules and blocking hazards, and
 [`examples/scopes.py`](examples/scopes.py) for local output with root-owned
