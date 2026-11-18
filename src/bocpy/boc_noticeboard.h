@@ -3,8 +3,8 @@
 ///
 /// The noticeboard is a fixed-capacity table (max @ref NB_MAX_ENTRIES
 /// entries, each keyed by a UTF-8 string of up to @ref NB_KEY_SIZE-1
-/// bytes) holding cross-interpreter data plus a list of pinned
-/// @ref BOCCown references that the entry's value depends on.
+/// bytes) holding cross-interpreter data plus owned native references
+/// that the entry's value depends on.
 ///
 /// **Thread model.** All mutations (@ref noticeboard_write,
 /// @ref noticeboard_delete, @ref noticeboard_clear) must be called
@@ -33,6 +33,7 @@
 
 #include "boc_compat.h"
 #include "boc_cown.h"
+#include "boc_native_ref.h"
 #include <bocpy/xidata.h>
 
 /// @brief Maximum number of entries the noticeboard can hold.
@@ -48,7 +49,7 @@ void noticeboard_init(void);
 /// @brief Drain remaining entries (XIData + pins) and tear down primitives.
 /// @details Called once at module free. Drops the calling thread's
 /// snapshot cache and frees every entry's @c XIDATA_T plus every
-/// pinned cown ref.
+/// owned native reference.
 void noticeboard_destroy(void);
 
 /// @brief Register the calling thread as the sole noticeboard mutator.
@@ -79,7 +80,7 @@ void noticeboard_drop_local_cache(void);
 void noticeboard_cache_clear_for_behavior(void);
 
 /// @brief Walk a Python sequence of integer cown pointers, returning the
-///        underlying @ref BOCCown array.
+///        owned native reference array.
 /// @details Each pointer in @p cowns is interpreted as a raw
 /// @ref BOCCown pointer (via @c PyLong_AsVoidPtr). The caller is
 /// expected to have pre-INCREFed each cown before passing the
@@ -88,34 +89,41 @@ void noticeboard_cache_clear_for_behavior(void);
 /// pointer is left NULL.
 /// @param cowns Sequence of integer pointer values, or @c Py_None.
 /// @param[out] out_array Heap-allocated array (PyMem_RawMalloc) of
-///        cown pointers. The caller is responsible for freeing it
+///        native references. The caller is responsible for freeing it
 ///        with @c PyMem_RawFree.
 /// @param[out] out_count Number of valid entries in @p out_array.
 /// @return 0 on success, -1 on failure (PyErr set).
-int nb_pin_cowns(PyObject *cowns, BOCCown ***out_array, int *out_count);
+int nb_pin_cowns(PyObject *cowns, BOCNativeRef **out_array, int *out_count);
+
+/// @brief Report whether serialization borrows entry-owned native references
+bool nb_pickle_borrowing(void);
+
+/// @brief Retain a deduplicated native reference in the active borrowing context
+/// @return Zero on success, -1 with PyErr on allocation failure
+int nb_pickle_retain(BOCNativeRef ref);
 
 /// @brief Write or overwrite a noticeboard entry.
 /// @details On success, the noticeboard takes ownership of @p xidata
 /// and the @p pins array (and the strong refs the caller pre-INCREFed
 /// onto each cown). On failure, @p xidata is freed via @c XIDATA_FREE
-/// and every pin is COWN_DECREFed before @c PyMem_RawFree(@p pins).
+/// and every native reference is released before @c PyMem_RawFree(@p pins).
 /// @param key UTF-8 key (must be NUL-free, up to @ref NB_KEY_SIZE-1
 ///        bytes long).
 /// @param key_len Length of @p key in bytes (does NOT include any
 ///        trailing NUL).
 /// @param xidata Serialized value; ownership transferred on success.
 /// @param pickled Whether @p xidata holds pickled bytes.
-/// @param pins Heap-allocated cown pin array; ownership transferred
+/// @param pins Heap-allocated native reference array; ownership transferred
 ///        on success. May be NULL when @p pin_count is 0.
 /// @param pin_count Number of entries in @p pins.
 /// @return 0 on success, -1 on failure (PyErr set; @p xidata and
 ///         @p pins are freed).
 int noticeboard_write(const char *key, Py_ssize_t key_len, XIDATA_T *xidata,
-                      bool pickled, BOCCown **pins, int pin_count);
+                      bool pickled, BOCNativeRef *pins, int pin_count);
 
 /// @brief Delete a single noticeboard entry by key.
-/// @details The entry's @c XIDATA_T is freed and all pinned cowns are
-/// COWN_DECREFed (after the noticeboard mutex is released). It is not
+/// @details The entry's @c XIDATA_T is freed and all native references are
+/// released (after the noticeboard mutex is released). It is not
 /// an error for the key to be absent.
 /// @return 0 on success, -1 on failure (PyErr set; e.g. key validation).
 int noticeboard_delete(const char *key, Py_ssize_t key_len);

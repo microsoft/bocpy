@@ -23,6 +23,20 @@ Behaviors
 .. autofunction:: quiesce
 .. autofunction:: start
 
+Scoped Concurrency
+^^^^^^^^^^^^^^^^^^
+
+See :ref:`scoped-concurrency` for local joins, repeatable
+:meth:`Scope.quiesce` checkpoints, output ownership, explicit
+``scope=`` destinations, and nested blocking hazards.
+
+.. autoclass:: Scope
+    :members:
+    :inherited-members:
+    :special-members: __init__, __enter__, __exit__
+
+.. autodata:: root_scope
+
 Cown Groups
 ^^^^^^^^^^^
 
@@ -60,22 +74,42 @@ Runtime Lifecycle
 
 The bocpy runtime follows a simple lifecycle:
 
-1. **Start** — the first ``@when`` call (or an explicit :func:`start`) spawns
+1. **Start** — the first ``@when`` call, :class:`Scope` entry, or explicit
+   :func:`start` spawns
    the worker sub-interpreters and the noticeboard thread.
 2. **Schedule** — ``@when`` / :func:`whencall` schedules behaviors against
    cowns. Scheduling and release run on the caller and worker threads; there
    is no central scheduler thread.
-3. **Wait** — :func:`wait` blocks until all scheduled behaviors complete, then
+3. **Wait** — :func:`wait` blocks until all scheduled behaviors and active
+   local scopes complete, then
    tears down the runtime (joins workers, closes the noticeboard).
    For a non-tearing-down checkpoint (e.g. parallel-search inspection
    between rounds), use :func:`quiesce` instead — it blocks until
-   the runtime is quiescent, returns optional ``stats`` /
-   ``noticeboard`` snapshots, and leaves workers and the noticeboard
+   the global completion count is initially zero or next reaches zero, returns
+   optional ``stats`` / ``noticeboard`` snapshots afterward, and leaves workers and the noticeboard
    thread running so further ``@when`` calls work immediately.
+   Open scopes hold lifetime reservations in this count: even idle scopes
+   delay both ``quiesce`` and ``wait``.
+   Newer work can already be active when ``quiesce`` returns.
 4. **Re-start** — after ``wait()`` returns, the next ``@when`` call spins up
    a fresh runtime. The noticeboard is cleared and worker statistics are
    reset; existing :class:`Cown` objects survive and can be scheduled
    against the new runtime.
+
+Local :class:`Scope` exit joins only its subtree and transfers its output;
+it does not stop the runtime or fence noticeboard mutations. Global
+``wait``, ``quiesce``, and runtime ``stop`` reject self-joins from any behavior
+or active local scope host body. Captured behavior failures remain on each
+behavior's own result cown; joining does not aggregate them.
+The original active host may call :meth:`Scope.quiesce` between batches
+without publishing output. Scope exit waits for current work zero and fences
+admission before transferring output; global shutdown also waits for active
+scope lifetime reservations and atomically closes admission at global count
+zero before teardown. Any work-drain timeout raises ``TimeoutError`` and
+leaves the runtime running and admission open for retry, including root-only
+work and calls requesting snapshots. A later noticeboard-shutdown timeout
+retains its existing ``RuntimeError`` and retry behavior; workers may already
+be stopped.
 
 .. autodata:: WORKER_COUNT
 

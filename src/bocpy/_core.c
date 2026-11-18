@@ -2,14 +2,17 @@
 
 #include "boc_compat.h"
 #include "boc_cown.h"
+#include "boc_execution.h"
 #include "boc_noticeboard.h"
 #include "boc_registry.h"
 #include "boc_sched.h"
+#include "boc_scope.h"
 #include "boc_tags.h"
 #include "boc_terminator.h"
 #include <assert.h>
 #include <bocpy/bocpy.h>
 #include <limits.h>
+#include <math.h>
 
 typedef struct boc_queue BOCQueue;
 
@@ -57,8 +60,6 @@ static boc_bq_t MAIN_PINNED_QUEUE;
 static atomic_int_least64_t MAIN_PINNED_DEPTH = 0;
 
 static atomic_int_least64_t MAIN_PINNED_NONEMPTY_SINCE_NS = 0;
-
-static thread_local bool IN_PUMP_BODY = false;
 
 static atomic_int_least64_t LAST_PUMP_NS = 0;
 
@@ -197,6 +198,7 @@ typedef struct boc_state {
   PyObject *loads;
   PyTypeObject *cown_capsule_type;
   PyTypeObject *behavior_capsule_type;
+  PyTypeObject *scope_capsule_type;
   /// @brief Cached reference to _cown_capsule_from_pointer_inheriting.
   /// @details The pickle reconstructor used by every CownCapsule.__reduce__
   /// call except those issued by the noticeboard's write-direct path.
@@ -235,13 +237,13 @@ static thread_local _core_module_state *BOC_STATE;
 /// that. If that ever changes, migration to a module-state cell is
 /// mechanical.
 typedef struct noticeboard_pickle_ctx {
-  /// @brief Caller-owned, exactly-sized array of pre-pinned @c BOCCown*.
+  /// @brief Owned native reference array, extended by scope reducers with native lifetime pins
   /// @details Borrowed (not owned) for the duration of one
   /// @c object_to_xidata call. The caller
   /// (@ref _core_noticeboard_write_direct) freed any prior pin array
   /// before installing this one and is responsible for releasing this
   /// one too.
-  BOCCown **pins;
+  BOCNativeRef *pins;
   /// @brief Number of valid entries in @ref pins.
   int pin_count;
   /// @brief Number of @c CownCapsule reductions seen during pickling
@@ -254,6 +256,28 @@ typedef struct noticeboard_pickle_ctx {
 } NoticeboardPickleCtx;
 
 static thread_local NoticeboardPickleCtx *BOC_NB_CTX = NULL;
+
+bool nb_pickle_borrowing(void) { return BOC_NB_CTX != NULL; }
+
+int nb_pickle_retain(BOCNativeRef ref) {
+  NoticeboardPickleCtx *ctx = BOC_NB_CTX;
+  assert(ctx != NULL);
+  for (int i = 0; i < ctx->pin_count; ++i) {
+    if (ctx->pins[i].pointer == ref.pointer && ctx->pins[i].ops == ref.ops) {
+      return 0;
+    }
+  }
+  BOCNativeRef *pins = PyMem_RawRealloc(
+      ctx->pins, ((size_t)ctx->pin_count + 1) * sizeof(*pins));
+  if (pins == NULL) {
+    PyErr_NoMemory();
+    return -1;
+  }
+  native_ref_retain(ref);
+  ctx->pins = pins;
+  ctx->pins[ctx->pin_count++] = ref;
+  return 0;
+}
 
 #define BOC_STATE_SET(m)                                                       \
   do {                                                                         \
@@ -392,14 +416,71 @@ static BOCRecycleQueue *BOCRecycleQueue_new(int_least64_t index) {
   return old_head;
 }
 
+typedef struct managed_pickle_context {
+  BOCCown **cowns;
+  Py_ssize_t count;
+  Py_ssize_t capacity;
+  struct managed_pickle_context *previous;
+} ManagedPickleContext;
+
+static thread_local ManagedPickleContext *BOC_MANAGED_PICKLE_CTX = NULL;
+
+/// @brief Begin tracking inheriting native references for one XIData pickle
+static bool managed_pickle_begin(void) {
+  ManagedPickleContext *ctx = PyMem_RawCalloc(1, sizeof(*ctx));
+  if (ctx == NULL) {
+    PyErr_NoMemory();
+    return false;
+  }
+  ctx->previous = BOC_MANAGED_PICKLE_CTX;
+  BOC_MANAGED_PICKLE_CTX = ctx;
+  return true;
+}
+
+/// @brief Track one successfully reduced cown until the XIData transfer owns it
+static int managed_pickle_retain(BOCCown *cown) {
+  ManagedPickleContext *ctx = BOC_MANAGED_PICKLE_CTX;
+  if (ctx == NULL) {
+    return 0;
+  }
+  if (ctx->count == ctx->capacity) {
+    Py_ssize_t capacity = ctx->capacity == 0 ? 8 : ctx->capacity * 2;
+    BOCCown **cowns = PyMem_RawRealloc(
+        ctx->cowns, (size_t)capacity * sizeof(*cowns));
+    if (cowns == NULL) {
+      PyErr_NoMemory();
+      return -1;
+    }
+    ctx->cowns = cowns;
+    ctx->capacity = capacity;
+  }
+  ctx->cowns[ctx->count++] = cown;
+  return 0;
+}
+
+/// @brief Finish an XIData pickle, rolling back references only on failure
+static void managed_pickle_end(bool commit) {
+  ManagedPickleContext *ctx = BOC_MANAGED_PICKLE_CTX;
+  assert(ctx != NULL);
+  if (!commit) {
+    for (Py_ssize_t i = 0; i < ctx->count; ++i) {
+      COWN_DECREF(ctx->cowns[i]);
+    }
+  }
+  BOC_MANAGED_PICKLE_CTX = ctx->previous;
+  PyMem_RawFree(ctx->cowns);
+  PyMem_RawFree(ctx);
+}
+
 static PyObject *_PyPickle_Dumps(PyObject *obj) {
-  PyObject *bytes = PyObject_CallOneArg(BOC_STATE->dumps, obj);
-  return bytes;
+  if (!managed_pickle_begin()) {
+    return NULL;
+  }
+  return PyObject_CallOneArg(BOC_STATE->dumps, obj);
 }
 
 static PyObject *_PyPickle_Loads(PyObject *bytes) {
-  PyObject *obj = PyObject_CallOneArg(BOC_STATE->loads, bytes);
-  return obj;
+  return PyObject_CallOneArg(BOC_STATE->loads, bytes);
 }
 
 /// @brief Deserializes a value from cross-interpereter data.
@@ -460,14 +541,17 @@ static PyObject *object_to_xidata(PyObject *value, XIDATA_T **xidata_ptr) {
 
   PyObject *bytes = _PyPickle_Dumps(value);
   if (bytes == NULL) {
+    managed_pickle_end(false);
     return NULL;
   }
 
   if (XIDATA_GETXIDATA(bytes, xidata) == 0) {
+    managed_pickle_end(true);
     Py_DECREF(bytes);
     Py_RETURN_TRUE;
   }
 
+  managed_pickle_end(false);
   Py_DECREF(bytes);
 
   PyErr_SetString(PyExc_RuntimeError,
@@ -492,7 +576,7 @@ static PyObject *object_to_xidata(PyObject *value, XIDATA_T **xidata_ptr) {
 /// @return Py_None on success, NULL on error (PyErr set).
 static PyObject *nb_serialize_and_commit(const char *key, Py_ssize_t key_len,
                                          PyObject *value, PyObject *cowns) {
-  BOCCown **new_pins = NULL;
+  BOCNativeRef *new_pins = NULL;
   int new_pin_count = 0;
   if (nb_pin_cowns(cowns, &new_pins, &new_pin_count) < 0) {
     return NULL;
@@ -513,12 +597,14 @@ static PyObject *nb_serialize_and_commit(const char *key, Py_ssize_t key_len,
   XIDATA_T *xidata = NULL;
   PyObject *pickled = object_to_xidata(value, &xidata);
   BOC_NB_CTX = NULL;
+  new_pins = nb_ctx.pins;
+  new_pin_count = nb_ctx.pin_count;
   if (pickled == NULL) {
     if (xidata != NULL) {
       XIDATA_FREE(xidata);
     }
     for (int i = 0; i < new_pin_count; i++) {
-      COWN_DECREF(new_pins[i]);
+      native_ref_release(new_pins[i]);
     }
     PyMem_RawFree(new_pins);
     return NULL;
@@ -531,7 +617,7 @@ static PyObject *nb_serialize_and_commit(const char *key, Py_ssize_t key_len,
     int unpinned = nb_ctx.unpinned_count;
     XIDATA_FREE(xidata);
     for (int i = 0; i < new_pin_count; i++) {
-      COWN_DECREF(new_pins[i]);
+      native_ref_release(new_pins[i]);
     }
     PyMem_RawFree(new_pins);
     PyErr_Format(PyExc_RuntimeError,
@@ -836,14 +922,7 @@ static PyObject *_core_registry_lookup(PyObject *Py_UNUSED(self),
 
 /// @brief Try to register a new behavior with the terminator.
 /// @details Returns the post-increment count on success, or -1 if the
-/// terminator is closed (runtime is shutting down). The double-check of
-/// TERMINATOR_CLOSED around the fetch_add closes the close-vs-inc race:
-/// if close() lands between our first check and our fetch_add, the
-/// second check sees it and we undo, signalling on a 0-transition so a
-/// concurrent terminator_wait() does not miss the wakeup. Uses the
-/// portable plain-atomic forms (seq_cst) — see the polyfill block at
-/// the top of this file; the terminator is not on a hot path so the
-/// stronger ordering is free.
+/// terminator is absent or closed (runtime is shutting down).
 /// @param self The module (unused)
 /// @param args Unused
 /// @return Python int — new count on success, -1 if closed.
@@ -853,14 +932,19 @@ static PyObject *_core_terminator_inc(PyObject *self,
   return PyLong_FromLongLong((long long)terminator_inc());
 }
 
-/// @brief Decrement the terminator. Wakes terminator_wait on 0-transition.
+/// @brief Decrement the terminator. Wakes waiters on 0-transition.
 /// @param self The module (unused)
 /// @param args Unused
 /// @return Python int — the new count.
 static PyObject *_core_terminator_dec(PyObject *self,
                                       PyObject *Py_UNUSED(args)) {
   BOC_STATE_SET(self);
-  return PyLong_FromLongLong((long long)terminator_dec());
+  int_least64_t count = terminator_dec();
+  if (count < 0) {
+    PyErr_SetString(PyExc_RuntimeError, "terminator has no work to release");
+    return NULL;
+  }
+  return PyLong_FromLongLong((long long)count);
 }
 
 /// @brief Set the closed bit. Future terminator_inc() calls return -1.
@@ -876,126 +960,20 @@ static PyObject *_core_terminator_close(PyObject *self,
                     "interpreter");
     return NULL;
   }
-  terminator_close();
+  if (!terminator_close()) {
+    PyErr_SetString(PyExc_TimeoutError,
+                    "cannot stop the runtime while outstanding reservations remain");
+    return NULL;
+  }
   Py_RETURN_NONE;
 }
 
-/// @brief Block until TERMINATOR_COUNT reaches 0.
-/// @details A negative or @c None timeout means wait forever.
-/// Releases the GIL across the wait.
-/// @param self The module (unused)
-/// @param args A tuple @c (timeout,) — float-or-None
-/// @return @c True on success, @c False on timeout.
-static PyObject *_core_terminator_wait(PyObject *self, PyObject *args) {
-  BOC_STATE_SET(self);
-  PyObject *timeout_obj;
-  if (!PyArg_ParseTuple(args, "O", &timeout_obj)) {
-    return NULL;
-  }
 
-  bool wait_forever = false;
-  double timeout = 0.0;
-  if (timeout_obj == Py_None) {
-    wait_forever = true;
-  } else {
-    timeout = PyFloat_AsDouble(timeout_obj);
-    if (timeout == -1.0 && PyErr_Occurred()) {
-      return NULL;
-    }
-    if (boc_validate_finite_timeout(timeout, &timeout, &wait_forever) < 0) {
-      return NULL;
-    }
-  }
-
-  bool ok;
-  Py_BEGIN_ALLOW_THREADS ok = terminator_wait(timeout, wait_forever);
-  Py_END_ALLOW_THREADS
-
-      if (ok) {
-    Py_RETURN_TRUE;
-  }
-  Py_RETURN_FALSE;
-}
-
-/// @brief Pumpable variant of @ref _core_terminator_wait.
-/// @details Forwards to @ref terminator_wait_pumpable, supplying the
-/// @ref _core_pinned_depth_load reader. Returns one of the three
-/// integer constants exposed on the module (`TERMINATED`,
-/// `PUMP_READY`, `WAIT_TIMED_OUT`). Releases the GIL across the wait.
-/// @param self The module (unused)
-/// @param timeout_obj A Python float — seconds to wait. Non-positive
-///                    performs a non-blocking poll.
-/// @return Python int — one of the wake-reason sentinels.
-static uint64_t _core_pinned_depth_load(void);
-static PyObject *_core_terminator_wait_pumpable(PyObject *self,
-                                                PyObject *timeout_obj) {
-  BOC_STATE_SET(self);
-  double timeout_s = PyFloat_AsDouble(timeout_obj);
-  if (timeout_s == -1.0 && PyErr_Occurred()) {
-    return NULL;
-  }
-
-  boc_terminator_wake_reason_t reason;
-  Py_BEGIN_ALLOW_THREADS reason =
-      terminator_wait_pumpable(timeout_s, _core_pinned_depth_load);
-  Py_END_ALLOW_THREADS
-
-      return PyLong_FromLong((long)reason);
-}
-
-/// @brief Idempotent one-shot decrement of the Pyrona seed.
-/// @details Called by stop()/wait() to remove the seed that keeps the
-/// terminator count above zero across momentary quiescence. Safe to call
-/// any number of times — only the first call performs the decrement.
+/// @brief Claim a fresh runtime start with admission closed
+/// @details Allocates a fresh root after the previous runtime has retired.
 /// @param self The module (unused)
 /// @param args Unused
-/// @return Python bool — True if this call removed the seed, False if
-/// the seed was already removed.
-static PyObject *_core_terminator_seed_dec(PyObject *self,
-                                           PyObject *Py_UNUSED(args)) {
-  BOC_STATE_SET(self);
-  if (BOC_STATE->index != 0) {
-    PyErr_SetString(PyExc_RuntimeError,
-                    "terminator_seed_dec must be called from the primary "
-                    "interpreter");
-    return NULL;
-  }
-  if (terminator_seed_dec()) {
-    Py_RETURN_TRUE;
-  }
-  Py_RETURN_FALSE;
-}
-
-/// @brief Idempotent one-shot re-arm of the Pyrona seed.
-/// @param self The module (unused)
-/// @param args Unused
-/// @return Python bool — True if this call restored the seed, False if
-/// the seed was already present.
-static PyObject *_core_terminator_seed_inc(PyObject *self,
-                                           PyObject *Py_UNUSED(args)) {
-  BOC_STATE_SET(self);
-  if (BOC_STATE->index != 0) {
-    PyErr_SetString(PyExc_RuntimeError,
-                    "terminator_seed_inc must be called from the primary "
-                    "interpreter");
-    return NULL;
-  }
-  if (terminator_seed_inc()) {
-    Py_RETURN_TRUE;
-  }
-  Py_RETURN_FALSE;
-}
-
-/// @brief Restore terminator state for a fresh runtime start.
-/// @details Sets count=1 (the Pyrona seed), clears the closed bit, and
-/// re-arms the seed one-shot. Called from Behaviors.start(). Returns
-/// the prior @c (count, seeded) tuple so callers can detect drift left
-/// over from a previous run that died without reaching its
-/// reconciliation point (e.g. KeyboardInterrupt or stop() that raised
-/// before the assertion).
-/// @param self The module (unused)
-/// @param args Unused
-/// @return A 2-tuple @c (prior_count, prior_seeded).
+/// @return Py_None on success, NULL on failure (PyErr set).
 static PyObject *_core_terminator_reset(PyObject *self,
                                         PyObject *Py_UNUSED(args)) {
   PRINTDBG("_core_terminator_reset\n");
@@ -1006,26 +984,31 @@ static PyObject *_core_terminator_reset(PyObject *self,
                     "interpreter");
     return NULL;
   }
-  int_least64_t prior_count = 0;
-  int_least64_t prior_seeded = 0;
-  terminator_reset(&prior_count, &prior_seeded);
+  if (!terminator_reset()) {
+    return NULL;
+  }
   atomic_store(&MAIN_PINNED_NONEMPTY_SINCE_NS, 0);
   atomic_store(&WATCHDOG_LAST_WARN_NS, 0);
   atomic_store(&LAST_PUMP_NS, 0);
 #ifdef Py_GIL_DISABLED
   atomic_store_intptr(&MAIN_PUMP_THREAD, (intptr_t)0);
 #endif
-  return Py_BuildValue("(LL)", (long long)prior_count, (long long)prior_seeded);
+  Py_RETURN_NONE;
 }
 
-/// @brief Read the current TERMINATOR_SEEDED flag (for reconciliation).
-/// @param self The module (unused)
-/// @param args Unused
-/// @return Python int — 0 or 1.
-static PyObject *_core_terminator_seeded(PyObject *self,
-                                         PyObject *Py_UNUSED(args)) {
+/// @brief Open admission after the claimed runtime's resources are ready
+static PyObject *_core_terminator_activate(PyObject *self,
+                                           PyObject *Py_UNUSED(args)) {
   BOC_STATE_SET(self);
-  return PyLong_FromLongLong((long long)terminator_seeded());
+  if (BOC_STATE->index != 0) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "terminator_activate must be called from the primary interpreter");
+    return NULL;
+  }
+  if (!terminator_activate()) {
+    return NULL;
+  }
+  Py_RETURN_NONE;
 }
 
 /// @brief Read the current terminator count (for reconciliation tests).
@@ -1037,6 +1020,35 @@ static PyObject *_core_terminator_count(PyObject *self,
   BOC_STATE_SET(self);
   return PyLong_FromLongLong((long long)terminator_count());
 }
+
+/// @brief Retire the root only after admission and all execution have stopped
+static PyObject *_core_terminator_retire(PyObject *self,
+                                        PyObject *Py_UNUSED(args)) {
+  BOC_STATE_SET(self);
+  if (BOC_STATE->index != 0) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "terminator_retire must be called from the primary interpreter");
+    return NULL;
+  }
+  if (!terminator_retire()) {
+    PyErr_SetString(PyExc_RuntimeError, "cannot retire an open or busy runtime");
+    return NULL;
+  }
+  Py_RETURN_NONE;
+}
+
+static PyObject *_core_terminator_wake(PyObject *self,
+                                      PyObject *Py_UNUSED(args)) {
+  BOC_STATE_SET(self);
+  terminator_wake_all();
+  Py_RETURN_NONE;
+}
+
+/// @brief Extend the public capsule prefix with an execution-local borrow
+typedef struct scoped_cown_capsule {
+  CownCapsuleObject base;
+  uint64_t execution;
+} ScopedCownCapsule;
 
 /// @details This can be safely referenced and used from multiple processes.
 typedef struct boc_cown {
@@ -1057,6 +1069,8 @@ typedef struct boc_cown {
   /// @c report_unhandled_exception / @c cown_disown to short-circuit
   /// the owner CAS and skip the XIData round-trip for pinned cowns.
   bool is_pinned;
+  /// @brief Permanent scope ownership, including after output consumption
+  BOCScopeOwner *scope_owner;
   /// @brief the threadsafe serialized cown contents
   XIDATA_T *xidata;
   /// @brief the module which last released this cown
@@ -1082,6 +1096,7 @@ static inline int_least64_t cown_weak_decref(BOCCown *cown) {
            cown, cown->id, weak_rc);
 
   if (weak_rc == 0) {
+    scope_owner_decref(cown->scope_owner);
     PyMem_RawFree(cown);
     BOC_REF_TRACKING_REMOVE_COWN();
   }
@@ -1292,6 +1307,7 @@ static BOCCown *BOCCown_new(PyObject *value) {
   cown->pickled = false;
   cown->exception = false;
   cown->is_pinned = false;
+  cown->scope_owner = NULL;
   atomic_store_intptr(&cown->last, 0);
   atomic_store(&cown->rc, 1);
   atomic_store(&cown->weak_rc, 1);
@@ -1482,6 +1498,7 @@ static void BOCRecycleQueue_free(BOCRecycleQueue *queue) {
 /// @note This will perform an atomic decref on the underlying cown
 /// @param op Pointer to the CownCapsule object
 static void CownCapsule_dealloc(PyObject *op) {
+  BOC_STATE = PyType_GetModuleState(Py_TYPE(op));
   CownCapsuleObject *self = (CownCapsuleObject *)op;
   PRINTDBG("CownCapsule_dealloc(%p, rc=%" PRIdLEAST64 ")\n", self,
            op->ob_refcnt);
@@ -1496,6 +1513,7 @@ static void CownCapsule_dealloc(PyObject *op) {
 /// @return An empty CownCapsule object
 static PyObject *CownCapsule_new(PyTypeObject *type, PyObject *args,
                                  PyObject *kwds) {
+  BOC_STATE = PyType_GetModuleState(type);
   CownCapsuleObject *self;
   self = (CownCapsuleObject *)type->tp_alloc(type, 0);
   if (self == NULL) {
@@ -1551,6 +1569,26 @@ static bool cown_check_acquired(BOCCown *cown, bool set_error) {
   return true;
 }
 
+/// @brief Restrict scope output payload access to the executing argument borrow
+static bool scope_cown_access(PyObject *op, bool borrowed, bool set_error) {
+  ScopedCownCapsule *capsule = (ScopedCownCapsule *)op;
+  BOCScopeOwner *owner = capsule->base.cown->scope_owner;
+  if (owner == NULL) {
+    return true;
+  }
+  if (borrowed && CURRENT_EXECUTION != 0 &&
+      capsule->execution == CURRENT_EXECUTION &&
+      scope_owner_accepts_work(owner)) {
+    return true;
+  }
+  if (set_error) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "scope result cown is only accessible as an acquired "
+                    "behavior argument and is closed after scope exit");
+  }
+  return false;
+}
+
 /// @brief Returns the value of the cown, if it has been acquired.
 /// @note This will set an exception if the cown is not acquired.
 /// @param op The CownCapsule object
@@ -1559,7 +1597,8 @@ static bool cown_check_acquired(BOCCown *cown, bool set_error) {
 static PyObject *CownCapsule_get(PyObject *op, PyObject *Py_UNUSED(dummy)) {
   CownCapsuleObject *self = (CownCapsuleObject *)op;
 
-  if (!cown_check_acquired(self->cown, true)) {
+  if (!scope_cown_access(op, true, true) ||
+      !cown_check_acquired(self->cown, true)) {
     return NULL;
   }
 
@@ -1578,7 +1617,8 @@ static PyObject *CownCapsule_set(PyObject *op, PyObject *args) {
     return NULL;
   }
 
-  if (!cown_check_acquired(self->cown, true)) {
+  if (!scope_cown_access(op, true, true) ||
+      !cown_check_acquired(self->cown, true)) {
     return NULL;
   }
 
@@ -1593,7 +1633,8 @@ static PyObject *CownCapsule_set(PyObject *op, PyObject *args) {
 static PyObject *CownCapsule_get_value(PyObject *op, void *Py_UNUSED(dummy)) {
   CownCapsuleObject *self = (CownCapsuleObject *)op;
 
-  if (!cown_check_acquired(self->cown, true)) {
+  if (!scope_cown_access(op, true, true) ||
+      !cown_check_acquired(self->cown, true)) {
     return NULL;
   }
 
@@ -1609,7 +1650,8 @@ static int CownCapsule_set_value(PyObject *op, PyObject *value,
 
   CownCapsuleObject *self = (CownCapsuleObject *)op;
 
-  if (!cown_check_acquired(self->cown, true)) {
+  if (!scope_cown_access(op, true, true) ||
+      !cown_check_acquired(self->cown, true)) {
     return -1;
   }
 
@@ -1624,7 +1666,8 @@ static int CownCapsule_set_value(PyObject *op, PyObject *value,
 static PyObject *CownCapsule_acquired(PyObject *op,
                                       PyObject *Py_UNUSED(dummy)) {
   CownCapsuleObject *self = (CownCapsuleObject *)op;
-  return PyBool_FromLong(cown_check_acquired(self->cown, false));
+  return PyBool_FromLong(scope_cown_access(op, true, false) &&
+                         cown_check_acquired(self->cown, false));
 }
 
 /// @brief Attempts to acquire the cown
@@ -1726,9 +1769,13 @@ static int cown_acquire(BOCCown *cown) {
 /// @param Py_UNUSED (ignored)
 /// @return None on success, NULL otherwise
 static PyObject *CownCapsule_acquire(PyObject *op, PyObject *Py_UNUSED(dummy)) {
+  BOC_STATE = PyType_GetModuleState(Py_TYPE(op));
   CownCapsuleObject *self = (CownCapsuleObject *)op;
   BOCCown *cown = self->cown;
 
+  if (!scope_cown_access(op, false, true)) {
+    return NULL;
+  }
   if (cown_acquire(cown) < 0) {
     return NULL;
   }
@@ -1806,9 +1853,13 @@ static int cown_release(BOCCown *cown) {
 /// @param Py_UNUSED (ignored)
 /// @return None if successful, NULL otherwise
 static PyObject *CownCapsule_release(PyObject *op, PyObject *Py_UNUSED(dummy)) {
+  BOC_STATE = PyType_GetModuleState(Py_TYPE(op));
   CownCapsuleObject *self = (CownCapsuleObject *)op;
   BOCCown *cown = self->cown;
 
+  if (!scope_cown_access(op, false, true)) {
+    return NULL;
+  }
   if (cown_release(cown) < 0) {
     return NULL;
   }
@@ -1861,9 +1912,13 @@ static int cown_disown(BOCCown *cown) {
 /// @param Py_UNUSED (ignored)
 /// @return None if successful, NULL otherwise
 static PyObject *CownCapsule_disown(PyObject *op, PyObject *Py_UNUSED(dummy)) {
+  BOC_STATE = PyType_GetModuleState(Py_TYPE(op));
   CownCapsuleObject *self = (CownCapsuleObject *)op;
   BOCCown *cown = self->cown;
 
+  if (!scope_cown_access(op, false, true)) {
+    return NULL;
+  }
   if (cown_disown(cown) < 0) {
     return NULL;
   }
@@ -1871,17 +1926,41 @@ static PyObject *CownCapsule_disown(PyObject *op, PyObject *Py_UNUSED(dummy)) {
   Py_RETURN_NONE;
 }
 
+/// @brief Discard interpreter-owned payloads during runtime teardown
+/// @note Runtime cleanup must first stop execution that can access this cown.
+static PyObject *CownCapsule_cleanup(PyObject *op, PyObject *Py_UNUSED(args)) {
+  BOC_STATE = PyType_GetModuleState(Py_TYPE(op));
+  BOCCown *cown = ((CownCapsuleObject *)op)->cown;
+  if (cown->scope_owner != NULL &&
+      atomic_load(&cown->scope_owner->state) != BOC_SCOPE_CLOSED) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "cannot discard an unfinished scope output during cleanup");
+    return NULL;
+  }
+  if (cown->scope_owner != NULL &&
+      cown->value == NULL && cown->xidata == NULL) {
+    Py_RETURN_NONE;
+  }
+  if (cown_acquire(cown) < 0 || cown_disown(cown) < 0) {
+    return NULL;
+  }
+  Py_RETURN_NONE;
+}
+
+/// @brief Identify permanent scope-output ownership without exposing its payload
+static PyObject *CownCapsule_is_scope_output(PyObject *op,
+                                            void *Py_UNUSED(args)) {
+  return PyBool_FromLong(((CownCapsuleObject *)op)->cown->scope_owner != NULL);
+}
+
 /// @brief Consumes and returns the stored value, or re-raises a captured
 /// behavior exception.
 /// @details Mirrors Rust's @c Result::unwrap. Acquires the cown for the read,
 /// so the runtime must be quiescent: any behavior still in flight could be
 /// mutating the cown, so the call fails fast with @c RuntimeError instead of
-/// racing the worker. Quiescence is tested as
-/// @c TERMINATOR_COUNT - TERMINATOR_SEEDED > 0, which counts behavior holds
-/// independently of the Pyrona seed: this is exact even inside a
-/// seed-dropped window (e.g. a pinned behavior running on the main thread
-/// during @c quiesce / @c wait), where the bare @c count > 1 test would miss
-/// the last in-flight behavior. @b unwrap @b consumes the cown: the stored
+/// racing the worker. Root work and scope-lifetime reservations must be absent,
+/// regardless of the caller's selected scope.
+/// @b unwrap @b consumes the cown: the stored
 /// payload is taken by reference and the cown is reset to hold @c None before
 /// it is released, so the release re-serializes @c None rather than the
 /// payload. This is required for move-type values (e.g. @c Matrix), which
@@ -1900,10 +1979,14 @@ static PyObject *CownCapsule_disown(PyObject *op, PyObject *Py_UNUSED(dummy)) {
 /// @param Py_UNUSED (ignored)
 /// @return The stored value on success, or NULL with an exception set
 static PyObject *CownCapsule_unwrap(PyObject *op, PyObject *Py_UNUSED(dummy)) {
+  BOC_STATE = PyType_GetModuleState(Py_TYPE(op));
   CownCapsuleObject *self = (CownCapsuleObject *)op;
   BOCCown *cown = self->cown;
 
-  if (terminator_count() - terminator_seeded() > 0) {
+  if (!scope_cown_access(op, false, true)) {
+    return NULL;
+  }
+  if (terminator_count() > 0) {
     PyErr_SetString(
         PyExc_RuntimeError,
         "Cown.unwrap() called while behaviors are still in flight. "
@@ -2011,7 +2094,8 @@ static PyObject *CownCapsule_reduce(PyObject *op, PyObject *Py_UNUSED(dummy)) {
   if (borrowing) {
     bool found = false;
     for (int i = 0; i < nb_ctx->pin_count; i++) {
-      if (nb_ctx->pins[i] == cown) {
+      if (nb_ctx->pins[i].pointer == cown &&
+          nb_ctx->pins[i].ops == &BOC_COWN_REF_OPS) {
         found = true;
         break;
       }
@@ -2037,11 +2121,18 @@ static PyObject *CownCapsule_reduce(PyObject *op, PyObject *Py_UNUSED(dummy)) {
   Py_DECREF(args);
   if (result == NULL && !borrowing) {
     COWN_DECREF(cown);
+  } else if (result != NULL && !borrowing) {
+    if (managed_pickle_retain(cown) < 0) {
+      Py_DECREF(result);
+      COWN_DECREF(cown);
+      return NULL;
+    }
   }
   return result;
 }
 
 static PyMethodDef CownCapsule_methods[] = {
+    {"_cleanup", CownCapsule_cleanup, METH_NOARGS, NULL},
     {"get", CownCapsule_get, METH_NOARGS, NULL},
     {"set", CownCapsule_set, METH_VARARGS, NULL},
     {"acquired", CownCapsule_acquired, METH_NOARGS, NULL},
@@ -2061,7 +2152,8 @@ static PyObject *CownCapsule_get_exception(PyObject *op,
                                            void *Py_UNUSED(dummy)) {
   CownCapsuleObject *self = (CownCapsuleObject *)op;
 
-  if (!cown_check_acquired(self->cown, true)) {
+  if (!scope_cown_access(op, true, true) ||
+      !cown_check_acquired(self->cown, true)) {
     return NULL;
   }
 
@@ -2082,7 +2174,8 @@ static int CownCapsule_set_exception(PyObject *op, PyObject *value,
 
   CownCapsuleObject *self = (CownCapsuleObject *)op;
 
-  if (!cown_check_acquired(self->cown, true)) {
+  if (!scope_cown_access(op, true, true) ||
+      !cown_check_acquired(self->cown, true)) {
     return -1;
   }
 
@@ -2096,6 +2189,7 @@ static int CownCapsule_set_exception(PyObject *op, PyObject *value,
 }
 
 static PyGetSetDef CownCapsule_getset[] = {
+    {"_scope_owned", CownCapsule_is_scope_output, NULL, NULL, NULL},
     {"value", (getter)CownCapsule_get_value, (setter)CownCapsule_set_value,
      NULL, NULL},
     {"exception", (getter)CownCapsule_get_exception,
@@ -2122,7 +2216,8 @@ static Py_hash_t CownCapsule_hash(PyObject *op) {
 
 static PyObject *CownCapsule_repr(PyObject *op) {
   CownCapsuleObject *self = (CownCapsuleObject *)op;
-  if (cown_check_acquired(self->cown, false)) {
+  if (scope_cown_access(op, true, false) &&
+      cown_check_acquired(self->cown, false)) {
     return PyUnicode_FromFormat("CownCapsule(%p, value=%R)", self,
                                 self->cown->value);
   } else {
@@ -2143,7 +2238,7 @@ static PyType_Slot CownCapsule_slots[] = {
 };
 
 static PyType_Spec CownCapsule_Spec = {.name = "bocpy._core.CownCapsule",
-                                       .basicsize = sizeof(CownCapsuleObject),
+                                       .basicsize = sizeof(ScopedCownCapsule),
                                        .itemsize = 0,
                                        .flags = Py_TPFLAGS_DEFAULT |
                                                 Py_TPFLAGS_IMMUTABLETYPE,
@@ -2196,6 +2291,113 @@ BOCCown *cown_unwrap(PyObject *op) {
   CownCapsuleObject *self = (CownCapsuleObject *)op;
   PRINTDBG("CownCapsule_unwrap(%p, rc=%zu)\n", self, op->ob_refcnt);
   return self->cown;
+}
+
+PyTypeObject *scope_capsule_type(PyObject *module) {
+  if (module != NULL) {
+    BOC_STATE_SET(module);
+  }
+  return BOC_STATE->scope_capsule_type;
+}
+
+bool cown_scope_available(BOCCown *cown) {
+  if (cown->scope_owner != NULL || cown->is_pinned ||
+      atomic_load_intptr(&cown->last) != 0) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "scope output must be a fresh, unscoped ordinary cown");
+    return false;
+  }
+  return true;
+}
+
+/// @brief Retain a cown capsule for transfer of a scope-owned output
+PyObject *cown_scope_capsule_ref(BOCCown *output) {
+  return cown_capsule_wrap(output, false);
+}
+
+BOCScopeOwner *cown_scope_owner(BOCCown *output) {
+  return output->scope_owner;
+}
+
+int cown_scope_bind(BOCCown *cown, BOCScopeOwner *owner) {
+  if (cown_release(cown) < 0) {
+    return -1;
+  }
+  cown->scope_owner = owner;
+  scope_owner_incref(owner);
+  return 0;
+}
+
+PyObject *cown_scope_finish(BOCCown *output, bool publish) {
+  PyObject *result = NULL;
+  if (cown_acquire(output) == 0) {
+    result = publish ? Py_NewRef(output->value) : Py_NewRef(Py_None);
+    Py_CLEAR(output->value);
+    output->exception = false;
+    atomic_store(&output->owner, BOCPY_NO_OWNER);
+  }
+  return result;
+}
+
+/// @brief Validate the live native wait cadence
+static PyObject *_core_set_wait_pump_poll(PyObject *module, PyObject *ms) {
+  BOC_STATE_SET(module);
+  if (!PyLong_Check(ms) || PyBool_Check(ms)) {
+    PyErr_SetString(PyExc_TypeError, "ms must be a positive int");
+    return NULL;
+  }
+  long long value = PyLong_AsLongLong(ms);
+  if (PyErr_Occurred()) {
+    return NULL;
+  }
+  if (value <= 0) {
+    PyErr_SetString(PyExc_TypeError, "ms must be a positive int");
+    return NULL;
+  }
+  atomic_store(&WAIT_PUMP_POLL_MS, value);
+  Py_RETURN_NONE;
+}
+
+/// @brief Wait for root completion without creating or reserving a runtime
+static PyObject *root_wait(PyObject *module, PyObject *args, PyObject *kwargs,
+                           bool drain) {
+  BOC_STATE_SET(module);
+  double end;
+  bool forever;
+  PyObject *boc_export;
+  if (!wait_arguments(args, kwargs, &end, &forever, &boc_export)) {
+    return NULL;
+  }
+  if (CURRENT_EXECUTION != 0) {
+    PyErr_SetString(PyExc_RuntimeError, "a behavior cannot wait for root completion");
+    return NULL;
+  }
+  BOCTerminator *root = terminator_root_acquire();
+  bool pumpable = bocpy_interpid() == bocpy_main_interpid() && !IN_PUMP_BODY;
+  PyObject *result = terminator_wait_driver(root, drain, end, forever, boc_export,
+                                           pumpable, NULL);
+  boc_terminator_decref(root);
+  return result;
+}
+
+static PyObject *_core_terminator_quiescence(PyObject *module, PyObject *args,
+                                            PyObject *kwargs) {
+  return root_wait(module, args, kwargs, false);
+}
+
+static PyObject *_core_terminator_drain(PyObject *module, PyObject *args,
+                                       PyObject *kwargs) {
+  return root_wait(module, args, kwargs, true);
+}
+
+static PyObject *_core_scope_active(PyObject *module, PyObject *Py_UNUSED(args)) {
+  BOC_STATE_SET(module);
+  return PyBool_FromLong(CURRENT_SCOPE != NULL || CURRENT_EXECUTION != 0);
+}
+
+static PyObject *_core_in_pump_body(PyObject *module, PyObject *Py_UNUSED(args)) {
+  BOC_STATE_SET(module);
+  return PyBool_FromLong(IN_PUMP_BODY);
 }
 
 /// @brief Module-level factory: allocate a pinned CownCapsule.
@@ -2273,7 +2475,7 @@ static PyObject *_core_pinned_cown_count(PyObject *Py_UNUSED(self),
 /// the node to this function, which owns the actual queue. On the
 /// `0 -> 1` depth transition we stamp
 /// @ref MAIN_PINNED_NONEMPTY_SINCE_NS and broadcast on the terminator
-/// condvar so a `wait()`-blocked main thread wakes to drive the pump.
+/// condvar so a pump-capable waiter in the main interpreter wakes to drive it.
 ///
 /// There is intentionally no `queue_max`-style cap: by construction
 /// `MAIN_PINNED_DEPTH` cannot exceed the live pinned-cown count
@@ -2309,10 +2511,10 @@ static PyObject *_core_main_pump_queue_depth(PyObject *Py_UNUSED(self),
       (unsigned long long)atomic_load(&MAIN_PINNED_DEPTH));
 }
 
-/// @brief Lock-free reader handed to @ref terminator_wait_pumpable.
+/// @brief Lock-free pinned-depth reader for the terminator wait driver
 /// @details Function-pointer indirection so `boc_terminator.c` does
 /// not need to see the file-scope `MAIN_PINNED_DEPTH` atomic.
-static uint64_t _core_pinned_depth_load(void) {
+uint64_t _core_pinned_depth_load(void) {
   return (uint64_t)atomic_load(&MAIN_PINNED_DEPTH);
 }
 
@@ -3311,6 +3513,12 @@ typedef struct behavior_s {
   atomic_int_least64_t count;
   /// @brief Atomic reference count
   atomic_int_least64_t rc;
+  /// @brief Scheduling identity, retained after its execution reservation ends
+  BOCScopeOwner *scope_owner;
+  BOCTerminator *root_owner;
+  bool scope_reserved;
+  bool root_reserved;
+  bool submitted;
 
   /// @brief Unique behavior ID
   int_least64_t id;
@@ -3382,6 +3590,7 @@ typedef struct behavior_capsule_object {
   Py_IS_TYPE((op), BOC_STATE->behavior_capsule_type)
 
 static void request_decref(BOCRequest *request);
+static void behavior_scope_complete(BOCBehavior *behavior);
 
 BOCBehavior *behavior_new() {
   void *raw =
@@ -3400,6 +3609,11 @@ BOCBehavior *behavior_new() {
   behavior->thunk = NULL;
   behavior->result = NULL;
   behavior->rc = 0;
+  behavior->scope_owner = NULL;
+  behavior->root_owner = NULL;
+  behavior->scope_reserved = false;
+  behavior->root_reserved = false;
+  behavior->submitted = false;
   behavior->group_ids = NULL;
   behavior->num_arg_slots = 0;
   behavior->args_size = 0;
@@ -3463,6 +3677,9 @@ void behavior_free(BOCBehavior *behavior) {
     BOCTag_free(behavior->thunk);
   }
 
+  behavior_scope_complete(behavior);
+  scope_owner_decref(behavior->scope_owner);
+  boc_terminator_decref(behavior->root_owner);
   PyMem_RawFree(BOC_BEHAVIOR_PREHDR(behavior));
   BOC_REF_TRACKING_REMOVE_BEHAVIOR();
 }
@@ -3502,6 +3719,7 @@ static void BehaviorCapsule_dealloc(PyObject *op) {
 
 static PyObject *BehaviorCapsule_new(PyTypeObject *type, PyObject *args,
                                      PyObject *kwds) {
+  BOC_STATE = PyType_GetModuleState(type);
   BehaviorCapsuleObject *self;
   self = (BehaviorCapsuleObject *)type->tp_alloc(type, 0);
   if (self == NULL) {
@@ -3724,30 +3942,8 @@ static int BehaviorCapsule_init(PyObject *op, PyObject *args,
 /// **Failure surface.** @ref boc_sched_dispatch can fail when called
 /// from the off-worker arm if the runtime has been torn down. On
 /// failure the queue-owned BEHAVIOR_INCREF taken just before dispatch
-/// is rolled back here, the Python exception set by
-/// @c boc_sched_dispatch is propagated, and the caller is expected
-/// to roll back its terminator hold (the reference path is
-/// @c whencall in @c behaviors.py).
-///
-/// **Cown-side residue on dispatch failure.** When the count==0
-/// transition fires here AND @c boc_sched_dispatch returns -1
-/// (runtime-down sentinel; see @c boc_sched_dispatch in @c boc_sched.c),
-/// the behavior's BOCRequest array has already been linked onto every
-/// target cown's MCS chain by the link/finish 2PL phases. The
-/// rollback below DECREFs only the queue-owned BEHAVIOR_INCREF; it
-/// does NOT walk and unlink the cown chains. Each request still
-/// holds its BEHAVIOR_INCREF, so the BOCBehavior cannot be freed,
-/// and no worker will ever call @c release_all on it. Any cown that
-/// happens to be linked into this stranded chain remains pinned
-/// awaiting a behavior that cannot run, until the next @c bocpy.start
-/// cycle (which frees the BOCCown via the GC of its owning Python
-/// @c Cown). This residue is intentional and only fires on the
-/// dying-runtime path; the upstream-detection alternative (an
-/// explicit @c scheduler_running check inside @c whencall before the
-/// chain link) introduces a TOCTOU window. The dedicated regression
-/// is @c test_schedule_after_runtime_stop_raises in
-/// @c test_scheduling_stress.py, which exercises this path and
-/// itself contributes one stranded chain per test process.
+/// is rolled back here. The scheduling caller releases its requests and
+/// completion reservations before propagating the dispatch exception.
 /// @param behavior the behavior whose count to decrement
 /// @return 0 on success, -1 if dispatch failed (Python exception set)
 static int behavior_resolve_one(BOCBehavior *behavior) {
@@ -3880,11 +4076,54 @@ static PyObject *BehaviorCapsule_create_requests(PyObject *op,
   return list;
 }
 
+/// @brief Drop actual local and root execution reservations exactly once after cleanup
+static void behavior_scope_complete(BOCBehavior *behavior) {
+  if (behavior->scope_reserved) {
+    behavior->scope_reserved = false;
+    boc_terminator_dec(behavior->scope_owner->term);
+  }
+  if (behavior->root_reserved) {
+    behavior->root_reserved = false;
+    boc_terminator_dec(behavior->root_owner);
+  }
+}
+
+/// @brief Ensure scoped payloads cannot remain attached to a worker after local completion
+static PyObject *behavior_release_scope_payloads(BOCBehavior *behavior) {
+  PyObject *error = NULL;
+  for (Py_ssize_t i = 0; i < behavior->args_size; ++i) {
+    BOCCown *cown = behavior->args[i];
+    if (cown->scope_owner == NULL ||
+        atomic_load(&cown->owner) != bocpy_interpid()) {
+      continue;
+    }
+    if (cown_release(cown) == 0) {
+      continue;
+    }
+    if (error == NULL) {
+      error = PyErr_GetRaisedException();
+    } else {
+      PyErr_Clear();
+    }
+    // An unserialisable output cannot survive its owning interpreter; mark it unavailable for the final transfer.
+    if (cown->xidata != NULL) {
+      XIDATA_FREE(cown->xidata);
+      cown->xidata = NULL;
+    }
+    Py_CLEAR(cown->value);
+    cown->exception = false;
+    atomic_store(&cown->owner, BOCPY_NO_OWNER);
+  }
+  return error;
+}
+
 static int behavior_release_all_impl(BOCBehavior *behavior) {
   if (behavior->requests == NULL) {
+    behavior_scope_complete(behavior);
     return 0;
   }
 
+  PyObject *error = behavior_release_scope_payloads(behavior);
   BOCRequest **requests = behavior->requests;
   Py_ssize_t requests_size = behavior->requests_size;
   behavior->requests = NULL;
@@ -3892,16 +4131,21 @@ static int behavior_release_all_impl(BOCBehavior *behavior) {
 
   for (Py_ssize_t i = 0; i < requests_size; ++i) {
     if (request_release_inner(requests[i]) < 0) {
-      for (Py_ssize_t k = i; k < requests_size; ++k) {
-        request_decref(requests[k]);
+      if (error == NULL) {
+        error = PyErr_GetRaisedException();
+      } else {
+        PyErr_Clear();
       }
-      PyMem_RawFree(requests);
-      return -1;
     }
     request_decref(requests[i]);
   }
 
   PyMem_RawFree(requests);
+  behavior_scope_complete(behavior);
+  if (error != NULL) {
+    PyErr_SetRaisedException(error);
+    return -1;
+  }
   return 0;
 }
 
@@ -3933,10 +4177,56 @@ static PyObject *BehaviorCapsule_release_all(PyObject *op,
 /// onto a worker's per-task queue, so there is nothing to pre-build.
 /// @param op The BehaviorCapsule to schedule
 /// @return Py_None on success, NULL on error
-static PyObject *BehaviorCapsule_schedule(PyObject *op,
-                                          PyObject *Py_UNUSED(dummy)) {
+static PyObject *BehaviorCapsule_schedule(PyObject *op, PyObject *args,
+                                          PyObject *kwargs) {
+  static char *names[] = {"scope", NULL};
+  PyObject *scope = NULL;
+  if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|O:schedule", names, &scope)) {
+    return NULL;
+  }
   BehaviorCapsuleObject *capsule = (BehaviorCapsuleObject *)op;
   BOCBehavior *behavior = capsule->behavior;
+  if (behavior->submitted) {
+    PyErr_SetString(PyExc_RuntimeError, "behavior has already been scheduled");
+    return NULL;
+  }
+  BOCScopeOwner *owner = CURRENT_SCOPE;
+  if (scope == Py_None) {
+    owner = NULL;
+  } else if (scope != NULL) {
+    if (!Py_IS_TYPE(scope, BOC_STATE->scope_capsule_type)) {
+      PyErr_SetString(PyExc_TypeError, "scope must be a ScopeCapsule or None");
+      return NULL;
+    }
+    owner = scope_capsule_owner(scope);
+  }
+  if (BOC_BEHAVIOR_PREHDR(behavior)->pinned && owner != NULL) {
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "pinned behaviors must be scheduled with root_scope");
+    return NULL;
+  }
+  if (owner != NULL && !scope_owner_accepts_work(owner)) {
+    PyErr_SetString(PyExc_RuntimeError, "scope is not active or draining");
+    return NULL;
+  }
+  for (Py_ssize_t i = -1; i < behavior->args_size; ++i) {
+    BOCCown *cown = i < 0 ? behavior->result : behavior->args[i];
+    if (cown->scope_owner != NULL &&
+        (!scope_owner_accepts_work(cown->scope_owner) ||
+         !scope_owner_contains(cown->scope_owner, owner))) {
+      PyErr_SetString(PyExc_RuntimeError,
+                      "scope output cannot be acquired outside its scope subtree");
+      return NULL;
+    }
+  }
+  for (Py_ssize_t i = 0; i < behavior->captures_size; ++i) {
+    if (behavior->captures[i]->scope_owner != NULL) {
+      PyErr_SetString(PyExc_RuntimeError,
+                      "scope output payloads must be acquired as behavior arguments");
+      return NULL;
+    }
+  }
 
   BOCRecycleQueue_empty(BOC_STATE->recycle_queue, false);
 
@@ -3947,6 +4237,26 @@ static PyObject *BehaviorCapsule_schedule(PyObject *op,
     }
     Py_DECREF(list);
   }
+
+  BOCTerminator *root = terminator_reserve();
+  if (root == NULL) {
+    PyErr_SetString(PyExc_RuntimeError, "runtime is shutting down");
+    return NULL;
+  }
+  if (owner != NULL) {
+    if (boc_terminator_inc(owner->term) < 0) {
+      boc_terminator_dec(root);
+      boc_terminator_decref(root);
+      PyErr_SetString(PyExc_RuntimeError, "scope is completed");
+      return NULL;
+    }
+    scope_owner_incref(owner);
+    behavior->scope_owner = owner;
+    behavior->scope_reserved = true;
+  }
+  behavior->root_owner = root;
+  behavior->root_reserved = true;
+  behavior->submitted = true;
 
   BOCRequest **requests = behavior->requests;
   Py_ssize_t n = behavior->requests_size;
@@ -3966,6 +4276,7 @@ static PyObject *BehaviorCapsule_schedule(PyObject *op,
   Py_END_ALLOW_THREADS
 
       if (!ok) {
+    behavior_release_all_impl(behavior);
     if (!PyErr_Occurred()) {
       PyErr_SetString(PyExc_RuntimeError,
                       "behavior_schedule: link phase failed");
@@ -3974,6 +4285,7 @@ static PyObject *BehaviorCapsule_schedule(PyObject *op,
   }
 
   if (behavior_resolve_one(behavior) < 0) {
+    behavior_release_all_impl(behavior);
     return NULL;
   }
 
@@ -4134,7 +4446,7 @@ static PyObject *BehaviorCapsule_release(PyObject *op,
 /// @param boc_export Namespace (module or object) carrying the thunk
 /// @return Borrowed reference to the stored result value, NULL on setup
 /// failure
-static PyObject *behavior_execute_impl(BOCBehavior *behavior,
+static PyObject *behavior_execute_body(BOCBehavior *behavior,
                                        PyObject *boc_export) {
   // Cown i -> slot abs(group_id)-1; untouched slots become empty groups [].
   size_t num_arg_slots = (size_t)behavior->num_arg_slots;
@@ -4155,6 +4467,7 @@ static PyObject *behavior_execute_impl(BOCBehavior *behavior,
       Py_DECREF(thunk_args);
       return NULL;
     }
+    ((ScopedCownCapsule *)capsule)->execution = CURRENT_EXECUTION;
 
     if (group_id > 0) {
       // Singleton argument: the slot holds the capsule directly.
@@ -4244,6 +4557,22 @@ static PyObject *behavior_execute_impl(BOCBehavior *behavior,
   return Py_XNewRef(behavior->result->value);
 }
 
+/// @brief Install and restore dynamic ownership across every execution outcome
+static PyObject *behavior_execute_impl(BOCBehavior *behavior,
+                                       PyObject *boc_export) {
+  BOCScopeOwner *saved_owner = CURRENT_SCOPE;
+  BOCScopeOwner *saved_executing_owner = EXECUTING_SCOPE;
+  uint64_t saved_execution = CURRENT_EXECUTION;
+  CURRENT_SCOPE = behavior->scope_owner;
+  EXECUTING_SCOPE = behavior->scope_owner;
+  CURRENT_EXECUTION = (uint64_t)atomic_fetch_add(&NEXT_EXECUTION, 1);
+  PyObject *result = behavior_execute_body(behavior, boc_export);
+  CURRENT_SCOPE = saved_owner;
+  EXECUTING_SCOPE = saved_executing_owner;
+  CURRENT_EXECUTION = saved_execution;
+  return result;
+}
+
 /// @brief Executes the thunk on the behavior.
 /// @details Before this function can be called, all of the cowns for the
 /// behavior must be acquired.
@@ -4268,7 +4597,8 @@ static PyMethodDef BehaviorCapsule_methods[] = {
     {"acquire", BehaviorCapsule_acquire, METH_NOARGS, NULL},
     {"release", BehaviorCapsule_release, METH_NOARGS, NULL},
     {"release_all", BehaviorCapsule_release_all, METH_NOARGS, NULL},
-    {"schedule", BehaviorCapsule_schedule, METH_NOARGS, NULL},
+    {"schedule", (PyCFunction)BehaviorCapsule_schedule,
+     METH_VARARGS | METH_KEYWORDS, NULL},
     {"execute", BehaviorCapsule_execute, METH_VARARGS, NULL},
     {NULL} /* Sentinel */
 };
@@ -4298,18 +4628,6 @@ static uint64_t deadline_or_zero(PyObject *deadline_ms) {
     return 0;
   }
   return boc_now_ns() + (uint64_t)ms * 1000000ULL;
-}
-
-static bool max_behaviors_or_inf(PyObject *max_behaviors, Py_ssize_t executed) {
-  if (max_behaviors == NULL || max_behaviors == Py_None) {
-    return true;
-  }
-  long long lim = PyLong_AsLongLong(max_behaviors);
-  if (lim <= 0) {
-    PyErr_Clear();
-    return true;
-  }
-  return (long long)executed < lim;
 }
 
 static inline void _core_log_release_error(void) {
@@ -4424,7 +4742,7 @@ static inline uintptr_t boc_pump_thread_id(void) {
 /// single-pumper CAS, nested-pump) plus the per-behavior layered
 /// try/finally pattern from `worker.run_behavior`. Every popped
 /// behavior runs its per-iteration cleanup (IN_PUMP_BODY clear +
-/// release pair + terminator_dec) regardless of where the body
+/// release pair + completion decrement) regardless of where the body
 /// failed. ``BaseException`` is stashed across cleanup and restored
 /// at the post-iteration check so the pump exits cleanly with the
 /// FT CAS released.
@@ -4435,8 +4753,9 @@ static inline uintptr_t boc_pump_thread_id(void) {
 ///              (installed for ``__main__``).
 /// @return ``(executed, deadline_reached, raised)`` 3-tuple on
 ///         success, NULL on gate rejection or raise_on_error trigger.
-static PyObject *_core_main_pump_bounded(PyObject *Py_UNUSED(self),
+static PyObject *_core_main_pump_bounded(PyObject *self,
                                          PyObject *args, PyObject *kwds) {
+  BOC_STATE_SET(self);
   static char *kwlist[] = {"deadline_ms", "max_behaviors", "raise_on_error",
                            "boc_export", NULL};
   PyObject *deadline_ms = Py_None;
@@ -4450,7 +4769,37 @@ static PyObject *_core_main_pump_bounded(PyObject *Py_UNUSED(self),
     return NULL;
   }
   bool raise_on_error = (bool)raise_on_error_flag;
+  uint64_t deadline_ns = deadline_or_zero(deadline_ms);
+  long long limit = 0;
+  if (max_behaviors != Py_None) {
+    limit = PyLong_AsLongLong(max_behaviors);
+    if (limit <= 0) {
+      PyErr_Clear();
+      limit = 0;
+    }
+  }
+  BOCPumpResult result;
+  BOCPumpStatus status = main_pump_bounded_impl(
+      deadline_ns, limit, raise_on_error, boc_export, &result);
+  if (status == BOC_PUMP_BUSY) {
+    PyErr_SetString(PyExc_RuntimeError,
+                    "pump() is in use by another thread on this "
+                    "free-threaded build");
+    return NULL;
+  }
+  if (status == BOC_PUMP_ERROR) {
+    return NULL;
+  }
+  return Py_BuildValue("(nOn)", result.executed,
+                       result.deadline_reached ? Py_True : Py_False,
+                       result.raised);
+}
 
+/// @brief Share the bounded native pump between explicit pumping and completion waits
+BOCPumpStatus main_pump_bounded_impl(uint64_t deadline_ns, long long max_behaviors,
+                                    bool raise_on_error, PyObject *boc_export,
+                                    BOCPumpResult *result) {
+  *result = (BOCPumpResult){0};
   Py_ssize_t executed = 0;
   Py_ssize_t raised = 0;
   bool deadline_reached = false;
@@ -4474,10 +4823,7 @@ static PyObject *_core_main_pump_bounded(PyObject *Py_UNUSED(self),
                                               self_id)) {
       pump_cas_owner = true;
     } else if (expected != self_id) {
-      PyErr_SetString(PyExc_RuntimeError,
-                      "pump() is in use by another thread on this "
-                      "free-threaded build");
-      goto pump_exit;
+      return BOC_PUMP_BUSY;
     }
   }
 #endif
@@ -4489,10 +4835,9 @@ static PyObject *_core_main_pump_bounded(PyObject *Py_UNUSED(self),
     goto pump_exit;
   }
 
-  uint64_t deadline_ns = deadline_or_zero(deadline_ms);
   boc_main_pinned_check_warn();
 
-  while (max_behaviors_or_inf(max_behaviors, executed)) {
+  while (max_behaviors <= 0 || executed < max_behaviors) {
     assert(!PyErr_Occurred());
 
     boc_bq_node_t *n = boc_bq_dequeue(&MAIN_PINNED_QUEUE);
@@ -4544,7 +4889,6 @@ static PyObject *_core_main_pump_bounded(PyObject *Py_UNUSED(self),
     if (behavior_release_all_impl(b) < 0) {
       _core_log_release_error();
     }
-    terminator_dec();
     BEHAVIOR_DECREF(b);
 
     IN_PUMP_BODY = false;
@@ -4575,13 +4919,14 @@ pump_exit:
   if (first_err) {
     PyErr_SetRaisedException(first_err);
     first_err = NULL;
-    return NULL;
   }
   if (PyErr_Occurred()) {
-    return NULL;
+    return BOC_PUMP_ERROR;
   }
-  return Py_BuildValue("(nOn)", executed, deadline_reached ? Py_True : Py_False,
-                       raised);
+  result->executed = executed;
+  result->raised = raised;
+  result->deadline_reached = deadline_reached;
+  return BOC_PUMP_OK;
 }
 
 /// @brief Shutdown-drain the main-pinned queue without executing bodies.
@@ -4640,7 +4985,6 @@ static PyObject *_core_main_pump_drain_all(PyObject *Py_UNUSED(self),
     if (behavior_release_all_impl(b) < 0) {
       PyErr_WriteUnraisable(NULL);
     }
-    terminator_dec();
     BEHAVIOR_DECREF(b);
     drained++;
   }
@@ -4772,10 +5116,8 @@ static int request_release_inner(BOCRequest *request) {
 /// @details Pure C, no Python allocation. The only failure surface
 /// is propagated by @ref behavior_resolve_one, which forwards a
 /// dispatch failure from @ref boc_sched_dispatch (e.g. the runtime
-/// was torn down between the caller's @c terminator_inc and our
-/// dispatch). On failure a Python exception is set and the link
-/// loop's caller is expected to roll back its terminator hold;
-/// see @c whencall in @c behaviors.py.
+/// was torn down before dispatch). The native scheduling caller owns
+/// rollback of requests and completion reservations.
 /// @param request The request to enqueue
 /// @param behavior The behavior owning the request
 /// @return 0 on success, -1 on error with a Python exception set
@@ -5534,7 +5876,31 @@ static PyObject *_core_scheduler_drain_all_queues(PyObject *Py_UNUSED(module),
   return out;
 }
 
+/// @brief Install the Python pickler used only for internal XIData transfers
+static PyObject *_core_set_pickle_dumps(PyObject *module, PyObject *dumps) {
+  BOC_STATE_SET(module);
+  if (!PyCallable_Check(dumps)) {
+    PyErr_SetString(PyExc_TypeError, "dumps must be callable");
+    return NULL;
+  }
+  Py_XSETREF(BOC_STATE->dumps, Py_NewRef(dumps));
+  Py_RETURN_NONE;
+}
+
+/// @brief Read the native strong reference count for a cown capsule
+static PyObject *_core_cown_refcount(PyObject *module, PyObject *op) {
+  BOC_STATE_SET(module);
+  BOCCown *cown = cown_unwrap(op);
+  if (cown == NULL) {
+    return NULL;
+  }
+  return PyLong_FromLongLong(
+      (long long)atomic_load_explicit(&cown->rc, memory_order_relaxed));
+}
+
 static PyMethodDef _core_module_methods[] = {
+    {"_set_pickle_dumps", _core_set_pickle_dumps, METH_O, NULL},
+    {"cown_refcount", _core_cown_refcount, METH_O, NULL},
     {"send", _core_send, METH_VARARGS,
      "send($module, tag, contents, /)\n--\n\nSends a message."},
     {"receive", (PyCFunction)(void (*)(void))_core_receive,
@@ -5584,6 +5950,8 @@ static PyMethodDef _core_module_methods[] = {
      "Drain every per-worker queue. Returns list[BehaviorCapsule]."},
     {"_cown_capsule_from_pointer_inheriting",
      _cown_capsule_from_pointer_inheriting, METH_VARARGS, NULL},
+    {"scope_active", _core_scope_active, METH_NOARGS, NULL},
+    {"in_pump_body", _core_in_pump_body, METH_NOARGS, NULL},
     {"_cown_capsule_from_pointer_borrowing",
      _cown_capsule_from_pointer_borrowing, METH_VARARGS, NULL},
     {"cown_pin_pointers", _core_cown_pin_pointers, METH_VARARGS,
@@ -5660,34 +6028,29 @@ static PyMethodDef _core_module_methods[] = {
      "\n--\n\nIncrement the terminator. Returns new count or -1 if closed."},
     {"terminator_dec", _core_terminator_dec, METH_NOARGS,
      "terminator_dec($module, /)"
-     "\n--\n\nDecrement the terminator. Wakes terminator_wait on 0."},
+     "\n--\n\nDecrement the terminator. Wakes waiters on 0."},
     {"terminator_close", _core_terminator_close, METH_NOARGS,
      "terminator_close($module, /)"
      "\n--\n\nMark the terminator closed; future terminator_inc returns -1."},
-    {"terminator_wait", _core_terminator_wait, METH_VARARGS,
-     "terminator_wait($module, timeout, /)"
-     "\n--\n\nBlock until the terminator count reaches 0 or timeout."},
-    {"terminator_wait_pumpable", _core_terminator_wait_pumpable, METH_O,
-     "terminator_wait_pumpable($module, timeout_s, /)"
-     "\n--\n\nBlock until the terminator count reaches 0, the "
-     "pinned-queue depth becomes positive, or timeout_s elapses. "
-     "Returns one of TERMINATED, PUMP_READY, or WAIT_TIMED_OUT."},
-    {"terminator_seed_dec", _core_terminator_seed_dec, METH_NOARGS,
-     "terminator_seed_dec($module, /)"
-     "\n--\n\nIdempotent one-shot decrement of the Pyrona seed."},
-    {"terminator_seed_inc", _core_terminator_seed_inc, METH_NOARGS,
-     "terminator_seed_inc($module, /)"
-     "\n--\n\nIdempotent one-shot re-arm of the Pyrona seed."},
     {"terminator_reset", _core_terminator_reset, METH_NOARGS,
      "terminator_reset($module, /)"
-     "\n--\n\nRestore terminator state for a fresh runtime start. "
-     "Returns the prior (count, seeded) for drift detection."},
+     "\n--\n\nClaim startup with a closed root after the previous root retired."},
+    {"terminator_activate", _core_terminator_activate, METH_NOARGS,
+     "terminator_activate($module, /)"
+     "\n--\n\nOpen admission after the claimed runtime's resources are ready."},
     {"terminator_count", _core_terminator_count, METH_NOARGS,
      "terminator_count($module, /)"
      "\n--\n\nRead the current terminator count."},
-    {"terminator_seeded", _core_terminator_seeded, METH_NOARGS,
-     "terminator_seeded($module, /)"
-     "\n--\n\nRead the current terminator SEEDED flag."},
+    {"terminator_quiescence", (PyCFunction)_core_terminator_quiescence,
+     METH_VARARGS | METH_KEYWORDS, "Wait for root quiescence"},
+    {"terminator_drain", (PyCFunction)_core_terminator_drain, METH_VARARGS | METH_KEYWORDS,
+     "Wait for zero root reservations, then close admission"},
+    {"set_wait_pump_poll", _core_set_wait_pump_poll, METH_O,
+     "Set the native wait polling interval in milliseconds"},
+    {"terminator_retire", _core_terminator_retire, METH_NOARGS,
+     "Retire the closed root after complete runtime shutdown"},
+    {"terminator_wake", _core_terminator_wake, METH_NOARGS,
+     "Notify registered main-interpreter completion waits"},
     {NULL} /* Sentinel */
 };
 
@@ -5836,6 +6199,11 @@ static int _core_module_exec(PyObject *module) {
     return -1;
   }
 
+  state->scope_capsule_type = scope_capsule_register(module);
+  if (state->scope_capsule_type == NULL) {
+    return -1;
+  }
+
   state->cown_reconstructor_inheriting =
       PyObject_GetAttrString(module, "_cown_capsule_from_pointer_inheriting");
   if (state->cown_reconstructor_inheriting == NULL) {
@@ -5852,18 +6220,6 @@ static int _core_module_exec(PyObject *module) {
   BOC_STATE = state;
 
   PyModule_AddStringConstant(module, "TIMEOUT", BOC_TIMEOUT);
-  if (PyModule_AddIntConstant(module, "TERMINATED", BOC_TERMINATOR_TERMINATED) <
-      0) {
-    return -1;
-  }
-  if (PyModule_AddIntConstant(module, "PUMP_READY", BOC_TERMINATOR_PUMP_READY) <
-      0) {
-    return -1;
-  }
-  if (PyModule_AddIntConstant(module, "WAIT_TIMED_OUT",
-                              BOC_TERMINATOR_WAIT_TIMED_OUT) < 0) {
-    return -1;
-  }
   return 0;
 }
 
@@ -5878,6 +6234,7 @@ static int _core_module_clear(PyObject *module) {
   Py_CLEAR(state->pickle);
   Py_CLEAR(state->cown_capsule_type);
   Py_CLEAR(state->behavior_capsule_type);
+  Py_CLEAR(state->scope_capsule_type);
   Py_CLEAR(state->cown_reconstructor_inheriting);
   Py_CLEAR(state->cown_reconstructor_borrowing);
   if (state->recycle_queue != NULL) {
@@ -5957,6 +6314,7 @@ static int _core_module_traverse(PyObject *module, visitproc visit, void *arg) {
   Py_VISIT(state->pickle);
   Py_VISIT(state->cown_capsule_type);
   Py_VISIT(state->behavior_capsule_type);
+  Py_VISIT(state->scope_capsule_type);
   Py_VISIT(state->cown_reconstructor_inheriting);
   Py_VISIT(state->cown_reconstructor_borrowing);
   if (state->recycle_queue != NULL) {

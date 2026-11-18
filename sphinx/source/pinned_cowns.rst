@@ -8,7 +8,7 @@ Pinned Cowns
 
 A :class:`PinnedCown` is a :class:`Cown` whose value never leaves the
 **main interpreter**. Behaviors whose request set contains *any*
-pinned cown run on the main thread, drained by :func:`pump` (called
+pinned cown run in the main interpreter, drained by :func:`pump` (called
 from your event loop) or implicitly by :func:`wait`. Use a pinned
 cown when the underlying value cannot survive an XIData round-trip:
 pyglet shapes, Tk widgets, open file handles, ctypes pointers, GPU
@@ -36,7 +36,7 @@ object.
 Pump Contract
 -------------
 
-:func:`pump` drains the main-thread queue of pinned-aware
+:func:`pump` drains the main-interpreter queue of pinned-aware
 behaviors. Each behavior runs to completion before the next starts.
 The pump is non-preemptive: ``deadline_ms`` gates *starting* the
 next behavior, not interrupting one already running.
@@ -63,14 +63,27 @@ Script-mode programs need not call :func:`pump` explicitly —
 :func:`wait` pumps internally when any :class:`PinnedCown` exists
 in the process.
 
+Ordinary :class:`Scope` entry and exit from a thread in the main interpreter
+pump ready pinned behavior while waiting. A pinned behavior cannot itself
+enter, quiesce, or synchronously
+join a scope: such an operation raises :class:`RuntimeError` because pumping is
+not reentrant and transitive pinned dependencies cannot be ruled out. It may
+still schedule descendants into an inherited, explicit, or :data:`root_scope`
+destination. A behavior containing a pinned cown must itself use
+:data:`root_scope`; inherited or explicit local scope ownership raises
+:class:`RuntimeError`. Its non-pinned descendants may select a local scope.
+Worker-side scope joins remain supported, but require a thread in the main
+interpreter to pump concurrently for pinned descendants. See
+:ref:`scoped-concurrency`.
+
 .. _pinned-coarse-grained:
 
 The Coarse-Grained Dispatch Pattern
 -----------------------------------
 
-The pinned arm is **single-consumer**: only the main thread drains
-the pump queue. If you schedule a pinned behavior per item, those
-behaviors serialise on the main thread and you lose worker
+The pinned arm is **single-consumer**: only one thread in the main interpreter
+drains the pump queue at a time. If you schedule a pinned behavior per item,
+those behaviors serialise in the main interpreter and you lose worker
 parallelism.
 
 Schedule pinned behaviors **coarsely** — one per logical frame or
@@ -172,32 +185,32 @@ Hosts that need to tune :func:`wait`'s internal pump cadence call
 is the upper bound on how long the auto-pump loop will park between
 checks when no broadcast wakes it.
 
-Main-thread Direct Reads
-------------------------
+Main-interpreter Direct Reads
+-----------------------------
 
 The pinned-cown contract refuses worker-side reads of the underlying
 value (the owner CAS rejects them). The symmetric question — "may
-the main thread read the value directly, outside a pinned ``@when``
+the main interpreter read the value directly, outside a pinned ``@when``
 body?" — has a narrower answer:
 
-- Reading the underlying object from the **main thread** is safe
+- Reading the underlying object from a thread in the **main interpreter** is safe
   **iff** no pinned ``@when`` is currently executing against that
   cown. Pinned bodies run synchronously inside :func:`pump`; once
   ``pump()`` (or :func:`wait`'s auto-pump) returns, no body holds
-  the cown, and an immediate main-thread read sees a consistent
+  the cown, and an immediate same-interpreter read sees a consistent
   value.
-- Reading from the main thread **while** ``pump()`` is dispatching
+- Reading from the main interpreter **while** ``pump()`` is dispatching
   a body that targets the same cown is **undefined**. Do not
   alternate between "I'm pumping" and "I'm reading directly"
   inside the same callback.
-- The safe pattern is: stash any main-thread alias for read-only
+- The safe pattern is: stash any main-interpreter alias for read-only
   rendering / event-loop integration, but treat the pinned ``@when``
   body as the only writer.
 
 In the boids example, the ``Simulation`` object aliases the same
 ``Matrix`` under ``self.positions`` (for pyglet rendering) and
 ``self.positions_cown = PinnedCown(positions)`` (for the per-frame
-write-back). The render path runs on the main thread between
+write-back). The render path runs in the main interpreter between
 ``pump()`` calls; the write-back runs inside ``pump()``. They never
 overlap.
 
@@ -243,7 +256,7 @@ Mixed Request Sets
 
 A behavior may freely combine pinned and unpinned cowns; the 2PL
 acquisition order is unchanged. As soon as the request set contains
-any pinned cown, the body runs on the main thread. Unpinned cowns
+any pinned cown, the body runs in the main interpreter. Unpinned cowns
 in the set still travel through XIData into the main interpreter
 for the body's duration.
 

@@ -255,11 +255,11 @@ construction.
 Some values can't survive an XIData round-trip — pyglet shapes, Tk widgets,
 open file handles, ctypes pointers into a library loaded by `__main__`, a
 GPU context. Wrap those in a `PinnedCown`. Behaviors whose request set
-contains any pinned cown run on the main thread, drained by `pump()` from
+contains any pinned cown run in the main interpreter, drained by `pump()` from
 your event loop (or implicitly by `wait()`).
 
 Keep dispatch coarse — one pinned `@when` per frame, not per item — so the
-single-consumer main thread doesn't serialise your worker parallelism. The
+single-consumer queue in the main interpreter doesn't serialise your worker parallelism. The
 `pump()` call drains whatever pinned behaviors are queued and returns
 immediately when the queue is empty (it never blocks), so it is safe to
 call from a tight render-loop tick. Hosts that want a starvation warning
@@ -314,6 +314,9 @@ We provide a few examples to show different ways of using BOC in a program:
    the cooking example written with plain threads, for comparison with `bocpy-cooking-boc`.
 9. [`bocpy-sketches`](https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/sketches.py):
    the cheese-and-spam sketch shown above as a runnable script.
+10. [`examples/scopes.py`](examples/scopes.py): a synchronous library call
+    returns its local output while root-owned background work has an
+    independent lifetime. Run with `python examples/scopes.py`.
 
 
 ## Why BOC for Python?
@@ -323,7 +326,9 @@ atomic, even under the GIL — and with the arrival of free-threaded builds
 eliminates these problems by construction: because behaviors interact with
 shared data exclusively through *cowns*, each behavior operates over its data
 as if it were single-threaded. There is no lock ordering to get right, no
-forgotten `acquire()`/`release()`, and no possibility of deadlock. This holds
+forgotten `acquire()`/`release()`, and no deadlock in cown acquisition. Blocking
+inside a behavior, including joining a nested `Scope`, can still introduce
+deadlocks; see [scoped concurrency](#scoped-concurrency). The cown guarantee holds
 whether your program runs under the GIL, on per-interpreter GIL (3.12+), or
 on a free-threaded interpreter.
 
@@ -355,7 +360,7 @@ example uses it to coordinate early termination across worker behaviors.
 For values that can't survive an XIData round-trip — UI handles, GPU
 contexts, file descriptors — the library provides `PinnedCown`, a cown whose
 value lives permanently in the main interpreter. Behaviors against a pinned
-cown run on the main thread, drained by `pump()` from your event loop or
+cown run in the main interpreter, drained by `pump()` from your event loop or
 implicitly by `wait()`. The full surface is `PinnedCown`, `pump`,
 `PumpResult`, `set_pump_watchdog`, and `set_wait_pump_poll`; the
 [`bocpy-boids`](https://github.com/microsoft/bocpy/blob/main/src/bocpy/examples/boids.py)
@@ -372,22 +377,28 @@ details.
 ### Waiting for completion
 
 Call `wait()` after scheduling all your behaviors. It blocks the calling
-thread until every scheduled behavior has finished, then tears down the
+thread until every scheduled behavior and active local scope has finished, then tears down the
 runtime (joins workers, closes the noticeboard). The next `@when` call will
 spin up a fresh runtime automatically.
 
 ```python
 wait()          # block indefinitely
-wait(timeout=5) # raise TimeoutError if not done in 5 s
+wait(timeout=5) # bound the quiescence and noticeboard-drain phases
 ```
 
 For a synchronization checkpoint that does **not** tear the runtime
 down — e.g. a parallel search that inspects a best-so-far cown
 between rounds and then continues — use `quiesce()` instead. It
-blocks until every in-flight behavior completes, optionally returns
-a per-worker stats or noticeboard snapshot, and leaves the worker
+returns immediately at global completion count zero, or waits for the next transition
+to zero. It optionally returns a per-worker stats or noticeboard snapshot
+and leaves the worker
 pool and the noticeboard thread running so the next `@when` call
-dispatches immediately.
+dispatches immediately. The global count includes each open scope's lifetime
+reservation, so even an idle scope on another host delays `quiesce` and
+can cause it to time out. With concurrent producers, newer work may already
+be running when `quiesce` returns. Snapshots are sampled after the observed
+zero; an ordinary `Cown.unwrap()` still requires the current global completion count to be zero
+and the usual host-access protections.
 
 ```python
 from bocpy import quiesce
@@ -396,6 +407,106 @@ snap = quiesce(noticeboard=True)  # dict[str, Any]
 print("best so far:", snap.get("best"))
 # ... schedule the next round of @when calls ...
 ```
+
+Global `wait()`, `quiesce()`, and runtime `stop()` raise `RuntimeError` when
+called from any behavior or an active local scope host body. Use
+`scope.quiesce()` inside a local host instead. Captured behavior exceptions
+remain on each behavior's own result cown; global waiting does not aggregate or re-raise
+them.
+
+If the work-drain phase of global `wait(timeout=...)` or
+`Behaviors.stop(timeout=...)` times out, it raises `TimeoutError` and leaves
+the runtime running and admission open for retry. This applies to root-only
+work as well as open scopes, including when snapshot options are requested.
+An open scope retains its lifetime reservation until output extraction or
+cleanup and restoration of the previous active scope are complete.
+Successful shutdown atomically closes admission at global count zero before
+tearing down workers. A later noticeboard-shutdown timeout retains its
+existing `RuntimeError` and retry behavior; workers may already be stopped.
+Scope exit has no timeout argument.
+
+### Scoped concurrency
+
+Use `Scope(initial=None)` to return a synchronous library result without
+joining unrelated application work:
+
+```python
+from bocpy import Scope, wait, when
+
+
+def sum_squares(values):
+    with Scope(0) as local:
+        midpoint = len(values) // 2
+        for batch in (values[:midpoint], values[midpoint:]):
+            for value in batch:
+                @when(local.output_cown)
+                def add_square(total, value=value):
+                    total.value += value * value
+
+            local.quiesce()
+
+    return local.output_value
+
+
+print(sum_squares([1, 2, 3, 4]))  # 30
+wait()
+```
+
+Each scope is single-use. Behaviors acquire `output_cown` through `@when`
+and mutate the acquired parameter's `.value`. Normal exit joins the scope's
+work and nested scopes, closes the output cown, and transfers its value to
+the read-only `output_value` property. Unrelated work may still be running.
+Direct host access to the output cown is forbidden; an ordinary
+`Cown.unwrap()` still requires **global** quiescence.
+
+`local.quiesce(timeout=None)` observes local work zero without closing the
+scope or publishing `output_value`. Each batch above can therefore be followed
+by another. Only the original host may call it while that scope is active
+and current; worker-captured handles cannot. A behavior cannot quiesce its
+own scope or an ancestor that accounts for its work. The method returns
+`None`, or raises `TimeoutError` at a finite nonnegative deadline while
+leaving the scope usable. Only `None` waits indefinitely; negative values,
+infinities, and NaN raise `ValueError`. As with global quiescence, concurrent
+producers may have added new work by return.
+
+Both `@when(*cowns, scope=destination)` and
+`whencall(func, args, captures, *, scope=destination)` accept a keyword-only
+destination. Omit it to inherit the active scope, falling back to
+`root_scope`. Explicit `scope=root_scope` schedules background work that
+can outlive the local call; an open enclosing scope can instead bound that
+work's lifetime. A root or sibling behavior cannot acquire a local scope's
+output cown. Scope handles captured by workers are scheduling-only:
+context-manager operations, `quiesce`, and `output_value` remain with the
+original host.
+
+Scope exit does not stop the shared runtime, fence noticeboard mutations,
+or report statistics. Lazy startup and explicit `start(4)` remain available;
+global `wait()` remains the application's final cleanup. Keep using global
+`wait` / `quiesce` snapshot options for noticeboard and statistics checkpoints.
+Retaining `root_scope` does not prevent completion or runtime restart.
+
+Behavior failures keep their existing semantics: an exception lives on that
+behavior's own result cown, with no rollback or scope-level aggregation.
+Normal scope exit can therefore publish partial mutations. A host-body
+exception instead joins the work, closes the output without publication,
+and propagates. If pumping during scope exit is interrupted, cleanup drains
+remaining local work before closing the output and propagating the
+interruption, restoring the previous active scope. This drain can wait
+indefinitely under the blocking hazards below; it adds no cancellation or
+exception grouping and leaves global `wait` / `pump` behavior unchanged.
+
+**Nested scopes can deadlock.** A waiting behavior retains its cowns and
+occupies a worker: descendants must not need those cowns or exhaust the
+remaining workers. A pinned behavior cannot enter, quiesce, or synchronously
+join a scope; it may still schedule work into an inherited or explicit scope,
+including `root_scope`. Ordinary code in the main interpreter can enter and join scopes,
+and scope waits pump pinned work. Behaviors containing a pinned cown must
+themselves be owned by `root_scope`; a local scope may observe their completion
+through a subsequent non-pinned behavior. See the
+[Scoped Concurrency guide](https://microsoft.github.io/bocpy/scoped_concurrency.html)
+for ownership rules and blocking hazards, and
+[`examples/scopes.py`](examples/scopes.py) for local output with root-owned
+background work.
 
 ### Additional Info
 BOC is built on a solid foundation of serious scholarship and engineering. For further reading, please see:

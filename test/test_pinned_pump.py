@@ -461,13 +461,22 @@ class TestPumpRuntimeRequired:
         assert _behaviors.BEHAVIORS is None
 
 
-def test_set_wait_pump_poll_re_read():
-    """``_WAIT_PUMP_POLL_MS`` is re-read on every auto-pump iteration."""
-    set_wait_pump_poll(50)
-    assert _behaviors._WAIT_PUMP_POLL_MS == 50
-    set_wait_pump_poll(5)
-    assert _behaviors._WAIT_PUMP_POLL_MS == 5
-    set_wait_pump_poll(50)
+def test_set_wait_pump_poll_updates_native_setting(monkeypatch):
+    """Forward interval changes to the native setter."""
+    native_setter = _core.set_wait_pump_poll
+    calls = []
+
+    def record(ms):
+        native_setter(ms)
+        calls.append(ms)
+
+    monkeypatch.setattr(_core, "set_wait_pump_poll", record)
+    try:
+        set_wait_pump_poll()
+        set_wait_pump_poll(5)
+        assert calls == [50, 5]
+    finally:
+        native_setter(50)
 
 
 def test_set_wait_pump_poll_validation():
@@ -480,17 +489,6 @@ def test_set_wait_pump_poll_validation():
         set_wait_pump_poll(1.5)
     with pytest.raises(TypeError):
         set_wait_pump_poll(True)
-
-
-def test_terminator_wake_reason_constants():
-    assert _core.TERMINATED == 0
-    assert _core.PUMP_READY == 1
-    assert _core.WAIT_TIMED_OUT == 2
-
-
-def test_terminator_wait_pumpable_terminated_when_empty():
-    reason = _core.terminator_wait_pumpable(0.01)
-    assert reason == _core.TERMINATED
 
 
 def test_main_pump_drain_all_empty():

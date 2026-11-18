@@ -21,7 +21,7 @@ import types
 
 import pytest
 
-from bocpy import Cown, quiesce, wait, when, whencall
+from bocpy import Cown, PinnedCown, quiesce, start, wait, when, whencall
 import bocpy._core as _core
 import bocpy.behaviors as behaviors
 from bocpy.behaviors import (
@@ -36,6 +36,7 @@ except ModuleNotFoundError:  # pragma: no cover - version floor fallback
 _HAS_REFCOUNT = hasattr(sys, "gettotalrefcount")
 
 QUIESCE_TIMEOUT = 5
+PINNED_DESCENDANT_INCREMENT = 7
 
 
 def _run_in_fresh_subinterpreter(script):
@@ -335,6 +336,27 @@ class TestResolverDispatch:
     def teardown_class(cls):
         """Tear the runtime down after the suite."""
         wait()
+
+    def test_pinned_descendant_uses_logical_defining_module(self):
+        """Resolve a worker descendant created in the main-thread bindings."""
+        wait()
+        start(worker_count=2, module=(__name__, __file__))
+        try:
+            pinned = PinnedCown(None)
+            value = Cown(42)
+
+            @when(pinned, value)
+            def parent(_pinned, value):
+                @when(value)
+                def child(value):
+                    return value.value + PINNED_DESCENDANT_INCREMENT
+
+                return child
+
+            quiesce(QUIESCE_TIMEOUT)
+            assert parent.unwrap().unwrap() == 49
+        finally:
+            wait()
 
     def test_registry_key_dispatches_through_resolver(self):
         """A behavior keyed by a registry hex key runs via the registry.

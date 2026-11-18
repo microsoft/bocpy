@@ -10,7 +10,7 @@ from ._math import Matrix, MatrixView
 from .behaviors import (Behaviors, Cown, notice_delete, notice_read,
                         notice_seed, notice_update, notice_write, noticeboard,
                         PinnedCown, pump, PumpResult, quiesce,
-                        REMOVED,
+                        REMOVED, root_scope, Scope,
                         set_pump_watchdog, set_wait_pump_poll,
                         start, wait, WaitResult, when, whencall, WORKER_COUNT)
 
@@ -68,7 +68,7 @@ def get_sources() -> list[str]:
 
 
 __all__ = ["Behaviors", "Cown", "Matrix", "MatrixView", "PinnedCown",
-           "PumpResult",
+           "PumpResult", "Scope",
            "REMOVED", "TIMEOUT",
            "WORKER_COUNT", "__version__", "drain",
            "get_include", "get_sources",
@@ -76,7 +76,7 @@ __all__ = ["Behaviors", "Cown", "Matrix", "MatrixView", "PinnedCown",
            "notice_update", "notice_write", "noticeboard",
            "pump",
            "quiesce",
-           "receive",
+           "receive", "root_scope",
            "send", "set_pump_watchdog", "set_tags", "set_wait_pump_poll",
            "start", "wait", "WaitResult",
            "when", "whencall"]

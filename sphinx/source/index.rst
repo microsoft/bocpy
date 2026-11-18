@@ -7,7 +7,8 @@ bocpy documentation
 **Behavior-Oriented Concurrency (BOC)**.  Programmers wrap shared data in
 **cowns** (concurrently-owned objects) and schedule **behaviors** with the
 ``@when`` decorator; the runtime runs each behavior once all of its required
-cowns are available, with deadlock freedom guaranteed by construction.  On
+cowns are available, with deadlock-free cown acquisition. Blocking inside a
+behavior, including joining a nested :class:`Scope`, can still deadlock. On
 Python 3.12 and newer, behaviors execute in parallel across worker
 sub-interpreters that each have their own GIL.
 
@@ -89,19 +90,29 @@ data-race-free order chosen by the runtime.
 
 For a non-tearing-down synchronization point — e.g. a parallel search that
 needs to inspect a best-so-far cown between rounds before continuing — use
-:func:`quiesce` instead of :func:`wait`. It blocks until the runtime is
-quiescent, optionally returns a stats or noticeboard snapshot, and leaves
+:func:`quiesce` instead of :func:`wait`. It observes global completion count zero,
+optionally returns a stats or noticeboard snapshot afterward, and leaves
 the worker pool and the noticeboard thread running so the next ``@when``
-call dispatches immediately.
+call dispatches immediately. Each open scope holds a reservation in this count,
+so even an idle scope on another host can delay or time out global quiescence.
+Concurrent producers can submit newer work before it returns;
+ordinary :meth:`Cown.unwrap` still requires current global completion count zero and
+the usual host-access protections.
 
 For cross-behavior shared state see :ref:`noticeboard`. For lower-level
 Erlang-style ``send`` / ``receive`` channels see :ref:`messaging`.
+
+For synchronous library calls that join only their own work and return a
+local result, use :class:`Scope`. Its :meth:`~Scope.quiesce` method permits
+multiple batches before scope exit publishes the final output;
+see :ref:`scoped-concurrency`.
 
 .. toctree::
    :maxdepth: 2
    :caption: Contents:
 
    api
+   scoped_concurrency
    pinned_cowns
    noticeboard
    messaging
